@@ -3,7 +3,9 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Optional
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.request import Request, urlopen
 
 
 @dataclass(frozen=True)
@@ -152,20 +154,20 @@ KNOWN_COMPANIES = {
     "openai": {
         "name": "OpenAI",
         "aliases": ("openai", "chatgpt", "gpt", "sora"),
-        "domains": ("openai.com", "platform.openai.com"),
+        "domains": ("openai.com", "platform.openai.com", "developers.openai.com"),
         "sources": {
             "news": "https://openai.com/news/",
-            "pricing": "https://openai.com/api/pricing/",
+            "pricing": "https://developers.openai.com/api/docs/pricing",
             "docs": "https://platform.openai.com/docs",
         },
     },
     "anthropic": {
         "name": "Anthropic",
         "aliases": ("anthropic", "claude"),
-        "domains": ("anthropic.com", "docs.anthropic.com"),
+        "domains": ("anthropic.com", "docs.anthropic.com", "claude.com", "platform.claude.com"),
         "sources": {
             "news": "https://www.anthropic.com/news",
-            "pricing": "https://www.anthropic.com/pricing",
+            "pricing": "https://platform.claude.com/docs/en/about-claude/pricing",
             "docs": "https://docs.anthropic.com",
         },
     },
@@ -175,7 +177,7 @@ KNOWN_COMPANIES = {
         "domains": ("groq.com", "console.groq.com"),
         "sources": {
             "news": "https://groq.com/news/",
-            "pricing": "https://groq.com/pricing/",
+            "pricing": "https://groq.com/pricing",
             "docs": "https://console.groq.com/docs",
         },
     },
@@ -185,7 +187,7 @@ KNOWN_COMPANIES = {
         "domains": ("google.com", "google.dev", "ai.google.dev", "cloud.google.com"),
         "sources": {
             "news": "https://blog.google/technology/ai/",
-            "pricing": "https://ai.google.dev/pricing",
+            "pricing": "https://ai.google.dev/gemini-api/docs/pricing",
             "docs": "https://ai.google.dev/gemini-api/docs",
         },
     },
@@ -245,11 +247,22 @@ Rules:
 - Prefer official source URLs when you are confident; otherwise use SEARCH: with a precise query.
 - Priority 1 means essential, 2 supporting, 3 optional."""
 
-    def __init__(self, use_llm: bool = True, model: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        use_llm: bool = True,
+        model: Optional[str] = None,
+        validate_urls: Optional[bool] = None,
+    ) -> None:
         """Initialize the planner with optional Groq LLM planning."""
 
         self.use_llm = use_llm
         self.model = model or os.environ.get("RESEARCH_PLANNER_MODEL", "llama-3.1-8b-instant")
+        self.validate_urls = (
+            validate_urls
+            if validate_urls is not None
+            else os.environ.get("RESEARCH_PLANNER_VALIDATE_URLS", "1").lower()
+            not in {"0", "false", "no"}
+        )
 
     def plan(self, objective: str) -> ResearchPlan:
         """Create a research plan using Groq first, then deterministic fallback."""
@@ -372,7 +385,9 @@ Rules:
             source_type = self._semantic_source_type(objective, task, source_type)
             target_type = task.target_type if task.target_type in {"company", "discovery"} else "discovery"
             url = self._normalize_task_url(task.url, source_type)
+            url = self._canonical_company_url(url, source_type, task)
             url = self._repair_untrusted_url(url, source_type, task)
+            url = self._repair_dead_url(url, source_type, task)
             if url.startswith("SEARCH:"):
                 source_type = "search"
             guarded.append(
@@ -596,6 +611,61 @@ Rules:
             return self._source_search_url(task, source_type)
 
         return url
+
+    def _canonical_company_url(
+        self,
+        url: str,
+        source_type: str,
+        task: ResearchTask,
+    ) -> str:
+        """Prefer maintained canonical URLs for known company source types."""
+
+        if url.startswith("SEARCH:") or source_type not in {"pricing", "news", "docs"}:
+            return url
+
+        canonical = self._known_company_source(task.target_name, source_type)
+        if canonical and self._is_official_target_url(url, task.target_name):
+            return canonical
+        return url
+
+    def _known_company_source(self, target_name: str, source_type: str) -> str:
+        """Return a maintained source URL for a known company and source type."""
+
+        target = target_name.strip().lower()
+        for company in KNOWN_COMPANIES.values():
+            if company["name"].lower() == target:
+                return company.get("sources", {}).get(source_type, "")
+        return ""
+
+    def _repair_dead_url(
+        self,
+        url: str,
+        source_type: str,
+        task: ResearchTask,
+    ) -> str:
+        """Replace confirmed 404/410 URLs with a canonical URL or search task."""
+
+        if not self.validate_urls or url.startswith("SEARCH:"):
+            return url
+        if self._url_is_alive(url):
+            return url
+
+        canonical = self._known_company_source(task.target_name, source_type)
+        if canonical and canonical != url and self._url_is_alive(canonical):
+            return canonical
+        return self._source_search_url(task, source_type)
+
+    def _url_is_alive(self, url: str) -> bool:
+        """Return False only for confirmed missing URLs."""
+
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status not in {404, 410}
+        except HTTPError as error:
+            return error.code not in {404, 410}
+        except (TimeoutError, URLError, OSError):
+            return True
 
     def _is_untrusted_webpage(self, url: str, source_type: str) -> bool:
         """Return True for direct URLs that should be resolved through search first."""
