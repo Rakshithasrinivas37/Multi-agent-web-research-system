@@ -3,7 +3,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 
 @dataclass(frozen=True)
@@ -221,7 +221,11 @@ Rules:
 - Comparisons should use output_format "comparison_table".
 - "How does X work" should use output_format "deep_dive".
 - Use SEARCH: when an exact URL is unknown.
-- For known company pricing/docs/news pages, prefer official vendor URLs.
+- SEARCH: tasks must set use_playwright to false because search is handled by the search executor.
+- URLs must be valid http/https links or SEARCH: queries.
+- synthesis_instruction must be specific to the objective and explain what dimensions to emphasize.
+- You decide the companies, source mix, URLs, search queries, synthesis dimensions, and output format.
+- Prefer official source URLs when you are confident; otherwise use SEARCH: with a precise query.
 - Priority 1 means essential, 2 supporting, 3 optional."""
 
     def __init__(self, use_llm: bool = True, model: Optional[str] = None) -> None:
@@ -294,8 +298,7 @@ Rules:
         if not tasks:
             raise ValueError("planner returned no tasks")
 
-        tasks = self._post_process_tasks(objective, companies, tasks)
-        tasks = self._enrich_known_technical_tasks(objective, tasks)
+        tasks = self._apply_task_guardrails(tasks)
         self._validate_plan_quality(tasks)
 
         return ResearchPlan(
@@ -304,7 +307,10 @@ Rules:
             companies=companies,
             sub_questions=list(data.get("sub_questions", [])),
             tasks=sorted(tasks, key=lambda task: task.priority),
-            synthesis_instruction=data.get("synthesis_instruction", "Synthesize findings clearly."),
+            synthesis_instruction=self._validate_synthesis_instruction(
+                data.get("synthesis_instruction", ""),
+                objective,
+            ),
             output_format=output_format,
         )
 
@@ -317,8 +323,7 @@ Rules:
             target_type = "discovery"
 
         url = str(task["url"]).strip()
-        if source_type == "search" and not url.startswith("SEARCH:") and not url.startswith("http"):
-            url = f"SEARCH:{url}"
+        url = self._normalize_task_url(url, source_type)
 
         return ResearchTask(
             task_id=f"task_{index:03d}",
@@ -333,39 +338,15 @@ Rules:
             expected_signals=list(task.get("expected_signals", [])),
         )
 
-    def _post_process_tasks(
-        self,
-        objective: str,
-        companies: list[str],
-        tasks: list[ResearchTask],
-    ) -> list[ResearchTask]:
-        """Normalize task fields and override unreliable LLM URLs where possible."""
+    def _apply_task_guardrails(self, tasks: list[ResearchTask]) -> list[ResearchTask]:
+        """Apply safety guardrails without changing the LLM's research decisions."""
 
-        known_by_name = {
-            company["name"].lower(): company
-            for company in KNOWN_COMPANIES.values()
-        }
-        processed = []
+        guarded = []
         for index, task in enumerate(tasks, start=1):
             source_type = self._normalize_source_type(task.source_type)
-            target_name = task.target_name.strip() or "General Research"
             target_type = task.target_type if task.target_type in {"company", "discovery"} else "discovery"
-
-            company = known_by_name.get(target_name.lower())
-            if company is None and target_type == "company":
-                company = self._known_company_from_context(target_name, companies, objective)
-            if company is not None:
-                target_type = "company"
-                target_name = company["name"]
-                source_type = self._infer_company_source_type(task, source_type)
-
-            url = task.url.strip()
-            if company is not None and source_type in company["sources"]:
-                url = company["sources"][source_type]
-            elif source_type == "search" and not url.startswith("SEARCH:") and not url.startswith("http"):
-                url = f"SEARCH:{url}"
-
-            processed.append(
+            url = self._normalize_task_url(task.url, source_type)
+            guarded.append(
                 ResearchTask(
                     task_id=f"task_{index:03d}",
                     query_context=task.query_context,
@@ -374,12 +355,12 @@ Rules:
                     priority=task.priority,
                     extraction_goal=task.extraction_goal,
                     target_type=target_type,
-                    target_name=target_name,
+                    target_name=task.target_name,
                     use_playwright=self._should_use_playwright(source_type, url, task.use_playwright),
                     expected_signals=task.expected_signals,
                 )
             )
-        return processed
+        return guarded
 
     def _enrich_known_technical_tasks(
         self,
@@ -468,10 +449,8 @@ Rules:
                 raise ValueError(f"{task.task_id} is missing extraction_goal")
             if task.source_type not in SOURCE_TYPES:
                 raise ValueError(f"{task.task_id} has unsupported source_type '{task.source_type}'")
-            if task.source_type == "search" and not (
-                task.url.startswith("SEARCH:") or task.url.startswith("http")
-            ):
-                raise ValueError(f"{task.task_id} search task has invalid url")
+            if not self._is_valid_task_url(task.url):
+                raise ValueError(f"{task.task_id} has invalid url: {task.url!r}")
 
     def _validate_research_mode(self, research_mode: str) -> str:
         """Require exactly one known research mode."""
@@ -491,6 +470,17 @@ Rules:
             return "summary"
         return normalized
 
+    def _validate_synthesis_instruction(self, instruction: str, objective: str) -> str:
+        """Keep the LLM's synthesis instruction unless it is empty."""
+
+        cleaned = str(instruction).strip()
+        if cleaned:
+            return cleaned
+        return (
+            f"Synthesize findings for: {objective}. "
+            "Answer the sub-questions, cite source URLs for major claims, and call out uncertainty."
+        )
+
     def _normalize_source_type(self, source_type: str) -> str:
         """Normalize LLM source type variants into supported values."""
 
@@ -500,50 +490,53 @@ Rules:
             return "webpage"
         return normalized
 
-    def _known_company_from_context(
-        self,
-        target_name: str,
-        companies: list[str],
-        objective: str,
-    ) -> Optional[dict[str, Any]]:
-        """Find a known company from task/company/objective text."""
+    def _normalize_task_url(self, url: str, source_type: str) -> str:
+        """Normalize task URLs into http(s) URLs or SEARCH: queries."""
 
-        haystack = " ".join([target_name, *companies, objective]).lower()
-        for company in KNOWN_COMPANIES.values():
-            if any(self._contains(haystack, alias) for alias in company["aliases"]):
-                return company
-        return None
+        normalized = url.strip()
+        if normalized.startswith("SEARCH:"):
+            query = normalized.removeprefix("SEARCH:").strip()
+            if not query:
+                raise ValueError("SEARCH task has empty query")
+            return f"SEARCH:{query}"
+
+        if self._is_valid_http_url(normalized):
+            return normalized
+
+        if source_type == "search":
+            return f"SEARCH:{normalized}"
+
+        if normalized.startswith("www."):
+            candidate = f"https://{normalized}"
+            if self._is_valid_http_url(candidate):
+                return candidate
+
+        if " " in normalized or "." not in normalized:
+            return f"SEARCH:{normalized}"
+
+        raise ValueError(f"invalid URL: {url!r}")
+
+    def _is_valid_task_url(self, url: str) -> bool:
+        """Return True for executable task URLs."""
+
+        if url.startswith("SEARCH:"):
+            return bool(url.removeprefix("SEARCH:").strip())
+        return self._is_valid_http_url(url)
+
+    def _is_valid_http_url(self, url: str) -> bool:
+        """Return True for valid http or https URLs with a host."""
+
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
     def _should_use_playwright(self, source_type: str, url: str, current: bool) -> bool:
         """Use browser rendering for dynamic pages and search pages."""
 
-        if source_type in {"search", "pricing", "careers", "reviews"}:
-            return True
-        if url.startswith("SEARCH:"):
+        if source_type == "search" or url.startswith("SEARCH:"):
+            return False
+        if source_type in {"pricing", "careers", "reviews"}:
             return True
         return current
-
-    def _infer_company_source_type(self, task: ResearchTask, source_type: str) -> str:
-        """Infer pricing/docs/news when the LLM labels a company page as generic webpage."""
-
-        if source_type != "webpage":
-            return source_type
-
-        text = " ".join(
-            [
-                task.query_context,
-                task.extraction_goal,
-                " ".join(task.expected_signals),
-                task.url,
-            ]
-        ).lower()
-        if self._contains_any(text, ["pricing", "price", "prices", "cost", "costs", "tier", "tiers"]):
-            return "pricing"
-        if self._contains_any(text, ["docs", "documentation", "api", "developer"]):
-            return "docs"
-        if self._contains_any(text, ["news", "launch", "announcement", "release", "blog"]):
-            return "news"
-        return source_type
 
     def _plan_with_rules(self, objective: str) -> ResearchPlan:
         """Fallback planner that works without network access or API keys."""
@@ -564,7 +557,13 @@ Rules:
             companies=[company["name"] for company in companies],
             sub_questions=[task.query_context for task in tasks],
             tasks=tasks,
-            synthesis_instruction=self._synthesis_instruction(research_mode),
+            synthesis_instruction=self._specific_synthesis_instruction(
+                objective=objective,
+                research_mode=research_mode,
+                output_format=self._output_format(objective, research_mode),
+                sub_questions=[task.query_context for task in tasks],
+                tasks=tasks,
+            ),
             output_format=self._output_format(objective, research_mode),
         )
 
@@ -724,6 +723,113 @@ Rules:
             "docs": f"What official documentation explains {objective}?",
         }
         return templates.get(source_type, f"What sources help answer {objective}?")
+
+    def _specific_synthesis_instruction(
+        self,
+        objective: str,
+        research_mode: str,
+        output_format: str,
+        sub_questions: list[str],
+        tasks: list[ResearchTask],
+        llm_instruction: str = "",
+    ) -> str:
+        """Create objective-specific guidance for the synthesis agent."""
+
+        dimensions = self._synthesis_dimensions(objective, tasks)
+        source_names = sorted({task.target_name for task in tasks if task.target_name})
+        source_text = ", ".join(source_names[:6]) if source_names else "the collected sources"
+        question_text = "; ".join(sub_questions[:4])
+
+        if output_format == "comparison_table":
+            return (
+                f"Create a comparison table for: {objective}. "
+                f"Compare these dimensions: {', '.join(dimensions)}. "
+                f"Use evidence from {source_text}; cite the source URL beside each major claim. "
+                f"After the table, summarize the best choice for each use case and list any missing or uncertain evidence. "
+                f"Make sure these questions are answered: {question_text}."
+            )
+
+        if output_format == "deep_dive":
+            return (
+                f"Create a technical deep dive for: {objective}. "
+                f"Explain the intuition first, then the mechanism step by step, then practical examples. "
+                f"Emphasize: {', '.join(dimensions)}. "
+                f"Cite source URLs for definitions, mechanisms, and examples. "
+                f"End with an interview-ready summary and common misconceptions."
+            )
+
+        if research_mode == "competitor_intel":
+            return (
+                f"Create a competitor intelligence report for: {objective}. "
+                f"Compare companies across: {', '.join(dimensions)}. "
+                f"Separate direct vendor evidence from third-party comparison evidence. "
+                f"Call out pricing/page changes, gaps, and claims that need re-checking."
+            )
+
+        if research_mode == "market_research":
+            return (
+                f"Create a market research report for: {objective}. "
+                f"Organize findings by trends, key players, evidence, risks, and opportunities. "
+                f"Use citations for every market claim and identify weak or missing evidence."
+            )
+
+        if llm_instruction and not self._is_generic_instruction(llm_instruction):
+            return llm_instruction
+
+        return (
+            f"Synthesize a clear answer for: {objective}. "
+            f"Answer these sub-questions: {question_text}. "
+            f"Emphasize {', '.join(dimensions)} and cite source URLs for key claims."
+        )
+
+    def _synthesis_dimensions(self, objective: str, tasks: list[ResearchTask]) -> list[str]:
+        """Choose dimensions the synthesis agent should emphasize."""
+
+        normalized = objective.lower()
+        source_types = {task.source_type for task in tasks}
+
+        if self._contains_any(normalized, ["pricing", "pricings", "price", "cost"]):
+            return [
+                "model names",
+                "input token price",
+                "output token price",
+                "free tier or limits",
+                "context window or usage limits",
+                "enterprise/volume pricing notes",
+            ]
+
+        if self._contains_any(normalized, ["architecture", "architectures", "rnn", "lstm", "transformer"]):
+            return [
+                "architecture structure",
+                "memory/state handling",
+                "parallelization",
+                "training and inference cost",
+                "strengths",
+                "limitations",
+                "best use cases",
+            ]
+
+        if "benchmarks" in source_types:
+            return ["datasets", "metrics", "performance results", "latency", "memory", "limitations"]
+
+        if "implementation" in source_types or "docs" in source_types:
+            return ["setup steps", "APIs or code examples", "constraints", "pitfalls", "best practices"]
+
+        return ["definition", "key evidence", "examples", "tradeoffs", "practical takeaway"]
+
+    def _is_generic_instruction(self, instruction: str) -> bool:
+        """Detect vague synthesis instructions that should be replaced."""
+
+        normalized = instruction.lower().strip()
+        generic_phrases = [
+            "combine evidence",
+            "combine the evidence",
+            "create a comparison table",
+            "synthesize findings",
+            "provide a comprehensive overview",
+            "highlighting the key differences",
+        ]
+        return any(phrase in normalized for phrase in generic_phrases)
 
     def _synthesis_instruction(self, research_mode: str) -> str:
         """Tell a later synthesis agent how to combine results."""
