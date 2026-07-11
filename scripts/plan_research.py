@@ -3,6 +3,14 @@ import json
 from pathlib import Path
 import sys
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs) -> bool:
+        """No-op when python-dotenv is not installed."""
+
+        return False
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -35,6 +43,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     """Generate and save a structured research plan."""
+
+    load_dotenv(PROJECT_ROOT / ".env")
 
     args = parse_args()
     objective = args.objective or input("Research objective: ").strip()

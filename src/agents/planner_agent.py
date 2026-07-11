@@ -3,7 +3,7 @@ import os
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Optional
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 
 @dataclass(frozen=True)
@@ -219,11 +219,15 @@ Rules:
 - Never combine modes with a pipe, slash, comma, or list.
 - source_type must be one of: webpage, arxiv, wikipedia, search, docs, news, pricing, careers, reviews, technical_overview, academic, benchmarks, implementation.
 - Comparisons should use output_format "comparison_table".
+- If the objective compares named companies or products, use research_mode "competitor_intel".
+- If the objective asks about pricing, costs, plans, or tiers, use source_type "pricing" for direct vendor pricing pages.
 - "How does X work" should use output_format "deep_dive".
 - Use SEARCH: when an exact URL is unknown.
+- Use SEARCH: for volatile vendor pages such as pricing, careers, reviews, and pages you cannot verify exactly.
 - SEARCH: tasks must set use_playwright to false because search is handled by the search executor.
+- Do not use Google/Bing search result URLs as webpage URLs; use SEARCH: instead.
 - URLs must be valid http/https links or SEARCH: queries.
-- synthesis_instruction must be specific to the objective and explain what dimensions to emphasize.
+- synthesis_instruction must be specific to the objective and list concrete dimensions to emphasize.
 - You decide the companies, source mix, URLs, search queries, synthesis dimensions, and output format.
 - Prefer official source URLs when you are confident; otherwise use SEARCH: with a precise query.
 - Priority 1 means essential, 2 supporting, 3 optional."""
@@ -288,9 +292,13 @@ Rules:
         """Parse the JSON plan returned by Groq."""
 
         data = json.loads(self._strip_markdown_fence(raw))
-        research_mode = self._validate_research_mode(data["research_mode"])
         output_format = self._validate_output_format(data.get("output_format", "summary"))
         companies = [str(company) for company in data.get("companies", []) if str(company).strip()]
+        research_mode = self._repair_research_mode(
+            objective=objective,
+            research_mode=self._validate_research_mode(data["research_mode"]),
+            companies=companies,
+        )
         tasks = [
             self._parse_llm_task(task, index)
             for index, task in enumerate(data.get("tasks", []), start=1)
@@ -298,8 +306,8 @@ Rules:
         if not tasks:
             raise ValueError("planner returned no tasks")
 
-        tasks = self._apply_task_guardrails(tasks)
-        self._validate_plan_quality(tasks)
+        tasks = self._apply_task_guardrails(tasks, objective)
+        self._validate_plan_quality(tasks, objective, companies)
 
         return ResearchPlan(
             objective=objective,
@@ -338,14 +346,22 @@ Rules:
             expected_signals=list(task.get("expected_signals", [])),
         )
 
-    def _apply_task_guardrails(self, tasks: list[ResearchTask]) -> list[ResearchTask]:
+    def _apply_task_guardrails(
+        self,
+        tasks: list[ResearchTask],
+        objective: str,
+    ) -> list[ResearchTask]:
         """Apply safety guardrails without changing the LLM's research decisions."""
 
         guarded = []
         for index, task in enumerate(tasks, start=1):
             source_type = self._normalize_source_type(task.source_type)
+            source_type = self._semantic_source_type(objective, task, source_type)
             target_type = task.target_type if task.target_type in {"company", "discovery"} else "discovery"
             url = self._normalize_task_url(task.url, source_type)
+            url = self._repair_untrusted_url(url, source_type, task)
+            if url.startswith("SEARCH:"):
+                source_type = "search"
             guarded.append(
                 ResearchTask(
                     task_id=f"task_{index:03d}",
@@ -434,7 +450,12 @@ Rules:
             for index, task in enumerate(sorted(enriched, key=lambda item: item.priority), start=1)
         ]
 
-    def _validate_plan_quality(self, tasks: list[ResearchTask]) -> None:
+    def _validate_plan_quality(
+        self,
+        tasks: list[ResearchTask],
+        objective: str,
+        companies: list[str],
+    ) -> None:
         """Reject plans that are technically valid JSON but too weak to execute."""
 
         if len(tasks) < 2:
@@ -451,6 +472,23 @@ Rules:
                 raise ValueError(f"{task.task_id} has unsupported source_type '{task.source_type}'")
             if not self._is_valid_task_url(task.url):
                 raise ValueError(f"{task.task_id} has invalid url: {task.url!r}")
+
+        if self._is_pricing_objective(objective) and companies:
+            pricing_targets = {
+                task.target_name.lower()
+                for task in tasks
+                if task.source_type in {"pricing", "search"}
+            }
+            missing = [
+                company
+                for company in companies
+                if company.lower() not in pricing_targets
+            ]
+            if missing:
+                raise ValueError(
+                    "pricing comparison is missing pricing/search tasks for: "
+                    + ", ".join(missing)
+                )
 
     def _validate_research_mode(self, research_mode: str) -> str:
         """Require exactly one known research mode."""
@@ -474,12 +512,109 @@ Rules:
         """Keep the LLM's synthesis instruction unless it is empty."""
 
         cleaned = str(instruction).strip()
+        if cleaned and self._is_generic_instruction(cleaned):
+            raise ValueError(
+                "synthesis_instruction is too generic; list concrete dimensions "
+                f"for this objective: {objective}"
+            )
         if cleaned:
             return cleaned
         return (
             f"Synthesize findings for: {objective}. "
             "Answer the sub-questions, cite source URLs for major claims, and call out uncertainty."
         )
+
+    def _repair_research_mode(
+        self,
+        objective: str,
+        research_mode: str,
+        companies: list[str],
+    ) -> str:
+        """Repair obvious mode mismatches while leaving nuanced choices to the LLM."""
+
+        if companies and (
+            self._is_pricing_objective(objective)
+            or self._contains_any(objective.lower(), ["compare", "versus", "vs"])
+        ):
+            return "competitor_intel"
+        return research_mode
+
+    def _semantic_source_type(
+        self,
+        objective: str,
+        task: ResearchTask,
+        source_type: str,
+    ) -> str:
+        """Correct source types that are obvious from the task semantics."""
+
+        if source_type == "search" or task.url.startswith("SEARCH:"):
+            return "search"
+
+        task_text = " ".join(
+            [
+                objective,
+                task.query_context,
+                task.extraction_goal,
+                task.url,
+            ]
+        ).lower()
+        if self._is_pricing_objective(task_text):
+            return "pricing"
+        return source_type
+
+    def _repair_untrusted_url(
+        self,
+        url: str,
+        source_type: str,
+        task: ResearchTask,
+    ) -> str:
+        """Replace likely hallucinated or volatile direct URLs with search tasks."""
+
+        if url.startswith("SEARCH:"):
+            return url
+
+        if source_type in {"pricing", "careers", "reviews"}:
+            return self._source_search_url(task, source_type)
+
+        if self._is_untrusted_webpage(url, source_type):
+            return self._source_search_url(task, source_type)
+
+        return url
+
+    def _is_untrusted_webpage(self, url: str, source_type: str) -> bool:
+        """Return True for direct URLs that should be resolved through search first."""
+
+        if source_type not in {"webpage", "technical_overview", "academic", "benchmarks", "implementation"}:
+            return False
+
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        trusted_hosts = (
+            "arxiv.org",
+            "wikipedia.org",
+            "tensorflow.org",
+            "pytorch.org",
+            "huggingface.co",
+            "github.com",
+            "docs.python.org",
+            "colah.github.io",
+        )
+        return not any(host == trusted or host.endswith(f".{trusted}") for trusted in trusted_hosts)
+
+    def _source_search_url(self, task: ResearchTask, source_type: str) -> str:
+        """Build a focused search task from an untrusted direct URL."""
+
+        target = task.target_name if task.target_name != "General Research" else ""
+        if source_type == "pricing" and target:
+            return f"SEARCH:{target} official model pricing"
+        if source_type == "careers" and target:
+            return f"SEARCH:{target} official careers jobs"
+        if source_type == "reviews" and target:
+            return f"SEARCH:{target} product reviews customer feedback"
+
+        parts = [target, task.query_context, task.extraction_goal]
+        query = " ".join(part.strip() for part in parts if part and part.strip())
+        return f"SEARCH:{query}"
 
     def _normalize_source_type(self, source_type: str) -> str:
         """Normalize LLM source type variants into supported values."""
@@ -500,6 +635,10 @@ Rules:
                 raise ValueError("SEARCH task has empty query")
             return f"SEARCH:{query}"
 
+        search_query = self._extract_search_query(normalized)
+        if search_query:
+            return f"SEARCH:{search_query}"
+
         if self._is_valid_http_url(normalized):
             return normalized
 
@@ -515,6 +654,16 @@ Rules:
             return f"SEARCH:{normalized}"
 
         raise ValueError(f"invalid URL: {url!r}")
+
+    def _extract_search_query(self, url: str) -> str:
+        """Convert search-engine URLs into executor-friendly SEARCH tasks."""
+
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if not any(domain in host for domain in ("google.", "bing.com", "duckduckgo.com")):
+            return ""
+        query = parse_qs(parsed.query).get("q", [""])[0].strip()
+        return query
 
     def _is_valid_task_url(self, url: str) -> bool:
         """Return True for executable task URLs."""
@@ -538,6 +687,14 @@ Rules:
             return True
         return current
 
+    def _is_pricing_objective(self, text: str) -> bool:
+        """Return True when text asks for pricing or packaging evidence."""
+
+        return self._contains_any(
+            text.lower(),
+            ["pricing", "pricings", "price", "prices", "cost", "costs", "plan", "plans", "tier", "tiers"],
+        )
+
     def _plan_with_rules(self, objective: str) -> ResearchPlan:
         """Fallback planner that works without network access or API keys."""
 
@@ -550,11 +707,14 @@ Rules:
         else:
             tasks = self._discovery_tasks(objective, source_types)
         tasks = self._enrich_known_technical_tasks(objective, tasks)
+        tasks = self._apply_task_guardrails(tasks, objective)
+        company_names = [company["name"] for company in companies]
+        self._validate_plan_quality(tasks, objective, company_names)
 
         return ResearchPlan(
             objective=objective,
             research_mode=research_mode,
-            companies=[company["name"] for company in companies],
+            companies=company_names,
             sub_questions=[task.query_context for task in tasks],
             tasks=tasks,
             synthesis_instruction=self._specific_synthesis_instruction(
