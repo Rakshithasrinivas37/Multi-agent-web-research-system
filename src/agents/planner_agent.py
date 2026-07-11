@@ -1,16 +1,38 @@
+"""
+Planner Agent
+=============
+
+This is a junior-friendly planner for the multi-agent research system.
+
+What it does:
+1. Takes one research objective from the user.
+2. Asks Groq to break it into sub-questions and source tasks.
+3. Fixes common LLM mistakes before the next agent runs.
+4. Falls back to simple rule-based planning when Groq is unavailable.
+
+Task URLs can be one of two forms:
+- "https://..." for a page that can be scraped.
+- "SEARCH:..." for a query that the search agent should resolve.
+"""
+
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, field
-from typing import Any, Iterable, Optional
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote_plus, urlparse
-from urllib.request import Request, urlopen
+from dataclasses import asdict, dataclass, field, replace
+from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
+
+import httpx
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class ResearchTask:
-    """One source-specific task that a browser or scraper agent can execute."""
+    """One small job for a search or scraper agent."""
 
     task_id: str
     query_context: str
@@ -26,7 +48,7 @@ class ResearchTask:
 
 @dataclass(frozen=True)
 class ResearchPlan:
-    """Structured research plan returned by the planner agent."""
+    """Final plan returned by the planner."""
 
     objective: str
     research_mode: str
@@ -50,81 +72,78 @@ class ResearchPlan:
         }
 
 
+# ---------------------------------------------------------------------------
+# Simple configuration
+# ---------------------------------------------------------------------------
+
+
 SOURCE_TYPES = {
     "webpage": {
-        "goal": "Extract the page's key facts, claims, links, and evidence relevant to the task.",
+        "goal": "Extract key facts, claims, links, and evidence from the page.",
         "signals": ["page title", "key claims", "source links"],
     },
     "search": {
-        "goal": "Extract useful result titles, URLs, snippets, and source candidates for follow-up browsing.",
+        "goal": "Find useful source URLs, result titles, and snippets.",
         "signals": ["result titles", "candidate URLs", "snippets"],
     },
     "wikipedia": {
-        "goal": "Extract definitions, background, taxonomy, and linked authoritative references.",
+        "goal": "Extract definitions, background, and references.",
         "signals": ["definitions", "background", "references"],
     },
     "arxiv": {
-        "goal": "Extract paper title, authors, abstract, method claims, and publication metadata.",
+        "goal": "Extract paper title, authors, abstract, and method claims.",
         "signals": ["paper title", "authors", "abstract", "method claims"],
     },
-    "overview": {
-        "goal": "Extract definitions, scope, key concepts, and background context.",
-        "signals": ["definitions", "main concepts", "important subtopics"],
-    },
-    "authoritative_sources": {
-        "goal": "Extract reliable source names, URLs, credibility signals, and primary-source evidence.",
-        "signals": ["official pages", "primary sources", "expert sources"],
-    },
-    "recent_updates": {
-        "goal": "Extract dates, new developments, announcements, and changed claims.",
-        "signals": ["new developments", "dates", "announcements"],
-    },
-    "evidence": {
-        "goal": "Extract facts, examples, metrics, quotes, and source links.",
-        "signals": ["supporting facts", "examples", "metrics", "source links"],
-    },
-    "synthesis": {
-        "goal": "Extract comparisons, tradeoffs, pros, cons, and unresolved questions.",
-        "signals": ["comparisons", "pros and cons", "tradeoffs"],
+    "academic": {
+        "goal": "Extract paper names, claims, methods, and publication context.",
+        "signals": ["papers", "authors", "research claims"],
     },
     "technical_overview": {
-        "goal": "Extract definitions, architecture components, conceptual differences, and use cases.",
-        "signals": ["core concepts", "architectural differences", "strengths and weaknesses"],
-    },
-    "academic": {
-        "goal": "Extract paper titles, authors, publication years, claims, and source links.",
-        "signals": ["seminal papers", "method descriptions", "research context"],
+        "goal": "Extract concepts, architecture details, tradeoffs, and use cases.",
+        "signals": ["concepts", "architecture", "strengths", "limitations"],
     },
     "benchmarks": {
-        "goal": "Extract benchmark tasks, metrics, datasets, results, and tradeoff explanations.",
-        "signals": ["metrics", "datasets", "accuracy", "latency", "memory tradeoffs"],
+        "goal": "Extract datasets, metrics, results, and performance tradeoffs.",
+        "signals": ["metrics", "datasets", "results", "latency"],
     },
     "implementation": {
-        "goal": "Extract code references, framework examples, training details, and practical limitations.",
-        "signals": ["code examples", "framework implementations", "common pitfalls"],
+        "goal": "Extract code examples, framework details, and practical pitfalls.",
+        "signals": ["code examples", "frameworks", "pitfalls"],
     },
     "news": {
-        "goal": "Extract article titles, dates, categories, summaries, and article URLs.",
-        "signals": ["announcements", "partnerships", "release timing"],
+        "goal": "Extract announcements, dates, article titles, and summaries.",
+        "signals": ["announcements", "dates", "article URLs"],
     },
     "pricing": {
-        "goal": "Extract model names, pricing units, input/output token costs, free tiers, limits, and enterprise notes.",
+        "goal": "Extract model names, token costs, tiers, limits, and enterprise notes.",
         "signals": ["model prices", "token units", "tiers", "limits"],
     },
     "docs": {
-        "goal": "Extract official API names, model references, examples, limits, and implementation guidance.",
-        "signals": ["API names", "model references", "examples", "limits"],
+        "goal": "Extract official API names, examples, limits, and setup guidance.",
+        "signals": ["API names", "examples", "limits"],
     },
     "careers": {
-        "goal": "Extract job titles, teams, locations, seniority, and skills being hired.",
-        "signals": ["job titles", "teams", "locations", "skills"],
+        "goal": "Extract roles, teams, locations, salary hints, benefits, and training.",
+        "signals": ["roles", "teams", "locations", "skills"],
     },
     "reviews": {
-        "goal": "Extract ratings, complaints, praise, feature requests, and customer segments.",
-        "signals": ["ratings", "complaints", "praise", "feature requests"],
+        "goal": "Extract ratings, praise, complaints, and feature requests.",
+        "signals": ["ratings", "complaints", "praise"],
     },
 }
 
+SOURCE_ALIASES = {
+    "blog": "news",
+    "company_blog": "news",
+    "documentation": "docs",
+    "official_docs": "docs",
+    "paper": "arxiv",
+    "papers": "arxiv",
+    "price": "pricing",
+    "pricing_page": "pricing",
+    "research_paper": "academic",
+    "search_query": "search",
+}
 
 VALID_RESEARCH_MODES = {
     "competitor_intel",
@@ -135,36 +154,22 @@ VALID_RESEARCH_MODES = {
 
 VALID_OUTPUT_FORMATS = {"comparison_table", "deep_dive", "summary", "report"}
 
-SOURCE_TYPE_ALIASES = {
-    "official_docs": "docs",
-    "documentation": "docs",
-    "blog": "news",
-    "company_blog": "news",
-    "paper": "arxiv",
-    "papers": "arxiv",
-    "scholarly": "academic",
-    "research_paper": "academic",
-    "pricing_page": "pricing",
-    "price": "pricing",
-    "search_query": "search",
-}
-
 
 KNOWN_COMPANIES = {
     "openai": {
         "name": "OpenAI",
-        "aliases": ("openai", "chatgpt", "gpt", "sora"),
-        "domains": ("openai.com", "platform.openai.com", "developers.openai.com"),
+        "aliases": ["openai", "chatgpt", "gpt", "sora"],
+        "domains": ["openai.com", "platform.openai.com", "developers.openai.com"],
         "sources": {
             "news": "https://openai.com/news/",
-            "pricing": "https://developers.openai.com/api/docs/pricing",
+            "pricing": "https://platform.openai.com/docs/pricing",
             "docs": "https://platform.openai.com/docs",
         },
     },
     "anthropic": {
         "name": "Anthropic",
-        "aliases": ("anthropic", "claude"),
-        "domains": ("anthropic.com", "docs.anthropic.com", "claude.com", "platform.claude.com"),
+        "aliases": ["anthropic", "claude"],
+        "domains": ["anthropic.com", "claude.com", "docs.anthropic.com", "platform.claude.com"],
         "sources": {
             "news": "https://www.anthropic.com/news",
             "pricing": "https://platform.claude.com/docs/en/about-claude/pricing",
@@ -173,8 +178,8 @@ KNOWN_COMPANIES = {
     },
     "groq": {
         "name": "Groq",
-        "aliases": ("groq", "llama on groq", "groqcloud"),
-        "domains": ("groq.com", "console.groq.com"),
+        "aliases": ["groq", "groqcloud"],
+        "domains": ["groq.com", "console.groq.com"],
         "sources": {
             "news": "https://groq.com/news/",
             "pricing": "https://groq.com/pricing",
@@ -183,8 +188,8 @@ KNOWN_COMPANIES = {
     },
     "google": {
         "name": "Google",
-        "aliases": ("google", "gemini", "vertex ai", "google ai"),
-        "domains": ("google.com", "google.dev", "ai.google.dev", "cloud.google.com"),
+        "aliases": ["google", "gemini", "vertex ai", "google ai"],
+        "domains": ["google.com", "google.dev", "ai.google.dev", "cloud.google.com"],
         "sources": {
             "news": "https://blog.google/technology/ai/",
             "pricing": "https://ai.google.dev/gemini-api/docs/pricing",
@@ -194,58 +199,106 @@ KNOWN_COMPANIES = {
 }
 
 
-class PlannerAgent:
-    """Break any research objective into source-specific subtasks."""
-
-    SYSTEM_PROMPT = """You are an expert planner for a multi-agent web research system.
-
-Create a structured research plan for the user's objective.
-
-Modes:
-- competitor_intel: monitor specific companies/products.
-- knowledge_research: explain concepts and comparisons.
-- technical_deep_dive: papers, internals, architectures, benchmarks.
-- market_research: industry trends, landscape, competitors.
-
-Return ONLY valid JSON:
-{
-  "research_mode": "competitor_intel",
-  "companies": ["optional company names"],
-  "sub_questions": ["specific answerable question"],
-  "tasks": [
-    {
-      "query_context": "which sub-question this answers",
-      "url": "https://exact-url.com OR SEARCH:search query",
-      "source_type": "webpage",
-      "priority": 1,
-      "extraction_goal": "precise extraction goal",
-      "target_type": "company|discovery",
-      "target_name": "company name or General Research",
-      "use_playwright": false,
-      "expected_signals": ["signal 1", "signal 2"]
-    }
-  ],
-  "synthesis_instruction": "how final answer should combine evidence",
-  "output_format": "comparison_table|deep_dive|summary|report"
+KNOWN_TOPIC_SOURCES = {
+    "attention": [
+        {
+            "query_context": "What did the Transformer paper establish about self-attention?",
+            "url": "https://arxiv.org/abs/1706.03762",
+            "source_type": "arxiv",
+            "target_name": "Attention Mechanism",
+        },
+        {
+            "query_context": "How did Bahdanau attention introduce neural machine translation alignment?",
+            "url": "https://arxiv.org/abs/1409.0473",
+            "source_type": "arxiv",
+            "target_name": "Bahdanau Attention",
+        },
+        {
+            "query_context": "How does Lilian Weng explain attention and transformer mechanisms?",
+            "url": "https://lilianweng.github.io/posts/2018-06-24-attention/",
+            "source_type": "webpage",
+            "target_name": "Attention Mechanism",
+        },
+    ],
+    "transformer": [
+        {
+            "query_context": "What did the original Transformer paper introduce?",
+            "url": "https://arxiv.org/abs/1706.03762",
+            "source_type": "arxiv",
+            "target_name": "Transformer",
+        }
+    ],
+    "lstm": [
+        {
+            "query_context": "How do LSTMs work and why were they introduced?",
+            "url": "https://colah.github.io/posts/2015-08-Understanding-LSTMs",
+            "source_type": "webpage",
+            "target_name": "LSTM",
+        }
+    ],
+    "rnn": [
+        {
+            "query_context": "What is a recurrent neural network?",
+            "url": "https://en.wikipedia.org/wiki/Recurrent_neural_network",
+            "source_type": "wikipedia",
+            "target_name": "RNN",
+        }
+    ],
 }
 
+TRUSTED_HOSTS = {
+    "arxiv.org",
+    "colah.github.io",
+    "docs.python.org",
+    "github.com",
+    "huggingface.co",
+    "lilianweng.github.io",
+    "pytorch.org",
+    "tensorflow.org",
+    "wikipedia.org",
+}
+
+UNTRUSTED_HOSTS = {"medium.com", "towardsdatascience.com"}
+
+
+# ---------------------------------------------------------------------------
+# Planner
+# ---------------------------------------------------------------------------
+
+
+class PlannerAgent:
+    """Create a research plan from one objective."""
+
+    SYSTEM_PROMPT = f"""You create plans for a multi-agent web research system.
+
+Return ONLY valid JSON with this shape:
+{{
+  "research_mode": "competitor_intel|knowledge_research|technical_deep_dive|market_research",
+  "companies": ["company names if any"],
+  "sub_questions": ["answerable research question"],
+  "tasks": [{{
+    "query_context": "which sub-question this task answers",
+    "url": "https://real-url.com OR SEARCH:search query",
+    "source_type": "one of {', '.join(SOURCE_TYPES)}",
+    "priority": 1,
+    "extraction_goal": "what to extract",
+    "target_type": "company|discovery",
+    "target_name": "company name or General Research",
+    "use_playwright": false,
+    "expected_signals": ["signals to look for"]
+  }}],
+  "synthesis_instruction": "specific comparison or summary guidance",
+  "output_format": "comparison_table|deep_dive|summary|report"
+}}
+
 Rules:
-- research_mode must be EXACTLY ONE of: competitor_intel, knowledge_research, technical_deep_dive, market_research.
-- Never combine modes with a pipe, slash, comma, or list.
-- source_type must be one of: webpage, arxiv, wikipedia, search, docs, news, pricing, careers, reviews, technical_overview, academic, benchmarks, implementation.
-- Comparisons should use output_format "comparison_table".
-- If the objective compares named companies or products, use research_mode "competitor_intel".
-- If the objective asks about pricing, costs, plans, or tiers, use source_type "pricing" for direct vendor pricing pages.
-- "How does X work" should use output_format "deep_dive".
-- Prefer direct official URLs that a scraper can open when the company/source page is known.
-- Use SEARCH: only when an exact official URL is unknown or the URL is a search-engine results page.
-- SEARCH: tasks must set use_playwright to false because search is handled by the search executor.
-- Do not use Google/Bing search result URLs as webpage URLs; use SEARCH: instead.
-- URLs must be valid http/https links or SEARCH: queries.
-- synthesis_instruction must be specific to the objective and list concrete dimensions to emphasize.
-- You decide the companies, source mix, URLs, search queries, synthesis dimensions, and output format.
-- Prefer official source URLs when you are confident; otherwise use SEARCH: with a precise query.
-- Priority 1 means essential, 2 supporting, 3 optional."""
+- Use competitor_intel when named companies or products are compared.
+- In competitor_intel, create one task for every company and every sub-question.
+- Use SEARCH: when you are not sure the URL is real.
+- SEARCH tasks must have use_playwright=false.
+- Prefer official company URLs for pricing, docs, and news.
+- For attention mechanism, include arXiv 1706.03762, arXiv 1409.0473, and Lilian Weng's attention post.
+- Make synthesis_instruction specific to the objective."""
 
     def __init__(
         self,
@@ -253,32 +306,29 @@ Rules:
         model: Optional[str] = None,
         validate_urls: Optional[bool] = None,
     ) -> None:
-        """Initialize the planner with optional Groq LLM planning."""
+        """Set Groq model and URL validation behavior."""
 
         self.use_llm = use_llm
         self.model = model or os.environ.get("RESEARCH_PLANNER_MODEL", "llama-3.1-8b-instant")
-        self.validate_urls = (
-            validate_urls
-            if validate_urls is not None
-            else os.environ.get("RESEARCH_PLANNER_VALIDATE_URLS", "1").lower()
-            not in {"0", "false", "no"}
-        )
+        env_value = os.environ.get("RESEARCH_PLANNER_VALIDATE_URLS", "1").lower()
+        self.validate_urls = validate_urls if validate_urls is not None else env_value not in {"0", "false", "no"}
 
     def plan(self, objective: str) -> ResearchPlan:
-        """Create a research plan using Groq first, then deterministic fallback."""
+        """Create a plan with Groq, or use fallback rules if Groq fails."""
 
         if self.use_llm:
             try:
                 return self._plan_with_groq(objective)
             except Exception as error:
                 print(f"[planner_agent] Groq planner unavailable; using fallback planner: {error}")
-        return self._plan_with_rules(objective)
+        return self._fallback_plan(objective)
 
     def _plan_with_groq(self, objective: str) -> ResearchPlan:
-        """Use Groq to create a flexible research plan."""
+        """Ask Groq for JSON and repair the result."""
 
         if not os.environ.get("GROQ_API_KEY"):
             raise RuntimeError("GROQ_API_KEY is not set")
+
         try:
             from groq import Groq
         except ImportError as error:
@@ -293,850 +343,647 @@ Rules:
                 model=self.model,
                 temperature=0,
                 max_tokens=2048,
-                messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    *messages,
-                ],
+                messages=[{"role": "system", "content": self.SYSTEM_PROMPT}, *messages],
             )
             raw = (response.choices[0].message.content or "").strip()
             messages.append({"role": "assistant", "content": raw})
+
             try:
-                return self._parse_llm_plan(raw, objective)
+                return self._parse_plan(raw, objective)
             except (json.JSONDecodeError, KeyError, ValueError) as error:
                 last_error = error
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": f"Fix this error and return only valid JSON: {error}",
-                    }
-                )
+                messages.append({"role": "user", "content": f"Fix this error and return only JSON: {error}"})
                 print(f"[planner_agent] Plan parse failed on attempt {attempt}: {error}")
 
         raise RuntimeError(f"Groq planner failed after 3 attempts: {last_error}")
 
-    def _parse_llm_plan(self, raw: str, objective: str) -> ResearchPlan:
-        """Parse the JSON plan returned by Groq."""
+    def _parse_plan(self, raw: str, objective: str) -> ResearchPlan:
+        """Convert LLM JSON into a clean ResearchPlan."""
 
-        data = json.loads(self._strip_markdown_fence(raw))
-        output_format = self._validate_output_format(data.get("output_format", "summary"))
-        companies = [str(company) for company in data.get("companies", []) if str(company).strip()]
-        research_mode = self._repair_research_mode(
-            objective=objective,
-            research_mode=self._validate_research_mode(data["research_mode"]),
-            companies=companies,
-        )
+        data = json.loads(strip_json_fence(raw))
+        companies = clean_strings(data.get("companies", [])) or detect_companies(objective)
+        sub_questions = clean_strings(data.get("sub_questions", [])) or default_questions(objective)
+        mode = fix_mode(data.get("research_mode", ""), objective, companies)
+
         tasks = [
-            self._parse_llm_task(task, index)
-            for index, task in enumerate(data.get("tasks", []), start=1)
+            self._task_from_dict(item, index)
+            for index, item in enumerate(data.get("tasks", []), 1)
+            if isinstance(item, dict)
         ]
         if not tasks:
-            raise ValueError("planner returned no tasks")
+            tasks = fallback_tasks(objective, companies)
 
-        tasks = self._apply_task_guardrails(tasks, objective)
-        self._validate_plan_quality(tasks, objective, companies)
+        tasks = self._add_known_topic_sources(objective, tasks)
+        tasks = self._repair_tasks(objective, tasks)
+        tasks = self._add_missing_company_tasks(mode, companies, sub_questions, tasks)
+        tasks = self._repair_tasks(objective, tasks)
+        self._validate_tasks(tasks, mode, companies, sub_questions)
 
         return ResearchPlan(
             objective=objective,
-            research_mode=research_mode,
+            research_mode=mode,
             companies=companies,
-            sub_questions=list(data.get("sub_questions", [])),
+            sub_questions=sub_questions,
             tasks=sorted(tasks, key=lambda task: task.priority),
-            synthesis_instruction=self._validate_synthesis_instruction(
-                data.get("synthesis_instruction", ""),
-                objective,
-            ),
-            output_format=output_format,
+            synthesis_instruction=fix_synthesis(data.get("synthesis_instruction", ""), objective),
+            output_format=fix_output_format(data.get("output_format", ""), objective, mode),
         )
 
-    def _parse_llm_task(self, task: dict[str, Any], index: int) -> ResearchTask:
-        """Parse one task object from the LLM response."""
+    def _task_from_dict(self, data: dict[str, Any], index: int) -> ResearchTask:
+        """Build one task from LLM JSON."""
 
-        source_type = self._normalize_source_type(task.get("source_type", "webpage"))
-        target_type = str(task.get("target_type", "discovery")).strip().lower()
-        if target_type not in {"company", "discovery"}:
-            target_type = "discovery"
-
-        url = str(task["url"]).strip()
-        url = self._normalize_task_url(url, source_type)
-
+        source_type = clean_source_type(data.get("source_type", "webpage"))
         return ResearchTask(
             task_id=f"task_{index:03d}",
-            query_context=str(task["query_context"]).strip(),
-            url=url,
+            query_context=str(data.get("query_context", "")).strip(),
+            url=normalize_url(str(data.get("url", "")).strip(), source_type),
             source_type=source_type,
-            priority=int(task.get("priority", index)),
-            extraction_goal=str(task["extraction_goal"]).strip(),
-            target_type=target_type,
-            target_name=str(task.get("target_name", "General Research")).strip() or "General Research",
-            use_playwright=bool(task.get("use_playwright", False)),
-            expected_signals=list(task.get("expected_signals", [])),
+            priority=to_int(data.get("priority", index), index),
+            extraction_goal=str(data.get("extraction_goal", "")).strip(),
+            target_type=clean_target_type(data.get("target_type", "discovery")),
+            target_name=str(data.get("target_name", "General Research")).strip() or "General Research",
+            use_playwright=bool(data.get("use_playwright", False)),
+            expected_signals=clean_strings(data.get("expected_signals", [])),
         )
 
-    def _apply_task_guardrails(
-        self,
-        tasks: list[ResearchTask],
-        objective: str,
-    ) -> list[ResearchTask]:
-        """Apply safety guardrails without changing the LLM's research decisions."""
+    def _repair_tasks(self, objective: str, tasks: list[ResearchTask]) -> list[ResearchTask]:
+        """Fix task IDs, source types, URLs, and Playwright flags."""
 
-        guarded = []
-        for index, task in enumerate(tasks, start=1):
-            source_type = self._normalize_source_type(task.source_type)
-            source_type = self._semantic_source_type(objective, task, source_type)
-            target_type = task.target_type if task.target_type in {"company", "discovery"} else "discovery"
-            url = self._normalize_task_url(task.url, source_type)
-            url = self._canonical_company_url(url, source_type, task)
-            url = self._repair_untrusted_url(url, source_type, task)
-            url = self._repair_dead_url(url, source_type, task)
+        fixed_tasks = []
+        for index, task in enumerate(tasks, 1):
+            source_type = infer_source_type(objective, task)
+            url = normalize_url(task.url, source_type)
+            url = dedupe_search(url)
+            url = self._replace_with_known_company_url(url, source_type, task.target_name)
+            url = self._make_url_safe(url, source_type, task)
+
             if url.startswith("SEARCH:"):
                 source_type = "search"
-            guarded.append(
-                ResearchTask(
+
+            fixed_tasks.append(
+                replace(
+                    task,
                     task_id=f"task_{index:03d}",
-                    query_context=task.query_context,
-                    url=url,
                     source_type=source_type,
-                    priority=task.priority,
-                    extraction_goal=task.extraction_goal,
-                    target_type=target_type,
-                    target_name=task.target_name,
-                    use_playwright=self._should_use_playwright(source_type, url, task.use_playwright),
-                    expected_signals=task.expected_signals,
+                    url=url,
+                    target_type=clean_target_type(task.target_type),
+                    use_playwright=source_type in {"pricing", "careers", "reviews"} and not url.startswith("SEARCH:"),
+                    expected_signals=task.expected_signals or source_info(source_type)["signals"],
+                    extraction_goal=task.extraction_goal or source_info(source_type)["goal"],
                 )
             )
-        return guarded
+        return fixed_tasks
 
-    def _enrich_known_technical_tasks(
-        self,
-        objective: str,
-        tasks: list[ResearchTask],
-    ) -> list[ResearchTask]:
-        """Add missing high-value sources for known technical comparison topics."""
-
-        tokens = set(re.findall(r"[a-z0-9]+", objective.lower()))
-        if not ({"transformer", "transformers", "rnn", "lstm"} & tokens):
-            return tasks
-
-        required = [
-            ResearchTask(
-                task_id="",
-                query_context="What did the original Transformer paper introduce?",
-                url="https://arxiv.org/abs/1706.03762",
-                source_type="arxiv",
-                priority=1,
-                extraction_goal="Extract the paper title, model idea, attention mechanism, and stated advantages.",
-                expected_signals=["self-attention", "parallelization", "sequence modeling"],
-            ),
-            ResearchTask(
-                task_id="",
-                query_context="How do LSTMs work and why were they introduced?",
-                url="https://colah.github.io/posts/2015-08-Understanding-LSTMs",
-                source_type="webpage",
-                priority=1,
-                extraction_goal="Extract gates, cell state, vanishing-gradient motivation, and intuitive explanation.",
-                expected_signals=["forget gate", "cell state", "sequence memory"],
-            ),
-            ResearchTask(
-                task_id="",
-                query_context="What is a recurrent neural network?",
-                url="https://en.wikipedia.org/wiki/Recurrent_neural_network",
-                source_type="wikipedia",
-                priority=2,
-                extraction_goal="Extract RNN definition, recurrence structure, strengths, and limitations.",
-                expected_signals=["hidden state", "sequence processing", "limitations"],
-            ),
-            ResearchTask(
-                task_id="",
-                query_context="What is long short-term memory?",
-                url="https://en.wikipedia.org/wiki/Long_short-term_memory",
-                source_type="wikipedia",
-                priority=2,
-                extraction_goal="Extract LSTM definition, gates, memory cell, and common use cases.",
-                expected_signals=["input gate", "output gate", "memory cell"],
-            ),
-        ]
+    def _add_known_topic_sources(self, objective: str, tasks: list[ResearchTask]) -> list[ResearchTask]:
+        """Add trusted sources for common technical topics."""
 
         existing_urls = {task.url for task in tasks}
-        enriched = list(tasks)
-        for required_task in required:
-            if required_task.url not in existing_urls:
-                enriched.append(required_task)
+        new_tasks = list(tasks)
 
-        return [
-            ResearchTask(
-                task_id=f"task_{index:03d}",
-                query_context=task.query_context,
-                url=task.url,
-                source_type=task.source_type,
-                priority=task.priority,
-                extraction_goal=task.extraction_goal,
-                target_type=task.target_type,
-                target_name=task.target_name,
-                use_playwright=task.use_playwright,
-                expected_signals=task.expected_signals,
-            )
-            for index, task in enumerate(sorted(enriched, key=lambda item: item.priority), start=1)
-        ]
+        for keyword, sources in KNOWN_TOPIC_SOURCES.items():
+            if keyword not in objective.lower():
+                continue
 
-    def _validate_plan_quality(
+            for source in sources:
+                if source["url"] in existing_urls:
+                    continue
+                source_type = clean_source_type(source["source_type"])
+                new_tasks.append(
+                    ResearchTask(
+                        task_id="",
+                        query_context=source["query_context"],
+                        url=source["url"],
+                        source_type=source_type,
+                        priority=1,
+                        extraction_goal=source_info(source_type)["goal"],
+                        target_type="discovery",
+                        target_name=source["target_name"],
+                        expected_signals=source_info(source_type)["signals"],
+                    )
+                )
+                existing_urls.add(source["url"])
+
+        return new_tasks
+
+    def _add_missing_company_tasks(
+        self,
+        mode: str,
+        companies: list[str],
+        sub_questions: list[str],
+        tasks: list[ResearchTask],
+    ) -> list[ResearchTask]:
+        """Make competitor plans symmetric across companies and questions."""
+
+        if mode != "competitor_intel" or not companies or not sub_questions:
+            return tasks
+
+        fixed_tasks = list(tasks)
+        for company in companies:
+            for question in sub_questions:
+                if any(task_matches_company_question(task, company, question) for task in fixed_tasks):
+                    continue
+
+                source_type = source_type_for_question(question)
+                fixed_tasks.append(
+                    ResearchTask(
+                        task_id="",
+                        query_context=f"{company}: {question}",
+                        url=self._known_company_url(company, source_type) or f"SEARCH:{company} {question}",
+                        source_type=source_type,
+                        priority=2,
+                        extraction_goal=goal_for(source_type, question),
+                        target_type="company",
+                        target_name=company,
+                        use_playwright=source_type in {"pricing", "careers", "reviews"},
+                        expected_signals=source_info(source_type)["signals"],
+                    )
+                )
+
+        return fixed_tasks
+
+    def _replace_with_known_company_url(self, url: str, source_type: str, target_name: str) -> str:
+        """Use maintained official URLs for known companies."""
+
+        if url.startswith("SEARCH:") or source_type not in {"pricing", "docs", "news"}:
+            return url
+
+        if is_known_company_url(url, target_name):
+            return self._known_company_url(target_name, source_type) or url
+
+        return url
+
+    def _make_url_safe(self, url: str, source_type: str, task: ResearchTask) -> str:
+        """Convert risky or dead direct URLs into SEARCH tasks."""
+
+        if url.startswith("SEARCH:"):
+            return url
+
+        if source_type in {"pricing", "careers", "reviews"} and not is_known_company_url(url, task.target_name):
+            return search_query_for(task, source_type)
+
+        if is_untrusted_url(url, source_type):
+            return search_query_for(task, source_type)
+
+        if self.validate_urls and not url_is_alive(url):
+            return self._known_company_url(task.target_name, source_type) or search_query_for(task, source_type)
+
+        return url
+
+    def _known_company_url(self, company_name: str, source_type: str) -> str:
+        """Return a maintained company source URL if we have one."""
+
+        company = find_known_company(company_name)
+        if not company:
+            return ""
+        return company["sources"].get(source_type, "")
+
+    def _validate_tasks(
         self,
         tasks: list[ResearchTask],
-        objective: str,
+        mode: str,
         companies: list[str],
+        sub_questions: list[str],
     ) -> None:
-        """Reject plans that are technically valid JSON but too weak to execute."""
+        """Raise clear errors if the plan is still broken after repair."""
 
         if len(tasks) < 2:
             raise ValueError("planner returned fewer than two tasks")
 
         for task in tasks:
-            if not task.url:
-                raise ValueError(f"{task.task_id} is missing url")
-            if not task.query_context:
-                raise ValueError(f"{task.task_id} is missing query_context")
-            if not task.extraction_goal:
-                raise ValueError(f"{task.task_id} is missing extraction_goal")
+            if not task.query_context or not task.url or not task.extraction_goal:
+                raise ValueError(f"{task.task_id} is missing required fields")
             if task.source_type not in SOURCE_TYPES:
-                raise ValueError(f"{task.task_id} has unsupported source_type '{task.source_type}'")
-            if not self._is_valid_task_url(task.url):
-                raise ValueError(f"{task.task_id} has invalid url: {task.url!r}")
+                raise ValueError(f"{task.task_id} has unsupported source_type {task.source_type!r}")
+            if not valid_task_url(task.url):
+                raise ValueError(f"{task.task_id} has invalid url {task.url!r}")
 
-        if self._is_pricing_objective(objective) and companies:
-            pricing_targets = {
-                task.target_name.lower()
-                for task in tasks
-                if task.source_type in {"pricing", "search"}
-            }
-            missing = [
-                company
-                for company in companies
-                if company.lower() not in pricing_targets
-            ]
-            if missing:
-                raise ValueError(
-                    "pricing comparison is missing pricing/search tasks for: "
-                    + ", ".join(missing)
-                )
+        if mode == "competitor_intel" and companies and sub_questions:
+            for company in companies:
+                count = sum(1 for task in tasks if task.target_name.lower() == company.lower())
+                if count < len(sub_questions):
+                    raise ValueError(f"{company} has only {count}/{len(sub_questions)} required tasks")
 
-    def _validate_research_mode(self, research_mode: str) -> str:
-        """Require exactly one known research mode."""
+    def _fallback_plan(self, objective: str) -> ResearchPlan:
+        """Simple rule-based plan for local development."""
 
-        normalized = str(research_mode).strip()
-        if normalized not in VALID_RESEARCH_MODES:
-            raise ValueError(
-                f"research_mode must be one of {sorted(VALID_RESEARCH_MODES)}, got {research_mode!r}"
-            )
-        return normalized
-
-    def _validate_output_format(self, output_format: str) -> str:
-        """Normalize final output format."""
-
-        normalized = str(output_format).strip()
-        if normalized not in VALID_OUTPUT_FORMATS:
-            return "summary"
-        return normalized
-
-    def _validate_synthesis_instruction(self, instruction: str, objective: str) -> str:
-        """Keep the LLM's synthesis instruction unless it is empty."""
-
-        cleaned = str(instruction).strip()
-        if cleaned and self._is_generic_instruction(cleaned):
-            raise ValueError(
-                "synthesis_instruction is too generic; list concrete dimensions "
-                f"for this objective: {objective}"
-            )
-        if cleaned:
-            return cleaned
-        return (
-            f"Synthesize findings for: {objective}. "
-            "Answer the sub-questions, cite source URLs for major claims, and call out uncertainty."
-        )
-
-    def _repair_research_mode(
-        self,
-        objective: str,
-        research_mode: str,
-        companies: list[str],
-    ) -> str:
-        """Repair obvious mode mismatches while leaving nuanced choices to the LLM."""
-
-        if companies and (
-            self._is_pricing_objective(objective)
-            or self._contains_any(objective.lower(), ["compare", "versus", "vs"])
-        ):
-            return "competitor_intel"
-        return research_mode
-
-    def _semantic_source_type(
-        self,
-        objective: str,
-        task: ResearchTask,
-        source_type: str,
-    ) -> str:
-        """Correct source types that are obvious from the task semantics."""
-
-        if source_type == "search" or task.url.startswith("SEARCH:"):
-            return "search"
-
-        task_text = " ".join(
-            [
-                objective,
-                task.query_context,
-                task.extraction_goal,
-                task.url,
-            ]
-        ).lower()
-        if self._is_pricing_objective(task_text):
-            return "pricing"
-        return source_type
-
-    def _repair_untrusted_url(
-        self,
-        url: str,
-        source_type: str,
-        task: ResearchTask,
-    ) -> str:
-        """Replace likely hallucinated or volatile direct URLs with search tasks."""
-
-        if url.startswith("SEARCH:"):
-            return url
-
-        if source_type in {"pricing", "careers", "reviews"} and not self._is_official_target_url(
-            url,
-            task.target_name,
-        ):
-            return self._source_search_url(task, source_type)
-
-        if self._is_untrusted_webpage(url, source_type):
-            return self._source_search_url(task, source_type)
-
-        return url
-
-    def _canonical_company_url(
-        self,
-        url: str,
-        source_type: str,
-        task: ResearchTask,
-    ) -> str:
-        """Prefer maintained canonical URLs for known company source types."""
-
-        if url.startswith("SEARCH:") or source_type not in {"pricing", "news", "docs"}:
-            return url
-
-        canonical = self._known_company_source(task.target_name, source_type)
-        if canonical and self._is_official_target_url(url, task.target_name):
-            return canonical
-        return url
-
-    def _known_company_source(self, target_name: str, source_type: str) -> str:
-        """Return a maintained source URL for a known company and source type."""
-
-        target = target_name.strip().lower()
-        for company in KNOWN_COMPANIES.values():
-            if company["name"].lower() == target:
-                return company.get("sources", {}).get(source_type, "")
-        return ""
-
-    def _repair_dead_url(
-        self,
-        url: str,
-        source_type: str,
-        task: ResearchTask,
-    ) -> str:
-        """Replace confirmed 404/410 URLs with a canonical URL or search task."""
-
-        if not self.validate_urls or url.startswith("SEARCH:"):
-            return url
-        if self._url_is_alive(url):
-            return url
-
-        canonical = self._known_company_source(task.target_name, source_type)
-        if canonical and canonical != url and self._url_is_alive(canonical):
-            return canonical
-        return self._source_search_url(task, source_type)
-
-    def _url_is_alive(self, url: str) -> bool:
-        """Return False only for confirmed missing URLs."""
-
-        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        try:
-            with urlopen(request, timeout=5) as response:
-                return response.status not in {404, 410}
-        except HTTPError as error:
-            return error.code not in {404, 410}
-        except (TimeoutError, URLError, OSError):
-            return True
-
-    def _is_untrusted_webpage(self, url: str, source_type: str) -> bool:
-        """Return True for direct URLs that should be resolved through search first."""
-
-        if source_type not in {"webpage", "technical_overview", "academic", "benchmarks", "implementation"}:
-            return False
-
-        parsed = urlparse(url)
-        host = parsed.netloc.lower()
-        trusted_hosts = (
-            "arxiv.org",
-            "wikipedia.org",
-            "tensorflow.org",
-            "pytorch.org",
-            "huggingface.co",
-            "github.com",
-            "docs.python.org",
-            "colah.github.io",
-        )
-        return not any(host == trusted or host.endswith(f".{trusted}") for trusted in trusted_hosts)
-
-    def _is_official_target_url(self, url: str, target_name: str) -> bool:
-        """Return True when a URL is on the known official domain for its target."""
-
-        target = target_name.strip().lower()
-        if not target or target == "general research":
-            return False
-
-        parsed = urlparse(url)
-        host = parsed.netloc.lower()
-        for company in KNOWN_COMPANIES.values():
-            if company["name"].lower() != target:
-                continue
-            return any(
-                host == domain or host.endswith(f".{domain}")
-                for domain in company.get("domains", ())
-            )
-        return False
-
-    def _source_search_url(self, task: ResearchTask, source_type: str) -> str:
-        """Build a focused search task from an untrusted direct URL."""
-
-        target = task.target_name if task.target_name != "General Research" else ""
-        if source_type == "pricing" and target:
-            return f"SEARCH:{target} official model pricing"
-        if source_type == "careers" and target:
-            return f"SEARCH:{target} official careers jobs"
-        if source_type == "reviews" and target:
-            return f"SEARCH:{target} product reviews customer feedback"
-
-        parts = [target, task.query_context, task.extraction_goal]
-        query = " ".join(part.strip() for part in parts if part and part.strip())
-        return f"SEARCH:{query}"
-
-    def _normalize_source_type(self, source_type: str) -> str:
-        """Normalize LLM source type variants into supported values."""
-
-        normalized = str(source_type).strip().lower().replace("-", "_").replace(" ", "_")
-        normalized = SOURCE_TYPE_ALIASES.get(normalized, normalized)
-        if normalized not in SOURCE_TYPES:
-            return "webpage"
-        return normalized
-
-    def _normalize_task_url(self, url: str, source_type: str) -> str:
-        """Normalize task URLs into http(s) URLs or SEARCH: queries."""
-
-        normalized = url.strip()
-        if normalized.startswith("SEARCH:"):
-            query = normalized.removeprefix("SEARCH:").strip()
-            if not query:
-                raise ValueError("SEARCH task has empty query")
-            return f"SEARCH:{query}"
-
-        search_query = self._extract_search_query(normalized)
-        if search_query:
-            return f"SEARCH:{search_query}"
-
-        if self._is_valid_http_url(normalized):
-            return normalized
-
-        if source_type == "search":
-            return f"SEARCH:{normalized}"
-
-        if normalized.startswith("www."):
-            candidate = f"https://{normalized}"
-            if self._is_valid_http_url(candidate):
-                return candidate
-
-        if " " in normalized or "." not in normalized:
-            return f"SEARCH:{normalized}"
-
-        raise ValueError(f"invalid URL: {url!r}")
-
-    def _extract_search_query(self, url: str) -> str:
-        """Convert search-engine URLs into executor-friendly SEARCH tasks."""
-
-        parsed = urlparse(url)
-        host = parsed.netloc.lower()
-        if not any(domain in host for domain in ("google.", "bing.com", "duckduckgo.com")):
-            return ""
-        query = parse_qs(parsed.query).get("q", [""])[0].strip()
-        return query
-
-    def _is_valid_task_url(self, url: str) -> bool:
-        """Return True for executable task URLs."""
-
-        if url.startswith("SEARCH:"):
-            return bool(url.removeprefix("SEARCH:").strip())
-        return self._is_valid_http_url(url)
-
-    def _is_valid_http_url(self, url: str) -> bool:
-        """Return True for valid http or https URLs with a host."""
-
-        parsed = urlparse(url)
-        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-
-    def _should_use_playwright(self, source_type: str, url: str, current: bool) -> bool:
-        """Use browser rendering for dynamic pages and search pages."""
-
-        if source_type == "search" or url.startswith("SEARCH:"):
-            return False
-        if source_type in {"pricing", "careers", "reviews"}:
-            return True
-        return current
-
-    def _is_pricing_objective(self, text: str) -> bool:
-        """Return True when text asks for pricing or packaging evidence."""
-
-        return self._contains_any(
-            text.lower(),
-            ["pricing", "pricings", "price", "prices", "cost", "costs", "plan", "plans", "tier", "tiers"],
-        )
-
-    def _plan_with_rules(self, objective: str) -> ResearchPlan:
-        """Fallback planner that works without network access or API keys."""
-
-        companies = self._detect_companies(objective)
-        research_mode = self._research_mode(objective, bool(companies))
-        source_types = self._source_types(objective, research_mode, bool(companies))
-
-        if companies:
-            tasks = self._company_tasks(objective, companies, source_types)
-        else:
-            tasks = self._discovery_tasks(objective, source_types)
-        tasks = self._enrich_known_technical_tasks(objective, tasks)
-        tasks = self._apply_task_guardrails(tasks, objective)
-        company_names = [company["name"] for company in companies]
-        self._validate_plan_quality(tasks, objective, company_names)
+        companies = detect_companies(objective)
+        mode = "competitor_intel" if companies else infer_mode(objective)
+        tasks = fallback_tasks(objective, companies)
+        tasks = self._add_known_topic_sources(objective, tasks)
+        tasks = self._repair_tasks(objective, tasks)
+        sub_questions = default_questions(objective)
+        tasks = self._add_missing_company_tasks(mode, companies, sub_questions, tasks)
+        tasks = self._repair_tasks(objective, tasks)
 
         return ResearchPlan(
             objective=objective,
-            research_mode=research_mode,
-            companies=company_names,
-            sub_questions=[task.query_context for task in tasks],
+            research_mode=mode,
+            companies=companies,
+            sub_questions=sub_questions,
             tasks=tasks,
-            synthesis_instruction=self._specific_synthesis_instruction(
-                objective=objective,
-                research_mode=research_mode,
-                output_format=self._output_format(objective, research_mode),
-                sub_questions=[task.query_context for task in tasks],
-                tasks=tasks,
-            ),
-            output_format=self._output_format(objective, research_mode),
+            synthesis_instruction=fix_synthesis("", objective),
+            output_format=fix_output_format("", objective, mode),
         )
 
-    def _company_tasks(
-        self,
-        objective: str,
-        companies: list[dict[str, Any]],
-        source_types: list[str],
-    ) -> list[ResearchTask]:
-        """Create direct company-source tasks when possible."""
 
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+
+def source_info(source_type: str) -> dict[str, Any]:
+    """Return metadata for a source type."""
+
+    return SOURCE_TYPES.get(source_type, SOURCE_TYPES["webpage"])
+
+
+def clean_source_type(value: Any) -> str:
+    """Normalize source type names."""
+
+    source_type = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    source_type = SOURCE_ALIASES.get(source_type, source_type)
+    return source_type if source_type in SOURCE_TYPES else "webpage"
+
+
+def clean_target_type(value: Any) -> str:
+    """Normalize target type names."""
+
+    target_type = str(value).strip().lower()
+    return target_type if target_type in {"company", "discovery"} else "discovery"
+
+
+def clean_strings(values: Any) -> list[str]:
+    """Return non-empty strings from a list-like value."""
+
+    if not isinstance(values, list):
+        return []
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def to_int(value: Any, default: int) -> int:
+    """Convert a value to int safely."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_url(url: str, source_type: str) -> str:
+    """Normalize direct URLs and SEARCH tasks."""
+
+    url = url.strip()
+    if not url:
+        return "SEARCH:research sources"
+
+    if url.startswith("SEARCH:"):
+        query = dedupe_words(url.removeprefix("SEARCH:"))
+        return f"SEARCH:{query or 'research sources'}"
+
+    search_query = query_from_search_engine_url(url)
+    if search_query:
+        return f"SEARCH:{dedupe_words(search_query)}"
+
+    if valid_http_url(url):
+        return url
+
+    if url.startswith("www.") and valid_http_url(f"https://{url}"):
+        return f"https://{url}"
+
+    if source_type == "search" or " " in url or "." not in url:
+        return f"SEARCH:{dedupe_words(url)}"
+
+    return f"SEARCH:{dedupe_words(url)}"
+
+
+def query_from_search_engine_url(url: str) -> str:
+    """Extract q= from Google, Bing, or DuckDuckGo URLs."""
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if not any(domain in host for domain in ["google.", "bing.com", "duckduckgo.com"]):
+        return ""
+    return parse_qs(parsed.query).get("q", [""])[0].strip()
+
+
+def dedupe_search(url: str) -> str:
+    """Remove duplicate words from SEARCH queries."""
+
+    if not url.startswith("SEARCH:"):
+        return url
+    return f"SEARCH:{dedupe_words(url.removeprefix('SEARCH:'))}"
+
+
+def dedupe_words(text: str) -> str:
+    """Remove repeated words while keeping order."""
+
+    words = re.findall(r"[A-Za-z0-9+.#-]+", text)
+    result = []
+    seen = set()
+
+    for word in words:
+        key = word.lower()
+        if key in seen:
+            continue
+        result.append(word)
+        seen.add(key)
+
+    return " ".join(result).strip()
+
+
+def infer_source_type(objective: str, task: ResearchTask) -> str:
+    """Repair obvious source type mistakes."""
+
+    if task.url.startswith("SEARCH:") or task.source_type == "search":
+        return "search"
+
+    text = " ".join([objective, task.query_context, task.extraction_goal, task.url]).lower()
+    if has_any(text, ["pricing", "price", "cost", "tier", "token"]):
+        return "pricing"
+    if has_any(text, ["career", "job", "salary", "training", "benefit"]):
+        return "careers"
+    if has_any(text, ["docs", "documentation", "api"]):
+        return "docs"
+    if "arxiv.org" in task.url:
+        return "arxiv"
+    if "wikipedia.org" in task.url:
+        return "wikipedia"
+
+    return clean_source_type(task.source_type)
+
+
+def source_type_for_question(question: str) -> str:
+    """Choose a source type from a sub-question."""
+
+    text = question.lower()
+    if has_any(text, ["pricing", "price", "cost", "tier", "token"]):
+        return "pricing"
+    if has_any(text, ["career", "job", "salary", "training", "benefit"]):
+        return "careers"
+    if has_any(text, ["docs", "api", "developer"]):
+        return "docs"
+    if has_any(text, ["review", "feedback", "complaint"]):
+        return "reviews"
+    if has_any(text, ["news", "launch", "release", "announcement"]):
+        return "news"
+    return "search"
+
+
+def search_query_for(task: ResearchTask, source_type: str) -> str:
+    """Build a focused SEARCH query from a task."""
+
+    target = "" if task.target_name == "General Research" else task.target_name
+    if source_type == "pricing" and target:
+        return f"SEARCH:{target} official model pricing"
+    if source_type == "careers" and target:
+        return f"SEARCH:{target} official careers jobs salary benefits training"
+    if source_type == "reviews" and target:
+        return f"SEARCH:{target} reviews customer feedback"
+    return f"SEARCH:{dedupe_words(' '.join([target, task.query_context, task.extraction_goal]))}"
+
+
+def valid_task_url(url: str) -> bool:
+    """Check whether a task URL can be executed."""
+
+    return (url.startswith("SEARCH:") and bool(url.removeprefix("SEARCH:").strip())) or valid_http_url(url)
+
+
+def valid_http_url(url: str) -> bool:
+    """Check for an http or https URL with a host."""
+
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def url_is_alive(url: str) -> bool:
+    """Return False only when the URL is confirmed as gone."""
+
+    try:
+        response = httpx.head(
+            url,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        return response.status_code not in {404, 410}
+    except httpx.HTTPError:
+        return True
+
+
+def is_untrusted_url(url: str, source_type: str) -> bool:
+    """Avoid scraping weak article URLs directly."""
+
+    if source_type not in {"webpage", "technical_overview", "academic", "benchmarks", "implementation", "news"}:
+        return False
+
+    host = urlparse(url).netloc.lower()
+    if any(host == bad or host.endswith(f".{bad}") for bad in UNTRUSTED_HOSTS):
+        return True
+    return not any(host == good or host.endswith(f".{good}") for good in TRUSTED_HOSTS)
+
+
+def find_known_company(company_name: str) -> Optional[dict[str, Any]]:
+    """Find company metadata by display name or alias."""
+
+    company_name = company_name.strip().lower()
+    for company in KNOWN_COMPANIES.values():
+        names = [company["name"].lower(), *company["aliases"]]
+        if company_name in names:
+            return company
+    return None
+
+
+def is_known_company_url(url: str, company_name: str) -> bool:
+    """Check if a URL belongs to a known company."""
+
+    company = find_known_company(company_name)
+    if not company:
+        return False
+
+    host = urlparse(url).netloc.lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in company["domains"])
+
+
+def detect_companies(objective: str) -> list[str]:
+    """Detect known companies mentioned in the objective."""
+
+    text = objective.lower()
+    companies = []
+
+    for company in KNOWN_COMPANIES.values():
+        if any(term_match(text, alias) for alias in company["aliases"]):
+            companies.append(company["name"])
+
+    return companies
+
+
+def default_questions(objective: str) -> list[str]:
+    """Create simple fallback sub-questions."""
+
+    if has_any(objective.lower(), ["compare", "vs", "versus", "difference"]):
+        return [
+            "What are the main features or claims?",
+            "What are the pricing, cost, or resource tradeoffs?",
+            "What are the strengths and limitations?",
+            "Which option is best for each use case?",
+        ]
+
+    return [
+        f"What is the background of {objective}?",
+        f"What evidence or sources explain {objective}?",
+        f"What are the practical takeaways for {objective}?",
+    ]
+
+
+def fallback_tasks(objective: str, companies: list[str]) -> list[ResearchTask]:
+    """Build tasks without an LLM."""
+
+    if companies:
         tasks = []
-        task_number = 1
         for company in companies:
-            for priority, source_type in enumerate(source_types, start=1):
-                url = company["sources"].get(source_type) or self._search_url(
-                    f"{company['name']} {objective}",
-                    source_type,
-                )
+            for question in default_questions(objective):
+                source_type = source_type_for_question(question)
+                known = find_known_company(company)
+                url = known["sources"].get(source_type, "") if known else ""
                 tasks.append(
                     ResearchTask(
-                        task_id=f"task_{task_number:03d}",
-                        query_context=f"{company['name']}: {self._context(objective, source_type)}",
-                        url=url,
+                        task_id="",
+                        query_context=f"{company}: {question}",
+                        url=url or f"SEARCH:{company} {question}",
                         source_type=source_type,
-                        priority=priority,
-                        extraction_goal=SOURCE_TYPES.get(source_type, SOURCE_TYPES["overview"])["goal"],
+                        priority=1,
+                        extraction_goal=goal_for(source_type, question),
                         target_type="company",
-                        target_name=company["name"],
-                        use_playwright=source_type in {"pricing", "careers", "reviews"},
-                        expected_signals=list(
-                            SOURCE_TYPES.get(source_type, SOURCE_TYPES["overview"])["signals"]
-                        ),
+                        target_name=company,
+                        expected_signals=source_info(source_type)["signals"],
                     )
                 )
-                task_number += 1
         return tasks
 
-    def _discovery_tasks(self, objective: str, source_types: list[str]) -> list[ResearchTask]:
-        """Create general discovery tasks when no company is named."""
+    return [
+        ResearchTask(
+            task_id="",
+            query_context=question,
+            url=f"SEARCH:{question}",
+            source_type="search",
+            priority=index,
+            extraction_goal=goal_for("search", question),
+            expected_signals=source_info("search")["signals"],
+        )
+        for index, question in enumerate(default_questions(objective), 1)
+    ]
 
-        tasks = []
-        for priority, source_type in enumerate(source_types, start=1):
-            source = SOURCE_TYPES.get(source_type, SOURCE_TYPES["overview"])
-            tasks.append(
-                ResearchTask(
-                    task_id=f"task_{priority:03d}",
-                    query_context=self._context(objective, source_type),
-                    url=self._seed_url(objective, source_type),
-                    source_type=source_type,
-                    priority=priority,
-                    extraction_goal=source["goal"],
-                    target_type="discovery",
-                    target_name="General Research",
-                    use_playwright=False,
-                    expected_signals=["authoritative source URLs", *list(source["signals"])],
-                )
-            )
-        return tasks
 
-    def _seed_url(self, objective: str, source_type: str) -> str:
-        """Return a known source URL or a browser-ready search URL."""
+def task_matches_company_question(task: ResearchTask, company: str, question: str) -> bool:
+    """Check if a task already covers this exact company and question."""
 
-        normalized = objective.lower()
-        tokens = set(re.findall(r"[a-z0-9]+", normalized))
-        if {"transformers", "transformer", "rnn", "lstm"} & tokens:
-            if source_type == "technical_overview":
-                return "https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)"
-            if source_type == "academic":
-                return "https://arxiv.org/abs/1706.03762"
-        if "rag" in tokens:
-            if source_type == "academic":
-                return "https://arxiv.org/abs/2005.11401"
-            if source_type in {"docs", "implementation"}:
-                return "https://python.langchain.com/docs/concepts/rag/"
-        return self._search_url(objective, source_type)
+    if task.target_name.lower() != company.lower():
+        return False
 
-    def _search_url(self, objective: str, source_type: str) -> str:
-        """Build a search URL for the browsing agent."""
+    task_question = task.query_context.lower().removeprefix(f"{company.lower()}:").strip()
+    return simplify_text(task_question) == simplify_text(question)
 
-        suffixes = {
-            "overview": "overview explanation background guide",
-            "authoritative_sources": "official source primary source expert reference",
-            "recent_updates": "latest news recent updates announcements",
-            "evidence": "examples data metrics evidence facts",
-            "synthesis": "comparison analysis pros cons tradeoffs summary",
-            "technical_overview": "architecture overview explanation comparison",
-            "academic": "research paper survey arxiv",
-            "benchmarks": "benchmark comparison performance evaluation",
-            "implementation": "implementation tutorial pytorch tensorflow code",
-            "news": "latest news announcements",
-            "pricing": "pricing plans tiers packaging",
-            "docs": "official docs documentation",
-        }
-        query = quote_plus(f"{objective} {suffixes.get(source_type, 'research sources')}")
-        if source_type in {"recent_updates", "news"}:
-            return f"https://news.google.com/search?q={query}"
-        return f"https://www.google.com/search?q={query}"
 
-    def _research_mode(self, objective: str, company_specific: bool) -> str:
-        """Classify the objective."""
+def simplify_text(text: str) -> str:
+    """Normalize text before comparing generated questions."""
 
-        normalized = objective.lower()
-        if company_specific:
-            return "competitor_intel"
-        if self._contains_any(normalized, ["architecture", "algorithm", "attention", "paper", "lstm", "rnn", "transformer"]):
-            return "technical_deep_dive"
-        if self._contains_any(normalized, ["market", "industry", "landscape", "trend", "competitive", "best"]):
-            return "market_research"
-        return "knowledge_research"
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
-    def _source_types(self, objective: str, research_mode: str, company_specific: bool) -> list[str]:
-        """Choose source categories for the objective."""
 
-        normalized = objective.lower()
-        if research_mode == "technical_deep_dive":
-            return ["technical_overview", "academic", "benchmarks", "implementation"]
-        if research_mode == "market_research":
-            return ["recent_updates", "authoritative_sources", "evidence", "synthesis"]
-        if company_specific:
-            selected = []
-            for source_type, keywords in {
-                "pricing": ["pricing", "pricings", "price", "prices", "cost", "costs", "plan", "tier"],
-                "docs": ["docs", "api", "developer"],
-                "news": ["news", "launch", "release", "announce"],
-            }.items():
-                if self._contains_any(normalized, keywords):
-                    selected.append(source_type)
-            return selected or ["news", "pricing", "docs"]
-        return ["overview", "authoritative_sources", "recent_updates", "evidence", "synthesis"]
+def fix_mode(mode: Any, objective: str, companies: list[str]) -> str:
+    """Repair invalid research mode values."""
 
-    def _detect_companies(self, objective: str) -> list[dict[str, Any]]:
-        """Detect known companies/products mentioned in the objective."""
+    mode = str(mode).strip()
+    if companies:
+        return "competitor_intel"
+    if mode in VALID_RESEARCH_MODES:
+        return mode
+    return infer_mode(objective)
 
-        normalized = objective.lower()
-        return [
-            company
-            for company in KNOWN_COMPANIES.values()
-            if any(self._contains(normalized, alias) for alias in company["aliases"])
-        ]
 
-    def _context(self, objective: str, source_type: str) -> str:
-        """Create a focused sub-question for a task."""
+def infer_mode(objective: str) -> str:
+    """Infer a mode without an LLM."""
 
-        templates = {
-            "overview": f"What is the scope and background of {objective}?",
-            "authoritative_sources": f"Which sources are most authoritative for {objective}?",
-            "recent_updates": f"What changed recently about {objective}?",
-            "evidence": f"What evidence, examples, or metrics support analysis of {objective}?",
-            "synthesis": f"What are the tradeoffs and conclusions for {objective}?",
-            "technical_overview": f"What are the core concepts and architecture details behind {objective}?",
-            "academic": f"Which papers or scholarly sources best explain {objective}?",
-            "benchmarks": f"What benchmark evidence compares performance and tradeoffs for {objective}?",
-            "implementation": f"How is {objective} implemented in practice?",
-            "news": f"What recent announcements or updates relate to {objective}?",
-            "pricing": f"What pricing or packaging information relates to {objective}?",
-            "docs": f"What official documentation explains {objective}?",
-        }
-        return templates.get(source_type, f"What sources help answer {objective}?")
+    text = objective.lower()
+    if has_any(text, ["architecture", "algorithm", "attention", "paper", "lstm", "rnn", "transformer"]):
+        return "technical_deep_dive"
+    if has_any(text, ["market", "industry", "landscape", "trend", "competitive"]):
+        return "market_research"
+    return "knowledge_research"
 
-    def _specific_synthesis_instruction(
-        self,
-        objective: str,
-        research_mode: str,
-        output_format: str,
-        sub_questions: list[str],
-        tasks: list[ResearchTask],
-        llm_instruction: str = "",
-    ) -> str:
-        """Create objective-specific guidance for the synthesis agent."""
 
-        dimensions = self._synthesis_dimensions(objective, tasks)
-        source_names = sorted({task.target_name for task in tasks if task.target_name})
-        source_text = ", ".join(source_names[:6]) if source_names else "the collected sources"
-        question_text = "; ".join(sub_questions[:4])
+def fix_output_format(value: Any, objective: str, mode: str) -> str:
+    """Repair invalid output format values."""
 
-        if output_format == "comparison_table":
-            return (
-                f"Create a comparison table for: {objective}. "
-                f"Compare these dimensions: {', '.join(dimensions)}. "
-                f"Use evidence from {source_text}; cite the source URL beside each major claim. "
-                f"After the table, summarize the best choice for each use case and list any missing or uncertain evidence. "
-                f"Make sure these questions are answered: {question_text}."
-            )
+    value = str(value).strip()
+    if value in VALID_OUTPUT_FORMATS:
+        return value
+    if has_any(objective.lower(), ["compare", "vs", "versus", "difference"]):
+        return "comparison_table"
+    if mode in {"competitor_intel", "market_research"}:
+        return "report"
+    return "summary"
 
-        if output_format == "deep_dive":
-            return (
-                f"Create a technical deep dive for: {objective}. "
-                f"Explain the intuition first, then the mechanism step by step, then practical examples. "
-                f"Emphasize: {', '.join(dimensions)}. "
-                f"Cite source URLs for definitions, mechanisms, and examples. "
-                f"End with an interview-ready summary and common misconceptions."
-            )
 
-        if research_mode == "competitor_intel":
-            return (
-                f"Create a competitor intelligence report for: {objective}. "
-                f"Compare companies across: {', '.join(dimensions)}. "
-                f"Separate direct vendor evidence from third-party comparison evidence. "
-                f"Call out pricing/page changes, gaps, and claims that need re-checking."
-            )
+def fix_synthesis(instruction: Any, objective: str) -> str:
+    """Return useful synthesis instructions."""
 
-        if research_mode == "market_research":
-            return (
-                f"Create a market research report for: {objective}. "
-                f"Organize findings by trends, key players, evidence, risks, and opportunities. "
-                f"Use citations for every market claim and identify weak or missing evidence."
-            )
+    text = str(instruction).strip()
+    if text and not is_generic_instruction(text):
+        return text
 
-        if llm_instruction and not self._is_generic_instruction(llm_instruction):
-            return llm_instruction
-
+    if has_any(objective.lower(), ["compare", "vs", "versus", "difference"]):
         return (
-            f"Synthesize a clear answer for: {objective}. "
-            f"Answer these sub-questions: {question_text}. "
-            f"Emphasize {', '.join(dimensions)} and cite source URLs for key claims."
+            f"Create a comparison for: {objective}. Compare features, pricing or cost, "
+            "strengths, limitations, use cases, and cite source URLs for major claims."
         )
 
-    def _synthesis_dimensions(self, objective: str, tasks: list[ResearchTask]) -> list[str]:
-        """Choose dimensions the synthesis agent should emphasize."""
+    return f"Synthesize findings for: {objective}. Cite source URLs and mention uncertainty."
 
-        normalized = objective.lower()
-        source_types = {task.source_type for task in tasks}
 
-        if self._contains_any(normalized, ["pricing", "pricings", "price", "cost"]):
-            return [
-                "model names",
-                "input token price",
-                "output token price",
-                "free tier or limits",
-                "context window or usage limits",
-                "enterprise/volume pricing notes",
-            ]
+def goal_for(source_type: str, question: str) -> str:
+    """Return an extraction goal for a source type."""
 
-        if self._contains_any(normalized, ["architecture", "architectures", "rnn", "lstm", "transformer"]):
-            return [
-                "architecture structure",
-                "memory/state handling",
-                "parallelization",
-                "training and inference cost",
-                "strengths",
-                "limitations",
-                "best use cases",
-            ]
+    return source_info(source_type)["goal"] if source_type in SOURCE_TYPES else f"Find evidence for: {question}"
 
-        if "benchmarks" in source_types:
-            return ["datasets", "metrics", "performance results", "latency", "memory", "limitations"]
 
-        if "implementation" in source_types or "docs" in source_types:
-            return ["setup steps", "APIs or code examples", "constraints", "pitfalls", "best practices"]
+def is_generic_instruction(text: str) -> bool:
+    """Detect vague synthesis instructions."""
 
-        return ["definition", "key evidence", "examples", "tradeoffs", "practical takeaway"]
+    text = text.lower().strip()
+    generic_phrases = [
+        "combine evidence",
+        "combine the evidence",
+        "create a comparison table",
+        "provide a comprehensive overview",
+        "synthesize findings",
+    ]
+    return any(text == phrase or text.startswith(f"{phrase}.") for phrase in generic_phrases)
 
-    def _is_generic_instruction(self, instruction: str) -> bool:
-        """Detect vague synthesis instructions that should be replaced."""
 
-        normalized = instruction.lower().strip()
-        generic_phrases = [
-            "combine evidence",
-            "combine the evidence",
-            "create a comparison table",
-            "synthesize findings",
-            "provide a comprehensive overview",
-            "highlighting the key differences",
-        ]
-        return any(phrase in normalized for phrase in generic_phrases)
+def strip_json_fence(raw: str) -> str:
+    """Remove markdown fences around JSON."""
 
-    def _synthesis_instruction(self, research_mode: str) -> str:
-        """Tell a later synthesis agent how to combine results."""
+    raw = raw.strip()
+    if not raw.startswith("```"):
+        return raw
 
-        return {
-            "competitor_intel": "Compare company signals and cite source evidence.",
-            "knowledge_research": "Create a clear learning-oriented answer with cited sources.",
-            "technical_deep_dive": "Explain mechanisms, compare tradeoffs, and cite papers or technical sources.",
-            "market_research": "Summarize landscape, trends, evidence, and practical implications.",
-        }[research_mode]
+    lines = raw.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
 
-    def _output_format(self, objective: str, research_mode: str) -> str:
-        """Choose a final answer format."""
 
-        normalized = objective.lower()
-        if self._contains_any(normalized, ["compare", "versus", "vs", "difference"]):
-            return "comparison_table"
-        if self._contains_any(normalized, ["how", "explain", "architecture", "mechanism"]):
-            return "deep_dive"
-        if research_mode in {"competitor_intel", "market_research"}:
-            return "report"
-        return "summary"
+def term_match(text: str, keyword: str) -> bool:
+    """Match words or phrases without substring mistakes."""
 
-    def _strip_markdown_fence(self, raw: str) -> str:
-        """Remove markdown fences around JSON."""
+    pattern = r"(?<![a-z0-9])" + re.escape(keyword.lower()) + r"(?![a-z0-9])"
+    return re.search(pattern, text) is not None
 
-        clean = raw.strip()
-        if clean.startswith("```"):
-            lines = clean.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            clean = "\n".join(lines)
-        return clean.strip()
 
-    def _contains_any(self, text: str, keywords: Iterable[str]) -> bool:
-        """Return True if any keyword appears as a term."""
+def has_any(text: str, keywords: list[str]) -> bool:
+    """Return True when any keyword appears in the text."""
 
-        return any(self._contains(text, keyword) for keyword in keywords)
-
-    def _contains(self, text: str, keyword: str) -> bool:
-        """Match full words or phrases without substring false positives."""
-
-        pattern = r"(?<![a-z0-9])" + re.escape(keyword.lower()) + r"(?![a-z0-9])"
-        return re.search(pattern, text) is not None
+    return any(term_match(text, keyword) for keyword in keywords)
