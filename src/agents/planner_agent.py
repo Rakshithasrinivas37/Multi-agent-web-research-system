@@ -152,6 +152,7 @@ KNOWN_COMPANIES = {
     "openai": {
         "name": "OpenAI",
         "aliases": ("openai", "chatgpt", "gpt", "sora"),
+        "domains": ("openai.com", "platform.openai.com"),
         "sources": {
             "news": "https://openai.com/news/",
             "pricing": "https://openai.com/api/pricing/",
@@ -161,15 +162,27 @@ KNOWN_COMPANIES = {
     "anthropic": {
         "name": "Anthropic",
         "aliases": ("anthropic", "claude"),
+        "domains": ("anthropic.com", "docs.anthropic.com"),
         "sources": {
             "news": "https://www.anthropic.com/news",
             "pricing": "https://www.anthropic.com/pricing",
             "docs": "https://docs.anthropic.com",
         },
     },
+    "groq": {
+        "name": "Groq",
+        "aliases": ("groq", "llama on groq", "groqcloud"),
+        "domains": ("groq.com", "console.groq.com"),
+        "sources": {
+            "news": "https://groq.com/news/",
+            "pricing": "https://groq.com/pricing/",
+            "docs": "https://console.groq.com/docs",
+        },
+    },
     "google": {
         "name": "Google",
         "aliases": ("google", "gemini", "vertex ai", "google ai"),
+        "domains": ("google.com", "google.dev", "ai.google.dev", "cloud.google.com"),
         "sources": {
             "news": "https://blog.google/technology/ai/",
             "pricing": "https://ai.google.dev/pricing",
@@ -222,8 +235,8 @@ Rules:
 - If the objective compares named companies or products, use research_mode "competitor_intel".
 - If the objective asks about pricing, costs, plans, or tiers, use source_type "pricing" for direct vendor pricing pages.
 - "How does X work" should use output_format "deep_dive".
-- Use SEARCH: when an exact URL is unknown.
-- Use SEARCH: for volatile vendor pages such as pricing, careers, reviews, and pages you cannot verify exactly.
+- Prefer direct official URLs that a scraper can open when the company/source page is known.
+- Use SEARCH: only when an exact official URL is unknown or the URL is a search-engine results page.
 - SEARCH: tasks must set use_playwright to false because search is handled by the search executor.
 - Do not use Google/Bing search result URLs as webpage URLs; use SEARCH: instead.
 - URLs must be valid http/https links or SEARCH: queries.
@@ -573,7 +586,10 @@ Rules:
         if url.startswith("SEARCH:"):
             return url
 
-        if source_type in {"pricing", "careers", "reviews"}:
+        if source_type in {"pricing", "careers", "reviews"} and not self._is_official_target_url(
+            url,
+            task.target_name,
+        ):
             return self._source_search_url(task, source_type)
 
         if self._is_untrusted_webpage(url, source_type):
@@ -600,6 +616,24 @@ Rules:
             "colah.github.io",
         )
         return not any(host == trusted or host.endswith(f".{trusted}") for trusted in trusted_hosts)
+
+    def _is_official_target_url(self, url: str, target_name: str) -> bool:
+        """Return True when a URL is on the known official domain for its target."""
+
+        target = target_name.strip().lower()
+        if not target or target == "general research":
+            return False
+
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        for company in KNOWN_COMPANIES.values():
+            if company["name"].lower() != target:
+                continue
+            return any(
+                host == domain or host.endswith(f".{domain}")
+                for domain in company.get("domains", ())
+            )
+        return False
 
     def _source_search_url(self, task: ResearchTask, source_type: str) -> str:
         """Build a focused search task from an untrusted direct URL."""
