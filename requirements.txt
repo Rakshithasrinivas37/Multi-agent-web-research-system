@@ -1,3 +1,4 @@
 groq
 httpx
 python-dotenv
+tavily-python

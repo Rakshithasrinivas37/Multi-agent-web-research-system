@@ -77,6 +77,7 @@ SOURCE_ALIASES = {
 
 RESEARCH_MODES = {"competitor_intel", "knowledge_research", "technical_deep_dive", "market_research"}
 OUTPUT_FORMATS = {"comparison_table", "deep_dive", "summary", "report"}
+DIRECT_URL_SOURCE_TYPES = {"arxiv"}
 
 
 class PlannerAgent:
@@ -107,8 +108,9 @@ Return only valid JSON:
 
 Rules:
 - You decide all companies, sources, URLs, queries, and sub-questions.
-- Only use direct URLs that are likely to be exact official/source pages.
-- Do not invent paths. Use SEARCH: when you are not certain the URL exists.
+- Prefer SEARCH: queries for company pages, pricing pages, careers pages, blogs, and docs.
+- Use direct URLs only for stable arXiv paper links when exact.
+- Do not invent paths.
 - In competitor_intel mode, cover every company across the important sub-questions.
 - Keep the plan compact enough to execute: usually 6 to 10 tasks.
 - Return JSON only. No markdown."""
@@ -118,6 +120,11 @@ Rules:
         self.model = model or os.environ.get("RESEARCH_PLANNER_MODEL", "llama-3.1-8b-instant")
         env_value = os.environ.get("RESEARCH_PLANNER_VALIDATE_URLS", "1").lower()
         self.validate_urls = validate_urls if validate_urls is not None else env_value not in {"0", "false", "no"}
+        direct_value = os.environ.get("RESEARCH_PLANNER_ALLOW_DIRECT_URLS", "0").lower()
+        self.allow_direct_urls = direct_value in {"1", "true", "yes"}
+        resolve_value = os.environ.get("RESEARCH_PLANNER_RESOLVE_SEARCH", "1").lower()
+        self.resolve_search = resolve_value not in {"0", "false", "no"}
+        self.search_results = max(1, to_int(os.environ.get("RESEARCH_PLANNER_SEARCH_RESULTS"), 5))
 
     def plan(self, objective: str) -> ResearchPlan:
         if self.use_llm:
@@ -172,6 +179,7 @@ Rules:
             raise ValueError("planner returned no tasks")
 
         tasks = [self._safe_task(task) for task in tasks]
+        tasks = [self._resolve_search_task(task) for task in tasks]
         tasks = dedupe_and_renumber(tasks)
         validate_plan(tasks, mode, companies, sub_questions)
 
@@ -208,7 +216,10 @@ Rules:
         url = dedupe_search(task.url)
         source_type = "search" if url.startswith("SEARCH:") else task.source_type
 
-        if self.validate_urls and valid_http_url(url) and not url_is_reachable(url):
+        if valid_http_url(url) and not self._can_keep_direct_url(url, source_type):
+            url = search_from_task(task)
+            source_type = "search"
+        elif self.validate_urls and valid_http_url(url) and not url_is_reachable(url):
             url = search_from_task(task)
             source_type = "search"
 
@@ -218,6 +229,24 @@ Rules:
             source_type=source_type,
             use_playwright=task.use_playwright and not url.startswith("SEARCH:"),
         )
+
+    def _can_keep_direct_url(self, url: str, source_type: str) -> bool:
+        if self.allow_direct_urls:
+            return True
+        return source_type in DIRECT_URL_SOURCE_TYPES and stable_reference_url(url)
+
+    def _resolve_search_task(self, task: ResearchTask) -> ResearchTask:
+        if not self.resolve_search or not task.url.startswith("SEARCH:"):
+            return task
+
+        query = task.url.removeprefix("SEARCH:").strip()
+        url = search_with_tavily(query, self.search_results)
+        if not url:
+            return task
+        if self.validate_urls and not url_is_reachable(url):
+            return task
+
+        return replace(task, url=url, source_type="webpage", use_playwright=False)
 
     def _fallback_plan(self, objective: str) -> ResearchPlan:
         tasks = [
@@ -240,6 +269,7 @@ Rules:
                 expected_signals=["evidence", "examples", "metrics"],
             ),
         ]
+        tasks = [self._resolve_search_task(task) for task in tasks]
         return ResearchPlan(
             objective=objective,
             research_mode="knowledge_research",
@@ -335,21 +365,56 @@ def dedupe_search(url: str) -> str:
 
 
 def dedupe_words(text: str) -> str:
+    text = clean_query_text(text)
     words = re.findall(r"[A-Za-z0-9+.#-]+", text)
     seen = set()
     result = []
     for word in words:
         key = word.lower()
-        if key in seen:
+        if key in seen or key in {"a", "an", "and", "for", "of", "the", "to", "what", "which"}:
             continue
         result.append(word)
         seen.add(key)
     return " ".join(result).strip()
 
 
+def clean_query_text(text: str) -> str:
+    text = re.sub(r"\b(pricing models of|pricing tiers of|discounts and promotions of)\b", " ", text, flags=re.I)
+    text = re.sub(r"\b(what are|what is|how does|how do|are there any)\b", " ", text, flags=re.I)
+    return text
+
+
 def search_from_task(task: ResearchTask) -> str:
     parts = [task.target_name if task.target_name != "General Research" else "", task.query_context, task.extraction_goal]
     return f"SEARCH:{dedupe_words(' '.join(parts)) or 'research sources'}"
+
+
+def search_with_tavily(query: str, max_results: int) -> str:
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key or not query:
+        return ""
+
+    try:
+        from tavily import TavilyClient
+    except ImportError:
+        print("[planner_agent] tavily-python is not installed; keeping SEARCH task.")
+        return ""
+
+    try:
+        response = TavilyClient(api_key=api_key).search(
+            query=query,
+            max_results=max_results,
+            search_depth="basic",
+        )
+    except Exception as error:
+        print(f"[planner_agent] Tavily search failed for {query!r}: {error}")
+        return ""
+
+    for item in response.get("results", []):
+        url = clean_text(item.get("url"))
+        if valid_http_url(url):
+            return url
+    return ""
 
 
 def valid_task_url(url: str) -> bool:
@@ -373,6 +438,12 @@ def url_is_reachable(url: str) -> bool:
         return 200 <= response.status_code < 400
     except httpx.HTTPError:
         return False
+
+
+def stable_reference_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    path = urlparse(url).path.lower()
+    return host == "arxiv.org" and path.startswith("/abs/")
 
 
 def dedupe_and_renumber(tasks: list[ResearchTask]) -> list[ResearchTask]:
