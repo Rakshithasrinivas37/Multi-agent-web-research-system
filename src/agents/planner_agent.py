@@ -176,7 +176,8 @@ Rules:
 - In competitor_intel, every company must have one task per sub-question.
 - Use direct official URLs only when confident; otherwise use SEARCH:.
 - SEARCH tasks must set use_playwright=false.
-- Prefer official URLs for pricing, docs, and news."""
+- Prefer official URLs for pricing, docs, and news.
+- Keep the JSON compact: 3 to 6 sub_questions, short strings, and no markdown."""
 
     def __init__(self, use_llm: bool = True, model: Optional[str] = None, validate_urls: Optional[bool] = None) -> None:
         self.use_llm = use_llm
@@ -201,27 +202,30 @@ Rules:
             raise RuntimeError("groq package is not installed") from error
 
         client = Groq()
-        messages = [{"role": "user", "content": f"Create a research plan for: {objective}"}]
+        user_request = f"Create a compact research plan for: {objective}"
+        messages = [{"role": "user", "content": user_request}]
         last_error: Optional[Exception] = None
 
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
             response = client.chat.completions.create(
                 model=self.model,
                 temperature=0,
-                max_tokens=2048,
+                max_tokens=1400,
                 messages=[{"role": "system", "content": self.PROMPT}, *messages],
             )
             raw = (response.choices[0].message.content or "").strip()
-            messages.append({"role": "assistant", "content": raw})
 
             try:
                 return self._parse_plan(raw, objective)
             except (json.JSONDecodeError, KeyError, ValueError) as error:
                 last_error = error
-                messages.append({"role": "user", "content": f"Fix this error and return only JSON: {error}"})
+                messages = [
+                    {"role": "user", "content": user_request},
+                    {"role": "user", "content": f"The previous response was invalid JSON: {error}. Return shorter valid JSON only."},
+                ]
                 print(f"[planner_agent] Plan parse failed on attempt {attempt}: {error}")
 
-        raise RuntimeError(f"Groq planner failed after 3 attempts: {last_error}")
+        raise RuntimeError(f"Groq planner failed after 2 attempts: {last_error}")
 
     def _parse_plan(self, raw: str, objective: str) -> ResearchPlan:
         data = json.loads(strip_fence(raw))
