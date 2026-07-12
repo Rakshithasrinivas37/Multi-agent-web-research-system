@@ -261,6 +261,19 @@ def clean_list(value: Any) -> list[str]:
     return [clean_text(item) for item in value if clean_text(item)]
 
 
+def strip_fence(raw: str) -> str:
+    raw = raw.strip()
+    if not raw.startswith("```"):
+        return raw
+
+    lines = raw.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def clean_source_type(value: Any) -> str:
     source_type = clean_text(value).lower().replace("-", "_").replace(" ", "_")
     source_type = SOURCE_ALIASES.get(source_type, source_type)
