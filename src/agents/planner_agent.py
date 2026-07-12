@@ -124,6 +124,8 @@ Rules:
         self.allow_direct_urls = direct_value in {"1", "true", "yes"}
         resolve_value = os.environ.get("RESEARCH_PLANNER_RESOLVE_SEARCH", "1").lower()
         self.resolve_search = resolve_value not in {"0", "false", "no"}
+        rerank_value = os.environ.get("RESEARCH_PLANNER_RERANK_SEARCH", "1").lower()
+        self.rerank_search = rerank_value not in {"0", "false", "no"}
         self.search_results = max(1, to_int(os.environ.get("RESEARCH_PLANNER_SEARCH_RESULTS"), 5))
 
     def plan(self, objective: str) -> ResearchPlan:
@@ -240,13 +242,21 @@ Rules:
             return task
 
         query = task.url.removeprefix("SEARCH:").strip()
-        url = search_with_tavily(query, self.search_results)
+        candidates = search_candidates_with_tavily(query, self.search_results)
+        url = self._choose_search_url(task, query, candidates)
         if not url:
             return task
         if self.validate_urls and not url_is_reachable(url):
             return task
 
         return replace(task, url=url, source_type="webpage", use_playwright=False)
+
+    def _choose_search_url(self, task: ResearchTask, query: str, candidates: list[dict[str, str]]) -> str:
+        if not candidates:
+            return ""
+        if not self.rerank_search:
+            return candidates[0]["url"]
+        return select_candidate_with_groq(task, query, candidates, self.model)
 
     def _fallback_plan(self, objective: str) -> ResearchPlan:
         tasks = [
@@ -389,16 +399,16 @@ def search_from_task(task: ResearchTask) -> str:
     return f"SEARCH:{dedupe_words(' '.join(parts)) or 'research sources'}"
 
 
-def search_with_tavily(query: str, max_results: int) -> str:
+def search_candidates_with_tavily(query: str, max_results: int) -> list[dict[str, str]]:
     api_key = os.environ.get("TAVILY_API_KEY")
     if not api_key or not query:
-        return ""
+        return []
 
     try:
         from tavily import TavilyClient
     except ImportError:
         print("[planner_agent] tavily-python is not installed; keeping SEARCH task.")
-        return ""
+        return []
 
     try:
         response = TavilyClient(api_key=api_key).search(
@@ -408,13 +418,66 @@ def search_with_tavily(query: str, max_results: int) -> str:
         )
     except Exception as error:
         print(f"[planner_agent] Tavily search failed for {query!r}: {error}")
-        return ""
+        return []
 
+    candidates = []
     for item in response.get("results", []):
         url = clean_text(item.get("url"))
         if valid_http_url(url):
-            return url
-    return ""
+            candidates.append(
+                {
+                    "title": clean_text(item.get("title")),
+                    "url": url,
+                    "snippet": clean_text(item.get("content")),
+                }
+            )
+    return candidates
+
+
+def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[dict[str, str]], model: str) -> str:
+    if not os.environ.get("GROQ_API_KEY"):
+        return ""
+
+    try:
+        from groq import Groq
+    except ImportError:
+        return ""
+
+    prompt = {
+        "task": {
+            "query_context": task.query_context,
+            "target_name": task.target_name,
+            "extraction_goal": task.extraction_goal,
+            "expected_signals": task.expected_signals,
+        },
+        "search_query": query,
+        "candidate_urls": candidates,
+    }
+    instructions = (
+        "Choose the single best URL for this research task. Prefer official, primary, "
+        "authoritative, recent, and directly relevant sources. Avoid low-quality blogs, "
+        "forums, random PDFs, or unrelated pages. If no candidate is good enough, return "
+        '{"url": ""}. Return JSON only with one key: url.'
+    )
+
+    try:
+        response = Groq().chat.completions.create(
+            model=model,
+            temperature=0,
+            max_tokens=80,
+            messages=[
+                {"role": "system", "content": instructions},
+                {"role": "user", "content": json.dumps(prompt)},
+            ],
+        )
+        data = json.loads(strip_fence(response.choices[0].message.content or "{}"))
+    except Exception as error:
+        print(f"[planner_agent] Groq URL selection failed for {query!r}: {error}")
+        return ""
+
+    selected_url = clean_text(data.get("url"))
+    candidate_urls = {candidate["url"] for candidate in candidates}
+    return selected_url if selected_url in candidate_urls else ""
 
 
 def valid_task_url(url: str) -> bool:
