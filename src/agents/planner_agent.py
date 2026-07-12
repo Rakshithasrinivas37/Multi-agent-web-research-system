@@ -107,8 +107,8 @@ Return only valid JSON:
 
 Rules:
 - You decide all companies, sources, URLs, queries, and sub-questions.
-- Prefer real source URLs when you are confident they exist.
-- Use SEARCH: when you are not confident about the exact URL.
+- Only use direct URLs that are likely to be exact official/source pages.
+- Do not invent paths. Use SEARCH: when you are not certain the URL exists.
 - In competitor_intel mode, cover every company across the important sub-questions.
 - Keep the plan compact enough to execute: usually 6 to 10 tasks.
 - Return JSON only. No markdown."""
@@ -208,7 +208,7 @@ Rules:
         url = dedupe_search(task.url)
         source_type = "search" if url.startswith("SEARCH:") else task.source_type
 
-        if self.validate_urls and valid_http_url(url) and not url_alive(url):
+        if self.validate_urls and valid_http_url(url) and not url_is_reachable(url):
             url = search_from_task(task)
             source_type = "search"
 
@@ -362,11 +362,17 @@ def valid_http_url(url: str) -> bool:
 
 
 def url_alive(url: str) -> bool:
+    return url_is_reachable(url)
+
+
+def url_is_reachable(url: str) -> bool:
     try:
-        response = httpx.head(url, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        return response.status_code not in {404, 410}
+        response = httpx.head(url, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if response.status_code in {403, 405}:
+            response = httpx.get(url, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        return 200 <= response.status_code < 400
     except httpx.HTTPError:
-        return True
+        return False
 
 
 def dedupe_and_renumber(tasks: list[ResearchTask]) -> list[ResearchTask]:
