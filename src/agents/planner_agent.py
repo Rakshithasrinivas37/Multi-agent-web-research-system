@@ -109,6 +109,11 @@ Return only valid JSON:
 Rules:
 - You decide all companies, sources, URLs, queries, and sub-questions.
 - Prefer SEARCH: queries for company pages, pricing pages, careers pages, blogs, and docs.
+- In competitor_intel mode, prefer official company pages for pricing, docs, products,
+  careers, benefits, training, culture, and diversity topics.
+- Use third-party pages only for independent reviews, salary data, benchmarks,
+  customer sentiment, news, or outside analysis.
+- For official company evidence, include the word "official" in the SEARCH query.
 - Use direct URLs only for stable arXiv paper links when exact.
 - Do not invent paths.
 - In competitor_intel mode, cover every company across the important sub-questions.
@@ -241,7 +246,7 @@ Rules:
         if not self.resolve_search or not task.url.startswith("SEARCH:"):
             return task
 
-        query = task.url.removeprefix("SEARCH:").strip()
+        query = search_query_for_task(task)
         candidates = search_candidates_with_tavily(query, self.search_results)
         url = self._choose_search_url(task, query, candidates)
         if not url:
@@ -399,6 +404,19 @@ def search_from_task(task: ResearchTask) -> str:
     return f"SEARCH:{dedupe_words(' '.join(parts)) or 'research sources'}"
 
 
+def search_query_for_task(task: ResearchTask) -> str:
+    query = task.url.removeprefix("SEARCH:").strip()
+    if task.target_type == "company" and needs_official_source(task):
+        query = " ".join([task.target_name, query, "official"])
+    return dedupe_words(query) or "research sources"
+
+
+def needs_official_source(task: ResearchTask) -> bool:
+    text = " ".join([task.query_context, task.extraction_goal, " ".join(task.expected_signals)]).lower()
+    third_party_topics = {"salary", "salaries", "review", "reviews", "benchmark", "benchmarks", "sentiment", "news"}
+    return not any(topic in text for topic in third_party_topics)
+
+
 def search_candidates_with_tavily(query: str, max_results: int) -> list[dict[str, str]]:
     api_key = os.environ.get("TAVILY_API_KEY")
     if not api_key or not query:
@@ -446,17 +464,22 @@ def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[
     prompt = {
         "task": {
             "query_context": task.query_context,
+            "target_type": task.target_type,
             "target_name": task.target_name,
             "extraction_goal": task.extraction_goal,
             "expected_signals": task.expected_signals,
+            "needs_official_source": needs_official_source(task),
         },
         "search_query": query,
         "candidate_urls": candidates,
     }
     instructions = (
-        "Choose the single best URL for this research task. Prefer official, primary, "
-        "authoritative, recent, and directly relevant sources. Avoid low-quality blogs, "
-        "forums, random PDFs, or unrelated pages. If no candidate is good enough, return "
+        "Choose the single best URL for this research task. If needs_official_source is true, "
+        "strongly prefer the official company/product/documentation/careers page for the "
+        "target. If the task asks for salaries, reviews, benchmarks, sentiment, news, or "
+        "outside analysis, independent third-party sources are acceptable. Always prefer "
+        "primary, authoritative, recent, and directly relevant sources. Avoid low-quality "
+        "blogs, forums, random PDFs, or unrelated pages. If no candidate is good enough, return "
         '{"url": ""}. Return JSON only with one key: url.'
     )
 
