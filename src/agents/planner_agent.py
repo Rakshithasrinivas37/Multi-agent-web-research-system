@@ -232,7 +232,7 @@ Rules:
         url = dedupe_search(task.url)
         source_type = "search" if url.startswith("SEARCH:") else task.source_type
 
-        if self.validate_urls and valid_http_url(url) and not url_is_reachable(url):
+        if self.validate_urls and valid_http_url(url) and url_is_missing(url):
             url = search_from_task(task)
             source_type = "search"
         elif valid_http_url(url) and not self._can_keep_direct_url(url, source_type, task):
@@ -253,22 +253,42 @@ Rules:
             return True
         if task.target_type == "company" and likely_official_url(task.target_name, url):
             return True
-        return source_type in {"academic", "technical_overview", "benchmarks", "implementation", "news", "docs", "reviews"}
+        return source_type in {
+            "academic",
+            "benchmarks",
+            "careers",
+            "docs",
+            "implementation",
+            "news",
+            "pricing",
+            "reviews",
+            "technical_overview",
+            "webpage",
+            "wikipedia",
+        }
 
     def _resolve_search_task(self, task: ResearchTask, objective: str = "") -> ResearchTask:
         if not self.resolve_search or self.search_results == 0 or not task.url.startswith("SEARCH:"):
             return task
 
         query = search_query_for_task(task, objective)
-        candidates = search_candidates_with_tavily(query, self.search_results)
-        if needs_official_source(task):
-            candidates = [candidate for candidate in candidates if likely_official_url(task.target_name, candidate["url"])]
+        all_candidates = search_candidates_with_tavily(query, self.search_results)
+        candidates = preferred_candidates(task, all_candidates)
         url = self._choose_search_url(task, query, candidates)
-        if not url and candidates and not needs_official_source(task):
+        if not url and candidates:
             url = candidates[0]["url"]
+        if not url and candidates != all_candidates:
+            url = self._choose_search_url(task, query, all_candidates)
+        if not url and all_candidates:
+            url = all_candidates[0]["url"]
         if not url:
             return task
-        if self.validate_urls and not url_is_reachable(url):
+        if self.validate_urls and url_is_missing(url):
+            missing_url = url
+            url = first_existing_url(candidates, exclude={missing_url})
+            if not url and candidates != all_candidates:
+                url = first_existing_url(all_candidates, exclude={missing_url})
+        if not url:
             return task
 
         return replace(task, url=url, source_type=resolved_source_type(task, url), use_playwright=False)
@@ -548,6 +568,21 @@ def likely_official_url(company: str, url: str) -> bool:
     host_key = re.sub(r"[^a-z0-9]", "", host)
     return bool(company_key and company_key in host_key)
 
+def preferred_candidates(task: ResearchTask, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
+    if task.target_type != "company" or not needs_official_source(task):
+        return candidates
+
+    official = [candidate for candidate in candidates if likely_official_url(task.target_name, candidate["url"])]
+    return official or candidates
+
+def first_existing_url(candidates: list[dict[str, str]], exclude: Optional[set[str]] = None) -> str:
+    exclude = exclude or set()
+    for candidate in candidates:
+        url = candidate["url"]
+        if url not in exclude and not url_is_missing(url):
+            return url
+    return ""
+
 def search_candidates_with_tavily(query: str, max_results: int) -> list[dict[str, str]]:
     api_key = os.environ.get("TAVILY_API_KEY")
     if not api_key or not query:
@@ -660,6 +695,15 @@ def url_is_reachable(url: str) -> bool:
         if response.status_code in {403, 405}:
             response = httpx.get(url, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
         return 200 <= response.status_code < 400
+    except httpx.HTTPError:
+        return False
+
+def url_is_missing(url: str) -> bool:
+    try:
+        response = httpx.head(url, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        if response.status_code in {403, 405}:
+            response = httpx.get(url, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        return response.status_code in {404, 410}
     except httpx.HTTPError:
         return False
 
