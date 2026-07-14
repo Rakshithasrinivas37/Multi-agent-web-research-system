@@ -108,13 +108,18 @@ Return only valid JSON:
 
 Rules:
 - You decide all companies, sources, URLs, queries, and sub-questions.
+- Normalize company and product names to their official capitalization.
+  Examples: OpenAI, Groq, Google, Anthropic, Microsoft, AWS, NVIDIA, Capgemini, Accenture, Infosys.
+- Use the normalized name consistently in companies, target_name, query_context, and SEARCH queries.
+- If unsure, use the most widely recognized public brand spelling.
 - Prefer SEARCH: queries for company pages, pricing pages, careers pages, blogs, and docs.
-- In competitor_intel mode, prefer official company URLs for pricing, docs, products,
-  careers, benefits, training, culture, and diversity topics.
+- In competitor_intel mode, prefer and provide official company URLs for pricing, docs, products,
+  careers, benefits, training, culture, and diversity topics. Provide information for each company across all sub-questions.
 - Use third-party pages only for independent reviews, salary data, benchmarks,
   customer sentiment, news, or outside analysis.
 - For official company evidence, include the word "official" in the SEARCH query.
 - Use direct URLs only for stable arXiv paper links when exact.
+- Provide URLs from the most authoritative, primary sources possible for all the topics.
 - Do not hallucinate and invent paths.
 - In competitor_intel mode, cover every company across the important sub-questions.
 - Keep the plan compact enough to execute: usually 6 to 10 tasks.
@@ -492,7 +497,7 @@ def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[
     }
     instructions = (
         "Choose the single best URL for this research task. If needs_official_source is true, "
-        "strongly prefer the official company/product/documentation/careers page for the "
+        "strongly prefer the official company/product/documentation/careers URLS/page for the "
         "target. If the task asks for salaries, reviews, benchmarks, sentiment, news, or "
         "outside analysis, independent third-party sources are acceptable. Always prefer "
         "primary, authoritative, recent, and directly relevant sources. Avoid low-quality "
