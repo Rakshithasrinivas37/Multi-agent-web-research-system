@@ -109,13 +109,13 @@ Return only valid JSON:
 Rules:
 - You decide all companies, sources, URLs, queries, and sub-questions.
 - Prefer SEARCH: queries for company pages, pricing pages, careers pages, blogs, and docs.
-- In competitor_intel mode, prefer official company pages for pricing, docs, products,
+- In competitor_intel mode, prefer official company URLs for pricing, docs, products,
   careers, benefits, training, culture, and diversity topics.
 - Use third-party pages only for independent reviews, salary data, benchmarks,
   customer sentiment, news, or outside analysis.
 - For official company evidence, include the word "official" in the SEARCH query.
 - Use direct URLs only for stable arXiv paper links when exact.
-- Do not invent paths.
+- Do not hallucinate and invent paths.
 - In competitor_intel mode, cover every company across the important sub-questions.
 - Keep the plan compact enough to execute: usually 6 to 10 tasks.
 - Return JSON only. No markdown."""
