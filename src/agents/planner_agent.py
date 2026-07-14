@@ -131,7 +131,7 @@ Rules:
         self.resolve_search = resolve_value not in {"0", "false", "no"}
         rerank_value = os.environ.get("RESEARCH_PLANNER_RERANK_SEARCH", "1").lower()
         self.rerank_search = rerank_value not in {"0", "false", "no"}
-        self.search_results = max(1, to_int(os.environ.get("RESEARCH_PLANNER_SEARCH_RESULTS"), 5))
+        self.search_results = max(0, to_int(os.environ.get("RESEARCH_PLANNER_SEARCH_RESULTS"), 5))
 
     def plan(self, objective: str) -> ResearchPlan:
         if self.use_llm:
@@ -186,7 +186,7 @@ Rules:
             raise ValueError("planner returned no tasks")
 
         tasks = [self._safe_task(task) for task in tasks]
-        tasks = [self._resolve_search_task(task) for task in tasks]
+        tasks = [self._resolve_search_task(task, objective) for task in tasks]
         tasks = dedupe_and_renumber(tasks)
         validate_plan(tasks, mode, companies, sub_questions)
 
@@ -242,12 +242,14 @@ Rules:
             return True
         return source_type in DIRECT_URL_SOURCE_TYPES and stable_reference_url(url)
 
-    def _resolve_search_task(self, task: ResearchTask) -> ResearchTask:
-        if not self.resolve_search or not task.url.startswith("SEARCH:"):
+    def _resolve_search_task(self, task: ResearchTask, objective: str = "") -> ResearchTask:
+        if not self.resolve_search or self.search_results == 0 or not task.url.startswith("SEARCH:"):
             return task
 
-        query = search_query_for_task(task)
+        query = search_query_for_task(task, objective)
         candidates = search_candidates_with_tavily(query, self.search_results)
+        if needs_official_source(task):
+            candidates = [candidate for candidate in candidates if likely_official_url(task.target_name, candidate["url"])]
         url = self._choose_search_url(task, query, candidates)
         if not url:
             return task
@@ -284,7 +286,7 @@ Rules:
                 expected_signals=["evidence", "examples", "metrics"],
             ),
         ]
-        tasks = [self._resolve_search_task(task) for task in tasks]
+        tasks = [self._resolve_search_task(task, objective) for task in tasks]
         return ResearchPlan(
             objective=objective,
             research_mode="knowledge_research",
@@ -404,10 +406,10 @@ def search_from_task(task: ResearchTask) -> str:
     return f"SEARCH:{dedupe_words(' '.join(parts)) or 'research sources'}"
 
 
-def search_query_for_task(task: ResearchTask) -> str:
+def search_query_for_task(task: ResearchTask, objective: str = "") -> str:
     query = task.url.removeprefix("SEARCH:").strip()
     if task.target_type == "company" and needs_official_source(task):
-        query = " ".join([task.target_name, query, "official"])
+        query = " ".join([task.target_name, objective_topic(objective), query, "official"])
     return dedupe_words(query) or "research sources"
 
 
@@ -415,6 +417,21 @@ def needs_official_source(task: ResearchTask) -> bool:
     text = " ".join([task.query_context, task.extraction_goal, " ".join(task.expected_signals)]).lower()
     third_party_topics = {"salary", "salaries", "review", "reviews", "benchmark", "benchmarks", "sentiment", "news"}
     return not any(topic in text for topic in third_party_topics)
+
+
+def objective_topic(objective: str) -> str:
+    text = objective.lower()
+    for phrase in ("model pricing", "api pricing", "careers", "benefits", "training", "culture", "diversity"):
+        if phrase in text:
+            return phrase
+    return ""
+
+
+def likely_official_url(company: str, url: str) -> bool:
+    company_key = re.sub(r"[^a-z0-9]", "", company.lower())
+    host = urlparse(url).netloc.lower()
+    host_key = re.sub(r"[^a-z0-9]", "", host)
+    return bool(company_key and company_key in host_key)
 
 
 def search_candidates_with_tavily(query: str, max_results: int) -> list[dict[str, str]]:
@@ -493,7 +510,7 @@ def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[
                 {"role": "user", "content": json.dumps(prompt)},
             ],
         )
-        data = json.loads(strip_fence(response.choices[0].message.content or "{}"))
+        data = parse_json_object(response.choices[0].message.content or "{}")
     except Exception as error:
         print(f"[planner_agent] Groq URL selection failed for {query!r}: {error}")
         return ""
@@ -501,6 +518,19 @@ def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[
     selected_url = clean_text(data.get("url"))
     candidate_urls = {candidate["url"] for candidate in candidates}
     return selected_url if selected_url in candidate_urls else ""
+
+
+def parse_json_object(raw: str) -> dict[str, Any]:
+    text = strip_fence(raw)
+    decoder = json.JSONDecoder()
+    start = text.find("{")
+    if start == -1:
+        return {}
+    try:
+        data, _ = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def valid_task_url(url: str) -> bool:
