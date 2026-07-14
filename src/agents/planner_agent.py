@@ -112,6 +112,12 @@ Rules:
 - In competitor_intel mode, create company-specific tasks with official company URLs
   for pricing, docs, products, careers, benefits, training, culture, and diversity topics.
   Provide information for each company across all key sub-questions.
+- For API/model pricing, prefer official API, docs, platform, model, token, or developer
+  pricing pages. Avoid consumer subscription pages unless the objective asks for subscriptions.
+- For company growth, prefer official investor relations, annual reports, earnings releases,
+  fact sheets, SEC filings, and company profile pages.
+- For technical research, prefer original papers, arXiv, DOI pages, official documentation,
+  university pages, and respected technical blogs.
 - Use third-party pages only for independent reviews, salary data, benchmarks,
   customer sentiment, news, or outside analysis.
 - For official company evidence, include the word "official" in the SEARCH query.
@@ -253,6 +259,8 @@ Rules:
             return True
         if task.target_type == "company" and likely_official_url(task.target_name, url):
             return True
+        if task.target_type == "company" and needs_official_source(task):
+            return False
         return source_type in {
             "academic",
             "benchmarks",
@@ -272,8 +280,10 @@ Rules:
             return task
 
         query = search_query_for_task(task, objective)
-        all_candidates = search_candidates_with_tavily(query, self.search_results)
+        all_candidates = rank_candidates(task, search_candidates_with_tavily(query, self.search_results))
         candidates = preferred_candidates(task, all_candidates)
+        if task.target_type == "company" and needs_official_source(task) and not candidates:
+            return task
         url = self._choose_search_url(task, query, candidates)
         if not url and candidates:
             url = candidates[0]["url"]
@@ -547,8 +557,16 @@ def supplemental_search_tasks(objective: str, mode: str, companies: list[str]) -
 def search_query_for_task(task: ResearchTask, objective: str = "") -> str:
     query = task.url.removeprefix("SEARCH:").strip()
     if task.target_type == "company" and needs_official_source(task):
-        query = " ".join([task.target_name, objective_topic(objective), query, "official"])
+        query = " ".join([task.target_name, objective_topic(objective), query, official_query_terms(task), "official"])
     return dedupe_words(query) or "research sources"
+
+def official_query_terms(task: ResearchTask) -> str:
+    topic = task_topic(task)
+    if topic == "pricing":
+        return "api model token pricing docs platform developer"
+    if topic == "growth":
+        return "investor annual report earnings revenue employee count fact sheet company profile"
+    return ""
 
 def needs_official_source(task: ResearchTask) -> bool:
     text = " ".join([task.query_context, task.extraction_goal, " ".join(task.expected_signals)]).lower()
@@ -568,12 +586,66 @@ def likely_official_url(company: str, url: str) -> bool:
     host_key = re.sub(r"[^a-z0-9]", "", host)
     return bool(company_key and company_key in host_key)
 
+def rank_candidates(task: ResearchTask, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
+    return sorted(candidates, key=lambda candidate: candidate_score(task, candidate), reverse=True)
+
+def candidate_score(task: ResearchTask, candidate: dict[str, str]) -> int:
+    url = candidate["url"]
+    text = candidate_text(candidate)
+    host = urlparse(url).netloc.lower()
+    score = 0
+
+    if task.target_type == "company" and likely_official_url(task.target_name, url):
+        score += 60
+    if stable_reference_url(url):
+        score += 50
+    if any(host.endswith(domain) for domain in (".edu", "acm.org", "ieee.org", "nature.com", "mitpressjournals.org")):
+        score += 25
+    if any(domain in host for domain in ("researchgate.net", "wikipedia.org")):
+        score -= 8
+    if any(domain in host for domain in ("paperdue.com", "studocu.com", "coursehero.com", "chegg.com")):
+        score -= 60
+
+    topic = task_topic(task)
+    if topic == "pricing":
+        score += count_matches(text, ["api", "model", "token", "pricing", "docs", "platform", "developer"]) * 8
+        score -= count_matches(text, ["chatgpt", "team", "enterprise", "subscription"]) * 8
+    elif topic == "growth":
+        score += count_matches(text, ["investor", "annual report", "earnings", "revenue", "quarter", "financial", "fact sheet", "sec"]) * 8
+        score -= count_matches(text, ["essay", "study guide", "homework", "sample"]) * 12
+    elif topic == "technical":
+        score += count_matches(text, ["arxiv", "doi", "paper", "research", "documentation", "tutorial", "blog", "university"]) * 6
+
+    return score
+
+def candidate_text(candidate: dict[str, str]) -> str:
+    return " ".join(
+        [
+            clean_text(candidate.get("title")),
+            clean_text(candidate.get("url")),
+            clean_text(candidate.get("snippet")),
+        ]
+    ).lower()
+
+def task_topic(task: ResearchTask) -> str:
+    text = " ".join([task.query_context, task.extraction_goal, " ".join(task.expected_signals)]).lower()
+    if any(word in text for word in ("price", "pricing", "cost", "token")):
+        return "pricing"
+    if any(word in text for word in ("revenue", "growth", "employee", "market expansion", "strategy")):
+        return "growth"
+    if any(word in text for word in ("architecture", "paper", "research", "technical", "rnn", "lstm", "transformer")):
+        return "technical"
+    return "general"
+
+def count_matches(text: str, phrases: list[str]) -> int:
+    return sum(1 for phrase in phrases if phrase in text)
+
 def preferred_candidates(task: ResearchTask, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
     if task.target_type != "company" or not needs_official_source(task):
         return candidates
 
     official = [candidate for candidate in candidates if likely_official_url(task.target_name, candidate["url"])]
-    return official or candidates
+    return official
 
 def first_existing_url(candidates: list[dict[str, str]], exclude: Optional[set[str]] = None) -> str:
     exclude = exclude or set()
@@ -641,7 +713,10 @@ def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[
     instructions = (
         "Choose the single best URL for this research task. If needs_official_source is true, "
         "strongly prefer the official company/product/documentation/careers URLS/page for the "
-        "target. If the task asks for salaries, reviews, benchmarks, sentiment, news, or "
+        "target. For API or model pricing, choose official API, token, model, developer, "
+        "platform, or docs pricing pages instead of consumer subscription pages. For company "
+        "growth, choose investor relations, annual reports, earnings releases, fact sheets, "
+        "SEC filings, or official company profile pages. If the task asks for salaries, reviews, benchmarks, sentiment, news, or "
         "outside analysis, independent third-party sources are acceptable. Always prefer "
         "primary, authoritative, recent, and directly relevant sources. Avoid low-quality "
         "blogs, forums, random PDFs, or unrelated pages. If no candidate is good enough, return "
