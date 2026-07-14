@@ -112,17 +112,22 @@ Rules:
   Examples: OpenAI, Groq, Google, Anthropic, Microsoft, AWS, NVIDIA, Capgemini, Accenture, Infosys.
 - Use the normalized name consistently in companies, target_name, query_context, and SEARCH queries.
 - If unsure, use the most widely recognized public brand spelling.
-- Prefer SEARCH: queries for company pages, pricing pages, careers pages, blogs, and docs.
-- In competitor_intel mode, prefer and provide official company URLs for pricing, docs, products,
-  careers, benefits, training, culture, and diversity topics. Provide information for each company across all sub-questions.
+- Prefer direct URLs for exact official pages, research papers, reputable blogs, and docs.
+- Use SEARCH: for 2 to 3 supplemental discovery tasks such as comparison, recent news,
+  third-party analysis, or missing source discovery.
+- In competitor_intel mode, create company-specific tasks with official company URLs
+  for pricing, docs, products, careers, benefits, training, culture, and diversity topics.
+  Provide information for each company across all key sub-questions.
 - Use third-party pages only for independent reviews, salary data, benchmarks,
   customer sentiment, news, or outside analysis.
 - For official company evidence, include the word "official" in the SEARCH query.
 - Use direct URLs only for stable arXiv paper links when exact.
 - Provide URLs from the most authoritative, primary sources possible for all the topics.
 - Do not hallucinate and invent paths.
-- In competitor_intel mode, cover every company across the important sub-questions.
-- Keep the plan compact enough to execute: usually 6 to 10 tasks.
+- In competitor_intel mode, cover every company across the important sub-questions;
+  12 to 20 tasks is acceptable when needed.
+- For technical/knowledge research, include authoritative papers, documentation,
+  and reputable blogs where relevant, plus 2 to 3 SEARCH tasks for discovery.
 - Return JSON only. No markdown."""
 
     def __init__(self, use_llm: bool = True, model: Optional[str] = None, validate_urls: Optional[bool] = None) -> None:
@@ -136,7 +141,10 @@ Rules:
         self.resolve_search = resolve_value not in {"0", "false", "no"}
         rerank_value = os.environ.get("RESEARCH_PLANNER_RERANK_SEARCH", "1").lower()
         self.rerank_search = rerank_value not in {"0", "false", "no"}
-        self.search_results = max(0, to_int(os.environ.get("RESEARCH_PLANNER_SEARCH_RESULTS"), 5))
+        search_results_value = os.environ.get("RESEARCH_PLANNER_SEARCH_RESULTS")
+        if search_results_value is None and resolve_value.isdigit() and resolve_value not in {"0", "1"}:
+            search_results_value = resolve_value
+        self.search_results = max(0, to_int(search_results_value, 5))
 
     def plan(self, objective: str) -> ResearchPlan:
         if self.use_llm:
@@ -163,7 +171,7 @@ Rules:
             response = client.chat.completions.create(
                 model=self.model,
                 temperature=0,
-                max_tokens=1600,
+                max_tokens=2600,
                 messages=[{"role": "system", "content": self.PROMPT}, *messages],
             )
             raw = (response.choices[0].message.content or "").strip()
@@ -190,8 +198,10 @@ Rules:
         if not tasks:
             raise ValueError("planner returned no tasks")
 
+        tasks = ensure_competitor_coverage(tasks, mode, companies, sub_questions)
         tasks = [self._safe_task(task) for task in tasks]
         tasks = [self._resolve_search_task(task, objective) for task in tasks]
+        tasks = add_supplemental_search_tasks(tasks, objective, mode, companies)
         tasks = dedupe_and_renumber(tasks)
         validate_plan(tasks, mode, companies, sub_questions)
 
@@ -228,10 +238,10 @@ Rules:
         url = dedupe_search(task.url)
         source_type = "search" if url.startswith("SEARCH:") else task.source_type
 
-        if valid_http_url(url) and not self._can_keep_direct_url(url, source_type):
+        if self.validate_urls and valid_http_url(url) and not url_is_reachable(url):
             url = search_from_task(task)
             source_type = "search"
-        elif self.validate_urls and valid_http_url(url) and not url_is_reachable(url):
+        elif valid_http_url(url) and not self._can_keep_direct_url(url, source_type, task):
             url = search_from_task(task)
             source_type = "search"
 
@@ -242,10 +252,14 @@ Rules:
             use_playwright=task.use_playwright and not url.startswith("SEARCH:"),
         )
 
-    def _can_keep_direct_url(self, url: str, source_type: str) -> bool:
+    def _can_keep_direct_url(self, url: str, source_type: str, task: ResearchTask) -> bool:
         if self.allow_direct_urls:
             return True
-        return source_type in DIRECT_URL_SOURCE_TYPES and stable_reference_url(url)
+        if source_type in DIRECT_URL_SOURCE_TYPES and stable_reference_url(url):
+            return True
+        if task.target_type == "company" and likely_official_url(task.target_name, url):
+            return True
+        return source_type in {"academic", "technical_overview", "benchmarks", "implementation", "news", "docs", "reviews"}
 
     def _resolve_search_task(self, task: ResearchTask, objective: str = "") -> ResearchTask:
         if not self.resolve_search or self.search_results == 0 or not task.url.startswith("SEARCH:"):
@@ -402,13 +416,118 @@ def dedupe_words(text: str) -> str:
 
 def clean_query_text(text: str) -> str:
     text = re.sub(r"\b(pricing models of|pricing tiers of|discounts and promotions of)\b", " ", text, flags=re.I)
-    text = re.sub(r"\b(what are|what is|how does|how do|are there any)\b", " ", text, flags=re.I)
+    text = re.sub(r"\b(what are|what is|how does|how do|are there any|can i get)\b", " ", text, flags=re.I)
     return text
 
 
 def search_from_task(task: ResearchTask) -> str:
     parts = [task.target_name if task.target_name != "General Research" else "", task.query_context, task.extraction_goal]
     return f"SEARCH:{dedupe_words(' '.join(parts)) or 'research sources'}"
+
+
+def ensure_competitor_coverage(
+    tasks: list[ResearchTask],
+    mode: str,
+    companies: list[str],
+    sub_questions: list[str],
+) -> list[ResearchTask]:
+    if mode != "competitor_intel" or not companies:
+        return tasks
+
+    result = list(tasks)
+    next_priority = max((task.priority for task in result), default=0) + 1
+    for company in companies:
+        for sub_question in sub_questions:
+            topic = topic_from_question(sub_question)
+            if not topic or has_company_topic_task(result, company, topic):
+                continue
+            result.append(
+                ResearchTask(
+                    task_id=f"coverage_{len(result) + 1}",
+                    query_context=f"{company} {topic}",
+                    url=f"SEARCH:{company} {topic} official",
+                    source_type="search",
+                    priority=next_priority,
+                    extraction_goal=f"Extract {topic}",
+                    target_type="company",
+                    target_name=company,
+                    expected_signals=[topic],
+                )
+            )
+            next_priority += 1
+    return result
+
+
+def has_company_topic_task(tasks: list[ResearchTask], company: str, topic: str) -> bool:
+    company_key = company.lower()
+    topic_words = set(topic.lower().split())
+    for task in tasks:
+        if task.target_name.lower() != company_key:
+            continue
+        task_text = " ".join([task.query_context, task.extraction_goal, " ".join(task.expected_signals)]).lower()
+        if topic_words and topic_words.intersection(task_text.split()):
+            return True
+    return False
+
+
+def topic_from_question(question: str) -> str:
+    text = clean_query_text(question)
+    text = re.sub(r"\b(company|companies|each|their|across|different)\b", " ", text, flags=re.I)
+    words = [
+        word
+        for word in re.findall(r"[A-Za-z0-9+.#-]+", text)
+        if word.lower()
+        not in {"a", "an", "are", "can", "for", "get", "has", "have", "how", "i", "many", "model", "models", "the", "with"}
+    ]
+    return " ".join(words[:4]).strip()
+
+
+def add_supplemental_search_tasks(
+    tasks: list[ResearchTask],
+    objective: str,
+    mode: str,
+    companies: list[str],
+    target_count: int = 2,
+) -> list[ResearchTask]:
+    search_count = sum(1 for task in tasks if task.url.startswith("SEARCH:"))
+    if search_count >= target_count:
+        return tasks
+
+    additions = supplemental_search_tasks(objective, mode, companies)
+    needed = target_count - search_count
+    return [*tasks, *additions[:needed]]
+
+
+def supplemental_search_tasks(objective: str, mode: str, companies: list[str]) -> list[ResearchTask]:
+    company_text = " ".join(companies)
+    topic = objective_topic(objective) or objective
+    if mode == "competitor_intel" and companies:
+        queries = [
+            (f"{company_text} {topic} comparison analysis", "third-party comparison and analysis"),
+            (f"{company_text} {topic} recent news updates", "recent news and changes"),
+            (f"{company_text} {topic} blog analysis", "expert blog analysis"),
+        ]
+    else:
+        queries = [
+            (f"{objective} research papers arxiv", "research paper sources"),
+            (f"{objective} technical blog explanation", "reputable blog explanation"),
+            (f"{objective} official documentation tutorial", "official documentation or tutorial"),
+        ]
+
+    return [
+        ResearchTask(
+            task_id=f"supplemental_{index}",
+            query_context=goal,
+            url=f"SEARCH:{dedupe_words(query)}",
+            source_type="search",
+            priority=90 + index,
+            extraction_goal=goal,
+            target_type="discovery",
+            target_name="General Research",
+            expected_signals=["source URL", "evidence", "summary"],
+        )
+        for index, (query, goal) in enumerate(queries, 1)
+    ]
 
 
 def search_query_for_task(task: ResearchTask, objective: str = "") -> str:
