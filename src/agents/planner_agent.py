@@ -8,8 +8,6 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-
-
 @dataclass(frozen=True)
 class ResearchTask:
     task_id: str
@@ -22,8 +20,6 @@ class ResearchTask:
     target_name: str = "General Research"
     use_playwright: bool = False
     expected_signals: list[str] = field(default_factory=list)
-
-
 @dataclass(frozen=True)
 class ResearchPlan:
     objective: str
@@ -44,7 +40,6 @@ class ResearchPlan:
             "synthesis_instruction": self.synthesis_instruction,
             "output_format": self.output_format,
         }
-
 
 SOURCE_TYPES = {
     "webpage",
@@ -78,7 +73,6 @@ SOURCE_ALIASES = {
 RESEARCH_MODES = {"competitor_intel", "knowledge_research", "technical_deep_dive", "market_research"}
 OUTPUT_FORMATS = {"comparison_table", "deep_dive", "summary", "report"}
 DIRECT_URL_SOURCE_TYPES = {"arxiv"}
-
 
 class PlannerAgent:
     PROMPT = f"""You are the planner in a multi-agent web research system.
@@ -270,12 +264,14 @@ Rules:
         if needs_official_source(task):
             candidates = [candidate for candidate in candidates if likely_official_url(task.target_name, candidate["url"])]
         url = self._choose_search_url(task, query, candidates)
+        if not url and candidates and not needs_official_source(task):
+            url = candidates[0]["url"]
         if not url:
             return task
         if self.validate_urls and not url_is_reachable(url):
             return task
 
-        return replace(task, url=url, source_type="webpage", use_playwright=False)
+        return replace(task, url=url, source_type=resolved_source_type(task, url), use_playwright=False)
 
     def _choose_search_url(self, task: ResearchTask, query: str, candidates: list[dict[str, str]]) -> str:
         if not candidates:
@@ -316,16 +312,13 @@ Rules:
             output_format="summary",
         )
 
-
 def clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
-
 
 def clean_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [clean_text(item) for item in value if clean_text(item)]
-
 
 def strip_fence(raw: str) -> str:
     raw = raw.strip()
@@ -339,34 +332,28 @@ def strip_fence(raw: str) -> str:
         lines = lines[:-1]
     return "\n".join(lines).strip()
 
-
 def clean_source_type(value: Any) -> str:
     source_type = clean_text(value).lower().replace("-", "_").replace(" ", "_")
     source_type = SOURCE_ALIASES.get(source_type, source_type)
     return source_type if source_type in SOURCE_TYPES else "webpage"
 
-
 def clean_target_type(value: Any) -> str:
     target_type = clean_text(value).lower()
     return target_type if target_type in {"company", "discovery"} else "discovery"
-
 
 def clean_mode(value: Any) -> str:
     mode = clean_text(value)
     return mode if mode in RESEARCH_MODES else "knowledge_research"
 
-
 def clean_output_format(value: Any) -> str:
     output_format = clean_text(value)
     return output_format if output_format in OUTPUT_FORMATS else "summary"
-
 
 def to_int(value: Any, fallback: int) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return fallback
-
 
 def normalize_url(url: str, source_type: str) -> str:
     if not url:
@@ -385,7 +372,6 @@ def normalize_url(url: str, source_type: str) -> str:
         return f"SEARCH:{dedupe_words(url)}"
     return f"SEARCH:{url}"
 
-
 def query_from_search_url(url: str) -> str:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
@@ -393,12 +379,10 @@ def query_from_search_url(url: str) -> str:
         return ""
     return parse_qs(parsed.query).get("q", [""])[0].strip()
 
-
 def dedupe_search(url: str) -> str:
     if not url.startswith("SEARCH:"):
         return url
     return f"SEARCH:{dedupe_words(url.removeprefix('SEARCH:')) or 'research sources'}"
-
 
 def dedupe_words(text: str) -> str:
     text = clean_query_text(text)
@@ -413,17 +397,31 @@ def dedupe_words(text: str) -> str:
         seen.add(key)
     return " ".join(result).strip()
 
-
 def clean_query_text(text: str) -> str:
     text = re.sub(r"\b(pricing models of|pricing tiers of|discounts and promotions of)\b", " ", text, flags=re.I)
     text = re.sub(r"\b(what are|what is|how does|how do|are there any|can i get)\b", " ", text, flags=re.I)
+    text = re.sub(r"\bemployee counts count\b", "employee count", text, flags=re.I)
+    text = re.sub(r"\brevenue growth rates rate\b", "revenue growth rate", text, flags=re.I)
     return text
-
 
 def search_from_task(task: ResearchTask) -> str:
     parts = [task.target_name if task.target_name != "General Research" else "", task.query_context, task.extraction_goal]
     return f"SEARCH:{dedupe_words(' '.join(parts)) or 'research sources'}"
 
+def resolved_source_type(task: ResearchTask, url: str) -> str:
+    if stable_reference_url(url):
+        return "arxiv"
+    path = urlparse(url).path.lower()
+    host = urlparse(url).netloc.lower()
+    if "pricing" in path or "pricing" in task.extraction_goal.lower():
+        return "pricing"
+    if "docs" in host or "/docs" in path or "documentation" in task.extraction_goal.lower():
+        return "docs"
+    if "blog" in host or "/blog" in path:
+        return "news"
+    if task.source_type != "search":
+        return task.source_type
+    return "webpage"
 
 def ensure_competitor_coverage(
     tasks: list[ResearchTask],
@@ -457,7 +455,6 @@ def ensure_competitor_coverage(
             next_priority += 1
     return result
 
-
 def has_company_topic_task(tasks: list[ResearchTask], company: str, topic: str) -> bool:
     company_key = company.lower()
     topic_words = set(topic.lower().split())
@@ -469,7 +466,6 @@ def has_company_topic_task(tasks: list[ResearchTask], company: str, topic: str) 
             return True
     return False
 
-
 def topic_from_question(question: str) -> str:
     text = clean_query_text(question)
     text = re.sub(r"\b(company|companies|each|their|across|different)\b", " ", text, flags=re.I)
@@ -480,7 +476,6 @@ def topic_from_question(question: str) -> str:
         not in {"a", "an", "are", "can", "for", "get", "has", "have", "how", "i", "many", "model", "models", "the", "with"}
     ]
     return " ".join(words[:4]).strip()
-
 
 def add_supplemental_search_tasks(
     tasks: list[ResearchTask],
@@ -529,19 +524,16 @@ def supplemental_search_tasks(objective: str, mode: str, companies: list[str]) -
         for index, (query, goal) in enumerate(queries, 1)
     ]
 
-
 def search_query_for_task(task: ResearchTask, objective: str = "") -> str:
     query = task.url.removeprefix("SEARCH:").strip()
     if task.target_type == "company" and needs_official_source(task):
         query = " ".join([task.target_name, objective_topic(objective), query, "official"])
     return dedupe_words(query) or "research sources"
 
-
 def needs_official_source(task: ResearchTask) -> bool:
     text = " ".join([task.query_context, task.extraction_goal, " ".join(task.expected_signals)]).lower()
     third_party_topics = {"salary", "salaries", "review", "reviews", "benchmark", "benchmarks", "sentiment", "news"}
     return not any(topic in text for topic in third_party_topics)
-
 
 def objective_topic(objective: str) -> str:
     text = objective.lower()
@@ -550,13 +542,11 @@ def objective_topic(objective: str) -> str:
             return phrase
     return ""
 
-
 def likely_official_url(company: str, url: str) -> bool:
     company_key = re.sub(r"[^a-z0-9]", "", company.lower())
     host = urlparse(url).netloc.lower()
     host_key = re.sub(r"[^a-z0-9]", "", host)
     return bool(company_key and company_key in host_key)
-
 
 def search_candidates_with_tavily(query: str, max_results: int) -> list[dict[str, str]]:
     api_key = os.environ.get("TAVILY_API_KEY")
@@ -591,7 +581,6 @@ def search_candidates_with_tavily(query: str, max_results: int) -> list[dict[str
                 }
             )
     return candidates
-
 
 def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[dict[str, str]], model: str) -> str:
     if not os.environ.get("GROQ_API_KEY"):
@@ -643,7 +632,6 @@ def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[
     candidate_urls = {candidate["url"] for candidate in candidates}
     return selected_url if selected_url in candidate_urls else ""
 
-
 def parse_json_object(raw: str) -> dict[str, Any]:
     text = strip_fence(raw)
     decoder = json.JSONDecoder()
@@ -656,19 +644,15 @@ def parse_json_object(raw: str) -> dict[str, Any]:
         return {}
     return data if isinstance(data, dict) else {}
 
-
 def valid_task_url(url: str) -> bool:
     return (url.startswith("SEARCH:") and bool(url.removeprefix("SEARCH:").strip())) or valid_http_url(url)
-
 
 def valid_http_url(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
-
 def url_alive(url: str) -> bool:
     return url_is_reachable(url)
-
 
 def url_is_reachable(url: str) -> bool:
     try:
@@ -679,12 +663,10 @@ def url_is_reachable(url: str) -> bool:
     except httpx.HTTPError:
         return False
 
-
 def stable_reference_url(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     path = urlparse(url).path.lower()
     return host == "arxiv.org" and path.startswith("/abs/")
-
 
 def dedupe_and_renumber(tasks: list[ResearchTask]) -> list[ResearchTask]:
     chosen: dict[tuple[str, str, str], ResearchTask] = {}
@@ -696,7 +678,6 @@ def dedupe_and_renumber(tasks: list[ResearchTask]) -> list[ResearchTask]:
 
     ordered = sorted(chosen.values(), key=lambda task: (task.priority, task.target_name.lower(), task.query_context.lower()))
     return [replace(task, task_id=f"task_{index:03d}") for index, task in enumerate(ordered, 1)]
-
 
 def validate_plan(tasks: list[ResearchTask], mode: str, companies: list[str], sub_questions: list[str]) -> None:
     if mode == "competitor_intel" and not companies:
