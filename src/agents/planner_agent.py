@@ -106,14 +106,15 @@ Rules:
   Examples: OpenAI, Groq, Google, Anthropic, Microsoft, AWS, NVIDIA, Capgemini, Accenture, Infosys.
 - Use the normalized name consistently in companies, target_name, query_context, and SEARCH queries.
 - If unsure, use the most widely recognized public brand spelling.
-- Prefer direct URLs for exact official pages, research papers, reputable blogs, and docs.
 - Use SEARCH: for 2 to 3 supplemental discovery tasks such as comparison, recent news,
   third-party analysis, or missing source discovery.
 - In competitor_intel mode, create company-specific tasks with official company URLs
   for pricing, docs, products, careers, benefits, training, culture, and diversity topics.
   Provide information for each company across all key sub-questions.
-- For API/model pricing, prefer official API, docs, platform, model, token, or developer
-  pricing pages. Avoid consumer subscription pages unless the objective asks for subscriptions.
+  6 to 12 tasks is acceptable when needed.
+- Provide direct and official URLs for exact official pages, research papers, reputable blogs, and docs.
+  If task is about model pricing, prefer official API, docs, platform, model, token, or developer pricing pages.
+  Avoid consumer subscription pages unless the objective asks for subscriptions.
 - For company growth, prefer official investor relations, annual reports, earnings releases,
   fact sheets, SEC filings, and company profile pages.
 - For technical research, prefer original papers, arXiv, DOI pages, official documentation,
@@ -124,10 +125,8 @@ Rules:
 - Use direct URLs only for stable arXiv paper links when exact.
 - Provide URLs from the most authoritative, primary sources possible for all the topics.
 - Do not hallucinate and invent paths.
-- In competitor_intel mode, cover every company across the important sub-questions;
-  12 to 20 tasks is acceptable when needed.
-- For technical/knowledge research, include authoritative papers, documentation,
-  and reputable blogs where relevant, plus 2 to 3 SEARCH tasks for discovery.
+- For technical/knowledge research, include authoritative papers, documentation, and sources from respected organizations.
+- Priority is a positive integer; lower numbers are higher priority. Assign priorities to ensure the most important tasks are completed first.
 - Return JSON only. No markdown."""
 
     def __init__(self, use_llm: bool = True, model: Optional[str] = None, validate_urls: Optional[bool] = None) -> None:
@@ -255,6 +254,8 @@ Rules:
     def _can_keep_direct_url(self, url: str, source_type: str, task: ResearchTask) -> bool:
         if self.allow_direct_urls:
             return True
+        if weak_url_for_task(task, url):
+            return False
         if source_type in DIRECT_URL_SOURCE_TYPES and stable_reference_url(url):
             return True
         if task.target_type == "company" and likely_official_url(task.target_name, url):
@@ -581,10 +582,23 @@ def objective_topic(objective: str) -> str:
     return ""
 
 def likely_official_url(company: str, url: str) -> bool:
-    company_key = re.sub(r"[^a-z0-9]", "", company.lower())
+    company_key = normalize_host_key(company)
     host = urlparse(url).netloc.lower()
-    host_key = re.sub(r"[^a-z0-9]", "", host)
-    return bool(company_key and company_key in host_key)
+    host_key = normalize_host_key(host)
+    official_keys = official_host_keys(company_key)
+    return bool(company_key and any(key in host_key for key in official_keys))
+
+def normalize_host_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+def official_host_keys(company_key: str) -> set[str]:
+    aliases = {
+        "anthropic": {"anthropic", "claude"},
+        "google": {"google", "gemini"},
+        "openai": {"openai"},
+        "groq": {"groq"},
+    }
+    return aliases.get(company_key, {company_key})
 
 def rank_candidates(task: ResearchTask, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
     return sorted(candidates, key=lambda candidate: candidate_score(task, candidate), reverse=True)
@@ -593,6 +607,7 @@ def candidate_score(task: ResearchTask, candidate: dict[str, str]) -> int:
     url = candidate["url"]
     text = candidate_text(candidate)
     host = urlparse(url).netloc.lower()
+    path = urlparse(url).path.lower()
     score = 0
 
     if task.target_type == "company" and likely_official_url(task.target_name, url):
@@ -608,13 +623,18 @@ def candidate_score(task: ResearchTask, candidate: dict[str, str]) -> int:
 
     topic = task_topic(task)
     if topic == "pricing":
-        score += count_matches(text, ["api", "model", "token", "pricing", "docs", "platform", "developer"]) * 8
-        score -= count_matches(text, ["chatgpt", "team", "enterprise", "subscription"]) * 8
+        score += count_matches(text, ["api", "model", "token", "pricing", "docs", "developer", "gemini-api"]) * 10
+        score += count_matches(host + path, ["developers.", "docs.", "/docs", "ai.google.dev", "console.groq.com"]) * 12
+        score -= count_matches(text, ["chatgpt", "team", "enterprise", "subscription", "consumer"]) * 10
+        if weak_pricing_url(url):
+            score -= 80
     elif topic == "growth":
         score += count_matches(text, ["investor", "annual report", "earnings", "revenue", "quarter", "financial", "fact sheet", "sec"]) * 8
         score -= count_matches(text, ["essay", "study guide", "homework", "sample"]) * 12
     elif topic == "technical":
         score += count_matches(text, ["arxiv", "doi", "paper", "research", "documentation", "tutorial", "blog", "university"]) * 6
+        if weak_technical_url(url):
+            score -= 45
 
     return score
 
@@ -640,7 +660,67 @@ def task_topic(task: ResearchTask) -> str:
 def count_matches(text: str, phrases: list[str]) -> int:
     return sum(1 for phrase in phrases if phrase in text)
 
+def weak_url_for_task(task: ResearchTask, url: str) -> bool:
+    topic = task_topic(task)
+    if topic == "pricing" and weak_pricing_url(url):
+        return True
+    if topic == "technical" and weak_technical_url(url):
+        return True
+    return weak_domain(url)
+
+def weak_pricing_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.rstrip("/").lower()
+    full = f"{host}{path}"
+    return full in {
+        "openai.com/pricing",
+        "www.openai.com/pricing",
+        "chatgpt.com/pricing",
+        "claude.com/pricing",
+        "anthropic.com/pricing",
+        "www.anthropic.com/pricing",
+        "cloud.google.com/ai-platform/pricing",
+    }
+
+def weak_technical_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if weak_domain(url):
+        return True
+    if host in {"consensus.app", "www.consensus.app"}:
+        return True
+    if path.endswith(".pdf") and not trusted_technical_host(host):
+        return True
+    return False
+
+def weak_domain(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return any(domain in host for domain in ("paperdue.com", "studocu.com", "coursehero.com", "chegg.com"))
+
+def trusted_technical_host(host: str) -> bool:
+    trusted_domains = (
+        "arxiv.org",
+        "aclanthology.org",
+        "dl.acm.org",
+        "ieee.org",
+        "jmlr.org",
+        "mitpressjournals.org",
+        "nature.com",
+        "nips.cc",
+        "openreview.net",
+        "proceedings.mlr.press",
+        "science.org",
+        "springer.com",
+    )
+    return any(host == domain or host.endswith(f".{domain}") for domain in trusted_domains)
+
 def preferred_candidates(task: ResearchTask, candidates: list[dict[str, str]]) -> list[dict[str, str]]:
+    filtered = [candidate for candidate in candidates if not weak_url_for_task(task, candidate["url"])]
+    if filtered:
+        candidates = filtered
+
     if task.target_type != "company" or not needs_official_source(task):
         return candidates
 
