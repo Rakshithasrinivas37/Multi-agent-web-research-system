@@ -93,7 +93,7 @@ Return only valid JSON:
     "extraction_goal": "what the next agent should extract",
     "target_type": "company|discovery",
     "target_name": "company/topic name or General Research",
-    "use_playwright": false,
+    "use_playwright": true,
     "expected_signals": ["facts or fields to look for"]
   }}],
   "synthesis_instruction": "specific instructions for the final answer",
@@ -231,7 +231,7 @@ Rules:
             extraction_goal=clean_text(item.get("extraction_goal")),
             target_type=clean_target_type(item.get("target_type")),
             target_name=clean_text(item.get("target_name")) or "General Research",
-            use_playwright=bool(item.get("use_playwright")) and not url.startswith("SEARCH:"),
+            use_playwright=should_use_playwright(url),
             expected_signals=clean_list(item.get("expected_signals")),
         )
 
@@ -250,7 +250,7 @@ Rules:
             task,
             url=url,
             source_type=source_type,
-            use_playwright=task.use_playwright and not url.startswith("SEARCH:"),
+            use_playwright=should_use_playwright(url),
         )
 
     def _can_keep_direct_url(self, url: str, source_type: str, task: ResearchTask) -> bool:
@@ -304,7 +304,7 @@ Rules:
         if not url:
             return task
 
-        return replace(task, url=url, source_type=resolved_source_type(task, url), use_playwright=False)
+        return replace(task, url=url, source_type=resolved_source_type(task, url), use_playwright=should_use_playwright(url))
 
     def _choose_search_url(self, task: ResearchTask, query: str, candidates: list[dict[str, str]]) -> str:
         if not candidates:
@@ -842,6 +842,20 @@ def valid_task_url(url: str) -> bool:
 def valid_http_url(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+def should_use_playwright(url: str) -> bool:
+    if url.startswith("SEARCH:") or not valid_http_url(url):
+        return False
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    if path.endswith(".pdf"):
+        return False
+    if host == "arxiv.org" and path.startswith("/abs/"):
+        return False
+    if host.endswith("doi.org"):
+        return False
+    return True
 
 def url_alive(url: str) -> bool:
     return url_is_reachable(url)
