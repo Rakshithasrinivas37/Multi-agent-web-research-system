@@ -101,34 +101,25 @@ Return only valid JSON:
 }}
 
 Rules:
-- You decide all companies, sources, URLs, queries, and sub-questions.
-- Normalize company and product names to their official capitalization.
-  Examples: OpenAI, Groq, Google, Anthropic, Microsoft, AWS, NVIDIA, Capgemini, Accenture, Infosys.
-- Use the normalized name consistently in companies, target_name, query_context, and SEARCH queries.
-- If unsure, use the most widely recognized public brand spelling.
-- Use SEARCH: for 2 to 3 supplemental discovery tasks such as comparison, recent news,
-  third-party analysis, or missing source discovery.
-- In competitor_intel mode, create company-specific tasks with official company URLs
-  for pricing, docs, products, careers, benefits, training, culture, and diversity topics.
-  Provide information for each company across all key sub-questions.
-  6 to 12 tasks is acceptable when needed.
-- Provide direct and official URLs for exact official pages, research papers, reputable blogs, and docs.
-  If task is about model pricing, prefer official API, docs, platform, model, token, or developer pricing pages.
-  Provide URLs for all companies when comparing pricing, features, or products.
-  Avoid consumer subscription pages unless the objective asks for subscriptions.
-- For company growth, prefer official investor relations, annual reports, earnings releases,
-  fact sheets, SEC filings, and company profile pages.
-- For technical research, prefer original papers, arXiv, DOI pages, official documentation,
-  university pages, and respected technical blogs.
-- Use third-party pages only for independent reviews, salary data, benchmarks,
-  customer sentiment, news, or outside analysis.
-- For official company evidence, include the word "official" in the SEARCH query.
-- Use direct URLs only for stable arXiv paper links when exact.
-- Provide URLs from the most authoritative, primary sources possible for all the topics.
-- Do not hallucinate and invent paths.
-- For technical/knowledge research, include authoritative papers, documentation, and sources from respected organizations.
-- Priority is a positive integer; lower numbers are higher priority. Assign priorities to ensure the most important tasks are completed first.
-- For use_playwright: use false for SEARCH:, PDFs, arXiv, and DOI/static paper pages. Use true for normal webpages such as official company pages, docs, pricing, blogs, and news pages.
+- Decide all companies/topics, sub-questions, URLs or SEARCH queries, and synthesis guidance.
+- Normalize names consistently, e.g. OpenAI, Groq, Google, Anthropic, AWS, NVIDIA, Capgemini, Accenture, Infosys.
+- Prefer authoritative direct URLs. Do not invent paths; use SEARCH: when unsure.
+- competitor_intel: cover each company across key questions with official sources; 6 to 12 tasks is OK.
+- Pricing/API tasks: use official API/docs/developer/model/token pricing pages. Avoid forums, support issues,
+  consumer subscription pages, and broad enterprise landing pages.
+- Company growth: use investor relations, annual reports, earnings, fact sheets, SEC filings, or company profiles.
+- Technical research: use original papers, arXiv, DOI pages, docs, university pages, and respected technical blogs.
+  Do not use Wikipedia, ResearchGate, source aggregators, random PDFs, homework sites, or forums as primary sources.
+- Knowledge research: match sources to the topic; for culture/history/society use government, institution,
+  museum, encyclopedia, university, or reputable publication sources.
+- Third-party pages are only for reviews, salary data, benchmarks, sentiment, news, or outside analysis.
+- Add 2 to 3 supplemental SEARCH tasks matching research_mode:
+  competitor_intel=comparison/news/third-party analysis; technical=paper/docs/blog;
+  knowledge=authoritative overview/institution/reference; market=reports/trends/industry analysis.
+- Priority is positive; lower number means higher priority.
+- use_playwright=false for SEARCH:, PDFs, arXiv, DOI/static paper pages.
+  use_playwright=true for normal webpages: company pages, docs, pricing, blogs, news, Wikipedia,
+  Britannica, government, and institution pages.
 - Return JSON only. No markdown."""
 
     def __init__(self, use_llm: bool = True, model: Optional[str] = None, validate_urls: Optional[bool] = None) -> None:
