@@ -114,6 +114,7 @@ Rules:
   6 to 12 tasks is acceptable when needed.
 - Provide direct and official URLs for exact official pages, research papers, reputable blogs, and docs.
   If task is about model pricing, prefer official API, docs, platform, model, token, or developer pricing pages.
+  Provide URLs for all companies when comparing pricing, features, or products.
   Avoid consumer subscription pages unless the objective asks for subscriptions.
 - For company growth, prefer official investor relations, annual reports, earnings releases,
   fact sheets, SEC filings, and company profile pages.
@@ -127,6 +128,7 @@ Rules:
 - Do not hallucinate and invent paths.
 - For technical/knowledge research, include authoritative papers, documentation, and sources from respected organizations.
 - Priority is a positive integer; lower numbers are higher priority. Assign priorities to ensure the most important tasks are completed first.
+- For use_playwright: use false for SEARCH:, PDFs, arXiv, and DOI/static paper pages. Use true for normal webpages such as official company pages, docs, pricing, blogs, and news pages.
 - Return JSON only. No markdown."""
 
     def __init__(self, use_llm: bool = True, model: Optional[str] = None, validate_urls: Optional[bool] = None) -> None:
