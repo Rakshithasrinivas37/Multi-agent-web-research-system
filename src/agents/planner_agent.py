@@ -105,17 +105,22 @@ Rules:
 - Normalize names consistently, e.g. OpenAI, Groq, Google, Anthropic, AWS, NVIDIA, Capgemini, Accenture, Infosys.
 - Prefer authoritative direct URLs. Do not invent paths; use SEARCH: when unsure.
 - competitor_intel: cover each company across key questions with official sources; 6 to 12 tasks is OK.
-- Pricing/API tasks: use official API/docs/developer/model/token pricing pages. Avoid forums, support issues,
+- For Pricing/API tasks: Must use official API/docs/developer/model/token pricing pages. Avoid forums, support issues,
   consumer subscription pages, and broad enterprise landing pages.
+- If the objective compares companies/products/vendors, use competitor_intel and list only those companies.
 - Company growth: use investor relations, annual reports, earnings, fact sheets, SEC filings, or company profiles.
 - Technical research: use original papers, arXiv, DOI pages, docs, university pages, and respected technical blogs.
   Do not use Wikipedia, ResearchGate, source aggregators, random PDFs, homework sites, or forums as primary sources.
 - Knowledge research: match sources to the topic; for culture/history/society use government, institution,
-  museum, encyclopedia, university, or reputable publication sources.
+  museum, encyclopedia, university, or reputable publication sources. Don't use arxiv or DOI pages for general knowledge topics.
+  Don't mention arxiv papers and blog explanantions in search query.
 - Third-party pages are only for reviews, salary data, benchmarks, sentiment, news, or outside analysis.
 - Add 2 to 3 supplemental SEARCH tasks matching research_mode:
-  competitor_intel=comparison/news/third-party analysis; technical=paper/docs/blog;
-  knowledge=authoritative overview/institution/reference; market=reports/trends/industry analysis.
+  competitor_intel=comparison/news/third-party analysis; 
+  technical=paper/docs/blog;
+  knowledge=authoritative overview/institution/reference; 
+  market=reports/trends/industry analysis.
+- If unsure, use a useful SEARCH: query instead of a weak direct URL
 - Priority is positive; lower number means higher priority.
 - use_playwright=false for SEARCH:, PDFs, arXiv, DOI/static paper pages.
   use_playwright=true for normal webpages: company pages, docs, pricing, blogs, news, Wikipedia,
