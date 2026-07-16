@@ -1,0 +1,7 @@
+groq
+firecrawl-py
+httpx
+playwright
+pypdf
+python-dotenv
+tavily-python

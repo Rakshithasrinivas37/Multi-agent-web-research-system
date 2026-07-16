@@ -1,0 +1,65 @@
+"""Playwright webpage rendering tool."""
+
+from typing import Any
+
+import httpx
+
+from src.tools.text_utils import title_from_html
+
+
+async def render_with_playwright(url: str) -> dict[str, Any]:
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return await fetch_with_httpx(url, "playwright package is not installed; used httpx fallback.")
+
+    errors = []
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page(user_agent="Mozilla/5.0")
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception as error:
+                    errors.append(f"Network idle wait skipped: {error}")
+
+                title = await page.title()
+                content = await page.content()
+                final_url = page.url
+                status_code = response.status if response else None
+            finally:
+                await browser.close()
+
+        if status_code and status_code >= 400:
+            errors.append(f"HTTP {status_code}")
+        return {
+            "url": final_url,
+            "title": title,
+            "content": content,
+            "method": "playwright",
+            "errors": errors,
+        }
+    except Exception as error:
+        return await fetch_with_httpx(url, f"Playwright failed: {error}")
+
+
+async def fetch_with_httpx(url: str, warning: str = "") -> dict[str, Any]:
+    errors = [warning] if warning else []
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=20,
+        headers={"User-Agent": "Mozilla/5.0"},
+    ) as client:
+        response = await client.get(url)
+
+    if response.status_code >= 400:
+        errors.append(f"HTTP {response.status_code}")
+    return {
+        "url": str(response.url),
+        "title": title_from_html(response.text),
+        "content": response.text,
+        "method": "httpx",
+        "errors": errors,
+    }

@@ -1,0 +1,89 @@
+{
+  "objective": "Compare transformers, RNN and LSTM architectures",
+  "research_mode": "technical_deep_dive",
+  "companies": [],
+  "sub_questions": [
+    "What are the core architecture components of Transformers, RNNs, and LSTMs?",
+    "How do they handle sequence context, memory, and long-range dependencies?",
+    "What are their strengths, weaknesses, and common use cases?",
+    "What research sources support the comparison?"
+  ],
+  "subtasks": [
+    {
+      "task_id": "task_001",
+      "query_context": "Transformer architecture original paper",
+      "url": "https://arxiv.org/abs/1706.03762",
+      "source_type": "arxiv",
+      "priority": 1,
+      "extraction_goal": "Extract Transformer architecture components, attention mechanism details, sequence modeling claims, and stated advantages over recurrent models.",
+      "target_type": "discovery",
+      "target_name": "Transformer",
+      "use_playwright": false,
+      "expected_signals": [
+        "self-attention",
+        "multi-head attention",
+        "positional encoding",
+        "encoder-decoder",
+        "parallelization",
+        "long-range dependencies"
+      ]
+    },
+    {
+      "task_id": "task_002",
+      "query_context": "LSTM architecture explanation",
+      "url": "https://colah.github.io/posts/2015-08-Understanding-LSTMs/",
+      "source_type": "technical_overview",
+      "priority": 1,
+      "extraction_goal": "Extract LSTM gate structure, cell state behavior, memory mechanism, and why LSTMs improve on basic RNNs.",
+      "target_type": "discovery",
+      "target_name": "LSTM",
+      "use_playwright": true,
+      "expected_signals": [
+        "cell state",
+        "forget gate",
+        "input gate",
+        "output gate",
+        "vanishing gradient",
+        "long-term memory"
+      ]
+    },
+    {
+      "task_id": "task_003",
+      "query_context": "RNN architecture overview",
+      "url": "https://en.wikipedia.org/wiki/Recurrent_neural_network",
+      "source_type": "wikipedia",
+      "priority": 2,
+      "extraction_goal": "Extract RNN recurrence structure, hidden state behavior, sequence processing flow, and core limitations.",
+      "target_type": "discovery",
+      "target_name": "RNN",
+      "use_playwright": true,
+      "expected_signals": [
+        "hidden state",
+        "recurrent connections",
+        "sequence processing",
+        "vanishing gradient",
+        "temporal dependencies"
+      ]
+    },
+    {
+      "task_id": "task_004",
+      "query_context": "Architecture comparison and implementation context",
+      "url": "SEARCH:Transformer RNN LSTM architecture comparison use cases limitations",
+      "source_type": "search",
+      "priority": 3,
+      "extraction_goal": "Find reliable comparison sources that explain practical tradeoffs, use cases, limitations, and implementation considerations.",
+      "target_type": "discovery",
+      "target_name": "General Research",
+      "use_playwright": false,
+      "expected_signals": [
+        "comparison table",
+        "use cases",
+        "limitations",
+        "training tradeoffs",
+        "sequence length behavior"
+      ]
+    }
+  ],
+  "synthesis_instruction": "Create a comparison of Transformer, RNN, and LSTM architectures. Emphasize architecture components, context handling, memory behavior, parallelization, strengths, weaknesses, and best-fit use cases. Cite source URLs.",
+  "output_format": "comparison_table"
+}
