@@ -1,0 +1,141 @@
+[
+  {
+    "task_id": "task_001",
+    "query_context": "Transformer architecture original paper",
+    "status": "success",
+    "sources": [
+      {
+        "url": "https://arxiv.org/abs/1706.03762",
+        "title": "",
+        "source_type": "arxiv",
+        "extraction_method": "firecrawl",
+        "relevance": "high",
+        "extracted_facts": [
+          "The Transformer architecture is based solely on attention mechanisms, dispensing with recurrence and convolutions entirely.",
+          "The Transformer model uses self-attention mechanisms to weigh the importance of different input elements.",
+          "The model achieves state-of-the-art results on machine translation tasks, including the WMT 2014 English-to-German and English-to-French translation tasks.",
+          "The Transformer generalizes well to other tasks, including English constituency parsing.",
+          "The model is more parallelizable and requires significantly less time to train than traditional recurrent or convolutional neural networks."
+        ],
+        "evidence": [
+          "The abstract states that 'We propose a new simple network architecture, the Transformer, based solely on attention mechanisms, dispensing with recurrence and convolutions entirely.'",
+          "The paper reports that 'Our model achieves 28.4 BLEU on the WMT 2014 English-to-German translation task, improving over the existing best results, including ensembles by over 2 BLEU.'",
+          "The paper also states that 'We show that the Transformer generalizes well to other tasks by applying it successfully to English constituency parsing both with large and limited training data.'"
+        ],
+        "notes": "The paper 'Attention Is All You Need' by Ashish Vaswani et al. introduces the Transformer architecture, which relies entirely on attention mechanisms to process input sequences. The model has achieved state-of-the-art results on several machine translation tasks and has been shown to generalize well to other tasks."
+      }
+    ],
+    "errors": []
+  },
+  {
+    "task_id": "task_002",
+    "query_context": "LSTM architecture explanation",
+    "status": "success",
+    "sources": [
+      {
+        "url": "https://colah.github.io/posts/2015-08-Understanding-LSTMs/",
+        "title": "Understanding LSTM Networks -- colah's blog",
+        "source_type": "technical_overview",
+        "extraction_method": "playwright",
+        "relevance": "high",
+        "extracted_facts": [
+          "LSTM architecture consists of a cell state and three gates: forget gate, input gate, and output gate.",
+          "The cell state acts as a conveyor belt, allowing information to flow through the network with minor linear interactions.",
+          "The forget gate decides what information to discard from the cell state, the input gate decides what new information to add, and the output gate decides what information to output.",
+          "LSTMs are designed to handle long-term dependencies, which are challenging for traditional RNNs to learn.",
+          "The use of gates in LSTMs helps to regulate the flow of information and prevent the vanishing gradient problem."
+        ],
+        "evidence": [
+          "The key to LSTMs is the cell state, the horizontal line running through the top of the diagram.",
+          "Gates are a way to optionally let information through, composed of a sigmoid neural net layer and a pointwise multiplication operation.",
+          "LSTMs are explicitly designed to avoid the long-term dependency problem, remembering information for long periods of time is practically their default behavior."
+        ],
+        "notes": "The provided text is a detailed explanation of LSTM architecture and its components, including the cell state and gates. The evidence extracted is based on the descriptions and diagrams provided in the text."
+      }
+    ],
+    "errors": []
+  },
+  {
+    "task_id": "task_003",
+    "query_context": "RNN architecture overview",
+    "status": "success",
+    "sources": [
+      {
+        "url": "https://en.wikipedia.org/wiki/Recurrent_neural_network",
+        "title": "Recurrent neural network - Wikipedia",
+        "source_type": "wikipedia",
+        "extraction_method": "playwright",
+        "relevance": "high",
+        "extracted_facts": [
+          "RNNs are designed for processing sequential data, such as text, speech, and time series.",
+          "RNNs utilize recurrent connections, where the output of a neuron at one time step is fed back as input to the network at the next time step.",
+          "The fundamental building block of RNN is the recurrent unit, which maintains a hidden state that is updated at each time step based on the current input and the previous hidden state.",
+          "RNNs can capture temporal dependencies and patterns within sequences.",
+          "Traditional RNNs suffer from the vanishing gradient problem, which limits their ability to learn long-range dependencies.",
+          "LSTM and GRU architectures were developed to address the vanishing gradient problem."
+        ],
+        "evidence": [
+          "Recurrent neural networks (RNNs) are designed for processing sequential data, such as text, speech, and time series.",
+          "The output of a neuron at one time step is fed back as input to the network at the next time step.",
+          "The fundamental building block of RNN is the recurrent unit, which maintains a hidden state \u2014 a form of memory that is updated at each time step based on the current input and the previous hidden state.",
+          "RNNs have been successfully applied to tasks such as unsegmented, connected handwriting recognition, speech recognition, natural language processing, and neural machine translation.",
+          "Traditional RNNs suffer from the vanishing gradient problem, which limits their ability to learn long-range dependencies."
+        ],
+        "notes": "The provided text is a comprehensive overview of RNNs, including their history, architecture, and applications. The extracted facts and evidence are based on the content of the text and are relevant to the task of understanding RNNs."
+      }
+    ],
+    "errors": []
+  },
+  {
+    "task_id": "task_004",
+    "query_context": "Architecture comparison and implementation context",
+    "status": "success",
+    "query": "Transformer RNN LSTM architecture comparison use cases limitations",
+    "sources": [
+      {
+        "url": "/goto?url=CAEShwEB7keqTSwULdJ6l00yGG1oglphQ7S-AQalkQpMufTJYKe2B_-dawhOsU1uCmlavKidRRmnPX1Sx7_ILZIgG4phBy1kVfLsa5R0RR4MlXADKibchvh1DVgT0tOeDr6y0OnQlh88oFSzkpetU9ef7ok9aUj7KbpQTREpCEmbbdAE02sWBFhl6Ao%3D",
+        "title": "RNN vs LSTM vs GRU vs Transformers",
+        "source_type": "search_result",
+        "relevance": "medium",
+        "extracted_facts": [
+          "RNNs have a limitation due to the vanishing gradient problem",
+          "RNNs struggle to remember information from earlier steps as sequences grow longer"
+        ],
+        "evidence": [
+          "The main limitation of RNNs is the vanishing gradient problem"
+        ],
+        "notes": "The source appears to discuss the limitations of RNNs, but the provided content is incomplete and lacks a direct comparison with other architectures like LSTM, GRU, and Transformers."
+      },
+      {
+        "url": "/goto?url=CAESjQEB7keqTeaCSMDAcMMDLoF_5i3SUo3R6UENFtWre1W53tzWU54Vqh2F554vDoy7y_xq1dPrHSte0sVwHIvumOT-3PH_eFatImA00V30ctzbt1wN1INwGZChKje7VidLLqd0eOHOOdh7rNAY17eAGLYjbh00PfLWum7sNnlWnDaamBCJ93EEoBJq1Kt0_ZM%3D",
+        "title": "Sequence Models Compared: RNNs, LSTMs, GRUs, and ...",
+        "source_type": "search_result",
+        "relevance": "medium",
+        "extracted_facts": [
+          "RNNs are less common in modern applications due to their limitations",
+          "RNNs are used in simple language modeling and time series prediction"
+        ],
+        "evidence": [
+          "plain RNNs are less common in modern applications",
+          "Used in simple language modeling, time series prediction"
+        ],
+        "notes": "The source provides some information on RNNs but does not offer a comprehensive comparison with other sequence models like LSTMs and GRUs. The content appears to be a preview or introduction to a larger article."
+      },
+      {
+        "url": "/goto?url=CAESeQHuR6pNEUrCLlC8-SNEL2Zsr36RnyUHWA0ZJ6ajVEaUHziE40PsmgaO9rEKcXjtGGZmSnKZGckRyAO2Ce8xamIdrI33NuW1mdAQfvh8Z7nM7_bc3_CXlizPREaBNZqkMokLL6D9GSCk8Dh0c15mvKUJLJCgFJAdmn4%3D",
+        "title": "Comparative Analysis of CNN, RNN, LSTM, and ...",
+        "source_type": "search_result",
+        "relevance": "high",
+        "extracted_facts": [
+          "The source provides a comparative evaluation of CNN, RNN, LSTM, and other models",
+          "The comparison highlights advantages, limitations, and real-world use cases of each model"
+        ],
+        "evidence": [
+          "The comparative evaluation highlights the advantages, limitations, and real-world use cases of each model"
+        ],
+        "notes": "The source appears to be a research paper or academic article, which is a reliable source for comparison and analysis of different models. However, the content provided is limited, and further reading of the full text would be necessary to extract more specific information about practical tradeoffs, use cases, limitations, and implementation considerations."
+      }
+    ],
+    "errors": []
+  }
+]

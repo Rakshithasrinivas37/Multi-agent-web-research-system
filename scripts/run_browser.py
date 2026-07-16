@@ -55,7 +55,12 @@ async def async_main() -> int:
         max_concurrency=args.max_concurrency,
         use_llm=not args.no_llm,
     )
-    results = await agent.run_tasks(plan.get("tasks", []))
+    tasks = plan.get("tasks") or plan.get("subtasks") or []
+    if not tasks:
+        print("No tasks found. Expected 'tasks' or 'subtasks' in the research plan.")
+        return 1
+
+    results = await agent.run_tasks(tasks)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
