@@ -39,11 +39,6 @@ def parse_args() -> argparse.Namespace:
         help="Also save the planner output as a standalone JSON plan file.",
     )
     parser.add_argument(
-        "--no-llm",
-        action="store_true",
-        help="Use deterministic fallback planning instead of Groq.",
-    )
-    parser.add_argument(
         "--memory-output",
         type=Path,
         default=PROJECT_ROOT / "data" / "shared_memory.json",
@@ -68,7 +63,7 @@ def main() -> int:
         print("Research objective is required.")
         return 1
 
-    planner = PlannerAgent(use_llm=not args.no_llm)
+    planner = PlannerAgent(use_llm=True)
     plan = planner.plan(objective)
 
     if args.save_plan:

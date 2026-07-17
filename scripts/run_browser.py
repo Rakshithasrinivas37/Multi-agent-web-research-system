@@ -37,11 +37,6 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Number of tasks to process in parallel.",
     )
-    parser.add_argument(
-        "--no-llm",
-        action="store_true",
-        help="Skip Groq extraction and save raw fallback snippets.",
-    )
     return parser.parse_args()
 
 
@@ -51,10 +46,7 @@ async def async_main() -> int:
     args = parse_args()
     plan = json.loads(args.plan.read_text(encoding="utf-8"))
 
-    agent = BrowserAgent(
-        max_concurrency=args.max_concurrency,
-        use_llm=not args.no_llm,
-    )
+    agent = BrowserAgent(max_concurrency=args.max_concurrency)
     tasks = plan.get("tasks") or plan.get("subtasks") or []
     if not tasks:
         print("No tasks found. Expected 'tasks' or 'subtasks' in the research plan.")
