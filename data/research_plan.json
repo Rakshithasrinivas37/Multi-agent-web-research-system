@@ -1,93 +1,79 @@
 {
-  "objective": "Explain Attention mechanism",
-  "research_mode": "technical_deep_dive",
+  "objective": "Different culture of India",
+  "research_mode": "knowledge_research",
   "companies": [],
   "sub_questions": [
-    "What is the Attention mechanism?",
-    "How does the Attention mechanism work?",
-    "What are the types of Attention mechanisms?",
-    "What are the applications of Attention mechanisms?"
+    "What are the main cultural aspects of India?",
+    "How does Indian culture vary across different regions?",
+    "What are the significant cultural festivals and traditions in India?"
   ],
   "tasks": [
     {
       "task_id": "task_001",
-      "query_context": "What is the Attention mechanism?",
-      "url": "https://en.wikipedia.org/wiki/Attention_mechanism",
-      "source_type": "wikipedia",
+      "query_context": "main cultural aspects of India",
+      "url": "https://www.britannica.com/place/India",
+      "source_type": "webpage",
       "priority": 1,
-      "extraction_goal": "Definition and overview of Attention mechanism",
+      "extraction_goal": "key cultural aspects",
       "target_type": "discovery",
       "target_name": "General Research",
       "use_playwright": true,
       "expected_signals": [
-        "definition",
-        "key components"
+        "cultural heritage",
+        "diversity",
+        "traditions"
       ]
     },
     {
       "task_id": "task_002",
-      "query_context": "How does the Attention mechanism work?",
-      "url": "https://arxiv.org/abs/1706.03762",
-      "source_type": "arxiv",
+      "query_context": "regional cultural variations in India",
+      "url": "https://www.india.gov.in/",
+      "source_type": "webpage",
       "priority": 2,
-      "extraction_goal": "Technical details of Attention mechanism",
+      "extraction_goal": "regional cultural differences",
       "target_type": "discovery",
       "target_name": "General Research",
-      "use_playwright": false,
+      "use_playwright": true,
       "expected_signals": [
-        "mathematical formulation",
-        "algorithmic steps"
+        "regional diversity",
+        "local customs"
       ]
     },
     {
       "task_id": "task_003",
-      "query_context": "What are the types of Attention mechanisms?",
-      "url": "https://www.geeksforgeeks.org/nlp/types-of-attention-mechanism",
+      "query_context": "cultural festivals and traditions in India",
+      "url": "https://www.culturalindia.net/",
       "source_type": "webpage",
       "priority": 3,
-      "extraction_goal": "Classification and comparison of Attention mechanisms",
+      "extraction_goal": "significant cultural festivals",
       "target_type": "discovery",
       "target_name": "General Research",
       "use_playwright": true,
       "expected_signals": [
-        "taxonomy",
-        "comparison of variants"
+        "festivals",
+        "traditions",
+        "celebrations"
       ]
     },
     {
       "task_id": "task_004",
-      "query_context": "What are the applications of Attention mechanisms?",
-      "url": "https://www.coursera.org/articles/what-is-attention-mechanism",
+      "query_context": "authoritative overview of Indian culture",
+      "url": "https://culture.gov.in/indian-culture-0",
       "source_type": "webpage",
       "priority": 4,
-      "extraction_goal": "Use cases and examples of Attention mechanisms",
+      "extraction_goal": "authoritative summary",
       "target_type": "discovery",
       "target_name": "General Research",
       "use_playwright": true,
       "expected_signals": [
-        "natural language processing",
-        "computer vision"
+        "cultural overview",
+        "authoritative sources"
       ]
     },
     {
       "task_id": "task_005",
-      "query_context": "Supplemental: Attention mechanism papers",
-      "url": "https://en.wikipedia.org/wiki/Attention_(machine_learning)",
-      "source_type": "webpage",
-      "priority": 5,
-      "extraction_goal": "Recent research and advancements in Attention mechanisms",
-      "target_type": "discovery",
-      "target_name": "General Research",
-      "use_playwright": true,
-      "expected_signals": [
-        "research findings",
-        "future directions"
-      ]
-    },
-    {
-      "task_id": "task_006",
       "query_context": "research paper sources",
-      "url": "SEARCH:Explain Attention mechanism research papers arxiv",
+      "url": "SEARCH:Different culture India research papers arxiv",
       "source_type": "search",
       "priority": 91,
       "extraction_goal": "research paper sources",
@@ -101,9 +87,9 @@
       ]
     },
     {
-      "task_id": "task_007",
+      "task_id": "task_006",
       "query_context": "reputable blog explanation",
-      "url": "SEARCH:Explain Attention mechanism technical blog explanation",
+      "url": "SEARCH:Different culture India technical blog explanation",
       "source_type": "search",
       "priority": 92,
       "extraction_goal": "reputable blog explanation",
@@ -117,6 +103,6 @@
       ]
     }
   ],
-  "synthesis_instruction": "Summarize the definition, working, types, and applications of Attention mechanisms, and provide an overview of recent research advancements.",
-  "output_format": "deep_dive"
+  "synthesis_instruction": "Summarize the main cultural aspects, regional variations, and significant festivals and traditions in India, using authoritative sources.",
+  "output_format": "summary"
 }

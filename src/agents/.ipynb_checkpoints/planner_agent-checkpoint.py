@@ -87,7 +87,7 @@ Return only valid JSON:
   "sub_questions": ["specific question the research should answer"],
   "tasks": [{{
     "query_context": "which sub-question this task answers",
-    "url": "https://real-source-url.com OR SEARCH:precise search query",
+    "url": "https://real-and-relevant-source-url.com OR SEARCH:precise search query",
     "source_type": "one of {', '.join(sorted(SOURCE_TYPES))}",
     "priority": 1,
     "extraction_goal": "what the next agent should extract",
@@ -112,13 +112,12 @@ Rules:
   consumer subscription pages, community posts, support pages, broad AI overview pages, and consumer subscription pages.
 - If the objective compares companies/products/vendors, use competitor_intel and list only those companies.
 - Company growth: use investor relations, annual reports, earnings, fact sheets, SEC filings, or company profiles.
-- For technical_deep_dive mode, use authoritative technical sources: original papers, arXiv pages, DOI pages, official docs, university pages, and respected technical blogs. Prefer   direct URLs when the exact source is known.
+- For technical_deep_dive mode, use authoritative and relevant technical sources: original papers, arXiv pages, DOI pages, official docs, university pages, and respected technical    blogs. Prefer direct URLs when the exact source is known.
   Use SEARCH: only when the exact authoritative URL is uncertain.
   Do not use Wikipedia, ResearchGate, source aggregators, random PDFs, homework sites, or forums as primary sources.
   For technical tasks, make sure URLs match the exact technical meaning of the topic; e.g. “Transformer architecture” means deep learning Transformer, not electrical transformers.
-- For Knowledge_research: match sources to the topic; for culture/history/society use government, institution,
-  museum, encyclopedia, university, or reputable publication sources. Don't use arxiv or DOI pages for general knowledge topics.
-  Don't mention arxiv papers and blog explanantions in search query.
+- For Knowledge_research: match sources to the topic; for culture/history/society related topics, use government, institution,
+  museum, encyclopedia, university, or reputable publication sources. Don't use and mention arxiv, blogs and DOI pages for general knowledge topics in search queries.
 - Third-party pages are only for reviews, salary data, benchmarks, sentiment, news, or outside analysis.
 - Add 2 to 3 supplemental SEARCH tasks matching research_mode:
   competitor_intel=comparison/news/third-party analysis; 
