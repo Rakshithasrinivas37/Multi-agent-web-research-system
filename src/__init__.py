@@ -1,1 +1,1 @@
-"""Multi-agent web research system."""
+"""Multi-agent web research system package."""

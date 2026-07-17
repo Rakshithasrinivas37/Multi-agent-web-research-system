@@ -1,6 +1,7 @@
 groq
 firecrawl-py
 httpx
+langgraph
 playwright
 pypdf
 python-dotenv
