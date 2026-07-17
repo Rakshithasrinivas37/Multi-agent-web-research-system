@@ -1,108 +1,44 @@
 {
-  "objective": "Different culture of India",
+  "objective": "Compare OpenAI, Groq, Anthropic and Google model pricing",
   "research_mode": "knowledge_research",
   "companies": [],
   "sub_questions": [
-    "What are the main cultural aspects of India?",
-    "How does Indian culture vary across different regions?",
-    "What are the significant cultural festivals and traditions in India?"
+    "Compare OpenAI, Groq, Anthropic and Google model pricing"
   ],
   "tasks": [
     {
       "task_id": "task_001",
-      "query_context": "main cultural aspects of India",
-      "url": "https://www.britannica.com/place/India",
-      "source_type": "webpage",
+      "query_context": "Find authoritative sources for Compare OpenAI, Groq, Anthropic and Google model pricing",
+      "url": "https://apify.com/devilscrapes/llm-pricing-monitor",
+      "source_type": "pricing",
       "priority": 1,
-      "extraction_goal": "key cultural aspects",
+      "extraction_goal": "Find source URLs, titles, snippets, and credibility signals.",
       "target_type": "discovery",
       "target_name": "General Research",
       "use_playwright": true,
       "expected_signals": [
-        "cultural heritage",
-        "diversity",
-        "traditions"
+        "source URLs",
+        "titles",
+        "snippets"
       ]
     },
     {
       "task_id": "task_002",
-      "query_context": "regional cultural variations in India",
-      "url": "https://www.india.gov.in/",
-      "source_type": "webpage",
+      "query_context": "Find evidence and examples for Compare OpenAI, Groq, Anthropic and Google model pricing",
+      "url": "https://intuitionlabs.ai/articles/ai-api-pricing-comparison-grok-gemini-openai-claude",
+      "source_type": "pricing",
       "priority": 2,
-      "extraction_goal": "regional cultural differences",
+      "extraction_goal": "Find evidence, examples, metrics, and practical context.",
       "target_type": "discovery",
       "target_name": "General Research",
       "use_playwright": true,
       "expected_signals": [
-        "regional diversity",
-        "local customs"
-      ]
-    },
-    {
-      "task_id": "task_003",
-      "query_context": "cultural festivals and traditions in India",
-      "url": "https://www.culturalindia.net/",
-      "source_type": "webpage",
-      "priority": 3,
-      "extraction_goal": "significant cultural festivals",
-      "target_type": "discovery",
-      "target_name": "General Research",
-      "use_playwright": true,
-      "expected_signals": [
-        "festivals",
-        "traditions",
-        "celebrations"
-      ]
-    },
-    {
-      "task_id": "task_004",
-      "query_context": "authoritative overview of Indian culture",
-      "url": "https://culture.gov.in/indian-culture-0",
-      "source_type": "webpage",
-      "priority": 4,
-      "extraction_goal": "authoritative summary",
-      "target_type": "discovery",
-      "target_name": "General Research",
-      "use_playwright": true,
-      "expected_signals": [
-        "cultural overview",
-        "authoritative sources"
-      ]
-    },
-    {
-      "task_id": "task_005",
-      "query_context": "research paper sources",
-      "url": "SEARCH:Different culture India research papers arxiv",
-      "source_type": "search",
-      "priority": 91,
-      "extraction_goal": "research paper sources",
-      "target_type": "discovery",
-      "target_name": "General Research",
-      "use_playwright": false,
-      "expected_signals": [
-        "source URL",
         "evidence",
-        "summary"
-      ]
-    },
-    {
-      "task_id": "task_006",
-      "query_context": "reputable blog explanation",
-      "url": "SEARCH:Different culture India technical blog explanation",
-      "source_type": "search",
-      "priority": 92,
-      "extraction_goal": "reputable blog explanation",
-      "target_type": "discovery",
-      "target_name": "General Research",
-      "use_playwright": false,
-      "expected_signals": [
-        "source URL",
-        "evidence",
-        "summary"
+        "examples",
+        "metrics"
       ]
     }
   ],
-  "synthesis_instruction": "Summarize the main cultural aspects, regional variations, and significant festivals and traditions in India, using authoritative sources.",
+  "synthesis_instruction": "Synthesize findings for: Compare OpenAI, Groq, Anthropic and Google model pricing. Cite source URLs.",
   "output_format": "summary"
 }
