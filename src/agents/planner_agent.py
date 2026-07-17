@@ -156,6 +156,14 @@ Rules:
                 print(f"[planner_agent] Groq planner unavailable; using fallback planner: {error}")
         return self._fallback_plan(objective)
 
+    def write_to_memory(self, plan: ResearchPlan, memory_path: str = "data/shared_memory.json") -> None:
+        from src.memory.shared_memory import SharedMemory
+
+        plan_dict = plan.to_dict()
+        memory = SharedMemory(memory_path)
+        memory.set("objective", plan.objective)
+        memory.write_agent_output("planner", {"research_plan": plan_dict})
+
     def _plan_with_groq(self, objective: str) -> ResearchPlan:
         if not os.environ.get("GROQ_API_KEY"):
             raise RuntimeError("GROQ_API_KEY is not set")

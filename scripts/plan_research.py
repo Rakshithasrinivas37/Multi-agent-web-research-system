@@ -31,12 +31,28 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=PROJECT_ROOT / "data" / "research_plan.json",
-        help="Path to save the JSON plan.",
+        help="Path to save the JSON plan when --save-plan is used.",
+    )
+    parser.add_argument(
+        "--save-plan",
+        action="store_true",
+        help="Also save the planner output as a standalone JSON plan file.",
     )
     parser.add_argument(
         "--no-llm",
         action="store_true",
         help="Use deterministic fallback planning instead of Groq.",
+    )
+    parser.add_argument(
+        "--memory-output",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "shared_memory.json",
+        help="Path to save shared memory JSON.",
+    )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Do not write planner output to shared memory.",
     )
     return parser.parse_args()
 
@@ -55,10 +71,16 @@ def main() -> int:
     planner = PlannerAgent(use_llm=not args.no_llm)
     plan = planner.plan(objective)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(plan.to_dict(), indent=2), encoding="utf-8")
+    if args.save_plan:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(plan.to_dict(), indent=2), encoding="utf-8")
+    if not args.no_memory:
+        planner.write_to_memory(plan, str(args.memory_output))
 
-    print(f"Saved research plan: {args.output}")
+    if args.save_plan:
+        print(f"Saved research plan: {args.output}")
+    if not args.no_memory:
+        print(f"Updated shared memory: {args.memory_output}")
     print(json.dumps(plan.to_dict(), indent=2))
     return 0
 
