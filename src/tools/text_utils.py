@@ -1,6 +1,7 @@
 """Small text helpers shared by browser tools."""
 
 from typing import Any
+import html
 import re
 
 
@@ -15,10 +16,21 @@ def clean_list(value: Any) -> list[str]:
 
 
 def clean_content(content: str) -> str:
-    text = re.sub(r"<script.*?</script>", " ", content, flags=re.I | re.S)
-    text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+    text = str(content or "")
+    text = re.sub(r"<script.*?</script>", "\n", text, flags=re.I | re.S)
+    text = re.sub(r"<style.*?</style>", "\n", text, flags=re.I | re.S)
+    text = re.sub(r"</(p|div|section|article|header|footer|main|nav|li|ul|ol|h[1-6]|tr)>", "\n", text, flags=re.I)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"</t[dh]>", " | ", text, flags=re.I)
     text = re.sub(r"<[^>]+>", " ", text)
-    return clean_text(text)
+    text = html.unescape(text)
+
+    lines = []
+    for line in text.splitlines():
+        cleaned = clean_text(line)
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines)
 
 
 def title_from_html(html: str) -> str:

@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-from src.tools.text_utils import title_from_html
+from src.tools.text_utils import clean_text, title_from_html
 
 
 async def render_with_playwright(url: str) -> dict[str, Any]:
@@ -26,7 +26,10 @@ async def render_with_playwright(url: str) -> dict[str, Any]:
                     errors.append(f"Network idle wait skipped: {error}")
 
                 title = await page.title()
-                content = await page.content()
+                content = await page.locator("body").inner_text(timeout=10000)
+                table_text = await extract_table_text(page)
+                if table_text:
+                    content = f"{content}\n\nExtracted tables:\n{table_text}"
                 final_url = page.url
                 status_code = response.status if response else None
             finally:
@@ -43,6 +46,23 @@ async def render_with_playwright(url: str) -> dict[str, Any]:
         }
     except Exception as error:
         return await fetch_with_httpx(url, f"Playwright failed: {error}")
+
+
+async def extract_table_text(page: Any) -> str:
+    rows = await page.evaluate(
+        """() => Array.from(document.querySelectorAll('tr')).map((row) =>
+            Array.from(row.querySelectorAll('th,td'))
+                .map((cell) => cell.innerText.trim().replace(/\\s+/g, ' '))
+                .filter(Boolean)
+                .join(' | ')
+        ).filter(Boolean)"""
+    )
+    unique_rows = []
+    for row in rows:
+        row = clean_text(row)
+        if row and row not in unique_rows:
+            unique_rows.append(row)
+    return "\n".join(unique_rows)
 
 
 async def fetch_with_httpx(url: str, warning: str = "") -> dict[str, Any]:

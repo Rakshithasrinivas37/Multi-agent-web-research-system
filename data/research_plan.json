@@ -1,89 +1,141 @@
 {
-  "objective": "Compare transformers, RNN and LSTM architectures",
-  "research_mode": "technical_deep_dive",
-  "companies": [],
-  "sub_questions": [
-    "What are the core architecture components of Transformers, RNNs, and LSTMs?",
-    "How do they handle sequence context, memory, and long-range dependencies?",
-    "What are their strengths, weaknesses, and common use cases?",
-    "What research sources support the comparison?"
+  "objective": "Compare OpenAI, Groq, Anthropic and Google model pricing",
+  "research_mode": "competitor_intel",
+  "companies": [
+    "OpenAI",
+    "Groq",
+    "Anthropic",
+    "Google"
   ],
-  "subtasks": [
+  "sub_questions": [
+    "What are the pricing models for each company's models?",
+    "How do the prices compare across companies?",
+    "What are the pricing tiers and their features?"
+  ],
+  "tasks": [
     {
       "task_id": "task_001",
-      "query_context": "Transformer architecture original paper",
-      "url": "https://arxiv.org/abs/1706.03762",
-      "source_type": "arxiv",
+      "query_context": "Anthropic model pricing",
+      "url": "SEARCH:Anthropic model pricing tiers features",
+      "source_type": "search",
       "priority": 1,
-      "extraction_goal": "Extract Transformer architecture components, attention mechanism details, sequence modeling claims, and stated advantages over recurrent models.",
-      "target_type": "discovery",
-      "target_name": "Transformer",
+      "extraction_goal": "Pricing tiers and features",
+      "target_type": "company",
+      "target_name": "Anthropic",
       "use_playwright": false,
       "expected_signals": [
-        "self-attention",
-        "multi-head attention",
-        "positional encoding",
-        "encoder-decoder",
-        "parallelization",
-        "long-range dependencies"
+        "price",
+        "tier",
+        "feature"
       ]
     },
     {
       "task_id": "task_002",
-      "query_context": "LSTM architecture explanation",
-      "url": "https://colah.github.io/posts/2015-08-Understanding-LSTMs/",
-      "source_type": "technical_overview",
+      "query_context": "Google model pricing",
+      "url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "source_type": "pricing",
       "priority": 1,
-      "extraction_goal": "Extract LSTM gate structure, cell state behavior, memory mechanism, and why LSTMs improve on basic RNNs.",
-      "target_type": "discovery",
-      "target_name": "LSTM",
+      "extraction_goal": "Pricing tiers and features",
+      "target_type": "company",
+      "target_name": "Google",
       "use_playwright": true,
       "expected_signals": [
-        "cell state",
-        "forget gate",
-        "input gate",
-        "output gate",
-        "vanishing gradient",
-        "long-term memory"
+        "price",
+        "tier",
+        "feature"
       ]
     },
     {
       "task_id": "task_003",
-      "query_context": "RNN architecture overview",
-      "url": "https://en.wikipedia.org/wiki/Recurrent_neural_network",
-      "source_type": "wikipedia",
-      "priority": 2,
-      "extraction_goal": "Extract RNN recurrence structure, hidden state behavior, sequence processing flow, and core limitations.",
-      "target_type": "discovery",
-      "target_name": "RNN",
+      "query_context": "Groq model pricing",
+      "url": "https://groq.com/pricing",
+      "source_type": "pricing",
+      "priority": 1,
+      "extraction_goal": "Pricing tiers and features",
+      "target_type": "company",
+      "target_name": "Groq",
       "use_playwright": true,
       "expected_signals": [
-        "hidden state",
-        "recurrent connections",
-        "sequence processing",
-        "vanishing gradient",
-        "temporal dependencies"
+        "price",
+        "tier",
+        "feature"
       ]
     },
     {
       "task_id": "task_004",
-      "query_context": "Architecture comparison and implementation context",
-      "url": "SEARCH:Transformer RNN LSTM architecture comparison use cases limitations",
-      "source_type": "search",
-      "priority": 3,
-      "extraction_goal": "Find reliable comparison sources that explain practical tradeoffs, use cases, limitations, and implementation considerations.",
+      "query_context": "OpenAI model pricing",
+      "url": "https://developers.openai.com/api/docs/pricing",
+      "source_type": "pricing",
+      "priority": 1,
+      "extraction_goal": "Pricing tiers and features",
+      "target_type": "company",
+      "target_name": "OpenAI",
+      "use_playwright": true,
+      "expected_signals": [
+        "price",
+        "tier",
+        "feature"
+      ]
+    },
+    {
+      "task_id": "task_005",
+      "query_context": "Comparison of model pricing",
+      "url": "https://www.buildmvpfast.com/api-costs/ai-llm",
+      "source_type": "pricing",
+      "priority": 2,
+      "extraction_goal": "Comparison of pricing models",
       "target_type": "discovery",
       "target_name": "General Research",
+      "use_playwright": true,
+      "expected_signals": [
+        "comparison",
+        "price"
+      ]
+    },
+    {
+      "task_id": "task_006",
+      "query_context": "News and analysis of model pricing",
+      "url": "https://intuitionlabs.ai/articles/ai-api-pricing-comparison-grok-gemini-openai-claude",
+      "source_type": "pricing",
+      "priority": 3,
+      "extraction_goal": "News and analysis of pricing models",
+      "target_type": "discovery",
+      "target_name": "General Research",
+      "use_playwright": true,
+      "expected_signals": [
+        "news",
+        "analysis"
+      ]
+    },
+    {
+      "task_id": "task_007",
+      "query_context": "OpenAI prices compare",
+      "url": "SEARCH:OpenAI prices compare official",
+      "source_type": "search",
+      "priority": 4,
+      "extraction_goal": "Extract prices compare",
+      "target_type": "company",
+      "target_name": "OpenAI",
       "use_playwright": false,
       "expected_signals": [
-        "comparison table",
-        "use cases",
-        "limitations",
-        "training tradeoffs",
-        "sequence length behavior"
+        "prices compare"
+      ]
+    },
+    {
+      "task_id": "task_008",
+      "query_context": "Anthropic prices compare",
+      "url": "SEARCH:Anthropic prices compare official",
+      "source_type": "search",
+      "priority": 6,
+      "extraction_goal": "Extract prices compare",
+      "target_type": "company",
+      "target_name": "Anthropic",
+      "use_playwright": false,
+      "expected_signals": [
+        "prices compare"
       ]
     }
   ],
-  "synthesis_instruction": "Create a comparison of Transformer, RNN, and LSTM architectures. Emphasize architecture components, context handling, memory behavior, parallelization, strengths, weaknesses, and best-fit use cases. Cite source URLs.",
+  "synthesis_instruction": "Compare the pricing models of OpenAI, Groq, Anthropic, and Google, and summarize the key features and prices of each tier.",
   "output_format": "comparison_table"
 }
