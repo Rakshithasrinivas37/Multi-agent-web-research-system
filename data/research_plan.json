@@ -1,0 +1,122 @@
+{
+  "objective": "Explain Attention mechanism",
+  "research_mode": "technical_deep_dive",
+  "companies": [],
+  "sub_questions": [
+    "What is the Attention mechanism?",
+    "How does the Attention mechanism work?",
+    "What are the types of Attention mechanisms?",
+    "What are the applications of Attention mechanisms?"
+  ],
+  "tasks": [
+    {
+      "task_id": "task_001",
+      "query_context": "What is the Attention mechanism?",
+      "url": "https://en.wikipedia.org/wiki/Attention_mechanism",
+      "source_type": "wikipedia",
+      "priority": 1,
+      "extraction_goal": "Definition and overview of Attention mechanism",
+      "target_type": "discovery",
+      "target_name": "General Research",
+      "use_playwright": true,
+      "expected_signals": [
+        "definition",
+        "key components"
+      ]
+    },
+    {
+      "task_id": "task_002",
+      "query_context": "How does the Attention mechanism work?",
+      "url": "https://arxiv.org/abs/1706.03762",
+      "source_type": "arxiv",
+      "priority": 2,
+      "extraction_goal": "Technical details of Attention mechanism",
+      "target_type": "discovery",
+      "target_name": "General Research",
+      "use_playwright": false,
+      "expected_signals": [
+        "mathematical formulation",
+        "algorithmic steps"
+      ]
+    },
+    {
+      "task_id": "task_003",
+      "query_context": "What are the types of Attention mechanisms?",
+      "url": "https://www.geeksforgeeks.org/nlp/types-of-attention-mechanism",
+      "source_type": "webpage",
+      "priority": 3,
+      "extraction_goal": "Classification and comparison of Attention mechanisms",
+      "target_type": "discovery",
+      "target_name": "General Research",
+      "use_playwright": true,
+      "expected_signals": [
+        "taxonomy",
+        "comparison of variants"
+      ]
+    },
+    {
+      "task_id": "task_004",
+      "query_context": "What are the applications of Attention mechanisms?",
+      "url": "https://www.coursera.org/articles/what-is-attention-mechanism",
+      "source_type": "webpage",
+      "priority": 4,
+      "extraction_goal": "Use cases and examples of Attention mechanisms",
+      "target_type": "discovery",
+      "target_name": "General Research",
+      "use_playwright": true,
+      "expected_signals": [
+        "natural language processing",
+        "computer vision"
+      ]
+    },
+    {
+      "task_id": "task_005",
+      "query_context": "Supplemental: Attention mechanism papers",
+      "url": "https://en.wikipedia.org/wiki/Attention_(machine_learning)",
+      "source_type": "webpage",
+      "priority": 5,
+      "extraction_goal": "Recent research and advancements in Attention mechanisms",
+      "target_type": "discovery",
+      "target_name": "General Research",
+      "use_playwright": true,
+      "expected_signals": [
+        "research findings",
+        "future directions"
+      ]
+    },
+    {
+      "task_id": "task_006",
+      "query_context": "research paper sources",
+      "url": "SEARCH:Explain Attention mechanism research papers arxiv",
+      "source_type": "search",
+      "priority": 91,
+      "extraction_goal": "research paper sources",
+      "target_type": "discovery",
+      "target_name": "General Research",
+      "use_playwright": false,
+      "expected_signals": [
+        "source URL",
+        "evidence",
+        "summary"
+      ]
+    },
+    {
+      "task_id": "task_007",
+      "query_context": "reputable blog explanation",
+      "url": "SEARCH:Explain Attention mechanism technical blog explanation",
+      "source_type": "search",
+      "priority": 92,
+      "extraction_goal": "reputable blog explanation",
+      "target_type": "discovery",
+      "target_name": "General Research",
+      "use_playwright": false,
+      "expected_signals": [
+        "source URL",
+        "evidence",
+        "summary"
+      ]
+    }
+  ],
+  "synthesis_instruction": "Summarize the definition, working, types, and applications of Attention mechanisms, and provide an overview of recent research advancements.",
+  "output_format": "deep_dive"
+}
