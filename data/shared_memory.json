@@ -1,0 +1,80 @@
+{
+  "objective": "Different culture in India",
+  "planner": {
+    "research_plan": {
+      "objective": "Different culture in India",
+      "research_mode": "knowledge_research",
+      "companies": [],
+      "sub_questions": [
+        "What are the main cultural differences in India?",
+        "How do regional cultures vary in India?",
+        "What role do traditions and customs play in Indian culture?"
+      ],
+      "tasks": [
+        {
+          "task_id": "task_001",
+          "query_context": "main cultural differences",
+          "url": "https://www.britannica.com/place/India",
+          "source_type": "webpage",
+          "priority": 1,
+          "extraction_goal": "key cultural aspects",
+          "target_type": "discovery",
+          "target_name": "General Research",
+          "use_playwright": true,
+          "expected_signals": [
+            "regional diversity",
+            "traditional practices"
+          ]
+        },
+        {
+          "task_id": "task_002",
+          "query_context": "regional cultural variation",
+          "url": "https://www.india.gov.in/",
+          "source_type": "webpage",
+          "priority": 2,
+          "extraction_goal": "regional cultural characteristics",
+          "target_type": "discovery",
+          "target_name": "General Research",
+          "use_playwright": true,
+          "expected_signals": [
+            "state-specific traditions",
+            "local customs"
+          ]
+        },
+        {
+          "task_id": "task_003",
+          "query_context": "traditions and customs",
+          "url": "https://en.wikipedia.org/wiki/Culture_of_India",
+          "source_type": "webpage",
+          "priority": 3,
+          "extraction_goal": "cultural practices and values",
+          "target_type": "discovery",
+          "target_name": "General Research",
+          "use_playwright": true,
+          "expected_signals": [
+            "festival celebrations",
+            "social norms"
+          ]
+        },
+        {
+          "task_id": "task_004",
+          "query_context": "supplemental - cultural overview",
+          "url": "https://culture.gov.in/indian-culture-0",
+          "source_type": "webpage",
+          "priority": 4,
+          "extraction_goal": "comprehensive cultural understanding",
+          "target_type": "discovery",
+          "target_name": "General Research",
+          "use_playwright": true,
+          "expected_signals": [
+            "historical context",
+            "cultural evolution"
+          ]
+        }
+      ],
+      "synthesis_instruction": "Compile key cultural aspects, regional variations, and traditional practices to provide a comprehensive understanding of the different cultures in India.",
+      "output_format": "summary"
+    },
+    "updated_at": "2026-07-17T04:53:35.463790+00:00"
+  }
+}
