@@ -139,12 +139,6 @@ Rules:
 - competitor_intel: cover each company across key questions with official sources; 6 to 12 tasks is OK.
 - For Pricing/API tasks: Must prefer and provide official API/docs/developer/model/token pricing pages/URLs. Avoid forums, support issues,
   consumer subscription pages, community posts, support pages, broad AI overview pages, and consumer subscription pages.
-- For model/API pricing tasks, prefer official provider pricing pages:
-  OpenAI, Anthropic/Claude, Google Gemini/Vertex AI, Groq, AWS Bedrock,
-  Azure OpenAI, Mistral, DeepSeek, Cohere, Together AI, Fireworks AI,
-  Perplexity, xAI/Grok, IBM watsonx.ai, Moonshot/Kimi, and Z.AI/GLM.
-- If the provider is not in this list or the exact URL is uncertain, use
-  SEARCH:<provider> official API model pricing docs.
 - For cloud providers, map brand names clearly: AWS/Amazon, Azure/Microsoft Azure, Google/Google Cloud.
 - In competitor_intel mode, cover every provider with official sources plus 1 to 2 comparison or news SEARCH tasks.
 - If the objective compares companies/products/vendors, use competitor_intel and list only those companies.
@@ -168,6 +162,7 @@ Rules:
   technical=primary papers/official docs/secondary explanations;
   knowledge=authoritative overview/institution/reference; 
   market=reports/trends/industry analysis.
+- Source types: use arxiv for arXiv papers, academic for DOI/journal/conference/university papers or PDFs, docs for official documentation, benchmarks for datasets/evaluation pages, technical_overview for reputable explainers, news for announcements/journalism, pricing for cost pages, search only for SEARCH:, and never label PDFs as webpage.
 - If unsure, use a useful SEARCH: query instead of a weak direct URL
 - Priority is positive; lower number means higher priority.
 - use_playwright=false for SEARCH:, PDFs, arXiv, DOI/static paper pages.
