@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+.env
+data/shared_memory.json
+data/browser_results.json
+data/research_plan.json

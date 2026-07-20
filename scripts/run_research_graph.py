@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 from pathlib import Path
 import sys
@@ -13,11 +14,11 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.graph.research_workflow import run_planner_graph
+from src.graph.research_workflow import run_research_graph
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the planner node with LangGraph.")
+    parser = argparse.ArgumentParser(description="Run planner and browser nodes with LangGraph.")
     parser.add_argument(
         "--objective",
         default=None,
@@ -29,10 +30,16 @@ def parse_args() -> argparse.Namespace:
         default=PROJECT_ROOT / "data" / "shared_memory.json",
         help="Path to save shared memory JSON.",
     )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=3,
+        help="Number of browser tasks to process in parallel.",
+    )
     return parser.parse_args()
 
 
-def main() -> int:
+async def async_main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
 
     args = parse_args()
@@ -41,9 +48,10 @@ def main() -> int:
         print("Research objective is required.")
         return 1
 
-    state = run_planner_graph(
+    state = await run_research_graph(
         objective=objective,
         memory_path=str(args.memory_output),
+        max_concurrency=args.max_concurrency,
     )
 
     if state.get("errors"):
@@ -51,8 +59,12 @@ def main() -> int:
         return 1
 
     print(f"Updated shared memory: {args.memory_output}")
-    print(json.dumps(state.get("research_plan", {}), indent=2))
+    print(json.dumps({"research_plan": state.get("research_plan"), "browser_results": state.get("browser_results")}, indent=2))
     return 0
+
+
+def main() -> int:
+    return asyncio.run(async_main())
 
 
 if __name__ == "__main__":

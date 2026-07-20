@@ -1,0 +1,697 @@
+"""Browser agent for running planner tasks in parallel."""
+
+import asyncio
+import re
+from typing import Any, Optional
+from urllib.parse import urlparse
+
+from src.tools.firecrawl_tool import extract_with_firecrawl_or_httpx
+from src.tools.pdf_tool import extract_pdf_text, is_pdf_url
+from src.tools.playwright_tool import render_with_playwright
+from src.tools.tavily_search import search_with_tavily
+from src.tools.text_utils import clean_content, clean_list, clean_text
+
+
+class BrowserAgent:
+    """Runs research-plan tasks and extracts task-focused evidence."""
+
+    def __init__(self, max_concurrency: int = 3) -> None:
+        self.semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def run_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        jobs = [self.run_task(task) for task in tasks]
+        return await asyncio.gather(*jobs)
+
+    async def run_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        async with self.semaphore:
+            try:
+                url = clean_text(task.get("url", ""))
+                if url.startswith("SEARCH:"):
+                    return await self.search_task(task)
+                url = arxiv_pdf_url(url)
+                if is_extractable_pdf_url(url):
+                    return await self.pdf_task(task, url)
+                return await self.url_task(task, url)
+            except Exception as error:
+                return self.failed_result(task, str(error))
+
+    async def search_task(self, task: dict[str, Any]) -> dict[str, Any]:
+        task_url = clean_text(task.get("url"))
+        query = search_query_for_task(task)
+        errors = []
+        try:
+            results = await asyncio.to_thread(search_with_tavily, query)
+        except Exception as error:
+            errors.append(f"Tavily search failed: {error}")
+            results = []
+
+        results = search_candidates_for_task(task, rank_search_results(task, results))
+
+        sources = []
+        for item in results:
+            url = clean_text(item.get("url"))
+            if not is_http_url(url):
+                errors.append(f"Skipped invalid search result URL: {url}")
+                continue
+
+            try:
+                page = await self.scrape_search_result(task, url)
+            except Exception as error:
+                errors.append(f"Failed to scrape search result {url}: {error}")
+                snippet = item.get("content") or item.get("snippet") or ""
+                page = {
+                    "url": url,
+                    "title": clean_text(item.get("title")),
+                    "content": snippet,
+                    "method": "tavily_snippet",
+                    "errors": [str(error)],
+                }
+
+            extraction = await self.extract(task, page["url"], page["title"] or clean_text(item.get("title")), page["content"])
+            payload = self.source_payload(page, item.get("source_type", "search_result"), page["method"], extraction, task)
+            if not source_is_useful(payload, task):
+                errors.append(f"Skipped low-quality source: {url} ({source_quality_note(payload, task)})")
+                continue
+            sources.append(payload)
+            errors.extend(page.get("errors", []))
+
+        return {
+            "task_id": task.get("task_id"),
+            "query_context": task.get("query_context"),
+            "task_url": task_url,
+            "status": task_status(sources, errors),
+            "query": query,
+            "sources": sources,
+            "errors": errors if sources else errors + ["No valid Tavily results found."],
+        }
+
+    async def scrape_search_result(self, task: dict[str, Any], url: str) -> dict[str, Any]:
+        url = arxiv_pdf_url(url)
+        if is_extractable_pdf_url(url):
+            text = await asyncio.to_thread(extract_pdf_text, url)
+            return {"url": url, "title": "", "content": text, "method": "pdf", "errors": [] if text else ["No PDF text extracted."]}
+        if use_playwright_for_search_result(task, url):
+            try:
+                return await render_with_playwright(url)
+            except Exception:
+                return await extract_with_firecrawl_or_httpx(url)
+        return await extract_with_firecrawl_or_httpx(url)
+
+    async def url_task(self, task: dict[str, Any], url: str) -> dict[str, Any]:
+        if task.get("use_playwright"):
+            page = await render_with_playwright(url)
+        else:
+            page = await extract_with_firecrawl_or_httpx(url)
+
+        extraction = await self.extract(task, page["url"], page["title"], page["content"])
+        result = self.source_result(task, page, task.get("source_type", "webpage"), page["method"], extraction)
+        if result["status"] in {"blocked", "failed"}:
+            return await self.retry_direct_url_with_search(task, result)
+        return result
+
+    async def pdf_task(self, task: dict[str, Any], url: str) -> dict[str, Any]:
+        try:
+            pdf_text = await asyncio.to_thread(extract_pdf_text, url)
+        except Exception as error:
+            result = self.failed_result(task, str(error))
+            return await self.retry_direct_url_with_search(task, result)
+
+        extraction = await self.extract(task, url, "", pdf_text)
+        page = {"url": url, "title": "", "content": pdf_text, "errors": [] if pdf_text else ["No PDF text extracted."]}
+        status = "success" if pdf_text else "failed"
+        result = self.source_result(task, page, "pdf", "pdf", extraction, status)
+        if result["status"] in {"blocked", "failed"}:
+            return await self.retry_direct_url_with_search(task, result)
+        return result
+
+    async def retry_direct_url_with_search(self, task: dict[str, Any], direct_result: dict[str, Any]) -> dict[str, Any]:
+        fallback_task = fallback_search_task(task, direct_result)
+        fallback_result = await self.search_task(fallback_task)
+        fallback_sources = fallback_result.get("sources", [])
+        fallback_errors = fallback_result.get("errors", [])
+        direct_errors = direct_result.get("errors", [])
+
+        if fallback_sources:
+            status = "partial"
+            sources = fallback_sources
+            errors = [
+                *direct_errors,
+                f"Direct URL extraction was {direct_result.get('status')}; used Tavily fallback search.",
+                *fallback_errors,
+            ]
+        else:
+            status = direct_result.get("status", "failed")
+            sources = direct_result.get("sources", [])
+            errors = [
+                *direct_errors,
+                f"Direct URL extraction was {direct_result.get('status')}; Tavily fallback search found no usable sources.",
+                *fallback_errors,
+            ]
+
+        return {
+            "task_id": task.get("task_id"),
+            "query_context": task.get("query_context"),
+            "task_url": task.get("url"),
+            "status": status,
+            "sources": sources,
+            "errors": errors,
+            "fallback_used": bool(fallback_sources),
+            "fallback_query": fallback_result.get("query"),
+            "fallback_status": fallback_result.get("status"),
+            "direct_url_status": direct_result.get("status"),
+            "direct_url_sources": direct_result.get("sources", []),
+            "direct_url_errors": direct_errors,
+        }
+
+    async def extract(self, task: dict[str, Any], url: str, title: str, content: str) -> dict[str, Any]:
+        return fallback_extraction(content, task)
+
+    def source_result(
+        self,
+        task: dict[str, Any],
+        page: dict[str, Any],
+        source_type: str,
+        method: str,
+        extraction: dict[str, Any],
+        status: str = "success",
+    ) -> dict[str, Any]:
+        payload = self.source_payload(page, source_type, method, extraction, task)
+        errors = list(page.get("errors", []))
+        if is_bot_blocked_page(page):
+            errors.append(bot_block_note())
+            payload["source_quality"] = "blocked"
+            payload["source_quality_note"] = bot_block_note()
+            payload["fallback_needed"] = True
+            payload["fallback_recommended"] = fallback_recommendation(task)
+            status = "blocked"
+        if status == "success" and not source_is_useful(payload, task):
+            errors.append(source_quality_note(payload, task))
+            status = "failed"
+
+        return {
+            "task_id": task.get("task_id"),
+            "query_context": task.get("query_context"),
+            "task_url": task.get("url"),
+            "status": status,
+            "sources": [payload],
+            "errors": errors,
+        }
+
+    def source_payload(
+        self,
+        page: dict[str, Any],
+        source_type: str,
+        method: str,
+        extraction: dict[str, Any],
+        task: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        full_text = clean_content(page.get("content", ""))
+        payload = {
+            "url": page["url"],
+            "title": page["title"],
+            "source_type": source_type,
+            "extraction_method": method,
+            "source_quality": "unchecked",
+            "content_length": len(full_text),
+            "content_preview": full_text[:2000],
+            "full_content": full_text,
+            "errors": list(page.get("errors", [])),
+            **extraction,
+        }
+        if is_bot_blocked_page(page):
+            payload["blocked"] = True
+            payload["fallback_needed"] = True
+            payload["fallback_recommended"] = fallback_recommendation(task or {})
+        if is_pricing_task(task or {}):
+            payload["pricing_rows"] = extract_pricing_rows(full_text)
+        if payload.get("blocked"):
+            payload["source_quality"] = "blocked"
+            payload["source_quality_note"] = bot_block_note()
+        else:
+            payload["source_quality"] = "useful" if source_is_useful(payload, task or {}) else "weak"
+            payload["source_quality_note"] = source_quality_note(payload, task or {})
+        return payload
+
+    def failed_result(self, task: dict[str, Any], error: str) -> dict[str, Any]:
+        return {
+            "task_id": task.get("task_id"),
+            "query_context": task.get("query_context"),
+            "task_url": task.get("url"),
+            "status": "failed",
+            "sources": [],
+            "errors": [error],
+        }
+
+
+def fallback_extraction(content: str, task: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    text = clean_content(content)
+    task = task or {}
+    if is_pricing_task(task):
+        rows = extract_pricing_rows(text)
+        facts = rows[:30] or extract_pricing_facts(text)
+        sections = extract_pricing_sections(text)
+        return {
+            "extraction_status": "fallback",
+            "relevance": "high" if facts else ("medium" if text else "low"),
+            "extracted_facts": facts or extract_important_sentences(text),
+            "evidence": facts[:8],
+            "important_sections": sections or extract_important_sections(text),
+            "notes": "Fallback pricing extraction used.",
+        }
+
+    return {
+        "extraction_status": "fallback",
+        "relevance": "medium" if text else "low",
+        "extracted_facts": extract_important_sentences(text),
+        "evidence": [],
+        "important_sections": extract_important_sections(text),
+        "notes": "Deterministic browser extraction used.",
+    }
+
+
+def is_pricing_task(task: dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            clean_text(task.get("source_type")),
+            clean_text(task.get("query_context")),
+            clean_text(task.get("extraction_goal")),
+            " ".join(clean_list(task.get("expected_signals"))),
+        ]
+    ).lower()
+    return any(word in text for word in ("price", "pricing", "tokens", "cached input", "batch", "free tier", "rate limits"))
+
+
+def extract_pricing_facts(text: str, limit: int = 30) -> list[str]:
+    if not text:
+        return []
+
+    snippets: list[str] = []
+    for match in re.finditer(r"\$[\d,]+(?:\.\d+)?", text):
+        snippet = clean_text(text[max(0, match.start() - 180) : min(len(text), match.end() + 260)])
+        if useful_pricing_snippet(snippet) and snippet not in snippets:
+            snippets.append(snippet[:700])
+        if len(snippets) >= limit:
+            return snippets
+    if snippets:
+        return snippets
+
+    patterns = (
+        r"(?i)(?:model|input|output|cached|cache|batch|price|pricing|token|free tier|rate limit|context)[^.]{0,220}(?:\$[\d.,]+|percent|free|tokens?|requests?)[^.]{0,220}",
+        r"(?i)[A-Za-z0-9_.-]{2,40}[^.]{0,160}\$[\d.,]+[^.]{0,180}(?:input|output|tokens?|cached|batch|context)?",
+        r"(?i)(?:\$[\d.,]+)[^.]{0,220}(?:per|/)\s*(?:1m|million|token|tokens|request|requests|minute|hour|day)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            snippet = clean_text(match.group(0))
+            if useful_pricing_snippet(snippet) and snippet not in snippets:
+                snippets.append(snippet[:700])
+            if len(snippets) >= limit:
+                return snippets
+
+    return snippets
+
+
+def extract_pricing_rows(text: str, limit: int = 80) -> list[str]:
+    rows = []
+    for line in text.splitlines():
+        row = normalize_pricing_row(line)
+        if not row or row in rows:
+            continue
+        if useful_pricing_row(row):
+            rows.append(row[:1000])
+        if len(rows) >= limit:
+            return rows
+    return rows
+
+
+def normalize_pricing_row(row: str) -> str:
+    row = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", str(row or ""))
+    row = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", row)
+    row = re.sub(r"https?://\S+", " ", row)
+    row = re.sub(r"\s*\|\s*", " | ", row)
+    return clean_text(row)
+
+
+def useful_pricing_row(row: str) -> bool:
+    lower = row.lower()
+    if not useful_pricing_snippet(row):
+        return False
+    if "$" not in row and "free of charge" not in lower:
+        return False
+
+    model_or_provider = any(
+        word in lower
+        for word in (
+            "gpt",
+            "claude",
+            "gemini",
+            "llama",
+            "mistral",
+            "qwen",
+            "deepseek",
+            "groq",
+            "openai",
+            "anthropic",
+            "google",
+            "model",
+        )
+    )
+    pricing_context = any(
+        word in lower
+        for word in (
+            "input",
+            "output",
+            "cached",
+            "cache",
+            "token",
+            "mtok",
+            "batch",
+            "context",
+            "rate limit",
+            "requests",
+            "tpm",
+            "rpm",
+        )
+    )
+    table_like = "|" in row and row.count("$") >= 2
+    compact_price_row = len(row) < 260 and row.count("$") >= 1 and model_or_provider
+    return (model_or_provider and pricing_context) or table_like or compact_price_row
+
+
+def extract_pricing_sections(text: str, limit: int = 12) -> list[str]:
+    keywords = (
+        "pricing",
+        "model input",
+        "cached input",
+        "cache writes",
+        "output",
+        "batch",
+        "free tier",
+        "rate limit",
+        "context",
+        "tokens",
+        "discount",
+    )
+    sections = []
+    lower_text = text.lower()
+    for keyword in keywords:
+        start = lower_text.find(keyword)
+        while start != -1:
+            section = clean_text(text[max(0, start - 250) : start + 900])
+            if section and section not in sections:
+                sections.append(section)
+            if len(sections) >= limit:
+                return sections
+            start = lower_text.find(keyword, start + len(keyword))
+    return sections
+
+
+def useful_snippet(snippet: str) -> bool:
+    lower = snippet.lower()
+    noisy = ("linkedin", "twitter", "facebook", "gmail", "copy_link", "cookie")
+    return len(snippet) > 30 and not any(word in lower for word in noisy)
+
+
+def useful_pricing_snippet(snippet: str) -> bool:
+    lower = snippet.lower()
+    noisy = (
+        "linkedin",
+        "twitter",
+        "facebook",
+        "gmail",
+        "copy_link",
+        "cookie",
+        "privacy policy",
+        "terms of service",
+        "careers",
+        "get started",
+        "our services",
+        "our work",
+        "partnership",
+        "log in",
+        "sign up",
+        "navbar",
+        "footer",
+    )
+    if len(snippet) <= 20 or any(word in lower for word in noisy):
+        return False
+    if snippet.count("[") + snippet.count("]") > 4:
+        return False
+    if snippet.count("http") > 0:
+        return False
+    return True
+
+
+def extract_important_sentences(text: str, limit: int = 12) -> list[str]:
+    if not text:
+        return []
+
+    keywords = (
+        "architecture",
+        "attention",
+        "benchmark",
+        "comparison",
+        "component",
+        "context",
+        "dependency",
+        "gate",
+        "limitation",
+        "memory",
+        "model",
+        "performance",
+        "price",
+        "pricing",
+        "tokens",
+        "input",
+        "output",
+        "cached",
+        "cache",
+        "batch",
+        "free tier",
+        "rate limit",
+        "recurrent",
+        "sequence",
+        "state",
+        "training",
+        "transformer",
+        "use case",
+    )
+    sentences = [sentence.strip() for sentence in text.replace("\n", " ").split(".") if sentence.strip()]
+    important = [sentence for sentence in sentences if any(keyword in sentence.lower() for keyword in keywords)]
+    chosen = important[:limit] if important else sentences[:limit]
+    return [sentence[:500] for sentence in chosen]
+
+
+def extract_important_sections(text: str, limit: int = 10) -> list[str]:
+    if not text:
+        return []
+    words = text.split()
+    chunks = [" ".join(words[index : index + 80]) for index in range(0, min(len(words), 800), 80)]
+    return [chunk for chunk in chunks if chunk][:limit]
+
+
+def is_http_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def arxiv_pdf_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != "arxiv.org":
+        return url
+    if parsed.path.startswith(("/abs/", "/html/")):
+        paper_id = re.sub(r"^/(abs|html)/", "", parsed.path).strip("/")
+        return f"https://arxiv.org/pdf/{paper_id}"
+    return url
+
+
+def is_arxiv_pdf_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.netloc.lower() == "arxiv.org" and parsed.path.startswith("/pdf/")
+
+
+def is_extractable_pdf_url(url: str) -> bool:
+    return is_pdf_url(url) or is_arxiv_pdf_url(url)
+
+
+def search_query_for_task(task: dict[str, Any]) -> str:
+    return clean_text(task.get("url")).removeprefix("SEARCH:").strip()
+
+
+def fallback_search_task(task: dict[str, Any], direct_result: dict[str, Any]) -> dict[str, Any]:
+    fallback_task = dict(task)
+    fallback_task["url"] = f"SEARCH:{direct_url_fallback_query(task, direct_result)}"
+    fallback_task["source_type"] = "search"
+    fallback_task["use_playwright"] = False
+    return fallback_task
+
+
+def direct_url_fallback_query(task: dict[str, Any], direct_result: dict[str, Any]) -> str:
+    original_url = clean_text(task.get("url"))
+    host = urlparse(original_url).netloc.replace("www.", "")
+    parts = [
+        clean_text(task.get("target_name")) if clean_text(task.get("target_name")) != "General Research" else "",
+        clean_text(task.get("query_context")),
+        clean_text(task.get("extraction_goal")),
+        " ".join(clean_list(task.get("expected_signals"))),
+        clean_text(task.get("source_type")),
+        host,
+        "alternative source",
+    ]
+    query = clean_text(" ".join(part for part in parts if part))
+    if not query:
+        query = clean_text(original_url) or "research source"
+    return dedupe_query_words(query)
+
+
+def dedupe_query_words(text: str) -> str:
+    words = re.findall(r"[A-Za-z0-9+.#:/_-]+", clean_text(text))
+    seen = set()
+    result = []
+    for word in words:
+        key = word.lower()
+        if key in seen or key in {"a", "an", "and", "for", "of", "the", "to", "what", "which"}:
+            continue
+        seen.add(key)
+        result.append(word)
+    return " ".join(result)[:300].strip()
+
+
+def task_status(sources: list[dict[str, Any]], errors: list[str]) -> str:
+    if not sources:
+        return "failed"
+    return "partial" if errors else "success"
+
+
+def source_is_useful(payload: dict[str, Any], task: dict[str, Any]) -> bool:
+    if payload.get("blocked"):
+        return False
+    if blocked_or_empty_source(payload):
+        return False
+    if is_pricing_task(task):
+        return bool(payload.get("pricing_rows") or payload.get("extracted_facts"))
+    return bool(payload.get("extracted_facts") or payload.get("important_sections") or payload.get("content_length", 0) >= 800)
+
+
+def source_quality_note(payload: dict[str, Any], task: dict[str, Any]) -> str:
+    if payload.get("blocked") or is_bot_blocked_text(
+        " ".join(
+            [
+                clean_text(payload.get("title")),
+                clean_text(payload.get("content_preview")),
+                clean_text(payload.get("full_content"))[:1000],
+                " ".join(clean_list(payload.get("errors"))),
+            ]
+        )
+    ):
+        return bot_block_note()
+    if blocked_or_empty_source(payload):
+        return "source content is empty, blocked, or too short"
+    if is_pricing_task(task) and not (payload.get("pricing_rows") or payload.get("extracted_facts")):
+        return "no pricing rows or pricing facts found"
+    return "source passed basic quality checks"
+
+
+def blocked_or_empty_source(payload: dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            clean_text(payload.get("title")),
+            clean_text(payload.get("content_preview")),
+            clean_text(payload.get("full_content"))[:1000],
+        ]
+    ).lower()
+    return payload.get("content_length", 0) < 300 or is_bot_blocked_text(text)
+
+
+def is_bot_blocked_page(page: dict[str, Any]) -> bool:
+    text = " ".join(
+        [
+            clean_text(page.get("title")),
+            clean_text(page.get("content"))[:3000],
+            " ".join(clean_list(page.get("errors"))),
+        ]
+    )
+    return is_bot_blocked_text(text)
+
+
+def is_bot_blocked_text(text: str) -> bool:
+    lower = clean_text(text).lower()
+    blocked_terms = (
+        "access denied",
+        "attention required",
+        "bot detection",
+        "captcha",
+        "cf-chl",
+        "checking if the site connection is secure",
+        "checking your browser",
+        "cloudflare",
+        "enable javascript and cookies",
+        "error 1005",
+        "error 1015",
+        "forbidden",
+        "http 403",
+        "http 429",
+        "http 503",
+        "just a moment",
+        "performance and security by cloudflare",
+        "please verify you are a human",
+        "rate limited",
+        "request blocked",
+        "unusual traffic",
+        "verify you are human",
+    )
+    return any(term in lower for term in blocked_terms)
+
+
+def bot_block_note() -> str:
+    return "page appears blocked by Cloudflare, CAPTCHA, bot protection, rate limits, or access controls"
+
+
+def fallback_recommendation(task: dict[str, Any]) -> str:
+    if clean_text(task.get("url")).startswith("SEARCH:"):
+        return "Use another Tavily result or retry later."
+    return "Use Tavily search, another authoritative source URL, cached content, or manual review."
+
+
+def search_candidates_for_task(task: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set()
+    unique = []
+    for item in results:
+        url = clean_text(item.get("url"))
+        key = normalize_url_key(url)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def normalize_url_key(url: str) -> str:
+    if not is_http_url(url):
+        return ""
+    parsed = urlparse(url)
+    return f"{parsed.netloc.lower()}{parsed.path.rstrip('/').lower()}"
+
+
+def use_playwright_for_search_result(task: dict[str, Any], url: str) -> bool:
+    return is_pdf_url(url) is False and bool(task.get("use_playwright"))
+
+
+def rank_search_results(task: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(results, key=lambda item: search_result_score(task, clean_text(item.get("url"))), reverse=True)
+
+
+def search_result_score(task: dict[str, Any], url: str) -> int:
+    if not is_http_url(url):
+        return -100
+
+    score = 0
+    target_name = clean_text(task.get("target_name")).lower()
+    parsed = urlparse(url)
+    text = f"{parsed.netloc.lower()} {parsed.path.lower()}"
+    if target_name and target_name != "general research" and target_name in text:
+        score += 40
+    if is_pricing_task(task):
+        score += sum(20 for word in ("pricing", "price", "docs", "console", "platform") if word in text)
+        score -= sum(80 for word in ("community", "forum", "wikipedia", "aipricing", "reddit", "medium.com") if word in text)
+    return score
