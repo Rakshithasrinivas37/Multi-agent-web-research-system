@@ -1,80 +1,101 @@
 {
-  "objective": "Different culture in India",
+  "objective": "Explain attention mechanism",
   "planner": {
     "research_plan": {
-      "objective": "Different culture in India",
-      "research_mode": "knowledge_research",
+      "objective": "Explain attention mechanism",
+      "research_mode": "technical_deep_dive",
       "companies": [],
       "sub_questions": [
-        "What are the main cultural differences in India?",
-        "How do regional cultures vary in India?",
-        "What role do traditions and customs play in Indian culture?"
+        "What is the attention mechanism in deep learning?",
+        "How does the attention mechanism work?",
+        "What are the types of attention mechanisms?",
+        "What are the applications of attention mechanisms?"
       ],
       "tasks": [
         {
           "task_id": "task_001",
-          "query_context": "main cultural differences",
-          "url": "https://www.britannica.com/place/India",
-          "source_type": "webpage",
+          "query_context": "What is the attention mechanism in deep learning?",
+          "url": "https://arxiv.org/abs/1409.0473",
+          "source_type": "arxiv",
           "priority": 1,
-          "extraction_goal": "key cultural aspects",
+          "extraction_goal": "Definition and explanation of attention mechanism",
           "target_type": "discovery",
           "target_name": "General Research",
-          "use_playwright": true,
+          "use_playwright": false,
           "expected_signals": [
-            "regional diversity",
-            "traditional practices"
+            "attention mechanism",
+            "deep learning",
+            "neural networks"
           ]
         },
         {
           "task_id": "task_002",
-          "query_context": "regional cultural variation",
-          "url": "https://www.india.gov.in/",
-          "source_type": "webpage",
+          "query_context": "How does the attention mechanism work?",
+          "url": "https://papers.nips.cc/paper/2014/file/09c8e5474af6a89035fca5bdf5a5b221-Paper.pdf",
+          "source_type": "academic",
           "priority": 2,
-          "extraction_goal": "regional cultural characteristics",
+          "extraction_goal": "Technical details of attention mechanism",
           "target_type": "discovery",
           "target_name": "General Research",
-          "use_playwright": true,
+          "use_playwright": false,
           "expected_signals": [
-            "state-specific traditions",
-            "local customs"
+            "attention weights",
+            "context vector",
+            "alignment"
           ]
         },
         {
           "task_id": "task_003",
-          "query_context": "traditions and customs",
-          "url": "https://en.wikipedia.org/wiki/Culture_of_India",
-          "source_type": "webpage",
+          "query_context": "What are the types of attention mechanisms?",
+          "url": "SEARCH:types attention mechanisms in deep learning",
+          "source_type": "search",
           "priority": 3,
-          "extraction_goal": "cultural practices and values",
+          "extraction_goal": "List of attention mechanism types",
           "target_type": "discovery",
           "target_name": "General Research",
-          "use_playwright": true,
+          "use_playwright": false,
           "expected_signals": [
-            "festival celebrations",
-            "social norms"
+            "self-attention",
+            "hierarchical attention",
+            "local attention"
           ]
         },
         {
           "task_id": "task_004",
-          "query_context": "supplemental - cultural overview",
-          "url": "https://culture.gov.in/indian-culture-0",
+          "query_context": "What are the applications of attention mechanisms?",
+          "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC7996841",
           "source_type": "webpage",
           "priority": 4,
-          "extraction_goal": "comprehensive cultural understanding",
+          "extraction_goal": "Applications of attention mechanisms",
           "target_type": "discovery",
           "target_name": "General Research",
           "use_playwright": true,
           "expected_signals": [
-            "historical context",
-            "cultural evolution"
+            "natural language processing",
+            "computer vision",
+            "speech recognition"
+          ]
+        },
+        {
+          "task_id": "task_005",
+          "query_context": "Recent research on attention mechanisms",
+          "url": "https://research.google/pubs/attention-is-all-you-need",
+          "source_type": "webpage",
+          "priority": 5,
+          "extraction_goal": "Recent research on attention mechanisms",
+          "target_type": "discovery",
+          "target_name": "General Research",
+          "use_playwright": true,
+          "expected_signals": [
+            "transformer architecture",
+            "BERT",
+            "attention-based models"
           ]
         }
       ],
-      "synthesis_instruction": "Compile key cultural aspects, regional variations, and traditional practices to provide a comprehensive understanding of the different cultures in India.",
-      "output_format": "summary"
+      "synthesis_instruction": "Summarize the definition, working, types, and applications of attention mechanisms in deep learning, and provide an overview of recent research in the field.",
+      "output_format": "deep_dive"
     },
-    "updated_at": "2026-07-17T04:53:35.463790+00:00"
+    "updated_at": "2026-07-20T03:04:31.285810+00:00"
   }
 }
