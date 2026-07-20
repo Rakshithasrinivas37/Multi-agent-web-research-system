@@ -149,18 +149,23 @@ Rules:
 - In competitor_intel mode, cover every provider with official sources plus 1 to 2 comparison or news SEARCH tasks.
 - If the objective compares companies/products/vendors, use competitor_intel and list only those companies.
 - Company growth: use investor relations, annual reports, earnings, fact sheets, SEC filings, or company profiles.
-- For technical_deep_dive mode, provide authoritative technical papers and sources:
-  original papers, arXiv pages, DOI pages, official docs, university pages, and respected technical blogs.
-  Prefer direct paper URLs when the exact source is known. Use SEARCH: only when the exact authoritative URL is uncertain.
-  Do not use Wikipedia, ResearchGate, source aggregators, random PDFs, homework sites, or forums as primary sources.
-  For technical tasks, make sure URLs match the exact technical meaning of the topic; e.g. “Transformer architecture” means deep learning Transformer, not electrical transformers.
-  Do not add recent-development/trend tasks unless the objective asks for recent/current/trends.
+- technical_deep_dive: build the plan around primary technical evidence.
+  For every core architecture, algorithm, method, model, protocol, dataset, benchmark, or paper-backed concept in the objective,
+  create a task for a primary source. Primary sources are original papers, arXiv pages, DOI pages, conference/journal proceedings,
+  official docs, university pages, standards/spec pages, or benchmark project pages.
+  If you know the exact primary URL, use it directly. If uncertain, use SEARCH:<topic> original paper DOI arxiv conference proceedings official docs.
+  Blogs, tutorials, explainers, and vendor articles may appear only as secondary context and must not replace primary sources.
+  Do not use Medium, Baeldung-style SEO explainers, Wikipedia, ResearchGate, source aggregators, homework/course-solution sites,
+  forums, broad overview pages, or random PDFs as primary technical sources.
+  Match the exact technical meaning of the objective; e.g. "Transformer architecture" means the deep-learning Transformer,
+  not electrical transformers.
+  Do not add recent/current/trend/development tasks unless the objective explicitly asks for recent/current/latest/trends.
 - For Knowledge_research: match sources to the topic; for culture/history/society related topics, use government, institution,
   museum, encyclopedia, university, or reputable publication sources. Don't use and mention arxiv, blogs and DOI pages for general knowledge topics in search queries.
 - Third-party pages are only for reviews, salary data, benchmarks, sentiment, news, or outside analysis.
 - Add 3 to 4 supplemental SEARCH tasks matching research_mode:
   competitor_intel=comparison/news/third-party analysis; 
-  technical=paper/docs/blog;
+  technical=primary papers/official docs/secondary explanations;
   knowledge=authoritative overview/institution/reference; 
   market=reports/trends/industry analysis.
 - If unsure, use a useful SEARCH: query instead of a weak direct URL
@@ -215,9 +220,11 @@ Rules:
         request = f"""Create a compact research plan for this research objective.
                     Focus on authoritative sources, official URLs, and relevant sub-questions.
                     Prioritize official model/API pricing pages for providers.
-                    For technical deep dives, provide authoritative technical papers, arXiv pages, DOI pages,
-                    official docs, university pages, and respected technical blogs. Prefer direct paper URLs
-                    when known; use SEARCH: only when the exact technical source is uncertain.
+                    For technical deep dives, create one primary-source task for every core architecture,
+                    algorithm, method, model, dataset, benchmark, or paper-backed concept. Prefer original
+                    papers, arXiv/DOI pages, conference/journal proceedings, official docs, university pages,
+                    standards/spec pages, and benchmark project pages. If uncertain, use SEARCH:<topic>
+                    original paper DOI arxiv conference proceedings official docs. Blogs/tutorials are secondary only.
                     Provide relevant URLs or SEARCH queries for each task. Use SEARCH: when the exact URL is uncertain.
                     Follow the rules in the system prompt. Return valid JSON only, no markdown or extra text.
 
@@ -971,7 +978,7 @@ def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[
 
     try:
         response = Groq().chat.completions.create(
-            model=model,
+            model="openai/gpt-oss-20b",
             temperature=0,
             max_tokens=80,
             messages=[
