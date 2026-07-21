@@ -7,3 +7,4 @@ __pycache__/
 data/shared_memory.json
 data/browser_results.json
 data/research_plan.json
+data/browser_history.db
