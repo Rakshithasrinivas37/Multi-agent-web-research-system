@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to save shared memory JSON.",
     )
     parser.add_argument(
+        "--history-db",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "browser_history.db",
+        help="SQLite database used for previous browser results.",
+    )
+    parser.add_argument(
         "--max-concurrency",
         type=int,
         default=3,
@@ -51,6 +57,7 @@ async def async_main() -> int:
     state = await run_research_graph(
         objective=objective,
         memory_path=str(args.memory_output),
+        history_db_path=str(args.history_db),
         max_concurrency=args.max_concurrency,
     )
 
@@ -59,7 +66,17 @@ async def async_main() -> int:
         return 1
 
     print(f"Updated shared memory: {args.memory_output}")
-    print(json.dumps({"research_plan": state.get("research_plan"), "browser_results": state.get("browser_results")}, indent=2))
+    print(f"Updated browser history DB: {args.history_db}")
+    print(
+        json.dumps(
+            {
+                "research_plan": state.get("research_plan"),
+                "browser_results": state.get("browser_results"),
+                "change_detection": state.get("change_detection"),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
