@@ -37,6 +37,12 @@ def parse_args() -> argparse.Namespace:
         help="SQLite database used for previous browser results.",
     )
     parser.add_argument(
+        "--chroma-path",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "chroma",
+        help="Persistent ChromaDB directory used for RAG indexing.",
+    )
+    parser.add_argument(
         "--max-concurrency",
         type=int,
         default=3,
@@ -58,6 +64,7 @@ async def async_main() -> int:
         objective=objective,
         memory_path=str(args.memory_output),
         history_db_path=str(args.history_db),
+        chroma_path=str(args.chroma_path),
         max_concurrency=args.max_concurrency,
     )
 
@@ -67,12 +74,14 @@ async def async_main() -> int:
 
     print(f"Updated shared memory: {args.memory_output}")
     print(f"Updated browser history DB: {args.history_db}")
+    print(f"Updated ChromaDB store: {args.chroma_path}")
     print(
         json.dumps(
             {
                 "research_plan": state.get("research_plan"),
                 "browser_results": state.get("browser_results"),
                 "change_detection": state.get("change_detection"),
+                "rag_index": state.get("rag_index"),
             },
             indent=2,
         )
