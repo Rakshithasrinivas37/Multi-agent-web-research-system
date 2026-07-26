@@ -57,6 +57,11 @@ class SentenceTransformerEmbeddingFunction:
         )
         return embeddings.tolist()
 
+    def name(self) -> str:
+        """Stable Chroma embedding function name used when reopening collections."""
+        safe_model_name = self.model_name.replace("/", "_").replace(":", "_")
+        return f"sentence-transformers_{safe_model_name}"
+
     def model(self) -> Any:
         if self._model is not None:
             return self._model
