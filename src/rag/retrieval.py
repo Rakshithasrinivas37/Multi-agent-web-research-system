@@ -27,6 +27,9 @@ DEFAULT_SEMANTIC_WEIGHT = 0.55
 DEFAULT_BM25_WEIGHT = 0.35
 DEFAULT_AUTHORITY_WEIGHT = 0.10
 DEFAULT_BM25_SCAN_LIMIT = 1000
+DEFAULT_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+DEFAULT_RERANK_K = 20
+DEFAULT_RERANK_WEIGHT = 0.70
 TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
 
 
@@ -39,6 +42,7 @@ class RetrievalResult:
     semantic_score: float
     bm25_score: float
     authority_score: float = 0.0
+    rerank_score: float = 0.0
     semantic_rank: Optional[int] = None
     bm25_rank: Optional[int] = None
 
@@ -81,6 +85,10 @@ def hybrid_retrieve(
     bm25_scan_limit: int = DEFAULT_BM25_SCAN_LIMIT,
     embedding_device: str = "",
     diversify_urls: bool = True,
+    rerank: bool = False,
+    reranker_model: str = DEFAULT_RERANKER_MODEL,
+    rerank_k: int = DEFAULT_RERANK_K,
+    rerank_weight: float = DEFAULT_RERANK_WEIGHT,
 ) -> list[RetrievalResult]:
     """Retrieve chunks using semantic vector similarity plus BM25 keyword matching."""
 
@@ -117,6 +125,15 @@ def hybrid_retrieve(
         bm25_weight=bm25_weight,
         authority_weight=authority_weight,
     )
+    if rerank:
+        merged = rerank_results(
+            query=query,
+            results=merged,
+            top_n=max(top_k, rerank_k),
+            model_name=reranker_model,
+            device=embedding_device,
+            rerank_weight=rerank_weight,
+        )
     if diversify_urls:
         merged = diversify_by_url(merged, top_k=top_k)
     return merged[:top_k]
@@ -155,6 +172,7 @@ def semantic_search(
                 semantic_score=to_float(score, 0.0),
                 bm25_score=0.0,
                 authority_score=source_authority_score(document.metadata),
+                rerank_score=0.0,
                 semantic_rank=index + 1,
             )
         )
@@ -206,6 +224,7 @@ def bm25_search(
                 semantic_score=0.0,
                 bm25_score=1.0 / bm25_rank,
                 authority_score=source_authority_score(document.metadata),
+                rerank_score=0.0,
                 bm25_rank=bm25_rank,
             )
         )
@@ -246,6 +265,7 @@ def merge_ranked_results(
                 semantic_score=semantic_score,
                 bm25_score=bm25_score,
                 authority_score=authority_score,
+                rerank_score=item.rerank_score,
                 semantic_rank=item.semantic_rank,
                 bm25_rank=item.bm25_rank,
             )
@@ -375,9 +395,97 @@ def merge_result(existing: RetrievalResult, incoming: RetrievalResult) -> Retrie
         semantic_score=max(existing.semantic_score, incoming.semantic_score),
         bm25_score=max(existing.bm25_score, incoming.bm25_score),
         authority_score=max(existing.authority_score, incoming.authority_score),
+        rerank_score=max(existing.rerank_score, incoming.rerank_score),
         semantic_rank=existing.semantic_rank or incoming.semantic_rank,
         bm25_rank=existing.bm25_rank or incoming.bm25_rank,
     )
+
+
+def rerank_results(
+    query: str,
+    results: Sequence[RetrievalResult],
+    top_n: int = DEFAULT_RERANK_K,
+    model_name: str = DEFAULT_RERANKER_MODEL,
+    device: str = "",
+    rerank_weight: float = DEFAULT_RERANK_WEIGHT,
+) -> list[RetrievalResult]:
+    """Rerank hybrid candidates with a CrossEncoder query/chunk relevance model."""
+    candidates = list(results[: max(1, top_n)])
+    remainder = list(results[max(1, top_n):])
+    if not candidates:
+        return []
+
+    reranker = langchain_cross_encoder_reranker(
+        model_name=model_name,
+        device=device,
+        top_n=len(candidates),
+    )
+    reranked_documents = reranker.compress_documents(
+        documents=retrieval_results_to_langchain_documents(candidates),
+        query=query,
+    )
+    normalized_scores = rank_scores([document_id(document) for document in reranked_documents])
+    rerank_weight = min(1.0, max(0.0, rerank_weight))
+
+    reranked = []
+    for item in candidates:
+        rerank_score = normalized_scores.get(item.id, 0.0)
+        combined_score = (rerank_weight * rerank_score) + ((1.0 - rerank_weight) * item.score)
+        reranked.append(
+            RetrievalResult(
+                id=item.id,
+                document=item.document,
+                metadata=item.metadata,
+                score=combined_score,
+                semantic_score=item.semantic_score,
+                bm25_score=item.bm25_score,
+                authority_score=item.authority_score,
+                rerank_score=rerank_score,
+                semantic_rank=item.semantic_rank,
+                bm25_rank=item.bm25_rank,
+            )
+        )
+
+    reranked = sorted(reranked, key=lambda item: item.score, reverse=True)
+    return reranked + remainder
+
+
+def langchain_cross_encoder_reranker(model_name: str, device: str, top_n: int) -> Any:
+    """Build LangChain's CrossEncoderReranker with a Hugging Face cross-encoder."""
+    try:
+        from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
+        from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+    except ImportError as error:
+        raise RuntimeError(
+            "LangChain reranking dependencies are unavailable. Install "
+            "`langchain-community langchain-classic sentence-transformers` or `pip install -r requirements.txt`."
+        ) from error
+
+    selected_device = select_embedding_device(device or "auto")
+    cross_encoder = HuggingFaceCrossEncoder(
+        model_name=clean_text(model_name) or DEFAULT_RERANKER_MODEL,
+        model_kwargs={"device": selected_device},
+    )
+    return CrossEncoderReranker(model=cross_encoder, top_n=max(1, top_n))
+
+
+def retrieval_results_to_langchain_documents(results: Sequence[RetrievalResult]) -> list[Any]:
+    try:
+        from langchain_core.documents import Document
+    except ImportError as error:
+        raise RuntimeError(
+            "langchain-core is not installed. Install it with `pip install langchain-core`."
+        ) from error
+
+    documents = []
+    for result in results:
+        documents.append(
+            Document(
+                page_content=display_document_preview(result.document, max_chars=1400),
+                metadata={**result.metadata, "chunk_id": result.id},
+            )
+        )
+    return documents
 
 
 def diversify_by_url(results: Sequence[RetrievalResult], top_k: int) -> list[RetrievalResult]:
@@ -499,6 +607,17 @@ def normalize_scores(scores: dict[str, float]) -> dict[str, float]:
     if max_score == min_score:
         return {key: 1.0 if value > 0 else 0.0 for key, value in scores.items()}
     return {key: (value - min_score) / (max_score - min_score) for key, value in scores.items()}
+
+
+def rank_scores(ids: Sequence[str]) -> dict[str, float]:
+    """Convert a reranked ID order into scores between 1.0 and 0.0."""
+    ids = [clean_text(item) for item in ids if clean_text(item)]
+    if not ids:
+        return {}
+    if len(ids) == 1:
+        return {ids[0]: 1.0}
+    denominator = len(ids) - 1
+    return {item_id: 1.0 - (index / denominator) for index, item_id in enumerate(ids)}
 
 
 def document_id(document: Any) -> str:

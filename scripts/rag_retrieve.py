@@ -36,6 +36,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bm25-weight", type=float, default=0.35, help="Hybrid weight for BM25 scores.")
     parser.add_argument("--authority-weight", type=float, default=0.10, help="Hybrid weight for source authority scores.")
     parser.add_argument("--no-diversify", action="store_true", help="Do not diversify final results by URL.")
+    parser.add_argument("--rerank", action="store_true", help="Rerank hybrid candidates with a CrossEncoder model.")
+    parser.add_argument(
+        "--reranker-model",
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        help="Sentence Transformers CrossEncoder model used when --rerank is enabled.",
+    )
+    parser.add_argument("--rerank-k", type=int, default=20, help="Number of hybrid candidates to rerank.")
+    parser.add_argument("--rerank-weight", type=float, default=0.70, help="Final score weight assigned to reranker scores.")
     parser.add_argument(
         "--device",
         default="",
@@ -52,6 +60,8 @@ def main() -> int:
     selected_device = select_embedding_device(requested_device or "auto")
     if not args.json:
         print(f"embedding device: {selected_device}")
+        if args.rerank:
+            print(f"reranker model: {args.reranker_model}")
 
     results = hybrid_retrieve(
         query=args.query,
@@ -66,6 +76,10 @@ def main() -> int:
         authority_weight=args.authority_weight,
         embedding_device=selected_device,
         diversify_urls=not args.no_diversify,
+        rerank=args.rerank,
+        reranker_model=args.reranker_model,
+        rerank_k=args.rerank_k,
+        rerank_weight=args.rerank_weight,
     )
 
     if args.json:
@@ -78,7 +92,8 @@ def main() -> int:
             f"\n[{rank}] score={result.score:.4f} "
             f"semantic={result.semantic_score:.4f} "
             f"bm25={result.bm25_score:.4f} "
-            f"authority={result.authority_score:.4f}"
+            f"authority={result.authority_score:.4f} "
+            f"rerank={result.rerank_score:.4f}"
         )
         print(f"id: {result.id}")
         print(f"title: {metadata.get('title', '')}")

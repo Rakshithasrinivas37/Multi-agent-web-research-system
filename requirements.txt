@@ -4,6 +4,7 @@ firecrawl-py
 httpx
 langgraph
 langchain-chroma
+langchain-classic
 langchain-community
 langchain-core
 langchain-text-splitters
