@@ -3,10 +3,17 @@ chromadb
 firecrawl-py
 httpx
 langgraph
+langchain-chroma
+langchain-community
 langchain-core
 langchain-text-splitters
 playwright
 pypdf
 python-dotenv
+numpy<2
+ragas
+rank-bm25
 sentence-transformers
 tavily-python
+torch>=2.2,<3
+transformers<5

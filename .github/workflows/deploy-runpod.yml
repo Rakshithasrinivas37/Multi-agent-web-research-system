@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
 
 env:
-  RUNPOD_HOST: 157.157.221.29
+  RUNPOD_HOST: ${{ vars.RUNPOD_HOST }}
   RUNPOD_USER: root
-  RUNPOD_PORT: 19805
+  RUNPOD_PORT: ${{ vars.RUNPOD_PORT }}
   DEPLOY_DIR: ${{ secrets.RUNPOD_DEPLOY_DIR || '/workspace/Multi-agent-web-research-system' }}
   # RunPod has a GPU, so deploy installs CUDA PyTorch. Override this secret if the pod uses another CUDA version.
   RUNPOD_TORCH_INDEX_URL: ${{ secrets.RUNPOD_TORCH_INDEX_URL || 'https://download.pytorch.org/whl/cu121' }}
@@ -22,6 +22,18 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Validate RunPod connection variables
+        run: |
+          if [ -z "$RUNPOD_HOST" ]; then
+            echo "RUNPOD_HOST repository variable is required."
+            exit 1
+          fi
+          if [ -z "$RUNPOD_PORT" ]; then
+            echo "RUNPOD_PORT repository variable is required."
+            exit 1
+          fi
+          echo "Deploy target: $RUNPOD_USER@$RUNPOD_HOST:$RUNPOD_PORT"
 
       - name: Configure SSH
         run: |
@@ -110,6 +122,22 @@ jobs:
             python -m pip install --upgrade --force-reinstall --index-url "$TORCH_INDEX_URL" torch
           fi
           timeout 25m python -m pip install --progress-bar off -r requirements.txt
+
+          python -B - <<'PY'
+          import numpy
+          import torch
+          import transformers
+
+          if int(numpy.__version__.split(".", 1)[0]) >= 2:
+              raise SystemExit(f"numpy must be <2 for compiled ML dependencies, found {numpy.__version__}")
+          if tuple(int(part) for part in transformers.__version__.split(".")[:1]) >= (5,):
+              raise SystemExit(f"transformers must be <5 for torch compatibility, found {transformers.__version__}")
+
+          print("dependency compatibility ok")
+          print("numpy", numpy.__version__)
+          print("torch", torch.__version__)
+          print("transformers", transformers.__version__)
+          PY
           REMOTE
 
       - name: Install Playwright Chromium on RunPod
@@ -141,6 +169,7 @@ jobs:
           import torch
           from src.graph.research_workflow import run_research_graph
           from src.rag.indexing import index_research_results, select_embedding_device
+          from src.rag.retrieval import hybrid_retrieve
 
           # Deployment should fail loudly when the GPU is not visible to PyTorch.
           if not torch.cuda.is_available():

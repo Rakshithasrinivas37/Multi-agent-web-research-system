@@ -235,7 +235,7 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
 def langchain_ingestion_classes() -> tuple[Any, Any]:
     try:
         from langchain_core.documents import Document
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        from langchain_text_splitters.character import RecursiveCharacterTextSplitter
     except ImportError as error:
         raise RuntimeError(
             "LangChain ingestion dependencies are not installed. Install them with "
