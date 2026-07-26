@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -21,6 +22,7 @@ from src.rag.retrieval import (
     metrics_to_dicts,
     retrieval_results_to_dicts,
 )
+from src.rag.indexing import select_embedding_device
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +47,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bm25-weight", type=float, default=0.35, help="Hybrid weight for BM25 scores.")
     parser.add_argument("--authority-weight", type=float, default=0.10, help="Hybrid weight for source authority scores.")
     parser.add_argument("--no-diversify", action="store_true", help="Do not diversify final results by URL.")
+    parser.add_argument("--rerank", action="store_true", help="Rerank hybrid candidates with a CrossEncoder model.")
+    parser.add_argument(
+        "--reranker-model",
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        help="Sentence Transformers CrossEncoder model used when --rerank is enabled.",
+    )
+    parser.add_argument("--rerank-k", type=int, default=20, help="Number of hybrid candidates to rerank.")
+    parser.add_argument("--rerank-weight", type=float, default=0.70, help="Final score weight assigned to reranker scores.")
+    parser.add_argument(
+        "--device",
+        default="",
+        help="Embedding/reranker device: cuda, cpu, mps, or auto. Defaults to RAG_EMBEDDING_DEVICE/auto.",
+    )
     parser.add_argument("--json", action="store_true", help="Print raw JSON output.")
     return parser.parse_args()
 
@@ -52,6 +67,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
     args = parse_args()
+    selected_device = select_embedding_device(args.device or os.environ.get("RAG_EMBEDDING_DEVICE", "") or "auto")
     k_values = parse_k_values(args.k)
     cases = load_cases(args)
     if not cases:
@@ -73,6 +89,11 @@ def main() -> int:
             bm25_weight=args.bm25_weight,
             authority_weight=args.authority_weight,
             diversify_urls=not args.no_diversify,
+            embedding_device=selected_device,
+            rerank=args.rerank,
+            reranker_model=args.reranker_model,
+            rerank_k=args.rerank_k,
+            rerank_weight=args.rerank_weight,
         )
         metrics = evaluate_retrieval(
             retrieved=results,
@@ -125,6 +146,7 @@ def print_retrieved_context_scores(output: dict[str, Any]) -> None:
             f"semantic={result['semantic_score']:.4f} "
             f"bm25={result['bm25_score']:.4f} "
             f"authority={result.get('authority_score', 0.0):.4f} "
+            f"rerank={result.get('rerank_score', 0.0):.4f} "
             f"semantic_rank={result.get('semantic_rank')} "
             f"bm25_rank={result.get('bm25_rank')}"
         )
