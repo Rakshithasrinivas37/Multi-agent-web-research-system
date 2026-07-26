@@ -14,6 +14,7 @@ from src.rag.indexing import (
     SentenceTransformerEmbeddingFunction,
     chunk_id,
     get_collection,
+    select_embedding_device,
     to_int,
 )
 from src.tools.text_utils import clean_text
@@ -54,8 +55,8 @@ class RetrievalMetrics:
 class LangChainSentenceTransformerEmbeddings:
     """LangChain embeddings adapter using the same model/device as indexing."""
 
-    def __init__(self) -> None:
-        self.embedding_function = SentenceTransformerEmbeddingFunction()
+    def __init__(self, device: str = "") -> None:
+        self.embedding_function = SentenceTransformerEmbeddingFunction(device=device)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self.embedding_function(texts)
@@ -75,6 +76,7 @@ def hybrid_retrieve(
     semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
     bm25_weight: float = DEFAULT_BM25_WEIGHT,
     bm25_scan_limit: int = DEFAULT_BM25_SCAN_LIMIT,
+    embedding_device: str = "",
 ) -> list[RetrievalResult]:
     """Retrieve chunks using semantic vector similarity plus BM25 keyword matching."""
 
@@ -94,6 +96,7 @@ def hybrid_retrieve(
         collection_name=collection_name,
         semantic_k=semantic_k,
         where=where,
+        embedding_device=embedding_device,
     )
     bm25_results = bm25_search(
         collection,
@@ -118,8 +121,13 @@ def semantic_search(
     collection_name: str,
     semantic_k: int,
     where: Optional[dict[str, Any]] = None,
+    embedding_device: str = "",
 ) -> list[RetrievalResult]:
-    vector_store = get_langchain_chroma(chroma_path=chroma_path, collection_name=collection_name)
+    vector_store = get_langchain_chroma(
+        chroma_path=chroma_path,
+        collection_name=collection_name,
+        embedding_device=embedding_device,
+    )
     try:
         results = vector_store.similarity_search_with_relevance_scores(
             query,
@@ -355,7 +363,7 @@ def merge_result(existing: RetrievalResult, incoming: RetrievalResult) -> Retrie
     )
 
 
-def get_langchain_chroma(chroma_path: Union[str, Path], collection_name: str) -> Any:
+def get_langchain_chroma(chroma_path: Union[str, Path], collection_name: str, embedding_device: str = "") -> Any:
     try:
         from langchain_chroma import Chroma
     except ImportError as error:
@@ -367,7 +375,7 @@ def get_langchain_chroma(chroma_path: Union[str, Path], collection_name: str) ->
     return Chroma(
         collection_name=collection_name,
         persist_directory=str(chroma_path),
-        embedding_function=LangChainSentenceTransformerEmbeddings(),
+        embedding_function=LangChainSentenceTransformerEmbeddings(device=embedding_device),
     )
 
 

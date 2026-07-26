@@ -40,10 +40,10 @@ class SourceRecord:
 class SentenceTransformerEmbeddingFunction:
     """Chroma-compatible embedding function backed by sentence-transformers."""
 
-    def __init__(self, model_name: Optional[str] = None) -> None:
+    def __init__(self, model_name: Optional[str] = None, device: Optional[str] = None) -> None:
         self.model_name = clean_text(model_name or os.environ.get("RAG_EMBEDDING_MODEL")) or DEFAULT_EMBEDDING_MODEL
         # Set RAG_EMBEDDING_DEVICE=cuda in RunPod to force GPU embeddings.
-        self.device = clean_text(os.environ.get("RAG_EMBEDDING_DEVICE")) or DEFAULT_EMBEDDING_DEVICE
+        self.device = clean_text(device or os.environ.get("RAG_EMBEDDING_DEVICE")) or DEFAULT_EMBEDDING_DEVICE
         self._model = None
 
     def __call__(self, input: list[str]) -> list[list[float]]:
@@ -81,13 +81,20 @@ class SentenceTransformerEmbeddingFunction:
 def select_embedding_device(requested_device: str = DEFAULT_EMBEDDING_DEVICE) -> str:
     """Return the embedding device, preferring GPU when requested_device is auto."""
     requested_device = clean_text(requested_device).lower()
-    if requested_device and requested_device != "auto":
-        return requested_device
 
     try:
         import torch
     except ImportError:
+        if requested_device and requested_device not in {"auto", "cpu"}:
+            raise RuntimeError(f"RAG embedding device '{requested_device}' requires torch, but torch is not installed.")
         return "cpu"
+
+    if requested_device and requested_device != "auto":
+        if requested_device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("RAG_EMBEDDING_DEVICE=cuda was requested, but CUDA is not available to PyTorch.")
+        if requested_device == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            raise RuntimeError("RAG_EMBEDDING_DEVICE=mps was requested, but Apple MPS is not available to PyTorch.")
+        return requested_device
 
     if torch.cuda.is_available():
         return "cuda"
