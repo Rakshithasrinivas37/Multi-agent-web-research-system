@@ -5,7 +5,7 @@ httpx
 langgraph
 langchain-chroma
 langchain-classic
-langchain-community
+langchain-community<0.4
 langchain-core
 langchain-text-splitters
 playwright

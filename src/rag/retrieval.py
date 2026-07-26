@@ -348,19 +348,21 @@ def score_ragas_id_metrics(retrieved_context_ids: list[str], reference_context_i
 def ragas_id_metric_classes() -> tuple[Any, Any, Any]:
     try:
         from ragas.dataset_schema import SingleTurnSample
-    except ImportError:
+    except (ImportError, ModuleNotFoundError) as first_error:
         try:
             from ragas import SingleTurnSample
-        except ImportError as error:
+        except (ImportError, ModuleNotFoundError) as error:
             raise RuntimeError(
-                "ragas is not installed. Install it with `pip install ragas` or `pip install -r requirements.txt`."
+                "RAGAS could not be imported. This can happen when ragas and LangChain package versions "
+                f"are incompatible. Original error: {error or first_error}"
             ) from error
 
     try:
         from ragas.metrics import IDBasedContextPrecision, IDBasedContextRecall
-    except ImportError as error:
+    except (ImportError, ModuleNotFoundError) as error:
         raise RuntimeError(
-            "RAGAS ID-based retrieval metrics are unavailable. Upgrade ragas with `pip install -U ragas`."
+            "RAGAS ID-based retrieval metrics are unavailable. Upgrade ragas or adjust LangChain versions. "
+            f"Original error: {error}"
         ) from error
     return SingleTurnSample, IDBasedContextPrecision, IDBasedContextRecall
 
