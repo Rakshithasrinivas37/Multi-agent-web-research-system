@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+from langchain_core.cross_encoders import BaseCrossEncoder
+
 from src.rag.indexing import (
     DEFAULT_CHROMA_PATH,
     DEFAULT_COLLECTION_NAME,
@@ -456,19 +458,36 @@ def langchain_cross_encoder_reranker(model_name: str, device: str, top_n: int) -
     """Build LangChain's CrossEncoderReranker with a Hugging Face cross-encoder."""
     try:
         from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
-        from langchain_community.cross_encoders import HuggingFaceCrossEncoder
     except ImportError as error:
         raise RuntimeError(
             "LangChain reranking dependencies are unavailable. Install "
-            "`langchain-community langchain-classic sentence-transformers` or `pip install -r requirements.txt`."
+            "`langchain-classic sentence-transformers` or `pip install -r requirements.txt`."
         ) from error
 
     selected_device = select_embedding_device(device or "auto")
-    cross_encoder = HuggingFaceCrossEncoder(
+    cross_encoder = SentenceTransformerCrossEncoderAdapter(
         model_name=clean_text(model_name) or DEFAULT_RERANKER_MODEL,
-        model_kwargs={"device": selected_device},
+        device=selected_device,
     )
     return CrossEncoderReranker(model=cross_encoder, top_n=max(1, top_n))
+
+
+class SentenceTransformerCrossEncoderAdapter(BaseCrossEncoder):
+    """LangChain BaseCrossEncoder adapter for sentence-transformers CrossEncoder."""
+
+    def __init__(self, model_name: str, device: str) -> None:
+        try:
+            from sentence_transformers import CrossEncoder
+        except ImportError as error:
+            raise RuntimeError(
+                "sentence-transformers and langchain-core are required for reranking. "
+                "Install them with `pip install -r requirements.txt`."
+            ) from error
+        self.client = CrossEncoder(model_name, device=device)
+
+    def score(self, text_pairs: list[tuple[str, str]]) -> list[float]:
+        scores = self.client.predict(text_pairs, show_progress_bar=False)
+        return [to_float(score, 0.0) for score in list(scores)]
 
 
 def retrieval_results_to_langchain_documents(results: Sequence[RetrievalResult]) -> list[Any]:

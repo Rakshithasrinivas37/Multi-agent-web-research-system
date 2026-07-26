@@ -102,19 +102,27 @@ jobs:
           log "System Python: $(python3 --version)"
           log "Disk usage before install"
           df -h .
+          VENV_PATH="/tmp/multi-agent-web-research-system-venv"
+          log "Using fast local venv path: $VENV_PATH"
 
           # RunPod images often already include CUDA PyTorch. Recreate the venv with system packages
           # so we can reuse that GPU build instead of downloading multi-GB torch wheels each deploy.
-          if [ ! -x .venv/bin/python ] || ! .venv/bin/python - <<'PY'
+          # The venv lives in /tmp because /workspace is network-mounted and slow for many package files.
+          if [ ! -x "$VENV_PATH/bin/python" ] || ! "$VENV_PATH/bin/python" - <<'PY'
           import torch
           raise SystemExit(0 if torch.cuda.is_available() else 1)
           PY
           then
             log "Creating venv with system site packages so existing CUDA PyTorch can be reused"
-            rm -rf .venv
-            python3 -m venv --system-site-packages .venv
+            rm -rf "$VENV_PATH"
+            python3 -m venv --system-site-packages "$VENV_PATH"
           else
             log "Reusing existing venv"
+          fi
+          if [ ! -L .venv ] || [ "$(readlink .venv)" != "$VENV_PATH" ]; then
+            log "Pointing project .venv symlink to fast local venv"
+            rm -rf .venv
+            ln -s "$VENV_PATH" .venv
           fi
 
           . .venv/bin/activate
