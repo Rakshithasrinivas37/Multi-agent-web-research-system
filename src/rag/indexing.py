@@ -57,6 +57,11 @@ class SentenceTransformerEmbeddingFunction:
         )
         return embeddings.tolist()
 
+    def name(self) -> str:
+        """Stable Chroma embedding function name used when reopening collections."""
+        safe_model_name = self.model_name.replace("/", "_").replace(":", "_")
+        return f"sentence-transformers_{safe_model_name}"
+
     def model(self) -> Any:
         if self._model is not None:
             return self._model
@@ -230,7 +235,7 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
 def langchain_ingestion_classes() -> tuple[Any, Any]:
     try:
         from langchain_core.documents import Document
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        from langchain_text_splitters.character import RecursiveCharacterTextSplitter
     except ImportError as error:
         raise RuntimeError(
             "LangChain ingestion dependencies are not installed. Install them with "

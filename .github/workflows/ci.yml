@@ -6,6 +6,10 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  RUNPOD_HOST: ${{ vars.RUNPOD_HOST }}
+  RUNPOD_PORT: ${{ vars.RUNPOD_PORT }}
+
 jobs:
   checks:
     name: Python checks
@@ -27,6 +31,24 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install --progress-bar off -r requirements.txt
 
+      - name: Check dependency compatibility
+        run: |
+          python -B - <<'PY'
+          import numpy
+          import torch
+          import transformers
+
+          if int(numpy.__version__.split(".", 1)[0]) >= 2:
+              raise SystemExit(f"numpy must be <2 for compiled ML dependencies, found {numpy.__version__}")
+          if tuple(int(part) for part in transformers.__version__.split(".")[:1]) >= (5,):
+              raise SystemExit(f"transformers must be <5 for local torch compatibility, found {transformers.__version__}")
+
+          print("dependency compatibility ok")
+          print("numpy", numpy.__version__)
+          print("torch", torch.__version__)
+          print("transformers", transformers.__version__)
+          PY
+
       - name: Check Python syntax
         run: |
           python -B -m compileall -q src scripts
@@ -39,6 +61,7 @@ jobs:
           from src.agents.planner_agent import PlannerAgent
           from src.graph.research_workflow import build_research_graph
           from src.rag.indexing import index_research_results
+          from src.rag.retrieval import hybrid_retrieve
 
           build_research_graph()
           print("import smoke test ok")
