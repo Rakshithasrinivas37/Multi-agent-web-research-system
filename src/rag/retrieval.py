@@ -10,6 +10,7 @@ from typing import Any, Optional, Sequence, Union
 
 from langchain_core.cross_encoders import BaseCrossEncoder
 
+from src.agents.change_detection_agent import normalize_url
 from src.rag.indexing import (
     DEFAULT_CHROMA_PATH,
     DEFAULT_COLLECTION_NAME,
@@ -285,7 +286,7 @@ def evaluate_retrieval(
     """Compute RAGAS ID-based Recall@k/Precision@k plus local MRR."""
 
     relevant_ids = {clean_text(item) for item in (relevant_ids or set()) if clean_text(item)}
-    relevant_urls = {clean_text(item) for item in (relevant_urls or set()) if clean_text(item)}
+    relevant_urls = {normalize_source_url(item) for item in (relevant_urls or set()) if normalize_source_url(item)}
     reference_context_ids = sorted(relevant_ids.union(relevant_urls))
     relevant_count = len(reference_context_ids)
     if relevant_count == 0:
@@ -539,19 +540,19 @@ def diversify_by_url(results: Sequence[RetrievalResult], top_k: int) -> list[Ret
 def source_authority_score(metadata: Any) -> float:
     """Small ranking boost for primary/authoritative sources."""
     metadata = metadata if isinstance(metadata, dict) else {}
-    url = clean_text(metadata.get("url")).lower()
+    urls = " ".join(result_source_urls_from_metadata(metadata)).lower()
     title = clean_text(metadata.get("title")).lower()
     source_type = clean_text(metadata.get("source_type")).lower()
     source_quality = clean_text(metadata.get("source_quality")).lower()
 
     score = 0.0
-    if source_type in {"arxiv", "pdf", "paper"} or "arxiv.org" in url:
+    if source_type in {"arxiv", "pdf", "paper"} or "arxiv.org" in urls:
         score = max(score, 1.0)
-    if any(domain in url for domain in ("nature.com", "ibm.com", ".edu", "docs.", "documentation")):
+    if any(domain in urls for domain in ("nature.com", "ibm.com", ".edu", "docs.", "documentation")):
         score = max(score, 0.75)
     if source_type in {"webpage", "news"}:
         score = max(score, 0.45)
-    if any(domain in url for domain in ("geeksforgeeks.org", "medium.com", "blog", "erdem.pl")):
+    if any(domain in urls for domain in ("geeksforgeeks.org", "medium.com", "blog", "erdem.pl")):
         score = min(max(score, 0.35), 0.45)
     if "useful" in source_quality:
         score = max(score, 0.55 if score == 0 else score)
@@ -654,12 +655,44 @@ def document_id(document: Any) -> str:
 
 
 def is_relevant(result: RetrievalResult, relevant_ids: set[str], relevant_urls: set[str]) -> bool:
-    return result.id in relevant_ids or clean_text(result.metadata.get("url")) in relevant_urls
+    return result.id in relevant_ids or any(url in relevant_urls for url in result_source_urls(result))
 
 
 def evaluation_context_id(result: RetrievalResult, relevant_urls: set[str]) -> str:
-    url = clean_text(result.metadata.get("url"))
-    return url if url in relevant_urls else result.id
+    for url in result_source_urls(result):
+        if url in relevant_urls:
+            return url
+    return result.id
+
+
+def result_source_urls(result: RetrievalResult) -> list[str]:
+    return result_source_urls_from_metadata(result.metadata)
+
+
+def result_source_urls_from_metadata(metadata: Any) -> list[str]:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    urls = []
+    for key in ("url", "source_url"):
+        url = normalize_source_url(metadata.get(key))
+        if url and url not in urls:
+            urls.append(url)
+    for url in split_metadata_urls(metadata.get("task_urls")):
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def split_metadata_urls(value: Any) -> list[str]:
+    if isinstance(value, list):
+        candidates = value
+    else:
+        candidates = clean_text(value).split("|")
+    return [url for url in (normalize_source_url(item) for item in candidates) if url]
+
+
+def normalize_source_url(value: Any) -> str:
+    url = normalize_url(clean_text(value))
+    return url if url.startswith(("http://", "https://")) else ""
 
 
 def to_float(value: Any, default: float) -> float:
