@@ -141,7 +141,19 @@ jobs:
             log "requirements.txt unchanged; skipping pip install"
           else
             log "requirements.txt changed or not recorded; installing dependencies"
-            timeout 25m python -m pip install --progress-bar off -r requirements.txt
+            timeout 25m python -m pip install --progress-bar off -r requirements.txt &
+            INSTALL_PID=$!
+            while kill -0 "$INSTALL_PID" 2>/dev/null; do
+              sleep 60
+              if kill -0 "$INSTALL_PID" 2>/dev/null; then
+                log "pip install is still running"
+                ps -o pid,ppid,stat,etime,pcpu,pmem,cmd -p "$INSTALL_PID" || true
+                ps aux | grep -E "pip|python -m pip|torch|gcc|g\\+\\+|cmake|ninja|cargo|rustc" | grep -v grep || true
+                du -sh ~/.cache/pip .venv 2>/dev/null || true
+                ss -tpn 2>/dev/null | grep -E "python|pip" || true
+              fi
+            done
+            wait "$INSTALL_PID"
             printf '%s\n' "$REQUIREMENTS_HASH" > "$REQUIREMENTS_HASH_FILE"
             log "Recorded requirements hash $REQUIREMENTS_HASH"
           fi

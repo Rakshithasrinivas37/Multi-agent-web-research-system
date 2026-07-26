@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -13,6 +14,7 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.rag.indexing import select_embedding_device
 from src.rag.retrieval import hybrid_retrieve, retrieval_results_to_dicts
 
 
@@ -32,6 +34,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bm25-k", type=int, default=20, help="Number of BM25 keyword search candidates.")
     parser.add_argument("--semantic-weight", type=float, default=0.7, help="Hybrid weight for semantic scores.")
     parser.add_argument("--bm25-weight", type=float, default=0.3, help="Hybrid weight for BM25 scores.")
+    parser.add_argument(
+        "--device",
+        default="",
+        help="Embedding device for semantic search: cuda, cpu, mps, or auto. Defaults to RAG_EMBEDDING_DEVICE/auto.",
+    )
     parser.add_argument("--json", action="store_true", help="Print raw JSON output.")
     return parser.parse_args()
 
@@ -39,6 +46,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
     args = parse_args()
+    requested_device = args.device or os.environ.get("RAG_EMBEDDING_DEVICE", "")
+    selected_device = select_embedding_device(requested_device or "auto")
+    if not args.json:
+        print(f"embedding device: {selected_device}")
+
     results = hybrid_retrieve(
         query=args.query,
         chroma_path=args.chroma_path,
@@ -49,6 +61,7 @@ def main() -> int:
         history_key=args.history_key,
         semantic_weight=args.semantic_weight,
         bm25_weight=args.bm25_weight,
+        embedding_device=selected_device,
     )
 
     if args.json:
