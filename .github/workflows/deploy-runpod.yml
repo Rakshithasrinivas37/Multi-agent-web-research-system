@@ -1,0 +1,74 @@
+name: Deploy to RunPod
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  RUNPOD_HOST: 157.157.221.29
+  RUNPOD_USER: root
+  RUNPOD_PORT: 19805
+  DEPLOY_DIR: ${{ secrets.RUNPOD_DEPLOY_DIR || '/workspace/Multi-agent-web-research-system' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}" > ~/.ssh/runpod_key
+          chmod 600 ~/.ssh/runpod_key
+          ssh-keyscan -p "$RUNPOD_PORT" "$RUNPOD_HOST" >> ~/.ssh/known_hosts
+
+      - name: Build deployment archive
+        run: |
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='data/chroma' \
+            --exclude='data/*.db' \
+            --exclude='data/shared_memory.json' \
+            --exclude='data/browser_results.json' \
+            --exclude='data/research_plan.json' \
+            -czf /tmp/multi-agent-web-research-system.tar.gz .
+
+      - name: Upload archive
+        run: |
+          ssh -i ~/.ssh/runpod_key -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "mkdir -p '$DEPLOY_DIR'"
+          scp -i ~/.ssh/runpod_key -P "$RUNPOD_PORT" /tmp/multi-agent-web-research-system.tar.gz "$RUNPOD_USER@$RUNPOD_HOST:/tmp/multi-agent-web-research-system.tar.gz"
+
+      - name: Write remote environment file
+        run: |
+          cat > /tmp/runpod.env <<EOF
+          GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
+          TAVILY_API_KEY=${{ secrets.TAVILY_API_KEY }}
+          FIRECRAWL_API_KEY=${{ secrets.FIRECRAWL_API_KEY }}
+          RAG_EMBEDDING_MODEL=${{ secrets.RAG_EMBEDDING_MODEL }}
+          EOF
+          scp -i ~/.ssh/runpod_key -P "$RUNPOD_PORT" /tmp/runpod.env "$RUNPOD_USER@$RUNPOD_HOST:$DEPLOY_DIR/.env"
+
+      - name: Install and smoke test on RunPod
+        run: |
+          ssh -i ~/.ssh/runpod_key -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          cd "$DEPLOY_DIR"
+          tar -xzf /tmp/multi-agent-web-research-system.tar.gz -C "$DEPLOY_DIR"
+
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+          python -m playwright install --with-deps chromium || python -m playwright install chromium
+          python -B -c "from src.graph.research_workflow import run_research_graph; from src.rag.indexing import index_research_results; print('deploy import ok')"
+          REMOTE

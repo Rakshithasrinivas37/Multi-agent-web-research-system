@@ -8,6 +8,7 @@ from src.agents.browser_agent import BrowserAgent
 from src.agents.change_detection_agent import ChangeDetectionAgent
 from src.agents.planner_agent import PlannerAgent
 from src.memory.shared_memory import SharedMemory
+from src.rag import index_research_results
 from src.tools.text_utils import clean_text
 
 class ResearchState(TypedDict, total=False):
@@ -15,8 +16,10 @@ class ResearchState(TypedDict, total=False):
     research_plan: dict[str, Any]
     browser_results: list[dict[str, Any]]
     change_detection: dict[str, Any]
+    rag_index: dict[str, Any]
     memory_path: str
     history_db_path: str
+    chroma_path: str
     max_concurrency: int
     errors: list[str]
 
@@ -77,10 +80,11 @@ async def browser_node(state: ResearchState) -> ResearchState:
     }
 
 def change_detection_node(state: ResearchState) -> ResearchState:
-    """Compare previous and current browser results and write a compact diff."""
+    """Compare browser results, persist the diff, and index current content for RAG."""
 
     memory_path = state.get("memory_path") or "data/shared_memory.json"
     history_db_path = state.get("history_db_path") or "data/browser_history.db"
+    chroma_path = state.get("chroma_path") or "data/chroma"
     objective = clean_text(state.get("objective"))
     current_results = state.get("browser_results", [])
     plan = state.get("research_plan", {})
@@ -96,14 +100,52 @@ def change_detection_node(state: ResearchState) -> ResearchState:
     change_detector = ChangeDetectionAgent(history_db_path)
     diff = change_detector.detect_with_history(objective, current_results, plan)
     change_detector.write_to_memory(diff, memory_path)
+    rag_index = index_rag_after_change_detection(
+        browser_results=current_results,
+        research_plan=plan,
+        change_detection=diff,
+        memory_path=memory_path,
+        chroma_path=chroma_path,
+    )
+    errors = state.get("errors", [])
+    if rag_index.get("status") == "error":
+        errors = [*errors, clean_text(rag_index.get("error"))]
 
     return {
         **state,
         "change_detection": diff,
+        "rag_index": rag_index,
         "memory_path": memory_path,
         "history_db_path": history_db_path,
-        "errors": state.get("errors", []),
+        "chroma_path": chroma_path,
+        "errors": errors,
     }
+
+def index_rag_after_change_detection(
+    browser_results: list[dict[str, Any]],
+    research_plan: dict[str, Any],
+    change_detection: dict[str, Any],
+    memory_path: str,
+    chroma_path: str,
+) -> dict[str, Any]:
+    """Index browser content after change detection and write the summary to memory."""
+
+    try:
+        index_summary = index_research_results(
+            browser_results=browser_results,
+            research_plan=research_plan,
+            change_detection=change_detection,
+            chroma_path=chroma_path,
+        )
+    except RuntimeError as error:
+        index_summary = {"status": "error", "error": str(error), "chroma_path": chroma_path}
+        memory = SharedMemory(memory_path)
+        memory.write_agent_output("rag_index", {"index": index_summary})
+        return index_summary
+
+    memory = SharedMemory(memory_path)
+    memory.write_agent_output("rag_index", {"index": index_summary})
+    return index_summary
 
 def build_planner_graph():
     """Build a graph with only the planner node."""
@@ -142,9 +184,10 @@ async def run_research_graph(
     objective: str,
     memory_path: str = "data/shared_memory.json",
     history_db_path: str = "data/browser_history.db",
+    chroma_path: str = "data/chroma",
     max_concurrency: int = 3,
 ) -> ResearchState:
-    """Run the LangGraph workflow through planner, browser, and change detection nodes."""
+    """Run the LangGraph workflow through planner, browser, change detection, and RAG indexing."""
 
     graph = build_research_graph()
     return await graph.ainvoke(
@@ -152,6 +195,7 @@ async def run_research_graph(
             "objective": objective,
             "memory_path": memory_path,
             "history_db_path": history_db_path,
+            "chroma_path": chroma_path,
             "max_concurrency": max_concurrency,
         }
     )

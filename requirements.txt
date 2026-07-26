@@ -1,8 +1,12 @@
 groq
+chromadb
 firecrawl-py
 httpx
 langgraph
+langchain-core
+langchain-text-splitters
 playwright
 pypdf
 python-dotenv
+sentence-transformers
 tavily-python
