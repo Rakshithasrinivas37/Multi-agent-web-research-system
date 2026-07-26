@@ -11,10 +11,13 @@ env:
   RUNPOD_USER: root
   RUNPOD_PORT: 19805
   DEPLOY_DIR: ${{ secrets.RUNPOD_DEPLOY_DIR || '/workspace/Multi-agent-web-research-system' }}
+  # RunPod has a GPU, so deploy installs CUDA PyTorch. Override this secret if the pod uses another CUDA version.
+  RUNPOD_TORCH_INDEX_URL: ${{ secrets.RUNPOD_TORCH_INDEX_URL || 'https://download.pytorch.org/whl/cu121' }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -46,8 +49,9 @@ jobs:
 
       - name: Upload archive
         run: |
-          ssh -i ~/.ssh/runpod_key -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "mkdir -p '$DEPLOY_DIR'"
-          scp -i ~/.ssh/runpod_key -P "$RUNPOD_PORT" /tmp/multi-agent-web-research-system.tar.gz "$RUNPOD_USER@$RUNPOD_HOST:/tmp/multi-agent-web-research-system.tar.gz"
+          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "mkdir -p '$DEPLOY_DIR'"
+          scp $SSH_OPTS -P "$RUNPOD_PORT" /tmp/multi-agent-web-research-system.tar.gz "$RUNPOD_USER@$RUNPOD_HOST:/tmp/multi-agent-web-research-system.tar.gz"
 
       - name: Write remote environment file
         run: |
@@ -56,22 +60,83 @@ jobs:
           TAVILY_API_KEY=${{ secrets.TAVILY_API_KEY }}
           FIRECRAWL_API_KEY=${{ secrets.FIRECRAWL_API_KEY }}
           RAG_EMBEDDING_MODEL=${{ secrets.RAG_EMBEDDING_MODEL }}
+          # Force sentence-transformers embeddings onto the GPU during RunPod deployments.
+          RAG_EMBEDDING_DEVICE=${{ secrets.RAG_EMBEDDING_DEVICE || 'cuda' }}
           EOF
-          scp -i ~/.ssh/runpod_key -P "$RUNPOD_PORT" /tmp/runpod.env "$RUNPOD_USER@$RUNPOD_HOST:$DEPLOY_DIR/.env"
+          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+          scp $SSH_OPTS -P "$RUNPOD_PORT" /tmp/runpod.env "$RUNPOD_USER@$RUNPOD_HOST:$DEPLOY_DIR/.env"
 
-      - name: Install and smoke test on RunPod
+      - name: Extract source on RunPod
+        timeout-minutes: 5
         run: |
-          ssh -i ~/.ssh/runpod_key -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
+          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
           set -euo pipefail
 
           cd "$DEPLOY_DIR"
           tar --no-same-owner --no-same-permissions -xzf /tmp/multi-agent-web-research-system.tar.gz -C "$DEPLOY_DIR"
+          REMOTE
 
+      - name: Install Python dependencies on RunPod
+        timeout-minutes: 30
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' TORCH_INDEX_URL='$RUNPOD_TORCH_INDEX_URL' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          cd "$DEPLOY_DIR"
           python3 -m venv .venv
           . .venv/bin/activate
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # If an old venv already has CPU-only torch, replace it with the CUDA wheel.
+          if python - <<'PY'
+          import torch
+          raise SystemExit(0 if torch.cuda.is_available() else 1)
+          PY
+          then
+            echo "CUDA PyTorch is already available"
+          else
+            python -m pip install --upgrade --force-reinstall --index-url "$TORCH_INDEX_URL" torch
+          fi
+          timeout 25m python -m pip install --progress-bar off -r requirements.txt
+          REMOTE
 
-          python -m playwright install --with-deps chromium || python -m playwright install chromium
-          python -B -c "from src.graph.research_workflow import run_research_graph; from src.rag.indexing import index_research_results; print('deploy import ok')"
+      - name: Install Playwright Chromium on RunPod
+        timeout-minutes: 15
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          cd "$DEPLOY_DIR"
+          . .venv/bin/activate
+          timeout 10m python -m playwright install chromium
+          DEBIAN_FRONTEND=noninteractive timeout 10m python -m playwright install-deps chromium || true
+          REMOTE
+
+      - name: Smoke test imports on RunPod
+        timeout-minutes: 5
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          cd "$DEPLOY_DIR"
+          . .venv/bin/activate
+          set -a
+          . .env
+          set +a
+          python -B - <<'PY'
+          import torch
+          from src.graph.research_workflow import run_research_graph
+          from src.rag.indexing import index_research_results, select_embedding_device
+
+          # Deployment should fail loudly when the GPU is not visible to PyTorch.
+          if not torch.cuda.is_available():
+              raise SystemExit("CUDA is not available to PyTorch in the deploy venv")
+
+          print("torch cuda ok", torch.__version__, torch.cuda.get_device_name(0))
+          print("rag embedding device", select_embedding_device())
+          print("deploy import ok")
+          PY
           REMOTE
