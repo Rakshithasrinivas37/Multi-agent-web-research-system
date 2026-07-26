@@ -21,6 +21,8 @@ DEFAULT_CHROMA_PATH = "data/chroma"
 DEFAULT_CHUNK_SIZE = 1600
 DEFAULT_CHUNK_OVERLAP = 240
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
+DEFAULT_EMBEDDING_DEVICE = "auto"
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,8 @@ class SentenceTransformerEmbeddingFunction:
 
     def __init__(self, model_name: Optional[str] = None) -> None:
         self.model_name = clean_text(model_name or os.environ.get("RAG_EMBEDDING_MODEL")) or DEFAULT_EMBEDDING_MODEL
+        # Set RAG_EMBEDDING_DEVICE=cuda in RunPod to force GPU embeddings.
+        self.device = clean_text(os.environ.get("RAG_EMBEDDING_DEVICE")) or DEFAULT_EMBEDDING_DEVICE
         self._model = None
 
     def __call__(self, input: list[str]) -> list[list[float]]:
@@ -64,8 +68,27 @@ class SentenceTransformerEmbeddingFunction:
                 "`pip install sentence-transformers` or `pip install -r requirements.txt`."
             ) from error
 
-        self._model = SentenceTransformer(self.model_name)
+        self.device = select_embedding_device(self.device)
+        self._model = SentenceTransformer(self.model_name, device=self.device)
         return self._model
+
+
+def select_embedding_device(requested_device: str = DEFAULT_EMBEDDING_DEVICE) -> str:
+    """Return the embedding device, preferring GPU when requested_device is auto."""
+    requested_device = clean_text(requested_device).lower()
+    if requested_device and requested_device != "auto":
+        return requested_device
+
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def index_research_results(
