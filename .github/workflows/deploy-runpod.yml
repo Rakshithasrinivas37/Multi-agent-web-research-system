@@ -32,7 +32,10 @@ jobs:
           tar \
             --exclude='.git' \
             --exclude='.github' \
+            --exclude='.pycache' \
+            --exclude='.pycache/**' \
             --exclude='__pycache__' \
+            --exclude='__pycache__/**' \
             --exclude='*.pyc' \
             --exclude='data/chroma' \
             --exclude='data/*.db' \
@@ -62,7 +65,7 @@ jobs:
           set -euo pipefail
 
           cd "$DEPLOY_DIR"
-          tar -xzf /tmp/multi-agent-web-research-system.tar.gz -C "$DEPLOY_DIR"
+          tar --no-same-owner --no-same-permissions -xzf /tmp/multi-agent-web-research-system.tar.gz -C "$DEPLOY_DIR"
 
           python3 -m venv .venv
           . .venv/bin/activate
