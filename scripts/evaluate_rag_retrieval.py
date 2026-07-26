@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 try:
@@ -19,7 +20,10 @@ from src.rag.retrieval import (
     display_document_preview,
     evaluate_retrieval,
     hybrid_retrieve,
+    is_relevant as retrieval_is_relevant,
     metrics_to_dicts,
+    normalize_source_url,
+    result_source_urls_from_metadata,
     retrieval_results_to_dicts,
 )
 from src.rag.indexing import select_embedding_device
@@ -133,12 +137,13 @@ def print_evaluation_metric_scores(metrics: list[dict[str, Any]]) -> None:
 
 def print_retrieved_context_scores(output: dict[str, Any]) -> None:
     relevant_ids = set(output.get("relevant_ids", []))
-    relevant_urls = set(output.get("relevant_urls", []))
+    relevant_urls = {normalize_source_url(url) for url in output.get("relevant_urls", []) if normalize_source_url(url)}
     print("Retrieved context scores:")
     for rank, result in enumerate(output["results"], start=1):
         metadata = result.get("metadata", {})
         url = str(metadata.get("url", ""))
-        is_relevant = result.get("id") in relevant_ids or url in relevant_urls
+        result_like = SimpleNamespace(id=result.get("id", ""), metadata=metadata)
+        is_relevant = retrieval_is_relevant(result_like, relevant_ids, relevant_urls)
         print(
             f"  [{rank}] "
             f"relevant={str(is_relevant).lower()} "
@@ -152,6 +157,9 @@ def print_retrieved_context_scores(output: dict[str, Any]) -> None:
         )
         print(f"      id: {result.get('id', '')}")
         print(f"      url: {url}")
+        alternate_urls = [item for item in result_source_urls_from_metadata(metadata) if item != normalize_source_url(url)]
+        if alternate_urls:
+            print(f"      alternate_urls: {', '.join(alternate_urls)}")
         preview = display_document_preview(str(result.get("document", "")), max_chars=220).replace("\n", " ")
         if preview:
             print(f"      preview: {preview}")

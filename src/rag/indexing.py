@@ -23,12 +23,14 @@ DEFAULT_CHUNK_OVERLAP = 240
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
+DEFAULT_METADATA_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
 class SourceRecord:
     url: str
     title: str
+    task_urls: str
     task_ids: str
     query_contexts: str
     source_type: str
@@ -137,12 +139,15 @@ def index_research_results(
 
     for record in records:
         change_status = source_change_status(record.url, added_urls, changed_urls)
-        if not index_all and change_status == "unchanged":
+        existing_metadata_schema_version = source_metadata_schema_version_in_collection(collection, history_key, record.url)
+        metadata_is_stale = existing_metadata_schema_version < DEFAULT_METADATA_SCHEMA_VERSION
+        existing_content_hash = source_content_hash_in_collection(collection, history_key, record.url)
+        indexed_content_changed = bool(existing_content_hash and existing_content_hash != record.content_hash)
+        if not index_all and change_status == "unchanged" and not metadata_is_stale and not indexed_content_changed:
             skipped_source_count += 1
             continue
 
-        existing_content_hash = source_content_hash_in_collection(collection, history_key, record.url)
-        if existing_content_hash == record.content_hash:
+        if existing_content_hash == record.content_hash and not metadata_is_stale:
             skipped_source_count += 1
             continue
 
@@ -152,9 +157,10 @@ def index_research_results(
             skipped_source_count += 1
             continue
 
-        if existing_content_hash and existing_content_hash != record.content_hash:
+        if existing_content_hash and (existing_content_hash != record.content_hash or metadata_is_stale):
             delete_source_chunks(collection, history_key, record.url)
-            deleted_changed_source_count += 1
+            if existing_content_hash != record.content_hash:
+                deleted_changed_source_count += 1
 
         ids = []
         documents = []
@@ -217,12 +223,15 @@ def build_langchain_document(record: SourceRecord, objective: str, history_key: 
                 "history_key": history_key,
                 "objective": objective,
                 "url": record.url,
+                "source_url": record.url,
+                "task_urls": record.task_urls,
                 "title": record.title,
                 "task_ids": record.task_ids,
                 "query_contexts": record.query_contexts,
                 "source_type": record.source_type,
                 "source_quality": record.source_quality,
                 "content_hash": record.content_hash,
+                "metadata_schema_version": DEFAULT_METADATA_SCHEMA_VERSION,
                 "change_status": change_status,
             }
         ),
@@ -255,6 +264,7 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
     grouped: dict[str, dict[str, Any]] = {}
     for result in browser_results:
         task_id = clean_text(result.get("task_id"))
+        task_url = normalize_http_url(result.get("task_url"))
         query_context = clean_text(result.get("query_context"))
         for source in result.get("sources", []):
             if not isinstance(source, dict):
@@ -269,6 +279,7 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
                 {
                     "url": url,
                     "title": clean_text(source.get("title")),
+                    "task_urls": [],
                     "task_ids": [],
                     "query_contexts": [],
                     "source_type": clean_text(source.get("source_type")),
@@ -278,6 +289,8 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
             )
             if task_id and task_id not in record["task_ids"]:
                 record["task_ids"].append(task_id)
+            if task_url and task_url not in record["task_urls"]:
+                record["task_urls"].append(task_url)
             if query_context and query_context not in record["query_contexts"]:
                 record["query_contexts"].append(query_context)
 
@@ -292,6 +305,7 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
         yield SourceRecord(
             url=record["url"],
             title=record["title"],
+            task_urls=" | ".join(record["task_urls"]),
             task_ids=", ".join(record["task_ids"]),
             query_contexts=" | ".join(record["query_contexts"]),
             source_type=record["source_type"],
@@ -339,6 +353,16 @@ def delete_source_chunks(collection: Any, history_key: str, url: str) -> None:
 
 
 def source_content_hash_in_collection(collection: Any, history_key: str, url: str) -> str:
+    metadata = source_metadata_in_collection(collection, history_key, url)
+    return clean_text(metadata.get("content_hash")) if metadata else ""
+
+
+def source_metadata_schema_version_in_collection(collection: Any, history_key: str, url: str) -> int:
+    metadata = source_metadata_in_collection(collection, history_key, url)
+    return to_int(metadata.get("metadata_schema_version") if metadata else None, 0)
+
+
+def source_metadata_in_collection(collection: Any, history_key: str, url: str) -> dict[str, Any]:
     try:
         result = collection.get(
             where={"$and": [{"history_key": history_key}, {"url": url}]},
@@ -350,8 +374,8 @@ def source_content_hash_in_collection(collection: Any, history_key: str, url: st
 
     metadatas = result.get("metadatas", []) if isinstance(result, dict) else []
     if not metadatas or not isinstance(metadatas[0], dict):
-        return ""
-    return clean_text(metadatas[0].get("content_hash"))
+        return {}
+    return metadatas[0]
 
 
 def collection_is_empty(collection: Any) -> bool:
@@ -380,3 +404,8 @@ def to_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def normalize_http_url(value: Any) -> str:
+    url = normalize_url(clean_text(value))
+    return url if url.startswith(("http://", "https://")) else ""
