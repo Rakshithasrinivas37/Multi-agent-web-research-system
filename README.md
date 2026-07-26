@@ -18,3 +18,12 @@ Configure these repository secrets in GitHub:
 Trigger deployment by pushing to `main` or manually from the GitHub Actions tab.
 
 The workflow connects as SSH user `root` on SSH port `19805`.
+
+## Pull Request Checks
+
+The `CI` workflow runs on pull requests to `main` and checks dependency install,
+Python syntax, import smoke tests, and whitespace.
+
+To block merges until checks pass, enable branch protection in GitHub:
+Settings -> Branches -> Add branch protection rule -> `main` -> Require status
+checks to pass before merging -> select `Python checks`.

@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  checks:
+    name: Python checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check Python syntax
+        run: |
+          python -B -m compileall -q src scripts
+
+      - name: Smoke test imports
+        run: |
+          python -B - <<'PY'
+          from src.agents.browser_agent import BrowserAgent
+          from src.agents.change_detection_agent import ChangeDetectionAgent
+          from src.agents.planner_agent import PlannerAgent
+          from src.graph.research_workflow import build_research_graph
+          from src.rag.indexing import index_research_results
+
+          build_research_graph()
+          print("import smoke test ok")
+          PY
+
+      - name: Check whitespace
+        run: |
+          git diff --check
