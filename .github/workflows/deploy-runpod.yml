@@ -135,8 +135,16 @@ jobs:
             log "CUDA PyTorch not available in venv; installing torch from $TORCH_INDEX_URL"
             python -m pip install --upgrade --force-reinstall --index-url "$TORCH_INDEX_URL" torch
           fi
-          log "Installing requirements.txt"
-          timeout 25m python -m pip install --progress-bar off -r requirements.txt
+          REQUIREMENTS_HASH="$(sha256sum requirements.txt | awk '{print $1}')"
+          REQUIREMENTS_HASH_FILE=".venv/.requirements.sha256"
+          if [ -f "$REQUIREMENTS_HASH_FILE" ] && [ "$(cat "$REQUIREMENTS_HASH_FILE")" = "$REQUIREMENTS_HASH" ]; then
+            log "requirements.txt unchanged; skipping pip install"
+          else
+            log "requirements.txt changed or not recorded; installing dependencies"
+            timeout 25m python -m pip install --progress-bar off -r requirements.txt
+            printf '%s\n' "$REQUIREMENTS_HASH" > "$REQUIREMENTS_HASH_FILE"
+            log "Recorded requirements hash $REQUIREMENTS_HASH"
+          fi
 
           log "Checking dependency compatibility"
           python -B - <<'PY'
