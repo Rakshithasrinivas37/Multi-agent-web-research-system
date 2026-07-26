@@ -95,8 +95,14 @@ jobs:
           SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
           ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' TORCH_INDEX_URL='$RUNPOD_TORCH_INDEX_URL' bash -s" <<'REMOTE'
           set -euo pipefail
+          log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
           cd "$DEPLOY_DIR"
+          log "Starting dependency installation in $DEPLOY_DIR"
+          log "System Python: $(python3 --version)"
+          log "Disk usage before install"
+          df -h .
+
           # RunPod images often already include CUDA PyTorch. Recreate the venv with system packages
           # so we can reuse that GPU build instead of downloading multi-GB torch wheels each deploy.
           if [ ! -x .venv/bin/python ] || ! .venv/bin/python - <<'PY'
@@ -104,11 +110,17 @@ jobs:
           raise SystemExit(0 if torch.cuda.is_available() else 1)
           PY
           then
+            log "Creating venv with system site packages so existing CUDA PyTorch can be reused"
             rm -rf .venv
             python3 -m venv --system-site-packages .venv
+          else
+            log "Reusing existing venv"
           fi
 
           . .venv/bin/activate
+          log "Venv Python: $(python --version)"
+          log "Venv path: $(python -c 'import sys; print(sys.executable)')"
+          log "Upgrading pip"
           python -m pip install --upgrade pip
 
           # Fallback for minimal images that do not ship with GPU PyTorch.
@@ -117,12 +129,21 @@ jobs:
           raise SystemExit(0 if torch.cuda.is_available() else 1)
           PY
           then
-            echo "CUDA PyTorch is already available"
+            log "CUDA PyTorch is already available"
+            python - <<'PY'
+            import torch
+            print("torch", torch.__version__)
+            print("cuda available", torch.cuda.is_available())
+            print("cuda device", torch.cuda.get_device_name(0))
+            PY
           else
+            log "CUDA PyTorch not available in venv; installing torch from $TORCH_INDEX_URL"
             python -m pip install --upgrade --force-reinstall --index-url "$TORCH_INDEX_URL" torch
           fi
+          log "Installing requirements.txt"
           timeout 25m python -m pip install --progress-bar off -r requirements.txt
 
+          log "Checking dependency compatibility"
           python -B - <<'PY'
           import numpy
           import torch
@@ -138,6 +159,12 @@ jobs:
           print("torch", torch.__version__)
           print("transformers", transformers.__version__)
           PY
+          log "Top-level package versions"
+          python -m pip show numpy torch transformers sentence-transformers langgraph chromadb | sed -n '1,180p'
+          log "Disk usage after install"
+          df -h .
+          du -sh .venv ~/.cache/pip 2>/dev/null || true
+          log "Dependency installation completed"
           REMOTE
 
       - name: Install Playwright Chromium on RunPod
@@ -146,11 +173,17 @@ jobs:
           SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
           ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
           set -euo pipefail
+          log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
           cd "$DEPLOY_DIR"
           . .venv/bin/activate
+          log "Installing Playwright Chromium"
           timeout 10m python -m playwright install chromium
+          log "Installing Playwright Linux dependencies"
           DEBIAN_FRONTEND=noninteractive timeout 10m python -m playwright install-deps chromium || true
+          log "Playwright cache size"
+          du -sh ~/.cache/ms-playwright 2>/dev/null || true
+          log "Playwright installation completed"
           REMOTE
 
       - name: Smoke test imports on RunPod
@@ -159,12 +192,14 @@ jobs:
           SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
           ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
           set -euo pipefail
+          log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
           cd "$DEPLOY_DIR"
           . .venv/bin/activate
           set -a
           . .env
           set +a
+          log "Running deploy smoke test"
           python -B - <<'PY'
           import torch
           from src.graph.research_workflow import run_research_graph
@@ -179,4 +214,5 @@ jobs:
           print("rag embedding device", select_embedding_device())
           print("deploy import ok")
           PY
+          log "Deploy smoke test completed"
           REMOTE
