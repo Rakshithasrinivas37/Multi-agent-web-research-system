@@ -85,10 +85,21 @@ jobs:
           set -euo pipefail
 
           cd "$DEPLOY_DIR"
-          python3 -m venv .venv
+          # RunPod images often already include CUDA PyTorch. Recreate the venv with system packages
+          # so we can reuse that GPU build instead of downloading multi-GB torch wheels each deploy.
+          if [ ! -x .venv/bin/python ] || ! .venv/bin/python - <<'PY'
+          import torch
+          raise SystemExit(0 if torch.cuda.is_available() else 1)
+          PY
+          then
+            rm -rf .venv
+            python3 -m venv --system-site-packages .venv
+          fi
+
           . .venv/bin/activate
           python -m pip install --upgrade pip
-          # If an old venv already has CPU-only torch, replace it with the CUDA wheel.
+
+          # Fallback for minimal images that do not ship with GPU PyTorch.
           if python - <<'PY'
           import torch
           raise SystemExit(0 if torch.cuda.is_available() else 1)
