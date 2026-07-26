@@ -23,8 +23,9 @@ from src.tools.text_utils import clean_text
 DEFAULT_TOP_K = 5
 DEFAULT_SEMANTIC_K = 20
 DEFAULT_BM25_K = 20
-DEFAULT_SEMANTIC_WEIGHT = 0.7
-DEFAULT_BM25_WEIGHT = 0.3
+DEFAULT_SEMANTIC_WEIGHT = 0.55
+DEFAULT_BM25_WEIGHT = 0.35
+DEFAULT_AUTHORITY_WEIGHT = 0.10
 DEFAULT_BM25_SCAN_LIMIT = 1000
 TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
 
@@ -37,6 +38,7 @@ class RetrievalResult:
     score: float
     semantic_score: float
     bm25_score: float
+    authority_score: float = 0.0
     semantic_rank: Optional[int] = None
     bm25_rank: Optional[int] = None
 
@@ -75,8 +77,10 @@ def hybrid_retrieve(
     history_key: str = "",
     semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
     bm25_weight: float = DEFAULT_BM25_WEIGHT,
+    authority_weight: float = DEFAULT_AUTHORITY_WEIGHT,
     bm25_scan_limit: int = DEFAULT_BM25_SCAN_LIMIT,
     embedding_device: str = "",
+    diversify_urls: bool = True,
 ) -> list[RetrievalResult]:
     """Retrieve chunks using semantic vector similarity plus BM25 keyword matching."""
 
@@ -111,7 +115,10 @@ def hybrid_retrieve(
         bm25_results=bm25_results,
         semantic_weight=semantic_weight,
         bm25_weight=bm25_weight,
+        authority_weight=authority_weight,
     )
+    if diversify_urls:
+        merged = diversify_by_url(merged, top_k=top_k)
     return merged[:top_k]
 
 
@@ -147,6 +154,7 @@ def semantic_search(
                 score=0.0,
                 semantic_score=to_float(score, 0.0),
                 bm25_score=0.0,
+                authority_score=source_authority_score(document.metadata),
                 semantic_rank=index + 1,
             )
         )
@@ -197,6 +205,7 @@ def bm25_search(
                 score=0.0,
                 semantic_score=0.0,
                 bm25_score=1.0 / bm25_rank,
+                authority_score=source_authority_score(document.metadata),
                 bm25_rank=bm25_rank,
             )
         )
@@ -208,6 +217,7 @@ def merge_ranked_results(
     bm25_results: Sequence[RetrievalResult],
     semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
     bm25_weight: float = DEFAULT_BM25_WEIGHT,
+    authority_weight: float = DEFAULT_AUTHORITY_WEIGHT,
 ) -> list[RetrievalResult]:
     semantic_scores = normalize_scores({item.id: item.semantic_score for item in semantic_results})
     bm25_scores = normalize_scores({item.id: item.bm25_score for item in bm25_results})
@@ -221,7 +231,12 @@ def merge_ranked_results(
     for item_id, item in by_id.items():
         semantic_score = semantic_scores.get(item_id, 0.0)
         bm25_score = bm25_scores.get(item_id, 0.0)
-        score = (semantic_weight * semantic_score) + (bm25_weight * bm25_score)
+        authority_score = source_authority_score(item.metadata)
+        score = (
+            (semantic_weight * semantic_score)
+            + (bm25_weight * bm25_score)
+            + (authority_weight * authority_score)
+        )
         merged.append(
             RetrievalResult(
                 id=item.id,
@@ -230,6 +245,7 @@ def merge_ranked_results(
                 score=score,
                 semantic_score=semantic_score,
                 bm25_score=bm25_score,
+                authority_score=authority_score,
                 semantic_rank=item.semantic_rank,
                 bm25_rank=item.bm25_rank,
             )
@@ -358,9 +374,72 @@ def merge_result(existing: RetrievalResult, incoming: RetrievalResult) -> Retrie
         score=0.0,
         semantic_score=max(existing.semantic_score, incoming.semantic_score),
         bm25_score=max(existing.bm25_score, incoming.bm25_score),
+        authority_score=max(existing.authority_score, incoming.authority_score),
         semantic_rank=existing.semantic_rank or incoming.semantic_rank,
         bm25_rank=existing.bm25_rank or incoming.bm25_rank,
     )
+
+
+def diversify_by_url(results: Sequence[RetrievalResult], top_k: int) -> list[RetrievalResult]:
+    """Prefer source diversity, then fill remaining slots by score."""
+    top_k = max(1, top_k)
+    selected = []
+    selected_ids = set()
+    seen_urls = set()
+
+    for result in results:
+        url = clean_text(result.metadata.get("url"))
+        if url and url in seen_urls:
+            continue
+        selected.append(result)
+        selected_ids.add(result.id)
+        if url:
+            seen_urls.add(url)
+        if len(selected) >= top_k:
+            return selected
+
+    for result in results:
+        if result.id in selected_ids:
+            continue
+        selected.append(result)
+        if len(selected) >= top_k:
+            break
+    return selected
+
+
+def source_authority_score(metadata: Any) -> float:
+    """Small ranking boost for primary/authoritative sources."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    url = clean_text(metadata.get("url")).lower()
+    title = clean_text(metadata.get("title")).lower()
+    source_type = clean_text(metadata.get("source_type")).lower()
+    source_quality = clean_text(metadata.get("source_quality")).lower()
+
+    score = 0.0
+    if source_type in {"arxiv", "pdf", "paper"} or "arxiv.org" in url:
+        score = max(score, 1.0)
+    if any(domain in url for domain in ("nature.com", "ibm.com", ".edu", "docs.", "documentation")):
+        score = max(score, 0.75)
+    if source_type in {"webpage", "news"}:
+        score = max(score, 0.45)
+    if any(domain in url for domain in ("geeksforgeeks.org", "medium.com", "blog", "erdem.pl")):
+        score = min(max(score, 0.35), 0.45)
+    if "useful" in source_quality:
+        score = max(score, 0.55 if score == 0 else score)
+    if any(word in title for word in ("paper", "arxiv", "documentation", "docs")):
+        score = max(score, 0.7)
+    return min(1.0, max(0.0, score))
+
+
+def display_document_preview(document: str, max_chars: int = 700) -> str:
+    """Remove stored source headers from CLI previews."""
+    lines = clean_text(document).splitlines()
+    content_lines = [
+        line for line in lines
+        if not line.startswith("Source: ") and not line.startswith("URL: ") and not line.startswith("Task: ")
+    ]
+    preview = clean_text("\n".join(content_lines))
+    return preview[:max(80, max_chars)].strip()
 
 
 def get_langchain_chroma(chroma_path: Union[str, Path], collection_name: str, embedding_device: str = "") -> Any:

@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.rag.indexing import select_embedding_device
-from src.rag.retrieval import hybrid_retrieve, retrieval_results_to_dicts
+from src.rag.retrieval import display_document_preview, hybrid_retrieve, retrieval_results_to_dicts
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,8 +32,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=5, help="Number of final hybrid results.")
     parser.add_argument("--semantic-k", type=int, default=20, help="Number of semantic search candidates.")
     parser.add_argument("--bm25-k", type=int, default=20, help="Number of BM25 keyword search candidates.")
-    parser.add_argument("--semantic-weight", type=float, default=0.7, help="Hybrid weight for semantic scores.")
-    parser.add_argument("--bm25-weight", type=float, default=0.3, help="Hybrid weight for BM25 scores.")
+    parser.add_argument("--semantic-weight", type=float, default=0.55, help="Hybrid weight for semantic scores.")
+    parser.add_argument("--bm25-weight", type=float, default=0.35, help="Hybrid weight for BM25 scores.")
+    parser.add_argument("--authority-weight", type=float, default=0.10, help="Hybrid weight for source authority scores.")
+    parser.add_argument("--no-diversify", action="store_true", help="Do not diversify final results by URL.")
     parser.add_argument(
         "--device",
         default="",
@@ -61,7 +63,9 @@ def main() -> int:
         history_key=args.history_key,
         semantic_weight=args.semantic_weight,
         bm25_weight=args.bm25_weight,
+        authority_weight=args.authority_weight,
         embedding_device=selected_device,
+        diversify_urls=not args.no_diversify,
     )
 
     if args.json:
@@ -70,11 +74,16 @@ def main() -> int:
 
     for rank, result in enumerate(results, start=1):
         metadata = result.metadata
-        print(f"\n[{rank}] score={result.score:.4f} semantic={result.semantic_score:.4f} bm25={result.bm25_score:.4f}")
+        print(
+            f"\n[{rank}] score={result.score:.4f} "
+            f"semantic={result.semantic_score:.4f} "
+            f"bm25={result.bm25_score:.4f} "
+            f"authority={result.authority_score:.4f}"
+        )
         print(f"id: {result.id}")
         print(f"title: {metadata.get('title', '')}")
         print(f"url: {metadata.get('url', '')}")
-        print(result.document[:700].strip())
+        print(display_document_preview(result.document))
     return 0
 
 

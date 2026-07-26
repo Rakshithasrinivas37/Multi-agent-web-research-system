@@ -14,7 +14,13 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.rag.retrieval import evaluate_retrieval, hybrid_retrieve, metrics_to_dicts, retrieval_results_to_dicts
+from src.rag.retrieval import (
+    display_document_preview,
+    evaluate_retrieval,
+    hybrid_retrieve,
+    metrics_to_dicts,
+    retrieval_results_to_dicts,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,6 +41,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=10, help="Number of results to retrieve for evaluation.")
     parser.add_argument("--semantic-k", type=int, default=30, help="Number of semantic search candidates.")
     parser.add_argument("--bm25-k", type=int, default=30, help="Number of BM25 keyword search candidates.")
+    parser.add_argument("--semantic-weight", type=float, default=0.55, help="Hybrid weight for semantic scores.")
+    parser.add_argument("--bm25-weight", type=float, default=0.35, help="Hybrid weight for BM25 scores.")
+    parser.add_argument("--authority-weight", type=float, default=0.10, help="Hybrid weight for source authority scores.")
+    parser.add_argument("--no-diversify", action="store_true", help="Do not diversify final results by URL.")
     parser.add_argument("--json", action="store_true", help="Print raw JSON output.")
     return parser.parse_args()
 
@@ -59,6 +69,10 @@ def main() -> int:
             semantic_k=args.semantic_k,
             bm25_k=args.bm25_k,
             history_key=case.get("history_key") or args.history_key,
+            semantic_weight=args.semantic_weight,
+            bm25_weight=args.bm25_weight,
+            authority_weight=args.authority_weight,
+            diversify_urls=not args.no_diversify,
         )
         metrics = evaluate_retrieval(
             retrieved=results,
@@ -110,12 +124,13 @@ def print_retrieved_context_scores(output: dict[str, Any]) -> None:
             f"hybrid={result['score']:.4f} "
             f"semantic={result['semantic_score']:.4f} "
             f"bm25={result['bm25_score']:.4f} "
+            f"authority={result.get('authority_score', 0.0):.4f} "
             f"semantic_rank={result.get('semantic_rank')} "
             f"bm25_rank={result.get('bm25_rank')}"
         )
         print(f"      id: {result.get('id', '')}")
         print(f"      url: {url}")
-        preview = str(result.get("document", "")).replace("\n", " ")[:220].strip()
+        preview = display_document_preview(str(result.get("document", "")), max_chars=220).replace("\n", " ")
         if preview:
             print(f"      preview: {preview}")
 
