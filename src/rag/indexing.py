@@ -18,8 +18,8 @@ from src.tools.text_utils import clean_text
 
 DEFAULT_COLLECTION_NAME = "research_rag"
 DEFAULT_CHROMA_PATH = "data/chroma"
-DEFAULT_CHUNK_SIZE = 1600
-DEFAULT_CHUNK_OVERLAP = 240
+DEFAULT_CHUNK_SIZE = 3000
+DEFAULT_CHUNK_OVERLAP = 350
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"

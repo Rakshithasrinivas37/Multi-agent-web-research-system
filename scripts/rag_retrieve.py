@@ -15,7 +15,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.rag.indexing import select_embedding_device
-from src.rag.retrieval import display_document_preview, hybrid_retrieve, retrieval_results_to_dicts
+from src.rag.retrieval import (
+    display_document_preview,
+    hybrid_retrieve,
+    normalize_source_url,
+    result_source_urls_from_metadata,
+    retrieval_results_to_dicts,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,6 +104,12 @@ def main() -> int:
         print(f"id: {result.id}")
         print(f"title: {metadata.get('title', '')}")
         print(f"url: {metadata.get('url', '')}")
+        alternate_urls = [
+            item for item in result_source_urls_from_metadata(metadata)
+            if item != normalize_source_url(metadata.get("url", ""))
+        ]
+        if alternate_urls:
+            print(f"alternate_urls: {', '.join(alternate_urls)}")
         print(display_document_preview(result.document))
     return 0
 
