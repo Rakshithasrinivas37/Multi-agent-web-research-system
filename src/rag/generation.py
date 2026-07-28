@@ -61,6 +61,7 @@ def synthesize_report_from_research_plan(
     include_planned_source_urls: bool = True,
     source_url_k: int = DEFAULT_REPORT_SOURCE_URL_K,
     rewrite_query: bool = True,
+    print_rewritten_query: bool = True,
     model: str | None = None,
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
     max_tokens: int = DEFAULT_REPORT_MAX_TOKENS,
@@ -76,6 +77,9 @@ def synthesize_report_from_research_plan(
         queries=queries,
         model=model,
     ) if rewrite_query else ""
+    if print_rewritten_query and rewritten_query:
+        print("Rewritten retrieval query:")
+        print(rewritten_query)
     retrieval_queries = [rewritten_query] if rewritten_query else queries
     retrieved_context = multi_query_hybrid_retrieve(
         queries=retrieval_queries,
@@ -109,7 +113,7 @@ def synthesize_report_from_research_plan(
             top_k_per_url=source_url_k,
             scan_limit=bm25_scan_limit,
         )
-        retrieved_context = merge_retrieved_context(source_coverage_results, retrieved_context)
+        retrieved_context = merge_retrieved_context(retrieved_context, source_coverage_results)
 
     payload = synthesize_context_for_report(
         objective=objective,
@@ -129,10 +133,25 @@ def synthesize_report_from_research_plan(
 
 
 def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
-    """Build retrieval queries from PlannerAgent task output."""
-    objective = clean_text(research_plan.get("objective"))
-    queries = []
+    """Build retrieval queries from PlannerAgent output.
 
+    Sub-questions are the primary retrieval queries because they are already
+    concise search intents. Task details are used only as a fallback.
+    """
+    objective = clean_text(research_plan.get("objective"))
+    sub_question_queries = []
+
+    for sub_question in research_plan.get("sub_questions", []):
+        query = clean_text(sub_question)
+        if query:
+            sub_question_queries.append(query)
+
+    if sub_question_queries:
+        if objective:
+            sub_question_queries.append(objective)
+        return dedupe_preserve_order(sub_question_queries)
+
+    queries = []
     for task in research_plan.get("tasks", []):
         if not isinstance(task, dict):
             continue
@@ -146,11 +165,6 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
             expected_signals_text,
         ]
         query = clean_text(" ".join(clean_text(part) for part in parts if clean_text(part)))
-        if query:
-            queries.append(query)
-
-    for sub_question in research_plan.get("sub_questions", []):
-        query = clean_text(sub_question)
         if query:
             queries.append(query)
 
@@ -347,9 +361,10 @@ Return concise Markdown with these sections:
 - Conflicts Or Gaps
 - Recommended Report Angle
 
-Use only the numbered source markers that appear in the retrieved context, like [1], [2], [3].
+Use only plain ASCII numbered source markers that appear in the retrieved context, exactly like [1], [2], [3].
 Every evidence-backed claim must include at least one source marker.
 Use compact bullets only. Do not use Markdown tables.
+Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inline.
 Do not invent source names, authors, dates, titles, papers, or citations that are not present in the retrieved context."""
 
     response = Groq().chat.completions.create(
