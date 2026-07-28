@@ -142,6 +142,63 @@ def hybrid_retrieve(
     return merged[:top_k]
 
 
+def multi_query_hybrid_retrieve(
+    queries: Sequence[str],
+    chroma_path: Union[str, Path] = DEFAULT_CHROMA_PATH,
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+    top_k: int = DEFAULT_TOP_K,
+    per_query_k: int = DEFAULT_TOP_K,
+    semantic_k: int = DEFAULT_SEMANTIC_K,
+    bm25_k: int = DEFAULT_BM25_K,
+    history_key: str = "",
+    semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
+    bm25_weight: float = DEFAULT_BM25_WEIGHT,
+    authority_weight: float = DEFAULT_AUTHORITY_WEIGHT,
+    bm25_scan_limit: int = DEFAULT_BM25_SCAN_LIMIT,
+    embedding_device: str = "",
+    diversify_urls: bool = True,
+    rerank: bool = False,
+    reranker_model: str = DEFAULT_RERANKER_MODEL,
+    rerank_k: int = DEFAULT_RERANK_K,
+    rerank_weight: float = DEFAULT_RERANK_WEIGHT,
+) -> list[RetrievalResult]:
+    """Run hybrid retrieval for multiple queries and merge the best chunks."""
+    clean_queries = [clean_text(query) for query in queries if clean_text(query)]
+    if not clean_queries:
+        return []
+
+    by_id: dict[str, RetrievalResult] = {}
+    for query in clean_queries:
+        results = hybrid_retrieve(
+            query=query,
+            chroma_path=chroma_path,
+            collection_name=collection_name,
+            top_k=max(1, per_query_k),
+            semantic_k=semantic_k,
+            bm25_k=bm25_k,
+            history_key=history_key,
+            semantic_weight=semantic_weight,
+            bm25_weight=bm25_weight,
+            authority_weight=authority_weight,
+            bm25_scan_limit=bm25_scan_limit,
+            embedding_device=embedding_device,
+            diversify_urls=False,
+            rerank=rerank,
+            reranker_model=reranker_model,
+            rerank_k=rerank_k,
+            rerank_weight=rerank_weight,
+        )
+        for result in results:
+            existing = by_id.get(result.id)
+            if existing is None or result.score > existing.score:
+                by_id[result.id] = result
+
+    merged = sorted(by_id.values(), key=lambda item: item.score, reverse=True)
+    if diversify_urls:
+        merged = diversify_by_url(merged, top_k=top_k)
+    return merged[: max(1, top_k)]
+
+
 def semantic_search(
     query: str,
     chroma_path: Union[str, Path],
