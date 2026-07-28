@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Sequence
 
 from src.rag.retrieval import (
@@ -17,21 +18,25 @@ from src.rag.retrieval import (
     RetrievalResult,
     display_document_preview,
     multi_query_hybrid_retrieve,
+    normalize_source_url,
     result_source_urls_from_metadata,
+    source_url_coverage_retrieve,
 )
 from src.tools.text_utils import clean_text
 
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
-DEFAULT_MAX_CONTEXT_CHARS = 12000
+DEFAULT_MAX_CONTEXT_CHARS = 18000
 DEFAULT_MAX_TOKENS = 900
-DEFAULT_REPORT_MAX_TOKENS = 1400
-DEFAULT_REPORT_TOP_K = 12
-DEFAULT_REPORT_PER_QUERY_K = 20
+DEFAULT_REPORT_MAX_TOKENS = 2200
+DEFAULT_REPORT_TOP_K = 20
+DEFAULT_REPORT_PER_QUERY_K = 25
 DEFAULT_REPORT_SEMANTIC_WEIGHT = 0.30
 DEFAULT_REPORT_BM25_WEIGHT = 0.30
 DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
-DEFAULT_CONTEXT_BLOCK_CHARS = 1400
+DEFAULT_CONTEXT_BLOCK_CHARS = 1200
+DEFAULT_REPORT_SOURCE_URL_K = 1
+URL_PATTERN = re.compile(r"https?://[^\s\])}>\"']+")
 
 
 def synthesize_report_from_research_plan(
@@ -53,6 +58,8 @@ def synthesize_report_from_research_plan(
     reranker_model: str = DEFAULT_RERANKER_MODEL,
     rerank_k: int = DEFAULT_RERANK_K,
     rerank_weight: float = DEFAULT_RERANK_WEIGHT,
+    include_planned_source_urls: bool = True,
+    source_url_k: int = DEFAULT_REPORT_SOURCE_URL_K,
     model: str | None = None,
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
     max_tokens: int = DEFAULT_REPORT_MAX_TOKENS,
@@ -83,6 +90,20 @@ def synthesize_report_from_research_plan(
         rerank_k=rerank_k,
         rerank_weight=rerank_weight,
     )
+    planned_source_urls = planner_source_urls(research_plan)
+    source_coverage_results = []
+    if include_planned_source_urls and planned_source_urls:
+        source_coverage_results = source_url_coverage_retrieve(
+            source_urls=missing_source_urls(planned_source_urls, retrieved_context),
+            query=queries,
+            chroma_path=chroma_path,
+            collection_name=collection_name,
+            history_key=history_key,
+            top_k_per_url=source_url_k,
+            scan_limit=bm25_scan_limit,
+        )
+        retrieved_context = merge_retrieved_context(source_coverage_results, retrieved_context)
+
     payload = synthesize_context_for_report(
         objective=objective,
         retrieved_context=retrieved_context,
@@ -92,6 +113,8 @@ def synthesize_report_from_research_plan(
         max_tokens=max_tokens,
     )
     payload["queries"] = queries
+    payload["planned_source_urls"] = planned_source_urls
+    payload["source_coverage_count"] = len(source_coverage_results)
     payload["retrieved_count"] = len(retrieved_context)
     return payload
 
@@ -125,6 +148,52 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     if objective:
         queries.append(objective)
     return dedupe_preserve_order(queries)
+
+
+def planner_source_urls(research_plan: dict[str, Any]) -> list[str]:
+    """Extract source URLs from any planner fields without topic-specific rules."""
+    urls = []
+    for value in nested_values(research_plan):
+        if not isinstance(value, str):
+            continue
+        urls.extend(match.group(0).rstrip(".,;:") for match in URL_PATTERN.finditer(value))
+    return dedupe_source_urls(urls)
+
+
+def nested_values(value: Any) -> list[Any]:
+    if isinstance(value, dict):
+        values = []
+        for item in value.values():
+            values.extend(nested_values(item))
+        return values
+    if isinstance(value, list):
+        values = []
+        for item in value:
+            values.extend(nested_values(item))
+        return values
+    return [value]
+
+
+def missing_source_urls(
+    planned_urls: Sequence[str],
+    retrieved_context: Sequence[RetrievalResult],
+) -> list[str]:
+    covered_urls = set()
+    for result in retrieved_context:
+        covered_urls.update(result_source_urls_from_metadata(result.metadata))
+    return [url for url in planned_urls if url not in covered_urls]
+
+
+def merge_retrieved_context(*groups: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    merged = []
+    seen_ids = set()
+    for group in groups:
+        for result in group:
+            if result.id in seen_ids:
+                continue
+            seen_ids.add(result.id)
+            merged.append(result)
+    return merged
 
 
 def generate_answer_from_context(
@@ -222,6 +291,7 @@ Return concise Markdown with these sections:
 
 Use only the numbered source markers that appear in the retrieved context, like [1], [2], [3].
 Every evidence-backed claim must include at least one source marker.
+Use compact bullets only. Do not use Markdown tables.
 Do not invent source names, authors, dates, titles, papers, or citations that are not present in the retrieved context."""
 
     response = Groq().chat.completions.create(
@@ -262,15 +332,16 @@ def build_generation_context(
     ordered_results = source_balanced_results(retrieved_context)
     block_char_limit = context_block_char_limit(ordered_results, max_context_chars)
 
-    for index, result in enumerate(ordered_results, start=1):
+    for retrieval_rank, result in enumerate(ordered_results, start=1):
         metadata = result.metadata if isinstance(result.metadata, dict) else {}
         url = primary_source_url(metadata)
-        title = clean_text(metadata.get("title")) or url or f"Source {index}"
+        citation_index = len(blocks) + 1
+        title = clean_text(metadata.get("title")) or url or f"Source {citation_index}"
         chunk = display_document_preview(result.document, max_chars=block_char_limit)
         if not chunk:
             continue
 
-        block = f"[{index}] {title}\nURL: {url}\n{chunk}"
+        block = f"[{citation_index}] {title}\nURL: {url}\n{chunk}"
         if used_chars + len(block) > max_context_chars:
             remaining = max_context_chars - used_chars
             if remaining < 500:
@@ -280,7 +351,8 @@ def build_generation_context(
         blocks.append(block)
         sources.append(
             {
-                "index": index,
+                "index": citation_index,
+                "retrieval_rank": retrieval_rank,
                 "id": result.id,
                 "url": url,
                 "title": title,
@@ -327,7 +399,7 @@ def context_block_char_limit(
     nonempty_count = sum(1 for result in retrieved_context if clean_text(result.document))
     if nonempty_count <= 0:
         return DEFAULT_CONTEXT_BLOCK_CHARS
-    target_blocks = min(nonempty_count, 10)
+    target_blocks = min(nonempty_count, 14)
     per_block_budget = max_context_chars // max(1, target_blocks)
     return max(700, min(DEFAULT_CONTEXT_BLOCK_CHARS, per_block_budget - 120))
 
@@ -347,4 +419,16 @@ def dedupe_preserve_order(items: Sequence[str]) -> list[str]:
             continue
         seen.add(key)
         deduped.append(text)
+    return deduped
+
+
+def dedupe_source_urls(urls: Sequence[str]) -> list[str]:
+    seen = set()
+    deduped = []
+    for url in urls:
+        normalized = normalize_source_url(url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
     return deduped

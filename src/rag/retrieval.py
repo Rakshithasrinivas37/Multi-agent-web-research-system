@@ -33,6 +33,7 @@ DEFAULT_BM25_SCAN_LIMIT = 1000
 DEFAULT_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_RERANK_K = 20
 DEFAULT_RERANK_WEIGHT = 0.70
+DEFAULT_SOURCE_URL_K = 1
 TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
 
 
@@ -199,6 +200,78 @@ def multi_query_hybrid_retrieve(
     return merged[: max(1, top_k)]
 
 
+def source_url_coverage_retrieve(
+    source_urls: Sequence[str],
+    query: str | Sequence[str],
+    chroma_path: Union[str, Path] = DEFAULT_CHROMA_PATH,
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+    history_key: str = "",
+    top_k_per_url: int = DEFAULT_SOURCE_URL_K,
+    scan_limit: int = DEFAULT_BM25_SCAN_LIMIT,
+) -> list[RetrievalResult]:
+    """Retrieve query-matched chunks from specific planned URLs when indexed."""
+    target_urls = dedupe_urls(source_urls)
+    if not target_urls:
+        return []
+
+    query_text = joined_query_text(query)
+    collection = get_collection(chroma_path, collection_name)
+    get_args = {
+        "include": ["documents", "metadatas"],
+        "limit": max(scan_limit, len(target_urls) * max(1, top_k_per_url) * 10),
+    }
+    where = metadata_filter(history_key)
+    if where:
+        get_args["where"] = where
+
+    try:
+        result = collection.get(**get_args)
+    except Exception:
+        return []
+
+    ids = result.get("ids", []) if isinstance(result, dict) else []
+    documents = result.get("documents", []) if isinstance(result, dict) else []
+    metadatas = result.get("metadatas", []) if isinstance(result, dict) else []
+    rows_by_url: dict[str, list[tuple[Any, Any, Any]]] = {url: [] for url in target_urls}
+
+    for index, document in enumerate(documents):
+        metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
+        matched_url = first_matching_url(target_urls, result_source_urls_from_metadata(metadata))
+        if not matched_url:
+            continue
+        rows_by_url[matched_url].append(
+            (
+                ids[index] if index < len(ids) else "",
+                document,
+                metadata,
+            )
+        )
+
+    selected = []
+    selected_ids = set()
+    for target_url in target_urls:
+        ranked_documents = rank_source_rows(rows_by_url.get(target_url, []), query_text, top_k_per_url)
+        for rank, document in enumerate(ranked_documents, start=1):
+            item_id = document_id(document)
+            if not item_id or item_id in selected_ids:
+                continue
+            selected_ids.add(item_id)
+            selected.append(
+                RetrievalResult(
+                    id=item_id,
+                    document=clean_text(document.page_content),
+                    metadata=document.metadata if isinstance(document.metadata, dict) else {},
+                    score=source_authority_score(document.metadata),
+                    semantic_score=0.0,
+                    bm25_score=1.0 / rank,
+                    authority_score=source_authority_score(document.metadata),
+                    rerank_score=0.0,
+                    bm25_rank=rank,
+                )
+            )
+    return selected
+
+
 def semantic_search(
     query: str,
     chroma_path: Union[str, Path],
@@ -289,6 +362,43 @@ def bm25_search(
             )
         )
     return [row for row in rows if row.id]
+
+
+def rank_source_rows(
+    rows: Sequence[tuple[Any, Any, Any]],
+    query: str,
+    top_k: int,
+) -> list[Any]:
+    """Rank chunks from one source URL with BM25, falling back to chunk order."""
+    if not rows:
+        return []
+
+    ids = [row[0] for row in rows]
+    documents = [row[1] for row in rows]
+    metadatas = [row[2] for row in rows]
+    langchain_documents = build_langchain_documents(ids=ids, documents=documents, metadatas=metadatas)
+    if not langchain_documents:
+        return []
+
+    if query:
+        try:
+            BM25Retriever = langchain_bm25_retriever()
+            retriever = BM25Retriever.from_documents(
+                langchain_documents,
+                k=max(1, top_k),
+                preprocess_func=tokenize,
+            )
+            return retriever.invoke(query)[: max(1, top_k)]
+        except Exception:
+            pass
+
+    return sorted(
+        langchain_documents,
+        key=lambda document: to_int(
+            document.metadata.get("chunk_index") if isinstance(document.metadata, dict) else None,
+            0,
+        ),
+    )[: max(1, top_k)]
 
 
 def merge_ranked_results(
@@ -750,6 +860,32 @@ def split_metadata_urls(value: Any) -> list[str]:
 def normalize_source_url(value: Any) -> str:
     url = normalize_url(clean_text(value))
     return url if url.startswith(("http://", "https://")) else ""
+
+
+def dedupe_urls(urls: Sequence[str]) -> list[str]:
+    seen = set()
+    deduped = []
+    for url in urls:
+        normalized = normalize_source_url(url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def joined_query_text(query: str | Sequence[str]) -> str:
+    if isinstance(query, str):
+        return clean_text(query)
+    return clean_text(" ".join(clean_text(item) for item in query if clean_text(item)))
+
+
+def first_matching_url(target_urls: Sequence[str], candidate_urls: Sequence[str]) -> str:
+    candidates = set(dedupe_urls(candidate_urls))
+    for url in target_urls:
+        if url in candidates:
+            return url
+    return ""
 
 
 def to_float(value: Any, default: float) -> float:
