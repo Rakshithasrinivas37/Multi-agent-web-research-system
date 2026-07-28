@@ -31,6 +31,7 @@ DEFAULT_REPORT_PER_QUERY_K = 20
 DEFAULT_REPORT_SEMANTIC_WEIGHT = 0.30
 DEFAULT_REPORT_BM25_WEIGHT = 0.30
 DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
+DEFAULT_CONTEXT_BLOCK_CHARS = 1400
 
 
 def synthesize_report_from_research_plan(
@@ -155,7 +156,8 @@ Retrieved context:
 {context_text}
 
 Answer using only the retrieved context. If the context does not contain the answer, say that clearly.
-Use source markers like [1] or [2] when you use information from a source."""
+Use only the numbered source markers that appear in the retrieved context, like [1] or [2].
+Do not cite source names, authors, dates, or papers unless they are present in the retrieved context."""
 
     response = Groq().chat.completions.create(
         model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
@@ -218,7 +220,9 @@ Return concise Markdown with these sections:
 - Conflicts Or Gaps
 - Recommended Report Angle
 
-Use source markers like [1], [2], [3] for every evidence-backed claim."""
+Use only the numbered source markers that appear in the retrieved context, like [1], [2], [3].
+Every evidence-backed claim must include at least one source marker.
+Do not invent source names, authors, dates, titles, papers, or citations that are not present in the retrieved context."""
 
     response = Groq().chat.completions.create(
         model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
@@ -246,17 +250,23 @@ def build_generation_context(
     retrieved_context: Sequence[RetrievalResult],
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Convert retrieved chunks into compact numbered context blocks."""
+    """Convert retrieved chunks into compact numbered context blocks.
+
+    The prompt budget is spread across unique source URLs first so synthesis sees
+    evidence from more than just the highest-ranked long chunks.
+    """
     blocks = []
     sources = []
     used_chars = 0
     max_context_chars = max(1000, max_context_chars)
+    ordered_results = source_balanced_results(retrieved_context)
+    block_char_limit = context_block_char_limit(ordered_results, max_context_chars)
 
-    for index, result in enumerate(retrieved_context, start=1):
+    for index, result in enumerate(ordered_results, start=1):
         metadata = result.metadata if isinstance(result.metadata, dict) else {}
         url = primary_source_url(metadata)
         title = clean_text(metadata.get("title")) or url or f"Source {index}"
-        chunk = display_document_preview(result.document, max_chars=2200)
+        chunk = display_document_preview(result.document, max_chars=block_char_limit)
         if not chunk:
             continue
 
@@ -280,6 +290,46 @@ def build_generation_context(
         used_chars += len(block)
 
     return "\n\n".join(blocks), sources
+
+
+def source_balanced_results(retrieved_context: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    """Interleave results so each source URL gets represented before repeats."""
+    buckets: dict[str, list[RetrievalResult]] = {}
+    source_order = []
+
+    for result in retrieved_context:
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        url = primary_source_url(metadata) or result.id
+        if url not in buckets:
+            buckets[url] = []
+            source_order.append(url)
+        buckets[url].append(result)
+
+    ordered = []
+    while True:
+        added = False
+        for url in source_order:
+            bucket = buckets[url]
+            if not bucket:
+                continue
+            ordered.append(bucket.pop(0))
+            added = True
+        if not added:
+            break
+    return ordered
+
+
+def context_block_char_limit(
+    retrieved_context: Sequence[RetrievalResult],
+    max_context_chars: int,
+) -> int:
+    """Choose a per-block preview size that leaves room for many sources."""
+    nonempty_count = sum(1 for result in retrieved_context if clean_text(result.document))
+    if nonempty_count <= 0:
+        return DEFAULT_CONTEXT_BLOCK_CHARS
+    target_blocks = min(nonempty_count, 10)
+    per_block_budget = max_context_chars // max(1, target_blocks)
+    return max(700, min(DEFAULT_CONTEXT_BLOCK_CHARS, per_block_budget - 120))
 
 
 def primary_source_url(metadata: dict[str, Any]) -> str:
