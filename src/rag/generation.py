@@ -5,7 +5,20 @@ from __future__ import annotations
 import os
 from typing import Any, Sequence
 
-from src.rag.retrieval import RetrievalResult, display_document_preview, result_source_urls_from_metadata
+from src.rag.retrieval import (
+    DEFAULT_BM25_K,
+    DEFAULT_BM25_SCAN_LIMIT,
+    DEFAULT_CHROMA_PATH,
+    DEFAULT_COLLECTION_NAME,
+    DEFAULT_RERANK_K,
+    DEFAULT_RERANK_WEIGHT,
+    DEFAULT_RERANKER_MODEL,
+    DEFAULT_SEMANTIC_K,
+    RetrievalResult,
+    display_document_preview,
+    multi_query_hybrid_retrieve,
+    result_source_urls_from_metadata,
+)
 from src.tools.text_utils import clean_text
 
 
@@ -13,6 +26,104 @@ DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
 DEFAULT_MAX_CONTEXT_CHARS = 12000
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_REPORT_MAX_TOKENS = 1400
+DEFAULT_REPORT_TOP_K = 12
+DEFAULT_REPORT_PER_QUERY_K = 20
+DEFAULT_REPORT_SEMANTIC_WEIGHT = 0.30
+DEFAULT_REPORT_BM25_WEIGHT = 0.30
+DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
+
+
+def synthesize_report_from_research_plan(
+    research_plan: dict[str, Any],
+    chroma_path: str = DEFAULT_CHROMA_PATH,
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+    top_k: int = DEFAULT_REPORT_TOP_K,
+    per_query_k: int = DEFAULT_REPORT_PER_QUERY_K,
+    semantic_k: int = DEFAULT_SEMANTIC_K,
+    bm25_k: int = DEFAULT_BM25_K,
+    history_key: str = "",
+    semantic_weight: float = DEFAULT_REPORT_SEMANTIC_WEIGHT,
+    bm25_weight: float = DEFAULT_REPORT_BM25_WEIGHT,
+    authority_weight: float = DEFAULT_REPORT_AUTHORITY_WEIGHT,
+    bm25_scan_limit: int = DEFAULT_BM25_SCAN_LIMIT,
+    embedding_device: str = "",
+    diversify_urls: bool = True,
+    rerank: bool = False,
+    reranker_model: str = DEFAULT_RERANKER_MODEL,
+    rerank_k: int = DEFAULT_RERANK_K,
+    rerank_weight: float = DEFAULT_RERANK_WEIGHT,
+    model: str | None = None,
+    max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+    max_tokens: int = DEFAULT_REPORT_MAX_TOKENS,
+) -> dict[str, Any]:
+    """Retrieve with planner-derived queries, then synthesize report-ready notes."""
+    objective = clean_text(research_plan.get("objective"))
+    if not objective:
+        raise ValueError("research_plan.objective is required")
+
+    queries = planner_tasks_to_rag_queries(research_plan)
+    retrieved_context = multi_query_hybrid_retrieve(
+        queries=queries,
+        chroma_path=chroma_path,
+        collection_name=collection_name,
+        top_k=top_k,
+        per_query_k=per_query_k,
+        semantic_k=semantic_k,
+        bm25_k=bm25_k,
+        history_key=history_key,
+        semantic_weight=semantic_weight,
+        bm25_weight=bm25_weight,
+        authority_weight=authority_weight,
+        bm25_scan_limit=bm25_scan_limit,
+        embedding_device=embedding_device,
+        diversify_urls=diversify_urls,
+        rerank=rerank,
+        reranker_model=reranker_model,
+        rerank_k=rerank_k,
+        rerank_weight=rerank_weight,
+    )
+    payload = synthesize_context_for_report(
+        objective=objective,
+        retrieved_context=retrieved_context,
+        synthesis_instruction=clean_text(research_plan.get("synthesis_instruction")),
+        model=model,
+        max_context_chars=max_context_chars,
+        max_tokens=max_tokens,
+    )
+    payload["queries"] = queries
+    payload["retrieved_count"] = len(retrieved_context)
+    return payload
+
+
+def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
+    """Build retrieval queries from PlannerAgent task output."""
+    objective = clean_text(research_plan.get("objective"))
+    queries = []
+
+    for task in research_plan.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        expected_signals = task.get("expected_signals", [])
+        expected_signals_text = " ".join(clean_text(item) for item in expected_signals if clean_text(item))
+        parts = [
+            task.get("query_context"),
+            task.get("extraction_goal"),
+            task.get("target_name"),
+            task.get("url"),
+            expected_signals_text,
+        ]
+        query = clean_text(" ".join(clean_text(part) for part in parts if clean_text(part)))
+        if query:
+            queries.append(query)
+
+    for sub_question in research_plan.get("sub_questions", []):
+        query = clean_text(sub_question)
+        if query:
+            queries.append(query)
+
+    if objective:
+        queries.append(objective)
+    return dedupe_preserve_order(queries)
 
 
 def generate_answer_from_context(
@@ -174,3 +285,16 @@ def build_generation_context(
 def primary_source_url(metadata: dict[str, Any]) -> str:
     urls = result_source_urls_from_metadata(metadata)
     return urls[0] if urls else clean_text(metadata.get("url"))
+
+
+def dedupe_preserve_order(items: Sequence[str]) -> list[str]:
+    seen = set()
+    deduped = []
+    for item in items:
+        text = clean_text(item)
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(text)
+    return deduped
