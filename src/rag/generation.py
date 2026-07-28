@@ -60,6 +60,7 @@ def synthesize_report_from_research_plan(
     rerank_weight: float = DEFAULT_RERANK_WEIGHT,
     include_planned_source_urls: bool = True,
     source_url_k: int = DEFAULT_REPORT_SOURCE_URL_K,
+    rewrite_query: bool = True,
     model: str | None = None,
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
     max_tokens: int = DEFAULT_REPORT_MAX_TOKENS,
@@ -70,8 +71,14 @@ def synthesize_report_from_research_plan(
         raise ValueError("research_plan.objective is required")
 
     queries = planner_tasks_to_rag_queries(research_plan)
-    retrieved_context = multi_query_hybrid_retrieve(
+    rewritten_query = rewrite_query_from_planner_queries(
+        objective=objective,
         queries=queries,
+        model=model,
+    ) if rewrite_query else ""
+    retrieval_queries = [rewritten_query] if rewritten_query else queries
+    retrieved_context = multi_query_hybrid_retrieve(
+        queries=retrieval_queries,
         chroma_path=chroma_path,
         collection_name=collection_name,
         top_k=top_k,
@@ -95,7 +102,7 @@ def synthesize_report_from_research_plan(
     if include_planned_source_urls and planned_source_urls:
         source_coverage_results = source_url_coverage_retrieve(
             source_urls=missing_source_urls(planned_source_urls, retrieved_context),
-            query=queries,
+            query=retrieval_queries,
             chroma_path=chroma_path,
             collection_name=collection_name,
             history_key=history_key,
@@ -113,6 +120,8 @@ def synthesize_report_from_research_plan(
         max_tokens=max_tokens,
     )
     payload["queries"] = queries
+    payload["rewritten_query"] = rewritten_query
+    payload["retrieval_queries"] = retrieval_queries
     payload["planned_source_urls"] = planned_source_urls
     payload["source_coverage_count"] = len(source_coverage_results)
     payload["retrieved_count"] = len(retrieved_context)
@@ -148,6 +157,55 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     if objective:
         queries.append(objective)
     return dedupe_preserve_order(queries)
+
+
+def rewrite_query_from_planner_queries(
+    objective: str,
+    queries: Sequence[str],
+    model: str | None = None,
+    max_input_chars: int = 8000,
+) -> str:
+    """Rewrite all planner query text into one dense retrieval query."""
+    objective = clean_text(objective)
+    query_text = "\n".join(f"- {query}" for query in dedupe_preserve_order(queries))
+    query_text = query_text[: max(1000, max_input_chars)].strip()
+    if not query_text:
+        return objective
+    if not os.environ.get("GROQ_API_KEY"):
+        raise RuntimeError("GROQ_API_KEY is not set")
+
+    try:
+        from groq import Groq
+    except ImportError as error:
+        raise RuntimeError("groq package is not installed. Install it with `pip install -r requirements.txt`.") from error
+
+    prompt = f"""Research objective:
+{objective}
+
+Planner retrieval query contents:
+{query_text}
+
+Rewrite the planner query contents into one optimized RAG retrieval query.
+Requirements:
+- Preserve the core research intent, entities, URLs, technical terms, expected evidence, and subquestions.
+- Remove duplicates and filler words.
+- Keep it topic-agnostic and useful for semantic search plus BM25 keyword retrieval.
+- Return only the rewritten query text, no bullets, no markdown, no explanation."""
+
+    response = Groq().chat.completions.create(
+        model="llama-3.1-8b-instant",
+        temperature=0,
+        max_tokens=350,
+        messages=[
+            {
+                "role": "system",
+                "content": "You rewrite planner output into a single high-recall retrieval query. Return only the query.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+    rewritten_query = clean_text(response.choices[0].message.content)
+    return rewritten_query or objective
 
 
 def planner_source_urls(research_plan: dict[str, Any]) -> list[str]:
