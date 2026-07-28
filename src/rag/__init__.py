@@ -3,6 +3,7 @@
 from src.rag.generation import (
     generate_answer_from_context,
     planner_tasks_to_rag_queries,
+    rewrite_query_from_planner_queries,
     synthesize_context_for_report,
     synthesize_report_from_research_plan,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "index_research_results",
     "multi_query_hybrid_retrieve",
     "planner_tasks_to_rag_queries",
+    "rewrite_query_from_planner_queries",
     "synthesize_context_for_report",
     "synthesize_report_from_research_plan",
 ]
