@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
@@ -18,12 +19,13 @@ from src.tools.text_utils import clean_text
 
 DEFAULT_COLLECTION_NAME = "research_rag"
 DEFAULT_CHROMA_PATH = "data/chroma"
-DEFAULT_CHUNK_SIZE = 3000
-DEFAULT_CHUNK_OVERLAP = 350
+DEFAULT_CHUNK_SIZE = 700
+DEFAULT_CHUNK_OVERLAP = 100
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
-DEFAULT_METADATA_SCHEMA_VERSION = 2
+DEFAULT_METADATA_SCHEMA_VERSION = 3
+TOKEN_PATTERN = re.compile(r"\S+")
 
 
 @dataclass(frozen=True)
@@ -239,13 +241,89 @@ def build_langchain_document(record: SourceRecord, objective: str, history_key: 
 
 
 def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_overlap: int = DEFAULT_CHUNK_OVERLAP) -> list[Any]:
-    _, RecursiveCharacterTextSplitter = langchain_ingestion_classes()
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=max(400, chunk_size),
-        chunk_overlap=max(0, min(chunk_overlap, chunk_size // 2)),
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    return splitter.split_documents([document])
+    Document, _ = langchain_ingestion_classes()
+    max_tokens = max(100, chunk_size)
+    overlap_tokens = max(0, min(chunk_overlap, max_tokens // 2))
+    chunks = token_aware_chunks(document.page_content, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
+    return [
+        Document(
+            page_content=chunk,
+            metadata={
+                **document.metadata,
+                "chunking_strategy": "token_aware_v1",
+                "token_count": token_count(chunk),
+            },
+        )
+        for chunk in chunks
+    ]
+
+
+def token_aware_chunks(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
+    """Create ordered token-bounded chunks while preserving small text blocks."""
+    blocks = text_blocks(text)
+    chunks = []
+    current_blocks = []
+    current_tokens = 0
+
+    for block in blocks:
+        block_tokens = token_count(block)
+        if block_tokens <= 0:
+            continue
+
+        if block_tokens > max_tokens:
+            if current_blocks:
+                chunks.append(join_blocks(current_blocks))
+                current_blocks = []
+                current_tokens = 0
+            chunks.extend(split_large_block(block, max_tokens=max_tokens, overlap_tokens=overlap_tokens))
+            continue
+
+        if current_blocks and current_tokens + block_tokens > max_tokens:
+            chunks.append(join_blocks(current_blocks))
+            current_blocks = [block]
+            current_tokens = block_tokens
+            continue
+
+        current_blocks.append(block)
+        current_tokens += block_tokens
+
+    if current_blocks:
+        chunks.append(join_blocks(current_blocks))
+
+    return [chunk for chunk in chunks if clean_text(chunk)]
+
+
+def text_blocks(text: str) -> list[str]:
+    """Split text into coarse blocks without requiring section detection."""
+    raw_blocks = re.split(r"\n\s*\n+", str(text or ""))
+    blocks = [clean_text(block) for block in raw_blocks if clean_text(block)]
+    return blocks or ([clean_text(text)] if clean_text(text) else [])
+
+
+def split_large_block(block: str, max_tokens: int, overlap_tokens: int) -> list[str]:
+    tokens = TOKEN_PATTERN.findall(clean_text(block))
+    if not tokens:
+        return []
+
+    chunks = []
+    start = 0
+    step = max(1, max_tokens - overlap_tokens)
+    while start < len(tokens):
+        window = tokens[start : start + max_tokens]
+        if window:
+            chunks.append(" ".join(window))
+        if start + max_tokens >= len(tokens):
+            break
+        start += step
+    return chunks
+
+
+def join_blocks(blocks: list[str]) -> str:
+    return "\n\n".join(clean_text(block) for block in blocks if clean_text(block))
+
+
+def token_count(text: str) -> int:
+    return len(TOKEN_PATTERN.findall(clean_text(text)))
 
 
 def langchain_ingestion_classes() -> tuple[Any, Any]:
