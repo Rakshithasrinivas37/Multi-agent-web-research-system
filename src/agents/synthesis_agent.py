@@ -7,11 +7,14 @@ from typing import Any
 
 from src.memory.shared_memory import SharedMemory
 from src.rag.generation import (
+    DEFAULT_CONTEXT_BLOCK_CHARS,
+    DEFAULT_MAX_CONTEXT_CHARS,
     DEFAULT_REPORT_AUTHORITY_WEIGHT,
     DEFAULT_REPORT_BM25_WEIGHT,
     DEFAULT_REPORT_MAX_TOKENS,
     DEFAULT_REPORT_PER_QUERY_K,
     DEFAULT_REPORT_SEMANTIC_WEIGHT,
+    DEFAULT_REPORT_SUPPORTING_CHUNKS,
     DEFAULT_REPORT_SOURCE_URL_K,
     DEFAULT_REPORT_TOP_K,
     DEFAULT_RAG_GENERATION_MODEL,
@@ -56,7 +59,10 @@ class SynthesisAgent:
         source_url_k: int = DEFAULT_REPORT_SOURCE_URL_K,
         rewrite_query: bool = False,
         include_retrieved_chunks: bool = True,
+        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
         max_tokens: int = DEFAULT_REPORT_MAX_TOKENS,
+        retrieved_chunk_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+        supporting_chunk_count: int = DEFAULT_REPORT_SUPPORTING_CHUNKS,
     ) -> None:
         self.model = (
             clean_text(model)
@@ -84,7 +90,10 @@ class SynthesisAgent:
         self.source_url_k = source_url_k
         self.rewrite_query = rewrite_query
         self.include_retrieved_chunks = include_retrieved_chunks
+        self.max_context_chars = max_context_chars
         self.max_tokens = max_tokens
+        self.retrieved_chunk_chars = retrieved_chunk_chars
+        self.supporting_chunk_count = supporting_chunk_count
 
     def synthesize(self, research_plan: dict[str, Any]) -> dict[str, Any]:
         """Create report-agent-ready notes from indexed research evidence."""
@@ -114,8 +123,11 @@ class SynthesisAgent:
             source_url_k=self.source_url_k,
             rewrite_query=self.rewrite_query,
             model=self.model,
+            max_context_chars=self.max_context_chars,
             max_tokens=self.max_tokens,
             include_retrieved_chunks=self.include_retrieved_chunks,
+            retrieved_chunk_chars=self.retrieved_chunk_chars,
+            supporting_chunk_count=self.supporting_chunk_count,
         )
 
     def write_to_memory(
