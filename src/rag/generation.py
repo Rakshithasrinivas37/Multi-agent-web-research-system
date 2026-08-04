@@ -36,6 +36,7 @@ DEFAULT_REPORT_BM25_WEIGHT = 0.30
 DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
 DEFAULT_CONTEXT_BLOCK_CHARS = 1200
 DEFAULT_REPORT_SOURCE_URL_K = 1
+DEFAULT_REPORT_SUPPORTING_CHUNKS = 12
 URL_PATTERN = re.compile(r"https?://[^\s\])}>\"']+")
 
 
@@ -67,6 +68,7 @@ def synthesize_report_from_research_plan(
     max_tokens: int = DEFAULT_REPORT_MAX_TOKENS,
     include_retrieved_chunks: bool = False,
     retrieved_chunk_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+    supporting_chunk_count: int = DEFAULT_REPORT_SUPPORTING_CHUNKS,
 ) -> dict[str, Any]:
     """Retrieve with planner-derived queries, then synthesize report-ready notes."""
     objective = clean_text(research_plan.get("objective"))
@@ -131,9 +133,22 @@ def synthesize_report_from_research_plan(
     payload["planned_source_urls"] = planned_source_urls
     payload["source_coverage_count"] = len(source_coverage_results)
     payload["retrieved_count"] = len(retrieved_context)
+    payload["citation_policy"] = (
+        "Use only the numbered source indexes in sources. Prefer primary papers, "
+        "official documentation, academic sources, and authoritative surveys for "
+        "technical claims. Use secondary explainers only for intuition."
+    )
+    payload["supporting_chunks"] = report_supporting_chunks(
+        retrieved_context,
+        payload.get("sources", []),
+        max_chunks=supporting_chunk_count,
+        max_chars=retrieved_chunk_chars,
+    )
+    payload["diagnostics"] = synthesis_diagnostics(payload, retrieved_context)
     if include_retrieved_chunks:
         payload["retrieved_chunks"] = compact_retrieved_chunks(
             retrieved_context,
+            payload.get("sources", []),
             max_chars=retrieved_chunk_chars,
         )
     return payload
@@ -446,10 +461,12 @@ def build_generation_context(
 
 def compact_retrieved_chunks(
     retrieved_context: Sequence[RetrievalResult],
+    sources: Sequence[dict[str, Any]] | None = None,
     max_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
 ) -> list[dict[str, Any]]:
     """Serialize selected retrieved chunks for a downstream report agent."""
 
+    source_index_by_id = citation_index_by_chunk_id(sources or [])
     chunks = []
     for rank, result in enumerate(retrieved_context, start=1):
         metadata = result.metadata if isinstance(result.metadata, dict) else {}
@@ -460,15 +477,88 @@ def compact_retrieved_chunks(
             continue
         chunks.append(
             {
+                "source_index": source_index_by_id.get(result.id),
                 "retrieval_rank": rank,
                 "id": result.id,
                 "url": url,
                 "title": title,
                 "score": result.score,
+                "source_type": clean_text(metadata.get("source_type")),
+                "source_quality": clean_text(metadata.get("source_quality")),
+                "is_primary_source": is_primary_source(metadata),
                 "content": content,
             }
         )
     return chunks
+
+
+def report_supporting_chunks(
+    retrieved_context: Sequence[RetrievalResult],
+    sources: Sequence[dict[str, Any]],
+    max_chunks: int = DEFAULT_REPORT_SUPPORTING_CHUNKS,
+    max_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+) -> list[dict[str, Any]]:
+    """Return citation-linked chunks that are safest for the report agent."""
+
+    compact_chunks = compact_retrieved_chunks(
+        retrieved_context,
+        sources=sources,
+        max_chars=max_chars,
+    )
+    citation_backed = [chunk for chunk in compact_chunks if chunk.get("source_index") is not None]
+    ordered = sorted(
+        citation_backed,
+        key=lambda chunk: (
+            0 if chunk.get("is_primary_source") else 1,
+            chunk.get("source_index") or 10**6,
+            -(float(chunk.get("score") or 0.0)),
+        ),
+    )
+    return ordered[: max(1, max_chunks)]
+
+
+def citation_index_by_chunk_id(sources: Sequence[dict[str, Any]]) -> dict[str, int]:
+    indexes = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        chunk_id = clean_text(source.get("id"))
+        index = source.get("index")
+        if not chunk_id or not isinstance(index, int):
+            continue
+        indexes[chunk_id] = index
+    return indexes
+
+
+def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[RetrievalResult]) -> dict[str, Any]:
+    sources = payload.get("sources", [])
+    supporting_chunks = payload.get("supporting_chunks", [])
+    primary_source_count = sum(
+        1 for result in retrieved_context
+        if is_primary_source(result.metadata if isinstance(result.metadata, dict) else {})
+    )
+    return {
+        "retrieved_count": len(retrieved_context),
+        "source_count": len(sources) if isinstance(sources, list) else 0,
+        "supporting_chunk_count": len(supporting_chunks) if isinstance(supporting_chunks, list) else 0,
+        "primary_source_count": primary_source_count,
+        "source_coverage_count": payload.get("source_coverage_count", 0),
+    }
+
+
+def is_primary_source(metadata: dict[str, Any]) -> bool:
+    source_type = clean_text(metadata.get("source_type")).lower()
+    url = primary_source_url(metadata).lower()
+    return (
+        source_type in {"arxiv", "academic", "docs", "benchmarks", "pricing"}
+        or "arxiv.org/pdf/" in url
+        or "arxiv.org/abs/" in url
+        or "openreview.net/pdf" in url
+        or "tensorflow.org" in url
+        or "pytorch.org" in url
+        or ".edu" in url
+        or "doi.org" in url
+    )
 
 
 def retrieved_chunk_preview(document: str, metadata: dict[str, Any], max_chars: int) -> str:
