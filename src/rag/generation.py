@@ -417,7 +417,7 @@ def build_generation_context(
         url = primary_source_url(metadata)
         citation_index = len(blocks) + 1
         title = clean_text(metadata.get("title")) or url or f"Source {citation_index}"
-        chunk = display_document_preview(result.document, max_chars=block_char_limit)
+        chunk = retrieved_chunk_preview(result.document, metadata, max_chars=block_char_limit)
         if not chunk:
             continue
 
@@ -455,6 +455,9 @@ def compact_retrieved_chunks(
         metadata = result.metadata if isinstance(result.metadata, dict) else {}
         url = primary_source_url(metadata)
         title = clean_text(metadata.get("title")) or url or f"Source {rank}"
+        content = retrieved_chunk_preview(result.document, metadata, max_chars=max_chars)
+        if not content:
+            continue
         chunks.append(
             {
                 "retrieval_rank": rank,
@@ -462,10 +465,61 @@ def compact_retrieved_chunks(
                 "url": url,
                 "title": title,
                 "score": result.score,
-                "content": display_document_preview(result.document, max_chars=max_chars),
+                "content": content,
             }
         )
     return chunks
+
+
+def retrieved_chunk_preview(document: str, metadata: dict[str, Any], max_chars: int) -> str:
+    """Return chunk body text without dropping content after stored headers."""
+
+    body = strip_stored_chunk_headers(document, metadata)
+    if not body:
+        body = display_document_preview(document, max_chars=max_chars)
+    if not body:
+        body = clean_text(document)
+    return body[: max(80, max_chars)].strip()
+
+
+def strip_stored_chunk_headers(document: str, metadata: dict[str, Any]) -> str:
+    """Remove Source/URL/Task headers added during indexing while preserving body."""
+
+    raw_text = str(document or "")
+    if "\n" in raw_text:
+        content_lines = [
+            line for line in raw_text.splitlines()
+            if not line.startswith("Source: ") and not line.startswith("URL: ") and not line.startswith("Task: ")
+        ]
+        body = clean_text("\n".join(content_lines))
+        if body:
+            return body
+
+    text = clean_text(raw_text)
+    if not text:
+        return ""
+
+    url = clean_text(metadata.get("url"))
+    source_url = clean_text(metadata.get("source_url"))
+    title = clean_text(metadata.get("title")) or url or source_url or "Untitled Source"
+    task = clean_text(metadata.get("query_contexts"))
+
+    candidate_headers = [
+        clean_text(f"Source: {title} URL: {url} Task: {task}"),
+        clean_text(f"Source: {title} URL: {source_url} Task: {task}"),
+        clean_text(f"Source: {url} URL: {url} Task: {task}"),
+        clean_text(f"Source: {source_url} URL: {source_url} Task: {task}"),
+    ]
+    for header in candidate_headers:
+        if header and text.startswith(header):
+            return clean_text(text[len(header):])
+
+    task_marker = clean_text(f"Task: {task}")
+    if task_marker and task_marker in text:
+        _, _, tail = text.partition(task_marker)
+        return clean_text(tail)
+
+    return text
 
 
 def source_balanced_results(retrieved_context: Sequence[RetrievalResult]) -> list[RetrievalResult]:
