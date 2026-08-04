@@ -365,12 +365,16 @@ def synthesize_context_for_report(
         raise RuntimeError("groq package is not installed. Install it with `pip install -r requirements.txt`.") from error
 
     context_text, sources = build_generation_context(retrieved_context, max_context_chars=max_context_chars)
+    source_priority_guidance = build_source_priority_guidance(sources)
     instruction = clean_text(synthesis_instruction) or "Synthesize the retrieved evidence into report-ready research notes."
     prompt = f"""Research objective:
 {objective}
 
 Synthesis instruction:
 {instruction}
+
+Source priority guidance:
+{source_priority_guidance}
 
 Retrieved context from multiple sources:
 {context_text}
@@ -385,6 +389,9 @@ Return concise Markdown with these sections:
 
 Use only plain ASCII numbered source markers that appear in the retrieved context, exactly like [1], [2], [3].
 Every evidence-backed claim must include at least one source marker.
+For equations, formulas, API signatures, benchmark numbers, and historical attribution, cite original papers, official documentation, academic sources, or authoritative surveys first.
+If a primary/official source and a secondary explainer both support the same technical claim, cite the primary/official source and omit the secondary citation.
+Use secondary explainers only for intuition, examples, or background wording.
 Use compact bullets only. Do not use Markdown tables.
 Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inline.
 Do not invent source names, authors, dates, titles, papers, or citations that are not present in the retrieved context."""
@@ -401,7 +408,7 @@ Do not invent source names, authors, dates, titles, papers, or citations that ar
             {"role": "user", "content": prompt},
         ],
     )
-    synthesis = clean_text(response.choices[0].message.content)
+    synthesis = normalize_citation_markers(response.choices[0].message.content)
     return {
         "objective": objective,
         "synthesis_instruction": instruction,
@@ -457,6 +464,60 @@ def build_generation_context(
         used_chars += len(block)
 
     return "\n\n".join(blocks), sources
+
+
+def build_source_priority_guidance(sources: Sequence[dict[str, Any]]) -> str:
+    """Tell the synthesis LLM which retrieved sources are best for technical claims."""
+
+    primary = []
+    secondary = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        index = source.get("index")
+        url = clean_text(source.get("url"))
+        title = clean_text(source.get("title")) or url
+        if not isinstance(index, int) or not url:
+            continue
+        item = f"[{index}] {title} ({url})"
+        if primary_source_url_like(url):
+            primary.append(item)
+        else:
+            secondary.append(item)
+
+    lines = [
+        "Prefer primary/official sources for technical claims, formulas, API details, and benchmark evidence.",
+    ]
+    if primary:
+        lines.append("Primary/official candidates:")
+        lines.extend(f"- {item}" for item in primary[:12])
+    if secondary:
+        lines.append("Secondary/background candidates:")
+        lines.extend(f"- {item}" for item in secondary[:8])
+    return "\n".join(lines)
+
+
+def primary_source_url_like(url: str) -> bool:
+    normalized_url = clean_text(url).lower()
+    return (
+        "arxiv.org/pdf/" in normalized_url
+        or "arxiv.org/abs/" in normalized_url
+        or "docs." in normalized_url
+        or "pytorch.org" in normalized_url
+        or "tensorflow.org" in normalized_url
+        or "openreview.net/pdf" in normalized_url
+        or "doi.org" in normalized_url
+        or ".edu" in normalized_url
+    )
+
+
+def normalize_citation_markers(text: str) -> str:
+    """Convert model-specific citation glyphs to plain [n] markers."""
+
+    normalized = clean_text(text)
+    normalized = re.sub(r"【\s*(\d+)(?:[^】]*)?】", r"[\1]", normalized)
+    normalized = re.sub(r"\[\s*(\d+)\s*\]", r"[\1]", normalized)
+    return normalized
 
 
 def compact_retrieved_chunks(
