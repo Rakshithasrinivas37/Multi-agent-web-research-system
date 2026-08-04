@@ -26,17 +26,17 @@ from src.tools.text_utils import clean_text
 
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
-DEFAULT_MAX_CONTEXT_CHARS = 18000
+DEFAULT_MAX_CONTEXT_CHARS = 45000
 DEFAULT_MAX_TOKENS = 900
-DEFAULT_REPORT_MAX_TOKENS = 2200
+DEFAULT_REPORT_MAX_TOKENS = 4500
 DEFAULT_REPORT_TOP_K = 20
 DEFAULT_REPORT_PER_QUERY_K = 25
 DEFAULT_REPORT_SEMANTIC_WEIGHT = 0.30
 DEFAULT_REPORT_BM25_WEIGHT = 0.30
 DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
-DEFAULT_CONTEXT_BLOCK_CHARS = 1200
+DEFAULT_CONTEXT_BLOCK_CHARS = 1800
 DEFAULT_REPORT_SOURCE_URL_K = 1
-DEFAULT_REPORT_SUPPORTING_CHUNKS = 12
+DEFAULT_REPORT_SUPPORTING_CHUNKS = 18
 URL_PATTERN = re.compile(r"https?://[^\s\])}>\"']+")
 
 
@@ -123,6 +123,7 @@ def synthesize_report_from_research_plan(
         objective=objective,
         retrieved_context=retrieved_context,
         synthesis_instruction=clean_text(research_plan.get("synthesis_instruction")),
+        planner_questions=planner_sub_questions(research_plan),
         model=model,
         max_context_chars=max_context_chars,
         max_tokens=max_tokens,
@@ -193,6 +194,16 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     if objective:
         queries.append(objective)
     return dedupe_preserve_order(queries)
+
+
+def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
+    """Return planner sub-questions without mixing in fallback task text."""
+
+    return dedupe_preserve_order(
+        clean_text(question)
+        for question in research_plan.get("sub_questions", [])
+        if clean_text(question)
+    )
 
 
 def rewrite_query_from_planner_queries(
@@ -342,11 +353,12 @@ def synthesize_context_for_report(
     objective: str,
     retrieved_context: Sequence[RetrievalResult],
     synthesis_instruction: str = "",
+    planner_questions: Sequence[str] | None = None,
     model: str | None = None,
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
     max_tokens: int = DEFAULT_REPORT_MAX_TOKENS,
 ) -> dict[str, Any]:
-    """Synthesize retrieved chunks into a compact payload for a report agent."""
+    """Synthesize retrieved chunks into a detailed evidence package for a report agent."""
     objective = clean_text(objective)
     if not objective:
         raise ValueError("objective is required")
@@ -366,6 +378,7 @@ def synthesize_context_for_report(
 
     context_text, sources = build_generation_context(retrieved_context, max_context_chars=max_context_chars)
     source_priority_guidance = build_source_priority_guidance(sources)
+    planner_question_text = format_planner_questions(planner_questions or [])
     instruction = clean_text(synthesis_instruction) or "Synthesize the retrieved evidence into report-ready research notes."
     prompt = f"""Research objective:
 {objective}
@@ -373,28 +386,43 @@ def synthesize_context_for_report(
 Synthesis instruction:
 {instruction}
 
+Planner sub-questions to cover:
+{planner_question_text}
+
 Source priority guidance:
 {source_priority_guidance}
 
 Retrieved context from multiple sources:
 {context_text}
 
-Create report-agent-ready research notes using only the retrieved context.
-Return concise Markdown with these sections:
-- Key Findings
-- Technical Details
-- Source Evidence
-- Conflicts Or Gaps
-- Recommended Report Angle
+Create a detailed report-agent-ready evidence package using only the retrieved context.
+Do not write the final report. Prepare rich notes that another agent can turn into a technical report.
+
+Return Markdown with these sections:
+1. Coverage Map
+   - For each planner sub-question, state whether the retrieved context has strong, partial, or missing evidence.
+2. Section Notes By Planner Question
+   - Repeat each planner sub-question as a subsection.
+   - Include the direct answer, important evidence, equations/formulas/API details when available, and gaps.
+   - Keep enough detail for a report agent to write a full section without needing to infer missing facts.
+3. Cross-Source Synthesis
+   - Connect repeated ideas across sources and identify how the sources complement each other.
+4. Technical Details To Preserve
+   - Preserve exact equations, definitions, model components, implementation details, and benchmark values only when present in the retrieved context.
+5. Conflicts Or Gaps
+   - List missing evidence, weak citations, source conflicts, or claims that need caution.
+6. Recommended Report Structure
+   - Suggest report sections and which source markers support each section.
 
 Use only plain ASCII numbered source markers that appear in the retrieved context, exactly like [1], [2], [3].
 Every evidence-backed claim must include at least one source marker.
 For equations, formulas, API signatures, benchmark numbers, and historical attribution, cite original papers, official documentation, academic sources, or authoritative surveys first.
 If a primary/official source and a secondary explainer both support the same technical claim, cite the primary/official source and omit the secondary citation.
 Use secondary explainers only for intuition, examples, or background wording.
-Use compact bullets only. Do not use Markdown tables.
+Do not compress important technical details into vague summaries.
+Do not use Markdown tables.
 Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inline.
-Do not invent source names, authors, dates, titles, papers, or citations that are not present in the retrieved context."""
+Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
 
     response = Groq().chat.completions.create(
         model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
@@ -412,10 +440,18 @@ Do not invent source names, authors, dates, titles, papers, or citations that ar
     return {
         "objective": objective,
         "synthesis_instruction": instruction,
+        "planner_questions": list(planner_questions or []),
         "synthesis": synthesis,
         "sources": sources,
         "model": response.model,
     }
+
+
+def format_planner_questions(questions: Sequence[str]) -> str:
+    clean_questions = dedupe_preserve_order(questions)
+    if not clean_questions:
+        return "No planner sub-questions were provided. Cover the research objective directly."
+    return "\n".join(f"- {question}" for question in clean_questions)
 
 
 def build_generation_context(
@@ -514,9 +550,11 @@ def primary_source_url_like(url: str) -> bool:
 def normalize_citation_markers(text: str) -> str:
     """Convert model-specific citation glyphs to plain [n] markers."""
 
-    normalized = clean_text(text)
+    normalized = str(text or "").strip()
     normalized = re.sub(r"【\s*(\d+)(?:[^】]*)?】", r"[\1]", normalized)
     normalized = re.sub(r"\[\s*(\d+)\s*\]", r"[\1]", normalized)
+    normalized = re.sub(r"[ \t]+$", "", normalized, flags=re.MULTILINE)
+    normalized = re.sub(r"\n{4,}", "\n\n\n", normalized)
     return normalized
 
 
