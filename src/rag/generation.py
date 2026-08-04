@@ -26,17 +26,17 @@ from src.tools.text_utils import clean_text
 
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
-DEFAULT_MAX_CONTEXT_CHARS = 22000
+DEFAULT_MAX_CONTEXT_CHARS = 18000
 DEFAULT_MAX_TOKENS = 900
-DEFAULT_REPORT_MAX_TOKENS = 1800
+DEFAULT_REPORT_MAX_TOKENS = 1400
 DEFAULT_REPORT_TOP_K = 20
 DEFAULT_REPORT_PER_QUERY_K = 25
 DEFAULT_REPORT_SEMANTIC_WEIGHT = 0.30
 DEFAULT_REPORT_BM25_WEIGHT = 0.30
 DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
-DEFAULT_CONTEXT_BLOCK_CHARS = 900
-DEFAULT_REPORT_SOURCE_URL_K = 3
-DEFAULT_REPORT_SUPPORTING_CHUNKS = 8
+DEFAULT_CONTEXT_BLOCK_CHARS = 750
+DEFAULT_REPORT_SOURCE_URL_K = 2
+DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 URL_PATTERN = re.compile(r"https?://[^\s\])}>\"']+")
@@ -396,11 +396,17 @@ def synthesize_context_for_report(
     except ImportError as error:
         raise RuntimeError("groq package is not installed. Install it with `pip install -r requirements.txt`.") from error
 
-    context_text, sources = build_generation_context(retrieved_context, max_context_chars=max_context_chars)
-    source_priority_guidance = build_source_priority_guidance(sources)
     planner_question_text = format_planner_questions(planner_questions or [])
     instruction = clean_text(synthesis_instruction) or "Synthesize the retrieved evidence into report-ready research notes."
-    prompt = f"""Research objective:
+    client = Groq()
+    last_error: Exception | None = None
+
+    for attempt in range(3):
+        context_budget = max(8000, int(max_context_chars * (0.70 ** attempt)))
+        token_budget = max(700, int(max_tokens * (0.80 ** attempt)))
+        context_text, sources = build_generation_context(retrieved_context, max_context_chars=context_budget)
+        source_priority_guidance = build_source_priority_guidance(sources)
+        prompt = f"""Research objective:
 {objective}
 
 Synthesis instruction:
@@ -445,27 +451,41 @@ Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inl
 If a requested equation, number, API detail, or definition is not explicitly present in the retrieved context, mark it as missing evidence and tell the report agent not to add it.
 Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
 
-    response = Groq().chat.completions.create(
-        model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
-        temperature=0,
-        max_tokens=max(300, max_tokens),
-        messages=[
-            {
-                "role": "system",
-                "content": "You synthesize retrieved RAG evidence for a downstream report agent. Do not use outside knowledge.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-    )
-    synthesis = normalize_citation_markers(response.choices[0].message.content)
-    return {
-        "objective": objective,
-        "synthesis_instruction": instruction,
-        "planner_questions": list(planner_questions or []),
-        "synthesis": synthesis,
-        "sources": sources,
-        "model": response.model,
-    }
+        try:
+            response = client.chat.completions.create(
+                model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
+                temperature=0,
+                max_tokens=max(300, token_budget),
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You synthesize retrieved RAG evidence for a downstream report agent. Do not use outside knowledge.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+        except Exception as error:
+            last_error = error
+            if is_request_too_large_error(error) and attempt < 2:
+                continue
+            raise
+
+        synthesis = normalize_citation_markers(response.choices[0].message.content)
+        return {
+            "objective": objective,
+            "synthesis_instruction": instruction,
+            "planner_questions": list(planner_questions or []),
+            "synthesis": synthesis,
+            "sources": sources,
+            "model": response.model,
+            "synthesis_attempts": attempt + 1,
+            "synthesis_context_chars": context_budget,
+            "synthesis_max_tokens": max(300, token_budget),
+        }
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("synthesis failed before calling the generation model")
 
 
 def format_planner_questions(questions: Sequence[str]) -> str:
@@ -473,6 +493,16 @@ def format_planner_questions(questions: Sequence[str]) -> str:
     if not clean_questions:
         return "No planner sub-questions were provided. Cover the research objective directly."
     return "\n".join(f"- {question}" for question in clean_questions)
+
+
+def is_request_too_large_error(error: Exception) -> bool:
+    message = clean_text(error).lower()
+    return (
+        "request too large" in message
+        or "tokens per minute" in message
+        or "rate_limit_exceeded" in message
+        or "tpm" in message
+    )
 
 
 def build_generation_context(
