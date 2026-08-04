@@ -54,14 +54,17 @@ class ReportAgent:
             raise RuntimeError("groq package is not installed. Install it with `pip install -r requirements.txt`.") from error
 
         objective = clean_text(report_context.get("objective"))
-        synthesis = clean_text(report_context.get("synthesis"))
+        synthesis = normalize_citation_markers(report_context.get("synthesis"))
         if not objective:
             raise ValueError("report_context.objective is required")
         if not synthesis:
             raise ValueError("report_context.synthesis is required")
 
-        source_text = format_sources(report_context.get("sources", []))
-        evidence_text = format_supporting_evidence(report_context)
+        original_sources = report_context.get("sources", [])
+        sources, citation_aliases = dedupe_sources_by_url(original_sources)
+        synthesis = remap_citation_markers(synthesis, citation_aliases)
+        source_text = format_sources(sources)
+        evidence_text = format_supporting_evidence(report_context, citation_aliases=citation_aliases)
         citation_policy = clean_text(report_context.get("citation_policy")) or (
             "Use only numbered source markers from the provided sources."
         )
@@ -99,7 +102,7 @@ Requirements:
 - For formulas, APIs, benchmark claims, and historical attribution, prefer original papers, official docs, academic sources, or authoritative surveys.
 - Do not cite sources that are not listed.
 - Do not use citation formats like 【1】, footnotes, line citations, or URLs inline.
-- End with a References section mapping source markers to source URLs.
+- End with a References section mapping only used source markers to source URLs.
 - If evidence is incomplete, mention the limitation instead of inventing details."""
 
         response = Groq().chat.completions.create(
@@ -119,10 +122,11 @@ Requirements:
             "objective": objective,
             "output_format": clean_text(output_format) or "report",
             "report": report,
-            "sources": report_context.get("sources", []),
+            "sources": sources,
             "model": response.model,
             "diagnostics": {
-                "source_count": len(report_context.get("sources", []) or []),
+                "source_count": len(sources),
+                "deduped_source_count": len(original_sources or []) - len(sources),
                 "supporting_chunk_count": len(report_context.get("supporting_chunks", []) or []),
                 "report_length": len(report),
             },
@@ -155,6 +159,32 @@ def format_sources(sources: Sequence[Any]) -> str:
     return "\n\n".join(lines) or "No sources provided."
 
 
+def dedupe_sources_by_url(sources: Sequence[Any]) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    """Keep one citation marker per unique URL and alias duplicate markers."""
+
+    deduped = []
+    first_index_by_url: dict[str, int] = {}
+    citation_aliases: dict[int, int] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        index = source.get("index")
+        url = clean_text(source.get("url"))
+        if not isinstance(index, int) or not url:
+            continue
+        key = normalize_source_key(url)
+        if key in first_index_by_url:
+            citation_aliases[index] = first_index_by_url[key]
+            continue
+        first_index_by_url[key] = index
+        deduped.append(source)
+    return deduped, citation_aliases
+
+
+def normalize_source_key(url: str) -> str:
+    return clean_text(url).lower().rstrip("/")
+
+
 def write_report_file(
     report_payload: dict[str, Any],
     memory_path: str = "data/shared_memory.json",
@@ -162,7 +192,7 @@ def write_report_file(
 ) -> str:
     """Save report Markdown to disk and return its path."""
 
-    report = clean_text(report_payload.get("report"))
+    report = clean_markdown(report_payload.get("report"))
     if not report:
         raise ValueError("report_payload.report is required")
 
@@ -187,11 +217,15 @@ def slugify_filename(text: str, max_length: int = 80) -> str:
     return (slug[:max_length].strip("-") or "research-report")
 
 
-def format_supporting_evidence(report_context: dict[str, Any]) -> str:
+def format_supporting_evidence(
+    report_context: dict[str, Any],
+    citation_aliases: dict[int, int] | None = None,
+) -> str:
     chunks = report_context.get("supporting_chunks") or report_context.get("retrieved_chunks") or []
     if not isinstance(chunks, list):
         return "No supporting chunks provided."
 
+    citation_aliases = citation_aliases or {}
     blocks = []
     used_chars = 0
     for chunk in chunks:
@@ -200,6 +234,8 @@ def format_supporting_evidence(report_context: dict[str, Any]) -> str:
         source_index = chunk.get("source_index")
         if not isinstance(source_index, int):
             source_index = chunk.get("index")
+        if isinstance(source_index, int):
+            source_index = citation_aliases.get(source_index, source_index)
         url = clean_text(chunk.get("url"))
         title = clean_text(chunk.get("title")) or url or "Source"
         content = clean_text(chunk.get("content"))
@@ -216,7 +252,28 @@ def format_supporting_evidence(report_context: dict[str, Any]) -> str:
 
 
 def normalize_citation_markers(text: str) -> str:
-    normalized = clean_text(text)
+    normalized = clean_markdown(text)
     normalized = re.sub(r"【\s*(\d+)(?:[^】]*)?】", r"[\1]", normalized)
     normalized = re.sub(r"\[\s*(\d+)\s*\]", r"[\1]", normalized)
+    return normalized
+
+
+def remap_citation_markers(text: str, citation_aliases: dict[int, int]) -> str:
+    if not citation_aliases:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        index = int(match.group(1))
+        return f"[{citation_aliases.get(index, index)}]"
+
+    return re.sub(r"\[(\d+)\]", replace, text)
+
+
+def clean_markdown(value: Any) -> str:
+    """Normalize Markdown spacing without collapsing line breaks."""
+
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    normalized = "\n".join(lines).strip()
+    normalized = re.sub(r"\n{4,}", "\n\n\n", normalized)
     return normalized
