@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=None,
-        help="Groq model for planner and synthesis. Defaults to RESEARCH_PLANNER_MODEL.",
+        help="Groq model for planner, synthesis, and report. Defaults to RESEARCH_PLANNER_MODEL.",
     )
     return parser.parse_args()
 
@@ -89,6 +89,7 @@ async def async_main() -> int:
                 "change_detection": state.get("change_detection"),
                 "rag_index": state.get("rag_index"),
                 "synthesis": state.get("synthesis"),
+                "report": state.get("report"),
             },
             indent=2,
         )
