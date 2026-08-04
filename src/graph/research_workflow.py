@@ -7,6 +7,7 @@ from langgraph.graph import END, StateGraph
 from src.agents.browser_agent import BrowserAgent
 from src.agents.change_detection_agent import ChangeDetectionAgent
 from src.agents.planner_agent import PlannerAgent
+from src.agents.report_agent import ReportAgent
 from src.agents.synthesis_agent import SynthesisAgent
 from src.memory.shared_memory import SharedMemory
 from src.rag import index_research_results
@@ -23,6 +24,7 @@ class ResearchState(TypedDict, total=False):
     chroma_path: str
     model: str
     synthesis: dict[str, Any]
+    report: dict[str, Any]
     max_concurrency: int
     errors: list[str]
 
@@ -161,6 +163,43 @@ def synthesis_node(state: ResearchState) -> ResearchState:
         "errors": state.get("errors", []),
     }
 
+def report_node(state: ResearchState) -> ResearchState:
+    """Generate the final report from synthesis output."""
+
+    memory_path = state.get("memory_path") or "data/shared_memory.json"
+    report_context = state.get("synthesis")
+    if not report_context:
+        memory = SharedMemory(memory_path)
+        report_context = memory.read_agent_output("synthesis").get("report_context", {})
+    if not report_context:
+        return {
+            **state,
+            "memory_path": memory_path,
+            "errors": [*state.get("errors", []), "report_node requires synthesis.report_context"],
+        }
+
+    research_plan = state.get("research_plan") or read_research_plan_from_memory(memory_path)
+    report_agent = ReportAgent(model=state.get("model"))
+    try:
+        report = report_agent.generate(
+            report_context,
+            output_format=clean_text(research_plan.get("output_format")) or "report",
+        )
+    except Exception as error:
+        return {
+            **state,
+            "memory_path": memory_path,
+            "errors": [*state.get("errors", []), clean_text(error)],
+        }
+
+    report_agent.write_to_memory(report, memory_path)
+    return {
+        **state,
+        "report": report,
+        "memory_path": memory_path,
+        "errors": state.get("errors", []),
+    }
+
 def index_rag_after_change_detection(
     browser_results: list[dict[str, Any]],
     research_plan: dict[str, Any],
@@ -207,8 +246,10 @@ def build_research_graph():
     graph.add_edge("planner", "browser")
     graph.add_edge("browser", "change_detection")
     graph.add_node("synthesis", synthesis_node)
+    graph.add_node("report", report_node)
     graph.add_edge("change_detection", "synthesis")
-    graph.add_edge("synthesis", END)
+    graph.add_edge("synthesis", "report")
+    graph.add_edge("report", END)
     return graph.compile()
 
 def run_planner_graph(objective: str, memory_path: str = "data/shared_memory.json") -> ResearchState:
