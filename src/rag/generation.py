@@ -65,6 +65,8 @@ def synthesize_report_from_research_plan(
     model: str | None = None,
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
     max_tokens: int = DEFAULT_REPORT_MAX_TOKENS,
+    include_retrieved_chunks: bool = False,
+    retrieved_chunk_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
 ) -> dict[str, Any]:
     """Retrieve with planner-derived queries, then synthesize report-ready notes."""
     objective = clean_text(research_plan.get("objective"))
@@ -129,6 +131,11 @@ def synthesize_report_from_research_plan(
     payload["planned_source_urls"] = planned_source_urls
     payload["source_coverage_count"] = len(source_coverage_results)
     payload["retrieved_count"] = len(retrieved_context)
+    if include_retrieved_chunks:
+        payload["retrieved_chunks"] = compact_retrieved_chunks(
+            retrieved_context,
+            max_chars=retrieved_chunk_chars,
+        )
     return payload
 
 
@@ -207,7 +214,7 @@ Requirements:
 - Return only the rewritten query text, no bullets, no markdown, no explanation."""
 
     response = Groq().chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
         temperature=0,
         max_tokens=350,
         messages=[
@@ -435,6 +442,30 @@ def build_generation_context(
         used_chars += len(block)
 
     return "\n\n".join(blocks), sources
+
+
+def compact_retrieved_chunks(
+    retrieved_context: Sequence[RetrievalResult],
+    max_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+) -> list[dict[str, Any]]:
+    """Serialize selected retrieved chunks for a downstream report agent."""
+
+    chunks = []
+    for rank, result in enumerate(retrieved_context, start=1):
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        url = primary_source_url(metadata)
+        title = clean_text(metadata.get("title")) or url or f"Source {rank}"
+        chunks.append(
+            {
+                "retrieval_rank": rank,
+                "id": result.id,
+                "url": url,
+                "title": title,
+                "score": result.score,
+                "content": display_document_preview(result.document, max_chars=max_chars),
+            }
+        )
+    return chunks
 
 
 def source_balanced_results(retrieved_context: Sequence[RetrievalResult]) -> list[RetrievalResult]:

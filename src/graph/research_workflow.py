@@ -7,6 +7,7 @@ from langgraph.graph import END, StateGraph
 from src.agents.browser_agent import BrowserAgent
 from src.agents.change_detection_agent import ChangeDetectionAgent
 from src.agents.planner_agent import PlannerAgent
+from src.agents.synthesis_agent import SynthesisAgent
 from src.memory.shared_memory import SharedMemory
 from src.rag import index_research_results
 from src.tools.text_utils import clean_text
@@ -20,6 +21,8 @@ class ResearchState(TypedDict, total=False):
     memory_path: str
     history_db_path: str
     chroma_path: str
+    model: str
+    synthesis: dict[str, Any]
     max_concurrency: int
     errors: list[str]
 
@@ -31,7 +34,8 @@ def planner_node(state: ResearchState) -> ResearchState:
         return {"errors": ["objective is required"]}
 
     memory_path = state.get("memory_path") or "data/shared_memory.json"
-    planner = PlannerAgent(use_llm=True)
+    model = clean_text(state.get("model"))
+    planner = PlannerAgent(use_llm=True, model=model or None)
     plan = planner.plan(objective)
     planner.write_to_memory(plan, memory_path)
 
@@ -39,6 +43,7 @@ def planner_node(state: ResearchState) -> ResearchState:
         "objective": plan.objective,
         "research_plan": plan.to_dict(),
         "memory_path": memory_path,
+        "model": planner.model,
         "errors": [],
     }
 
@@ -121,6 +126,41 @@ def change_detection_node(state: ResearchState) -> ResearchState:
         "errors": errors,
     }
 
+def synthesis_node(state: ResearchState) -> ResearchState:
+    """Retrieve indexed evidence and write report-ready synthesis to memory."""
+
+    memory_path = state.get("memory_path") or "data/shared_memory.json"
+    chroma_path = state.get("chroma_path") or "data/chroma"
+    plan = state.get("research_plan") or read_research_plan_from_memory(memory_path)
+    if not plan:
+        return {
+            **state,
+            "memory_path": memory_path,
+            "errors": [*state.get("errors", []), "synthesis_node requires research_plan"],
+        }
+
+    synthesis_agent = SynthesisAgent(
+        model=state.get("model"),
+        chroma_path=chroma_path,
+    )
+    try:
+        synthesis = synthesis_agent.synthesize(plan)
+    except Exception as error:
+        return {
+            **state,
+            "memory_path": memory_path,
+            "errors": [*state.get("errors", []), clean_text(error)],
+        }
+
+    synthesis_agent.write_to_memory(synthesis, memory_path)
+    return {
+        **state,
+        "synthesis": synthesis,
+        "memory_path": memory_path,
+        "chroma_path": chroma_path,
+        "errors": state.get("errors", []),
+    }
+
 def index_rag_after_change_detection(
     browser_results: list[dict[str, Any]],
     research_plan: dict[str, Any],
@@ -166,7 +206,9 @@ def build_research_graph():
     graph.set_entry_point("planner")
     graph.add_edge("planner", "browser")
     graph.add_edge("browser", "change_detection")
-    graph.add_edge("change_detection", END)
+    graph.add_node("synthesis", synthesis_node)
+    graph.add_edge("change_detection", "synthesis")
+    graph.add_edge("synthesis", END)
     return graph.compile()
 
 def run_planner_graph(objective: str, memory_path: str = "data/shared_memory.json") -> ResearchState:
@@ -186,6 +228,7 @@ async def run_research_graph(
     history_db_path: str = "data/browser_history.db",
     chroma_path: str = "data/chroma",
     max_concurrency: int = 3,
+    model: str | None = None,
 ) -> ResearchState:
     """Run the LangGraph workflow through planner, browser, change detection, and RAG indexing."""
 
@@ -197,5 +240,6 @@ async def run_research_graph(
             "history_db_path": history_db_path,
             "chroma_path": chroma_path,
             "max_concurrency": max_concurrency,
+            "model": model or "",
         }
     )
