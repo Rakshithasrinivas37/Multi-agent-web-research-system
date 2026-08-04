@@ -35,8 +35,10 @@ DEFAULT_REPORT_SEMANTIC_WEIGHT = 0.30
 DEFAULT_REPORT_BM25_WEIGHT = 0.30
 DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
 DEFAULT_CONTEXT_BLOCK_CHARS = 900
-DEFAULT_REPORT_SOURCE_URL_K = 1
+DEFAULT_REPORT_SOURCE_URL_K = 3
 DEFAULT_REPORT_SUPPORTING_CHUNKS = 8
+MIN_EVIDENCE_CHARS = 120
+MIN_EVIDENCE_TOKENS = 12
 URL_PATTERN = re.compile(r"https?://[^\s\])}>\"']+")
 
 
@@ -109,7 +111,7 @@ def synthesize_report_from_research_plan(
     source_coverage_results = []
     if include_planned_source_urls and planned_source_urls:
         source_coverage_results = source_url_coverage_retrieve(
-            source_urls=missing_source_urls(planned_source_urls, retrieved_context),
+            source_urls=missing_or_weak_source_urls(planned_source_urls, retrieved_context),
             query=retrieval_queries,
             chroma_path=chroma_path,
             collection_name=collection_name,
@@ -137,7 +139,9 @@ def synthesize_report_from_research_plan(
     payload["citation_policy"] = (
         "Use only the numbered source indexes in sources. Prefer primary papers, "
         "official documentation, academic sources, and authoritative surveys for "
-        "technical claims. Use secondary explainers only for intuition."
+        "technical claims. Use secondary explainers only for intuition. If the "
+        "synthesis marks a formula, number, API detail, or definition as missing "
+        "evidence, do not add it to the report unless it appears in a supporting chunk."
     )
     payload["supporting_chunks"] = report_supporting_chunks(
         retrieved_context,
@@ -289,6 +293,22 @@ def missing_source_urls(
     return [url for url in planned_urls if url not in covered_urls]
 
 
+def missing_or_weak_source_urls(
+    planned_urls: Sequence[str],
+    retrieved_context: Sequence[RetrievalResult],
+) -> list[str]:
+    """Return planned URLs that do not have a meaningful retrieved evidence chunk."""
+
+    covered_urls = set()
+    for result in retrieved_context:
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        chunk = retrieved_chunk_preview(result.document, metadata, max_chars=MIN_EVIDENCE_CHARS * 3)
+        if not is_meaningful_evidence(chunk):
+            continue
+        covered_urls.update(result_source_urls_from_metadata(metadata))
+    return [url for url in planned_urls if url not in covered_urls]
+
+
 def merge_retrieved_context(*groups: Sequence[RetrievalResult]) -> list[RetrievalResult]:
     merged = []
     seen_ids = set()
@@ -422,6 +442,7 @@ Use secondary explainers only for intuition, examples, or background wording.
 Do not compress important technical details into vague summaries.
 Do not use Markdown tables.
 Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inline.
+If a requested equation, number, API detail, or definition is not explicitly present in the retrieved context, mark it as missing evidence and tell the report agent not to add it.
 Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
 
     response = Groq().chat.completions.create(
@@ -476,7 +497,7 @@ def build_generation_context(
         citation_index = len(blocks) + 1
         title = clean_text(metadata.get("title")) or url or f"Source {citation_index}"
         chunk = retrieved_chunk_preview(result.document, metadata, max_chars=block_char_limit)
-        if not chunk:
+        if not is_meaningful_evidence(chunk):
             continue
 
         block = f"[{citation_index}] {title}\nURL: {url}\n{chunk}"
@@ -572,7 +593,7 @@ def compact_retrieved_chunks(
         url = primary_source_url(metadata)
         title = clean_text(metadata.get("title")) or url or f"Source {rank}"
         content = retrieved_chunk_preview(result.document, metadata, max_chars=max_chars)
-        if not content:
+        if not is_meaningful_evidence(content):
             continue
         chunks.append(
             {
@@ -636,8 +657,11 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         1 for result in retrieved_context
         if is_primary_source(result.metadata if isinstance(result.metadata, dict) else {})
     )
+    evidence_chunk_count = count_meaningful_evidence_chunks(retrieved_context)
     return {
         "retrieved_count": len(retrieved_context),
+        "evidence_chunk_count": evidence_chunk_count,
+        "filtered_weak_chunk_count": max(0, len(retrieved_context) - evidence_chunk_count),
         "source_count": len(sources) if isinstance(sources, list) else 0,
         "supporting_chunk_count": len(supporting_chunks) if isinstance(supporting_chunks, list) else 0,
         "primary_source_count": primary_source_count,
@@ -664,11 +688,14 @@ def retrieved_chunk_preview(document: str, metadata: dict[str, Any], max_chars: 
     """Return chunk body text without dropping content after stored headers."""
 
     body = strip_stored_chunk_headers(document, metadata)
+    if not body and stored_chunk_header_present(document):
+        return ""
     if not body:
         body = display_document_preview(document, max_chars=max_chars)
     if not body:
         body = clean_text(document)
-    return body[: max(80, max_chars)].strip()
+    preview = body[: max(80, max_chars)].strip()
+    return preview if is_meaningful_evidence(preview) else ""
 
 
 def strip_stored_chunk_headers(document: str, metadata: dict[str, Any]) -> str:
@@ -709,6 +736,36 @@ def strip_stored_chunk_headers(document: str, metadata: dict[str, Any]) -> str:
         return clean_text(tail)
 
     return text
+
+
+def stored_chunk_header_present(document: str) -> bool:
+    """Detect chunks that begin with indexing metadata headers."""
+
+    text = clean_text(document).lower()
+    return text.startswith("source:") and " url:" in text and " task:" in text
+
+
+def is_meaningful_evidence(text: str) -> bool:
+    """Reject empty and metadata-only chunks before synthesis/report packaging."""
+
+    value = clean_text(text)
+    if len(value) < MIN_EVIDENCE_CHARS:
+        return False
+    if len(re.findall(r"[A-Za-z0-9_]+", value)) < MIN_EVIDENCE_TOKENS:
+        return False
+    if stored_chunk_header_present(value):
+        return False
+    return True
+
+
+def count_meaningful_evidence_chunks(retrieved_context: Sequence[RetrievalResult]) -> int:
+    count = 0
+    for result in retrieved_context:
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        chunk = retrieved_chunk_preview(result.document, metadata, max_chars=MIN_EVIDENCE_CHARS * 3)
+        if is_meaningful_evidence(chunk):
+            count += 1
+    return count
 
 
 def source_balanced_results(retrieved_context: Sequence[RetrievalResult]) -> list[RetrievalResult]:
