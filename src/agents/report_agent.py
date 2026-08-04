@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import Path
 from typing import Any, Sequence
 
 from src.memory.shared_memory import SharedMemory
@@ -14,6 +15,7 @@ DEFAULT_REPORT_AGENT_MODEL = "llama-3.1-8b-instant"
 DEFAULT_REPORT_AGENT_MAX_TOKENS = 3200
 DEFAULT_REPORT_AGENT_CONTEXT_CHARS = 30000
 DEFAULT_REPORT_AGENT_CHUNK_CHARS = 1000
+DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
 
 
 class ReportAgent:
@@ -130,9 +132,12 @@ Requirements:
         self,
         report_payload: dict[str, Any],
         memory_path: str = "data/shared_memory.json",
+        report_path: str | None = None,
     ) -> None:
-        """Persist the final report."""
+        """Persist the final report to a Markdown file and shared memory."""
 
+        saved_path = write_report_file(report_payload, memory_path, report_path)
+        report_payload = {**report_payload, "report_path": saved_path}
         memory = SharedMemory(memory_path)
         memory.write_agent_output("report", {"final_report": report_payload})
 
@@ -148,6 +153,38 @@ def format_sources(sources: Sequence[Any]) -> str:
         if isinstance(index, int) and url:
             lines.append(f"[{index}] {title}\nURL: {url}")
     return "\n\n".join(lines) or "No sources provided."
+
+
+def write_report_file(
+    report_payload: dict[str, Any],
+    memory_path: str = "data/shared_memory.json",
+    report_path: str | None = None,
+) -> str:
+    """Save report Markdown to disk and return its path."""
+
+    report = clean_text(report_payload.get("report"))
+    if not report:
+        raise ValueError("report_payload.report is required")
+
+    output_path = Path(report_path) if report_path else default_report_path(report_payload, memory_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(report + "\n", encoding="utf-8")
+    return str(output_path)
+
+
+def default_report_path(report_payload: dict[str, Any], memory_path: str) -> Path:
+    memory_parent = Path(memory_path).parent
+    if str(memory_parent) in {"", "."}:
+        output_dir = Path(DEFAULT_REPORT_OUTPUT_DIR)
+    else:
+        output_dir = memory_parent / "reports"
+    objective = clean_text(report_payload.get("objective")) or "research-report"
+    return output_dir / f"{slugify_filename(objective)}.md"
+
+
+def slugify_filename(text: str, max_length: int = 80) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", clean_text(text).lower()).strip("-")
+    return (slug[:max_length].strip("-") or "research-report")
 
 
 def format_supporting_evidence(report_context: dict[str, Any]) -> str:
