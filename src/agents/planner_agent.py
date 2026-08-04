@@ -983,7 +983,7 @@ def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[
 
     try:
         response = Groq().chat.completions.create(
-            model="openai/gpt-oss-20b",
+            model=clean_text(model) or os.environ.get("RESEARCH_PLANNER_MODEL", "llama-3.1-8b-instant"),
             temperature=0,
             max_tokens=80,
             messages=[

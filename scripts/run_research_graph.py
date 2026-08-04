@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Number of browser tasks to process in parallel.",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Groq model for planner and synthesis. Defaults to RESEARCH_PLANNER_MODEL.",
+    )
     return parser.parse_args()
 
 
@@ -66,6 +71,7 @@ async def async_main() -> int:
         history_db_path=str(args.history_db),
         chroma_path=str(args.chroma_path),
         max_concurrency=args.max_concurrency,
+        model=args.model,
     )
 
     if state.get("errors"):
@@ -82,6 +88,7 @@ async def async_main() -> int:
                 "browser_results": state.get("browser_results"),
                 "change_detection": state.get("change_detection"),
                 "rag_index": state.get("rag_index"),
+                "synthesis": state.get("synthesis"),
             },
             indent=2,
         )
