@@ -70,30 +70,42 @@ class SynthesisAgent:
             or clean_text(os.environ.get("RAG_GENERATION_MODEL"))
             or DEFAULT_RAG_GENERATION_MODEL
         )
-        self.chroma_path = chroma_path
-        self.collection_name = collection_name
-        self.top_k = top_k
-        self.per_query_k = per_query_k
-        self.semantic_k = semantic_k
-        self.bm25_k = bm25_k
-        self.semantic_weight = semantic_weight
-        self.bm25_weight = bm25_weight
-        self.authority_weight = authority_weight
-        self.bm25_scan_limit = bm25_scan_limit
-        self.embedding_device = embedding_device
-        self.diversify_urls = diversify_urls
-        self.rerank = rerank
-        self.reranker_model = reranker_model
-        self.rerank_k = rerank_k
-        self.rerank_weight = rerank_weight
-        self.include_planned_source_urls = include_planned_source_urls
-        self.source_url_k = source_url_k
-        self.rewrite_query = rewrite_query
-        self.include_retrieved_chunks = include_retrieved_chunks
-        self.max_context_chars = max_context_chars
-        self.max_tokens = max_tokens
-        self.retrieved_chunk_chars = retrieved_chunk_chars
-        self.supporting_chunk_count = supporting_chunk_count
+        self.chroma_path = env_text("RAG_CHROMA_PATH", chroma_path, DEFAULT_CHROMA_PATH)
+        self.collection_name = env_text("RAG_COLLECTION_NAME", collection_name, DEFAULT_COLLECTION_NAME)
+        self.top_k = env_int("RAG_REPORT_TOP_K", top_k, DEFAULT_REPORT_TOP_K)
+        self.per_query_k = env_int("RAG_REPORT_PER_QUERY_K", per_query_k, DEFAULT_REPORT_PER_QUERY_K)
+        self.semantic_k = env_int("RAG_SEMANTIC_K", semantic_k, DEFAULT_SEMANTIC_K)
+        self.bm25_k = env_int("RAG_BM25_K", bm25_k, DEFAULT_BM25_K)
+        self.semantic_weight = env_float("RAG_SEMANTIC_WEIGHT", semantic_weight, DEFAULT_REPORT_SEMANTIC_WEIGHT)
+        self.bm25_weight = env_float("RAG_BM25_WEIGHT", bm25_weight, DEFAULT_REPORT_BM25_WEIGHT)
+        self.authority_weight = env_float("RAG_AUTHORITY_WEIGHT", authority_weight, DEFAULT_REPORT_AUTHORITY_WEIGHT)
+        self.bm25_scan_limit = env_int("RAG_BM25_SCAN_LIMIT", bm25_scan_limit, DEFAULT_BM25_SCAN_LIMIT)
+        self.embedding_device = env_text("RAG_EMBEDDING_DEVICE", embedding_device, "")
+        self.diversify_urls = env_bool("RAG_DIVERSIFY_URLS", diversify_urls, True)
+        self.rerank = env_bool("RAG_RERANK", rerank, False)
+        self.reranker_model = env_text("RAG_RERANKER_MODEL", reranker_model, DEFAULT_RERANKER_MODEL)
+        self.rerank_k = env_int("RAG_RERANK_K", rerank_k, DEFAULT_RERANK_K)
+        self.rerank_weight = env_float("RAG_RERANK_WEIGHT", rerank_weight, DEFAULT_RERANK_WEIGHT)
+        self.include_planned_source_urls = env_bool(
+            "RAG_INCLUDE_PLANNED_SOURCE_URLS",
+            include_planned_source_urls,
+            True,
+        )
+        self.source_url_k = env_int("RAG_SOURCE_URL_K", source_url_k, DEFAULT_REPORT_SOURCE_URL_K)
+        self.rewrite_query = env_bool("RAG_REWRITE_QUERY", rewrite_query, False)
+        self.include_retrieved_chunks = env_bool("RAG_INCLUDE_RETRIEVED_CHUNKS", include_retrieved_chunks, True)
+        self.max_context_chars = env_int("RAG_MAX_CONTEXT_CHARS", max_context_chars, DEFAULT_MAX_CONTEXT_CHARS)
+        self.max_tokens = env_int("RAG_REPORT_MAX_TOKENS", max_tokens, DEFAULT_REPORT_MAX_TOKENS)
+        self.retrieved_chunk_chars = env_int(
+            "RAG_RETRIEVED_CHUNK_CHARS",
+            retrieved_chunk_chars,
+            DEFAULT_CONTEXT_BLOCK_CHARS,
+        )
+        self.supporting_chunk_count = env_int(
+            "RAG_SUPPORTING_CHUNKS",
+            supporting_chunk_count,
+            DEFAULT_REPORT_SUPPORTING_CHUNKS,
+        )
 
     def synthesize(self, research_plan: dict[str, Any]) -> dict[str, Any]:
         """Create report-agent-ready notes from indexed research evidence."""
@@ -101,7 +113,7 @@ class SynthesisAgent:
         if not isinstance(research_plan, dict) or not research_plan:
             raise ValueError("research_plan is required")
 
-        return synthesize_report_from_research_plan(
+        payload = synthesize_report_from_research_plan(
             research_plan=research_plan,
             chroma_path=self.chroma_path,
             collection_name=self.collection_name,
@@ -129,6 +141,26 @@ class SynthesisAgent:
             retrieved_chunk_chars=self.retrieved_chunk_chars,
             supporting_chunk_count=self.supporting_chunk_count,
         )
+        payload["synthesis_config"] = self.config_summary()
+        return payload
+
+    def config_summary(self) -> dict[str, Any]:
+        """Return the runtime knobs used by synthesis for debugging."""
+
+        return {
+            "model": self.model,
+            "top_k": self.top_k,
+            "per_query_k": self.per_query_k,
+            "semantic_k": self.semantic_k,
+            "bm25_k": self.bm25_k,
+            "diversify_urls": self.diversify_urls,
+            "source_url_k": self.source_url_k,
+            "rewrite_query": self.rewrite_query,
+            "max_context_chars": self.max_context_chars,
+            "max_tokens": self.max_tokens,
+            "supporting_chunk_count": self.supporting_chunk_count,
+            "include_retrieved_chunks": self.include_retrieved_chunks,
+        }
 
     def write_to_memory(
         self,
@@ -139,3 +171,37 @@ class SynthesisAgent:
 
         memory = SharedMemory(memory_path)
         memory.write_agent_output("synthesis", {"report_context": synthesis_payload})
+
+
+def env_text(name: str, current: str, default: str) -> str:
+    value = clean_text(os.environ.get(name))
+    if value and clean_text(current) == clean_text(default):
+        return value
+    return current
+
+
+def env_int(name: str, current: int, default: int) -> int:
+    value = os.environ.get(name)
+    if current != default or not value:
+        return current
+    try:
+        return int(value)
+    except ValueError:
+        return current
+
+
+def env_float(name: str, current: float, default: float) -> float:
+    value = os.environ.get(name)
+    if current != default or not value:
+        return current
+    try:
+        return float(value)
+    except ValueError:
+        return current
+
+
+def env_bool(name: str, current: bool, default: bool) -> bool:
+    value = clean_text(os.environ.get(name)).lower()
+    if current != default or not value:
+        return current
+    return value not in {"0", "false", "no", "off"}
