@@ -11,6 +11,20 @@ from src.tools.playwright_tool import render_with_playwright
 from src.tools.tavily_search import search_with_tavily
 from src.tools.text_utils import clean_content, clean_list, clean_text
 
+MIN_TASK_OVERLAP = 0.06
+SOURCE_STOPWORDS = {
+    "and",
+    "are",
+    "for",
+    "from",
+    "how",
+    "into",
+    "the",
+    "what",
+    "which",
+    "with",
+}
+
 
 class BrowserAgent:
     """Runs research-plan tasks and extracts task-focused evidence."""
@@ -568,6 +582,10 @@ def source_is_useful(payload: dict[str, Any], task: dict[str, Any]) -> bool:
         return False
     if blocked_or_empty_source(payload):
         return False
+    if is_bad_dictionary_source(payload, task) or is_not_found_source(payload):
+        return False
+    if not source_matches_task(payload, task):
+        return False
     if is_pricing_task(task):
         return bool(payload.get("pricing_rows") or payload.get("extracted_facts"))
     return bool(payload.get("extracted_facts") or payload.get("important_sections") or payload.get("content_length", 0) >= 800)
@@ -587,6 +605,12 @@ def source_quality_note(payload: dict[str, Any], task: dict[str, Any]) -> str:
         return bot_block_note()
     if blocked_or_empty_source(payload):
         return "source content is empty, blocked, or too short"
+    if is_bad_dictionary_source(payload, task):
+        return "dictionary result is not relevant to this research task"
+    if is_not_found_source(payload):
+        return "source appears to be a not-found or missing page"
+    if not source_matches_task(payload, task):
+        return "source content has low overlap with the task"
     if is_pricing_task(task) and not (payload.get("pricing_rows") or payload.get("extracted_facts")):
         return "no pricing rows or pricing facts found"
     return "source passed basic quality checks"
@@ -601,6 +625,54 @@ def blocked_or_empty_source(payload: dict[str, Any]) -> bool:
         ]
     ).lower()
     return payload.get("content_length", 0) < 300 or is_bot_blocked_text(text)
+
+
+def is_bad_dictionary_source(payload: dict[str, Any], task: dict[str, Any]) -> bool:
+    host = urlparse(clean_text(payload.get("url"))).netloc.lower()
+    if not any(domain in host for domain in ("dictionary.com", "merriam-webster.com", "vocabulary.com")):
+        return False
+    task_text = task_relevance_text(task).lower()
+    return not any(word in task_text for word in ("definition", "meaning", "etymology", "word"))
+
+
+def is_not_found_source(payload: dict[str, Any]) -> bool:
+    text = " ".join([clean_text(payload.get("title")), clean_text(payload.get("content_preview"))]).lower()
+    return any(term in text for term in ("404", "page not found", "does not exist", "no article"))
+
+
+def source_matches_task(payload: dict[str, Any], task: dict[str, Any]) -> bool:
+    task_terms = relevance_terms(task_relevance_text(task))
+    if not task_terms:
+        return True
+    source_text = " ".join(
+        [
+            clean_text(payload.get("title")),
+            clean_text(payload.get("content_preview")),
+            clean_text(payload.get("full_content"))[:3000],
+        ]
+    )
+    source_terms = relevance_terms(source_text)
+    overlap = len(task_terms & source_terms) / max(1, min(len(task_terms), len(source_terms)))
+    return overlap >= MIN_TASK_OVERLAP
+
+
+def task_relevance_text(task: dict[str, Any]) -> str:
+    return " ".join(
+        [
+            clean_text(task.get("query_context")),
+            clean_text(task.get("extraction_goal")),
+            clean_text(task.get("target_name")),
+            " ".join(clean_list(task.get("expected_signals"))),
+        ]
+    )
+
+
+def relevance_terms(text: str) -> set[str]:
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9_]+", clean_text(text))
+        if len(token) > 2 and token.lower() not in SOURCE_STOPWORDS
+    }
 
 
 def is_bot_blocked_page(page: dict[str, Any]) -> bool:
