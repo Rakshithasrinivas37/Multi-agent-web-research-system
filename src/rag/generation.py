@@ -205,11 +205,13 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     """
     objective = clean_text(research_plan.get("objective"))
     sub_question_queries = []
+    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
 
     for sub_question in research_plan.get("sub_questions", []):
         query = clean_text(sub_question)
         if query:
-            sub_question_queries.append(query)
+            details = matching_task_details(query, tasks)
+            sub_question_queries.append(clean_text(f"{query} {details}"))
 
     if sub_question_queries:
         if objective:
@@ -236,6 +238,33 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     if objective:
         queries.append(objective)
     return dedupe_preserve_order(queries)
+
+
+def matching_task_details(question: str, tasks: Sequence[dict[str, Any]]) -> str:
+    """Return task details that make a planner sub-question more retrievable."""
+
+    question_tokens = query_tokens(question)
+    parts = []
+    for task in tasks:
+        context = clean_text(task.get("query_context"))
+        context_tokens = query_tokens(context)
+        if not context_tokens:
+            continue
+        overlap = len(question_tokens & context_tokens) / max(1, min(len(question_tokens), len(context_tokens)))
+        if context.lower() != clean_text(question).lower() and overlap < 0.45:
+            continue
+        expected_signals = " ".join(clean_text(item) for item in task.get("expected_signals", []) if clean_text(item))
+        parts.extend([task.get("extraction_goal"), expected_signals, task.get("url")])
+    return clean_text(" ".join(clean_text(part) for part in parts if clean_text(part)))
+
+
+def query_tokens(text: str) -> set[str]:
+    stopwords = {"and", "are", "for", "from", "how", "the", "what", "with"}
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9_+#.-]+", clean_text(text))
+        if len(token) > 2 and token.lower() not in stopwords
+    }
 
 
 def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
