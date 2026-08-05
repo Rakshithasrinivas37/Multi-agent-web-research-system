@@ -83,6 +83,7 @@ def hybrid_retrieve(
     semantic_k: int = DEFAULT_SEMANTIC_K,
     bm25_k: int = DEFAULT_BM25_K,
     history_key: str = "",
+    history_keys: Sequence[str] | None = None,
     semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
     bm25_weight: float = DEFAULT_BM25_WEIGHT,
     authority_weight: float = DEFAULT_AUTHORITY_WEIGHT,
@@ -103,6 +104,40 @@ def hybrid_retrieve(
     top_k = max(1, top_k)
     semantic_k = max(top_k, semantic_k)
     bm25_k = max(top_k, bm25_k)
+
+    clean_history_keys = clean_history_key_list(history_keys)
+    if clean_history_keys:
+        scoped_results = []
+        seen_ids = set()
+        for scoped_history_key in clean_history_keys:
+            for result in hybrid_retrieve(
+                query=query,
+                chroma_path=chroma_path,
+                collection_name=collection_name,
+                top_k=top_k,
+                semantic_k=semantic_k,
+                bm25_k=bm25_k,
+                history_key=scoped_history_key,
+                semantic_weight=semantic_weight,
+                bm25_weight=bm25_weight,
+                authority_weight=authority_weight,
+                bm25_scan_limit=bm25_scan_limit,
+                embedding_device=embedding_device,
+                diversify_urls=False,
+                rerank=rerank,
+                reranker_model=reranker_model,
+                rerank_k=rerank_k,
+                rerank_weight=rerank_weight,
+            ):
+                if result.id in seen_ids:
+                    continue
+                seen_ids.add(result.id)
+                scoped_results.append(result)
+        scoped_results = sorted(scoped_results, key=lambda item: item.score, reverse=True)
+        if diversify_urls:
+            scoped_results = diversify_by_url(scoped_results, top_k=top_k)
+        return scoped_results[:top_k]
+
     where = metadata_filter(history_key)
     collection = get_collection(chroma_path, collection_name)
 
@@ -152,6 +187,7 @@ def multi_query_hybrid_retrieve(
     semantic_k: int = DEFAULT_SEMANTIC_K,
     bm25_k: int = DEFAULT_BM25_K,
     history_key: str = "",
+    history_keys: Sequence[str] | None = None,
     semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
     bm25_weight: float = DEFAULT_BM25_WEIGHT,
     authority_weight: float = DEFAULT_AUTHORITY_WEIGHT,
@@ -178,6 +214,7 @@ def multi_query_hybrid_retrieve(
             semantic_k=semantic_k,
             bm25_k=bm25_k,
             history_key=history_key,
+            history_keys=history_keys,
             semantic_weight=semantic_weight,
             bm25_weight=bm25_weight,
             authority_weight=authority_weight,
@@ -206,6 +243,7 @@ def source_url_coverage_retrieve(
     chroma_path: Union[str, Path] = DEFAULT_CHROMA_PATH,
     collection_name: str = DEFAULT_COLLECTION_NAME,
     history_key: str = "",
+    history_keys: Sequence[str] | None = None,
     top_k_per_url: int = DEFAULT_SOURCE_URL_K,
     scan_limit: int = DEFAULT_BM25_SCAN_LIMIT,
 ) -> list[RetrievalResult]:
@@ -213,6 +251,26 @@ def source_url_coverage_retrieve(
     target_urls = dedupe_urls(source_urls)
     if not target_urls:
         return []
+
+    clean_history_keys = clean_history_key_list(history_keys)
+    if clean_history_keys:
+        scoped_results = []
+        seen_ids = set()
+        for scoped_history_key in clean_history_keys:
+            for result in source_url_coverage_retrieve(
+                source_urls=target_urls,
+                query=query,
+                chroma_path=chroma_path,
+                collection_name=collection_name,
+                history_key=scoped_history_key,
+                top_k_per_url=top_k_per_url,
+                scan_limit=scan_limit,
+            ):
+                if result.id in seen_ids:
+                    continue
+                seen_ids.add(result.id)
+                scoped_results.append(result)
+        return scoped_results
 
     query_text = joined_query_text(query)
     collection = get_collection(chroma_path, collection_name)
@@ -556,6 +614,18 @@ def ragas_metric_value(result: Any) -> float:
 def metadata_filter(history_key: str) -> Optional[dict[str, Any]]:
     history_key = clean_text(history_key)
     return {"history_key": history_key} if history_key else None
+
+
+def clean_history_key_list(history_keys: Sequence[str] | None) -> list[str]:
+    seen = set()
+    clean_keys = []
+    for history_key in history_keys or []:
+        key = clean_text(history_key)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        clean_keys.append(key)
+    return clean_keys
 
 
 def merge_result(existing: RetrievalResult, incoming: RetrievalResult) -> RetrievalResult:
