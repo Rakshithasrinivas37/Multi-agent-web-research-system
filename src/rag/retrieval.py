@@ -36,6 +36,20 @@ DEFAULT_RERANK_K = 20
 DEFAULT_RERANK_WEIGHT = 0.70
 DEFAULT_SOURCE_URL_K = 1
 TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
+MIN_SOURCE_COVERAGE_OVERLAP = 0.08
+SOURCE_COVERAGE_STOPWORDS = {
+    "and",
+    "are",
+    "for",
+    "from",
+    "how",
+    "the",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+}
 
 
 @dataclass(frozen=True)
@@ -447,7 +461,8 @@ def rank_source_rows(
                 k=max(1, top_k),
                 preprocess_func=tokenize,
             )
-            return retriever.invoke(query)[: max(1, top_k)]
+            ranked = retriever.invoke(query)
+            return relevant_source_documents(ranked, query, top_k)
         except Exception:
             pass
 
@@ -458,6 +473,32 @@ def rank_source_rows(
             0,
         ),
     )[: max(1, top_k)]
+
+
+def relevant_source_documents(documents: Sequence[Any], query: str, top_k: int) -> list[Any]:
+    """Keep URL-coverage chunks that still match the retrieval query."""
+
+    query_terms = relevance_terms(query)
+    if not query_terms:
+        return list(documents[: max(1, top_k)])
+
+    selected = []
+    for document in documents:
+        doc_terms = relevance_terms(getattr(document, "page_content", ""))
+        overlap = len(query_terms & doc_terms) / max(1, min(len(query_terms), len(doc_terms)))
+        if overlap >= MIN_SOURCE_COVERAGE_OVERLAP:
+            selected.append(document)
+        if len(selected) >= max(1, top_k):
+            break
+    return selected
+
+
+def relevance_terms(text: str) -> set[str]:
+    return {
+        token
+        for token in tokenize(text)
+        if len(token) > 2 and token not in SOURCE_COVERAGE_STOPWORDS
+    }
 
 
 def merge_ranked_results(
