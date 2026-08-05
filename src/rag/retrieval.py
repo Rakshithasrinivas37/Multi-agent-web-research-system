@@ -35,6 +35,7 @@ DEFAULT_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 DEFAULT_RERANK_K = 20
 DEFAULT_RERANK_WEIGHT = 0.70
 DEFAULT_SOURCE_URL_K = 1
+DEFAULT_FEATURE_WEIGHT = 0.15
 TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
 MIN_SOURCE_COVERAGE_OVERLAP = 0.08
 SOURCE_COVERAGE_STOPWORDS = {
@@ -173,6 +174,7 @@ def hybrid_retrieve(
     )
 
     merged = merge_ranked_results(
+        query=query,
         semantic_results=semantic_results,
         bm25_results=bm25_results,
         semantic_weight=semantic_weight,
@@ -461,7 +463,7 @@ def rank_source_rows(
                 k=max(1, top_k),
                 preprocess_func=tokenize,
             )
-            ranked = retriever.invoke(query)
+            ranked = query_feature_rerank(retriever.invoke(query), query)
             return relevant_source_documents(ranked, query, top_k)
         except Exception:
             pass
@@ -502,6 +504,7 @@ def relevance_terms(text: str) -> set[str]:
 
 
 def merge_ranked_results(
+    query: str,
     semantic_results: Sequence[RetrievalResult],
     bm25_results: Sequence[RetrievalResult],
     semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
@@ -525,6 +528,7 @@ def merge_ranked_results(
             (semantic_weight * semantic_score)
             + (bm25_weight * bm25_score)
             + (authority_weight * authority_score)
+            + (DEFAULT_FEATURE_WEIGHT * query_feature_score(query, item.document))
         )
         merged.append(
             RetrievalResult(
@@ -542,6 +546,42 @@ def merge_ranked_results(
         )
 
     return sorted(merged, key=lambda item: item.score, reverse=True)
+
+
+def query_feature_rerank(documents: Sequence[Any], query: str) -> list[Any]:
+    """Lightly prefer chunks that preserve the query's terms and phrases."""
+
+    return [
+        document
+        for _, document in sorted(
+            enumerate(documents),
+            key=lambda pair: query_feature_score(query, getattr(pair[1], "page_content", "")) + (0.05 / (pair[0] + 1)),
+            reverse=True,
+        )
+    ]
+
+
+def query_feature_score(query: str, document: str) -> float:
+    query_terms = relevance_terms(query)
+    document_terms = relevance_terms(document)
+    if not query_terms or not document_terms:
+        return 0.0
+
+    term_overlap = len(query_terms & document_terms) / max(1, min(len(query_terms), len(document_terms)))
+    phrase_overlap = query_phrase_overlap(query, document)
+    return min(1.0, (0.75 * term_overlap) + (0.25 * phrase_overlap))
+
+
+def query_phrase_overlap(query: str, document: str) -> float:
+    query_tokens = [token for token in tokenize(query) if token not in SOURCE_COVERAGE_STOPWORDS]
+    document_text = clean_text(document).lower()
+    phrases = []
+    for size in (2, 3, 4):
+        phrases.extend(" ".join(query_tokens[index : index + size]) for index in range(len(query_tokens) - size + 1))
+    phrases = [phrase for phrase in phrases if len(phrase) > 5]
+    if not phrases:
+        return 0.0
+    return sum(1 for phrase in phrases if phrase in document_text) / len(phrases)
 
 
 def evaluate_retrieval(
