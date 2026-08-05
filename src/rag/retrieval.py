@@ -7,6 +7,7 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
+from urllib.parse import urlparse
 
 from langchain_core.cross_encoders import BaseCrossEncoder
 
@@ -929,7 +930,18 @@ def split_metadata_urls(value: Any) -> list[str]:
 
 def normalize_source_url(value: Any) -> str:
     url = normalize_url(clean_text(value))
-    return url if url.startswith(("http://", "https://")) else ""
+    if not url.startswith(("http://", "https://")):
+        return ""
+    return canonical_source_url(url)
+
+
+def canonical_source_url(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    match = re.match(r"^/(abs|pdf)/([0-9]{4}\.[0-9]{4,5})(?:v\d+)?(?:\.pdf)?$", path)
+    if parsed.netloc.lower() == "arxiv.org" and match:
+        return f"{parsed.scheme}://arxiv.org/pdf/{match.group(2)}"
+    return url
 
 
 def dedupe_urls(urls: Sequence[str]) -> list[str]:
