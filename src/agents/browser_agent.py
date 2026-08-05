@@ -19,6 +19,12 @@ SOURCE_STOPWORDS = {
     "from",
     "how",
     "into",
+    "compare",
+    "comparison",
+    "different",
+    "research",
+    "source",
+    "sources",
     "the",
     "what",
     "which",
@@ -584,6 +590,8 @@ def source_is_useful(payload: dict[str, Any], task: dict[str, Any]) -> bool:
         return False
     if is_bad_dictionary_source(payload, task) or is_not_found_source(payload):
         return False
+    if not source_matches_target(payload, task):
+        return False
     if not source_matches_task(payload, task):
         return False
     if is_pricing_task(task):
@@ -609,6 +617,8 @@ def source_quality_note(payload: dict[str, Any], task: dict[str, Any]) -> str:
         return "dictionary result is not relevant to this research task"
     if is_not_found_source(payload):
         return "source appears to be a not-found or missing page"
+    if not source_matches_target(payload, task):
+        return "source does not match the task target topic"
     if not source_matches_task(payload, task):
         return "source content has low overlap with the task"
     if is_pricing_task(task) and not (payload.get("pricing_rows") or payload.get("extracted_facts")):
@@ -640,20 +650,32 @@ def is_not_found_source(payload: dict[str, Any]) -> bool:
     return any(term in text for term in ("404", "page not found", "does not exist", "no article"))
 
 
+def source_matches_target(payload: dict[str, Any], task: dict[str, Any]) -> bool:
+    target_name = clean_text(task.get("target_name"))
+    if not target_name or target_name.lower() == "general research":
+        return True
+    target_terms = relevance_terms(target_name)
+    source_terms = relevance_terms(source_relevance_text(payload))
+    return not target_terms or bool(target_terms & source_terms)
+
+
 def source_matches_task(payload: dict[str, Any], task: dict[str, Any]) -> bool:
     task_terms = relevance_terms(task_relevance_text(task))
     if not task_terms:
         return True
-    source_text = " ".join(
+    source_terms = relevance_terms(source_relevance_text(payload))
+    overlap = len(task_terms & source_terms) / max(1, min(len(task_terms), len(source_terms)))
+    return overlap >= MIN_TASK_OVERLAP
+
+
+def source_relevance_text(payload: dict[str, Any]) -> str:
+    return " ".join(
         [
             clean_text(payload.get("title")),
             clean_text(payload.get("content_preview")),
             clean_text(payload.get("full_content"))[:3000],
         ]
     )
-    source_terms = relevance_terms(source_text)
-    overlap = len(task_terms & source_terms) / max(1, min(len(task_terms), len(source_terms)))
-    return overlap >= MIN_TASK_OVERLAP
 
 
 def task_relevance_text(task: dict[str, Any]) -> str:
