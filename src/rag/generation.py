@@ -6,6 +6,8 @@ import os
 import re
 from typing import Any, Sequence
 
+from src.agents.change_detection_agent import objective_key
+from src.rag.indexing import get_collection
 from src.rag.retrieval import (
     DEFAULT_BM25_K,
     DEFAULT_BM25_SCAN_LIMIT,
@@ -39,7 +41,32 @@ DEFAULT_REPORT_SOURCE_URL_K = 2
 DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
+DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
+DEFAULT_OBJECTIVE_SCOPE_MAX_KEYS = 6
 URL_PATTERN = re.compile(r"https?://[^\s\])}>\"']+")
+OBJECTIVE_TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
+OBJECTIVE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "architecture",
+    "architectures",
+    "based",
+    "compare",
+    "different",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "of",
+    "on",
+    "research",
+    "the",
+    "to",
+    "what",
+    "with",
+}
 
 
 def synthesize_report_from_research_plan(
@@ -78,6 +105,14 @@ def synthesize_report_from_research_plan(
         raise ValueError("research_plan.objective is required")
 
     queries = planner_tasks_to_rag_queries(research_plan)
+    current_history_key = clean_text(history_key) or objective_key(objective, research_plan)
+    objective_scope = resolve_objective_history_scope(
+        objective=objective,
+        current_history_key=current_history_key,
+        chroma_path=chroma_path,
+        collection_name=collection_name,
+    )
+    allowed_history_keys = objective_scope["history_keys"]
     rewritten_query = rewrite_query_from_planner_queries(
         objective=objective,
         queries=queries,
@@ -95,7 +130,7 @@ def synthesize_report_from_research_plan(
         per_query_k=per_query_k,
         semantic_k=semantic_k,
         bm25_k=bm25_k,
-        history_key=history_key,
+        history_keys=allowed_history_keys,
         semantic_weight=semantic_weight,
         bm25_weight=bm25_weight,
         authority_weight=authority_weight,
@@ -115,7 +150,7 @@ def synthesize_report_from_research_plan(
             query=retrieval_queries,
             chroma_path=chroma_path,
             collection_name=collection_name,
-            history_key=history_key,
+            history_keys=allowed_history_keys,
             top_k_per_url=source_url_k,
             scan_limit=bm25_scan_limit,
         )
@@ -133,6 +168,9 @@ def synthesize_report_from_research_plan(
     payload["queries"] = queries
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
+    payload["history_key"] = current_history_key
+    payload["allowed_history_keys"] = allowed_history_keys
+    payload["objective_scope"] = objective_scope
     payload["planned_source_urls"] = planned_source_urls
     payload["source_coverage_count"] = len(source_coverage_results)
     payload["retrieved_count"] = len(retrieved_context)
@@ -208,6 +246,130 @@ def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
         for question in research_plan.get("sub_questions", [])
         if clean_text(question)
     )
+
+
+def resolve_objective_history_scope(
+    objective: str,
+    current_history_key: str,
+    chroma_path: str = DEFAULT_CHROMA_PATH,
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+    similarity_threshold: float = DEFAULT_OBJECTIVE_SCOPE_SIMILARITY,
+    max_history_keys: int = DEFAULT_OBJECTIVE_SCOPE_MAX_KEYS,
+) -> dict[str, Any]:
+    """Choose current plus similar previous objective scopes for retrieval."""
+
+    objective = clean_text(objective)
+    current_history_key = clean_text(current_history_key)
+    selected = []
+    if current_history_key:
+        selected.append(
+            {
+                "history_key": current_history_key,
+                "objective": objective,
+                "similarity": 1.0,
+                "reason": "current_objective",
+            }
+        )
+
+    for record in list_indexed_objective_scopes(chroma_path, collection_name):
+        history_key_value = clean_text(record.get("history_key"))
+        previous_objective = clean_text(record.get("objective"))
+        if not history_key_value or not previous_objective or history_key_value == current_history_key:
+            continue
+        similarity = objective_similarity(objective, previous_objective)
+        if similarity < similarity_threshold:
+            continue
+        selected.append(
+            {
+                "history_key": history_key_value,
+                "objective": previous_objective,
+                "similarity": similarity,
+                "reason": "similar_previous_objective",
+            }
+        )
+
+    selected = sorted(
+        selected,
+        key=lambda item: (
+            0 if item.get("reason") == "current_objective" else 1,
+            -float(item.get("similarity") or 0.0),
+            clean_text(item.get("objective")).lower(),
+        ),
+    )[: max(1, max_history_keys)]
+    return {
+        "history_keys": [item["history_key"] for item in selected],
+        "selected_objectives": selected,
+        "similarity_threshold": similarity_threshold,
+    }
+
+
+def list_indexed_objective_scopes(
+    chroma_path: str = DEFAULT_CHROMA_PATH,
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+    limit: int = 5000,
+) -> list[dict[str, str]]:
+    """Read distinct objective/history_key pairs already stored in Chroma metadata."""
+
+    try:
+        collection = get_collection(chroma_path, collection_name)
+        result = collection.get(include=["metadatas"], limit=max(1, limit))
+    except Exception:
+        return []
+
+    metadatas = result.get("metadatas", []) if isinstance(result, dict) else []
+    records = []
+    seen = set()
+    for metadata in metadatas:
+        if not isinstance(metadata, dict):
+            continue
+        history_key_value = clean_text(metadata.get("history_key"))
+        objective_value = clean_text(metadata.get("objective"))
+        if not history_key_value or not objective_value:
+            continue
+        key = (history_key_value, objective_value.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append({"history_key": history_key_value, "objective": objective_value})
+    return records
+
+
+def objective_similarity(left: str, right: str) -> float:
+    left_tokens = objective_tokens(left)
+    right_tokens = objective_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = left_tokens.intersection(right_tokens)
+    if not overlap:
+        return 0.0
+    jaccard = len(overlap) / len(left_tokens.union(right_tokens))
+    overlap_coefficient = len(overlap) / min(len(left_tokens), len(right_tokens))
+    return max(jaccard, overlap_coefficient)
+
+
+def objective_tokens(text: str) -> set[str]:
+    tokens = set()
+    for token in OBJECTIVE_TOKEN_PATTERN.findall(clean_text(text).lower()):
+        normalized = normalize_objective_token(token)
+        if not normalized or normalized in OBJECTIVE_STOPWORDS or len(normalized) < 3:
+            continue
+        tokens.add(normalized)
+    return tokens
+
+
+def normalize_objective_token(token: str) -> str:
+    token = clean_text(token).lower()
+    if token == "indian":
+        return "india"
+    if token in {"cultures", "cultural"}:
+        return "culture"
+    if token in {"transformers"}:
+        return "transformer"
+    if token.endswith("ies") and len(token) > 4:
+        return f"{token[:-3]}y"
+    if token.endswith("s") and len(token) > 4:
+        return token[:-1]
+    return token
 
 
 def rewrite_query_from_planner_queries(
@@ -683,6 +845,8 @@ def citation_index_by_chunk_id(sources: Sequence[dict[str, Any]]) -> dict[str, i
 def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[RetrievalResult]) -> dict[str, Any]:
     sources = payload.get("sources", [])
     supporting_chunks = payload.get("supporting_chunks", [])
+    allowed_history_keys = payload.get("allowed_history_keys", [])
+    objective_scope = payload.get("objective_scope", {})
     primary_source_count = sum(
         1 for result in retrieved_context
         if is_primary_source(result.metadata if isinstance(result.metadata, dict) else {})
@@ -696,6 +860,13 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "supporting_chunk_count": len(supporting_chunks) if isinstance(supporting_chunks, list) else 0,
         "primary_source_count": primary_source_count,
         "source_coverage_count": payload.get("source_coverage_count", 0),
+        "allowed_history_key_count": len(allowed_history_keys) if isinstance(allowed_history_keys, list) else 0,
+        "similar_previous_objective_count": max(
+            0,
+            len(objective_scope.get("selected_objectives", [])) - 1
+            if isinstance(objective_scope, dict)
+            else 0,
+        ),
     }
 
 
