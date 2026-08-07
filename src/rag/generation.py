@@ -28,6 +28,7 @@ from src.tools.text_utils import clean_text
 
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
+DEFAULT_GAP_QUERY_MODEL = "openai/gpt-oss-20b"
 DEFAULT_MAX_CONTEXT_CHARS = 18000
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_REPORT_MAX_TOKENS = 1400
@@ -70,6 +71,16 @@ OBJECTIVE_STOPWORDS = {
     "what",
     "with",
 }
+
+
+def rag_generation_model(model: str | None = None) -> str:
+    """Use the same default model selection as the planner agent."""
+
+    return (
+        clean_text(model)
+        or clean_text(os.environ.get("RESEARCH_PLANNER_MODEL"))
+        or DEFAULT_RAG_GENERATION_MODEL
+    )
 
 
 def synthesize_report_from_research_plan(
@@ -172,6 +183,9 @@ def synthesize_report_from_research_plan(
     gap_queries = synthesis_gap_retrieval_queries(
         payload.get("synthesis"),
         objective=objective,
+        synthesis_instruction=synthesis_instruction,
+        sources=payload.get("sources", []),
+        model=model,
         max_queries=DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
     )
     gap_retry_results = []
@@ -509,7 +523,7 @@ Requirements:
 - Return only the rewritten query text, no bullets, no markdown, no explanation."""
 
     response = Groq().chat.completions.create(
-        model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
+        model=rag_generation_model(model),
         temperature=0,
         max_tokens=350,
         messages=[
@@ -619,7 +633,7 @@ Use only the numbered source markers that appear in the retrieved context, like 
 Do not cite source names, authors, dates, or papers unless they are present in the retrieved context."""
 
     response = Groq().chat.completions.create(
-        model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
+        model=rag_generation_model(model),
         temperature=0,
         max_tokens=max(100, max_tokens),
         messages=[
@@ -727,7 +741,7 @@ Do not invent source names, authors, dates, titles, papers, benchmark numbers, e
 
         try:
             response = client.chat.completions.create(
-                model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
+                model=rag_generation_model(model),
                 temperature=0,
                 max_tokens=max(300, token_budget),
                 messages=[
@@ -806,18 +820,133 @@ def instruction_requirement_items(instruction: str) -> list[str]:
 def synthesis_gap_retrieval_queries(
     synthesis: Any,
     objective: str = "",
+    synthesis_instruction: str = "",
+    sources: Sequence[dict[str, Any]] | None = None,
+    model: str | None = None,
     max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
 ) -> list[str]:
-    """Build targeted retrieval queries from synthesis coverage gaps."""
+    """Build LLM-generated retrieval queries from synthesis coverage gaps."""
 
+    gaps = synthesis_gap_items(synthesis)
+    if not gaps:
+        return []
+    fallback_queries = fallback_gap_retrieval_queries(
+        gaps,
+        objective=objective,
+        max_queries=max_queries,
+    )
+    llm_queries = llm_gap_retrieval_queries(
+        gaps,
+        objective=objective,
+        synthesis_instruction=synthesis_instruction,
+        sources=sources or [],
+        model=model,
+        max_queries=max_queries,
+    )
+    return dedupe_preserve_order([*llm_queries, *fallback_queries])[: max(1, max_queries)]
+
+
+def fallback_gap_retrieval_queries(
+    gaps: Sequence[str],
+    objective: str = "",
+    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+) -> list[str]:
     objective = clean_text(objective)
     queries = []
-    for gap in synthesis_gap_items(synthesis):
+    for gap in gaps:
         detail_terms = "exact equation formula benchmark number API signature implementation evidence"
         query = clean_text(f"{objective} {gap} {detail_terms}")
         if query:
             queries.append(query[:600])
     return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def llm_gap_retrieval_queries(
+    gaps: Sequence[str],
+    objective: str = "",
+    synthesis_instruction: str = "",
+    sources: Sequence[dict[str, Any]] | None = None,
+    model: str | None = None,
+    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+) -> list[str]:
+    """Ask the generation LLM for precise RAG queries for missing evidence."""
+
+    clean_gaps = dedupe_preserve_order(gaps)
+    if not clean_gaps:
+        return []
+    if not os.environ.get("GROQ_API_KEY"):
+        return []
+
+    try:
+        from groq import Groq
+    except ImportError:
+        return []
+
+    gap_text = "\n".join(f"- {gap}" for gap in clean_gaps[: max(1, max_queries)])
+    source_hints = format_gap_query_source_hints(sources or [])
+    prompt = f"""Research objective:
+{clean_text(objective)}
+
+Synthesis instruction:
+{clean_text(synthesis_instruction)}
+
+Missing or partial evidence items:
+{gap_text}
+
+Available source hints:
+{source_hints}
+
+Generate focused RAG retrieval queries to find the exact missing evidence in indexed chunks.
+Requirements:
+- Return one query per line.
+- Generate at most {max(1, max_queries)} queries.
+- Include literal technical terms, equation tokens, API names, benchmark names, model names, author names, and source titles when useful.
+- For missing equations, include likely symbols and variants, such as softmax, tanh, sqrt, QK, K^T, Concat, W^Q, W^K, W^V, W^O, score, alignment, query, key, value.
+- For missing API details, include official class/function names and parameters.
+- Do not answer the research question.
+- Do not add bullets, numbering, quotes, markdown, or explanation."""
+
+    try:
+        response = Groq().chat.completions.create(
+            model=DEFAULT_GAP_QUERY_MODEL,
+            temperature=0,
+            max_tokens=500,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You generate concise high-recall RAG retrieval queries for missing evidence. Return only queries.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+    except Exception:
+        return []
+
+    return parse_gap_query_lines(response.choices[0].message.content, max_queries=max_queries)
+
+
+def parse_gap_query_lines(text: Any, max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES) -> list[str]:
+    queries = []
+    for line in str(text or "").splitlines():
+        query = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+        query = clean_text(query.strip("\"'`"))
+        if query:
+            queries.append(query[:600])
+    return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def format_gap_query_source_hints(sources: Sequence[dict[str, Any]]) -> str:
+    lines = []
+    for source in sources[:12]:
+        if not isinstance(source, dict):
+            continue
+        title = clean_text(source.get("title"))
+        url = clean_text(source.get("url"))
+        index = source.get("index")
+        if title or url:
+            marker = f"[{index}] " if isinstance(index, int) else ""
+            lines.append(f"{marker}{title} {url}".strip())
+    return "\n".join(lines) or "No source hints available."
 
 
 def synthesis_gap_items(synthesis: Any) -> list[str]:
