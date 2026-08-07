@@ -118,6 +118,8 @@ Requirements:
             ],
         )
         report = normalize_citation_markers(response.choices[0].message.content)
+        if not clean_text(report):
+            raise ValueError("report_agent produced empty report")
         return {
             "objective": objective,
             "output_format": clean_text(output_format) or "report",
