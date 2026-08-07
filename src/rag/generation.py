@@ -39,6 +39,9 @@ DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
 DEFAULT_CONTEXT_BLOCK_CHARS = 750
 DEFAULT_REPORT_SOURCE_URL_K = 2
 DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
+DEFAULT_GAP_RETRIEVAL_TOP_K = 12
+DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
+DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
@@ -156,18 +159,66 @@ def synthesize_report_from_research_plan(
         )
         retrieved_context = merge_retrieved_context(retrieved_context, source_coverage_results)
 
+    synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
     payload = synthesize_context_for_report(
         objective=objective,
         retrieved_context=retrieved_context,
-        synthesis_instruction=clean_text(research_plan.get("synthesis_instruction")),
+        synthesis_instruction=synthesis_instruction,
         planner_questions=planner_sub_questions(research_plan),
         model=model,
         max_context_chars=max_context_chars,
         max_tokens=max_tokens,
     )
+    gap_queries = synthesis_gap_retrieval_queries(
+        payload.get("synthesis"),
+        objective=objective,
+        max_queries=DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+    )
+    gap_retry_results = []
+    gap_retry_count = 0
+    gap_new_chunk_count = 0
+    if gap_queries:
+        gap_retry_results = multi_query_hybrid_retrieve(
+            queries=gap_queries,
+            chroma_path=chroma_path,
+            collection_name=collection_name,
+            top_k=DEFAULT_GAP_RETRIEVAL_TOP_K,
+            per_query_k=DEFAULT_GAP_RETRIEVAL_PER_QUERY_K,
+            semantic_k=semantic_k,
+            bm25_k=max(bm25_k, DEFAULT_GAP_RETRIEVAL_TOP_K),
+            history_keys=allowed_history_keys,
+            semantic_weight=semantic_weight,
+            bm25_weight=bm25_weight,
+            authority_weight=authority_weight,
+            bm25_scan_limit=bm25_scan_limit,
+            embedding_device=embedding_device,
+            diversify_urls=False,
+            rerank=rerank,
+            reranker_model=reranker_model,
+            rerank_k=rerank_k,
+            rerank_weight=rerank_weight,
+        )
+        retry_context = merge_retrieved_context(gap_retry_results, retrieved_context)
+        gap_new_chunk_count = max(0, len(retry_context) - len(retrieved_context))
+        if gap_new_chunk_count:
+            retrieved_context = retry_context
+            gap_retry_count = 1
+            payload = synthesize_context_for_report(
+                objective=objective,
+                retrieved_context=retrieved_context,
+                synthesis_instruction=synthesis_instruction,
+                planner_questions=planner_sub_questions(research_plan),
+                model=model,
+                max_context_chars=max_context_chars,
+                max_tokens=max_tokens,
+            )
     payload["queries"] = queries
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
+    payload["gap_retrieval_queries"] = gap_queries
+    payload["gap_retrieved_count"] = len(gap_retry_results)
+    payload["gap_new_chunk_count"] = gap_new_chunk_count
+    payload["gap_retry_count"] = gap_retry_count
     payload["history_key"] = current_history_key
     payload["allowed_history_keys"] = allowed_history_keys
     payload["objective_scope"] = objective_scope
@@ -752,6 +803,73 @@ def instruction_requirement_items(instruction: str) -> list[str]:
     return dedupe_preserve_order(item for item in bullet_items if item) or [text]
 
 
+def synthesis_gap_retrieval_queries(
+    synthesis: Any,
+    objective: str = "",
+    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+) -> list[str]:
+    """Build targeted retrieval queries from synthesis coverage gaps."""
+
+    objective = clean_text(objective)
+    queries = []
+    for gap in synthesis_gap_items(synthesis):
+        detail_terms = "exact equation formula benchmark number API signature implementation evidence"
+        query = clean_text(f"{objective} {gap} {detail_terms}")
+        if query:
+            queries.append(query[:600])
+    return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def synthesis_gap_items(synthesis: Any) -> list[str]:
+    text = normalize_citation_markers(synthesis)
+    gaps = []
+    for line in text.splitlines():
+        line_text = clean_text(line)
+        if not line_text:
+            continue
+        table_gap = synthesis_gap_from_table_row(line_text)
+        if table_gap:
+            gaps.append(table_gap)
+            continue
+        lowered = line_text.lower()
+        if any(
+            phrase in lowered
+            for phrase in (
+                "missing evidence",
+                "not present in the retrieved",
+                "not present in the cited",
+                "not quoted in the retrieved",
+                "no explicit",
+                "no concrete",
+            )
+        ):
+            gaps.append(strip_markdown_markup(line_text)[:300])
+    return dedupe_preserve_order(gaps)
+
+
+def synthesis_gap_from_table_row(line: str) -> str:
+    if not line.startswith("|") or "---" in line:
+        return ""
+    cells = [strip_markdown_markup(cell) for cell in line.strip("|").split("|")]
+    if len(cells) < 2:
+        return ""
+    first_cell = clean_text(cells[0]).lower()
+    if first_cell in {"requirement", "planner sub-question", "source", "status"}:
+        return ""
+    status = clean_text(cells[1]).lower()
+    notes = clean_text(" ".join(cells[2:]))
+    if "missing" not in status and "partial" not in status and "missing evidence" not in notes.lower():
+        return ""
+    return clean_text(f"{cells[0]} {notes}")
+
+
+def strip_markdown_markup(text: str) -> str:
+    value = re.sub(r"`([^`]*)`", r"\1", str(text or ""))
+    value = re.sub(r"[*_#]+", "", value)
+    value = re.sub(r"\[(\d+)\]", "", value)
+    return clean_text(value)
+
+
 def is_request_too_large_error(error: Exception) -> bool:
     message = clean_text(error).lower()
     return (
@@ -1007,6 +1125,10 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "invalid_citation_count": len(payload.get("citation_audit", {}).get("invalid_source_indexes", [])),
         "cited_source_count": len(payload.get("citation_audit", {}).get("valid_referenced_source_indexes", [])),
         "source_coverage_count": payload.get("source_coverage_count", 0),
+        "gap_retrieval_query_count": len(payload.get("gap_retrieval_queries", [])),
+        "gap_retrieved_count": payload.get("gap_retrieved_count", 0),
+        "gap_new_chunk_count": payload.get("gap_new_chunk_count", 0),
+        "gap_retry_count": payload.get("gap_retry_count", 0),
         "allowed_history_key_count": len(allowed_history_keys) if isinstance(allowed_history_keys, list) else 0,
         "similar_previous_objective_count": max(
             0,
