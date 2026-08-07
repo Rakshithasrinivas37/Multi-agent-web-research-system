@@ -39,11 +39,23 @@ def planner_node(state: ResearchState) -> ResearchState:
     model = clean_text(state.get("model"))
     planner = PlannerAgent(use_llm=True, model=model or None)
     plan = planner.plan(objective)
+    plan_dict = plan.to_dict()
+    errors = validate_research_plan(plan_dict, objective)
+    if errors:
+        return {
+            **state,
+            "objective": plan.objective,
+            "research_plan": plan_dict,
+            "memory_path": memory_path,
+            "model": planner.model,
+            "errors": errors,
+        }
+
     planner.write_to_memory(plan, memory_path)
 
     return {
         "objective": plan.objective,
-        "research_plan": plan.to_dict(),
+        "research_plan": plan_dict,
         "memory_path": memory_path,
         "model": planner.model,
         "errors": [],
@@ -61,7 +73,18 @@ async def browser_node(state: ResearchState) -> ResearchState:
     """Read research plan from state or shared memory, then run browser tasks."""
 
     memory_path = state.get("memory_path") or "data/shared_memory.json"
+    if state.get("errors"):
+        return {**state, "memory_path": memory_path}
+
     plan = read_research_plan_from_memory(memory_path)
+    plan_errors = validate_research_plan(plan, clean_text(state.get("objective")))
+    if plan_errors:
+        return {
+            **state,
+            "memory_path": memory_path,
+            "errors": [*state.get("errors", []), *plan_errors],
+        }
+
     tasks = plan.get("tasks") or plan.get("subtasks") or []
     if not tasks:
         return {
@@ -74,6 +97,7 @@ async def browser_node(state: ResearchState) -> ResearchState:
         max_concurrency=state.get("max_concurrency", 3),
     )
     results = await browser.run_tasks(tasks)
+    result_errors = validate_browser_results(results)
 
     memory = SharedMemory(memory_path)
     memory.write_agent_output("browser", {"results": results})
@@ -83,7 +107,7 @@ async def browser_node(state: ResearchState) -> ResearchState:
         "research_plan": plan,
         "browser_results": results,
         "memory_path": memory_path,
-        "errors": state.get("errors", []),
+        "errors": [*state.get("errors", []), *result_errors],
     }
 
 def change_detection_node(state: ResearchState) -> ResearchState:
@@ -92,6 +116,9 @@ def change_detection_node(state: ResearchState) -> ResearchState:
     memory_path = state.get("memory_path") or "data/shared_memory.json"
     history_db_path = state.get("history_db_path") or "data/browser_history.db"
     chroma_path = state.get("chroma_path") or "data/chroma"
+    if state.get("errors"):
+        return {**state, "memory_path": memory_path, "history_db_path": history_db_path, "chroma_path": chroma_path}
+
     objective = clean_text(state.get("objective"))
     current_results = state.get("browser_results", [])
     plan = state.get("research_plan", {})
@@ -106,6 +133,7 @@ def change_detection_node(state: ResearchState) -> ResearchState:
 
     change_detector = ChangeDetectionAgent(history_db_path)
     diff = change_detector.detect_with_history(objective, current_results, plan)
+    diff_errors = validate_change_detection(diff)
     change_detector.write_to_memory(diff, memory_path)
     rag_index = index_rag_after_change_detection(
         browser_results=current_results,
@@ -114,7 +142,7 @@ def change_detection_node(state: ResearchState) -> ResearchState:
         memory_path=memory_path,
         chroma_path=chroma_path,
     )
-    errors = state.get("errors", [])
+    errors = [*state.get("errors", []), *diff_errors, *validate_rag_index(rag_index)]
     if rag_index.get("status") == "error":
         errors = [*errors, clean_text(rag_index.get("error"))]
 
@@ -133,6 +161,9 @@ def synthesis_node(state: ResearchState) -> ResearchState:
 
     memory_path = state.get("memory_path") or "data/shared_memory.json"
     chroma_path = state.get("chroma_path") or "data/chroma"
+    if state.get("errors"):
+        return {**state, "memory_path": memory_path, "chroma_path": chroma_path}
+
     plan = state.get("research_plan") or read_research_plan_from_memory(memory_path)
     if not plan:
         return {
@@ -154,6 +185,16 @@ def synthesis_node(state: ResearchState) -> ResearchState:
             "errors": [*state.get("errors", []), clean_text(error)],
         }
 
+    synthesis_errors = validate_synthesis_payload(synthesis, plan)
+    if synthesis_errors:
+        return {
+            **state,
+            "synthesis": synthesis,
+            "memory_path": memory_path,
+            "chroma_path": chroma_path,
+            "errors": [*state.get("errors", []), *synthesis_errors],
+        }
+
     synthesis_agent.write_to_memory(synthesis, memory_path)
     return {
         **state,
@@ -167,6 +208,9 @@ def report_node(state: ResearchState) -> ResearchState:
     """Generate the final report from synthesis output."""
 
     memory_path = state.get("memory_path") or "data/shared_memory.json"
+    if state.get("errors"):
+        return {**state, "memory_path": memory_path}
+
     report_context = state.get("synthesis")
     if not report_context:
         memory = SharedMemory(memory_path)
@@ -179,6 +223,14 @@ def report_node(state: ResearchState) -> ResearchState:
         }
 
     research_plan = state.get("research_plan") or read_research_plan_from_memory(memory_path)
+    context_errors = validate_synthesis_payload(report_context, research_plan)
+    if context_errors:
+        return {
+            **state,
+            "memory_path": memory_path,
+            "errors": [*state.get("errors", []), *context_errors],
+        }
+
     report_agent = ReportAgent(model=state.get("model"))
     try:
         report = report_agent.generate(
@@ -190,6 +242,15 @@ def report_node(state: ResearchState) -> ResearchState:
             **state,
             "memory_path": memory_path,
             "errors": [*state.get("errors", []), clean_text(error)],
+        }
+
+    report_errors = validate_report_payload(report, research_plan)
+    if report_errors:
+        return {
+            **state,
+            "report": report,
+            "memory_path": memory_path,
+            "errors": [*state.get("errors", []), *report_errors],
         }
 
     report_agent.write_to_memory(report, memory_path)
@@ -225,6 +286,93 @@ def index_rag_after_change_detection(
     memory = SharedMemory(memory_path)
     memory.write_agent_output("rag_index", {"index": index_summary})
     return index_summary
+
+
+def validate_research_plan(plan: dict[str, Any], expected_objective: str = "") -> list[str]:
+    errors = []
+    if not isinstance(plan, dict) or not plan:
+        return ["planner_node produced empty research_plan"]
+    if not clean_text(plan.get("objective")):
+        errors.append("planner_node research_plan.objective is required")
+    if expected_objective and clean_text(plan.get("objective")).lower() != clean_text(expected_objective).lower():
+        errors.append("planner_node research_plan.objective does not match requested objective")
+    if not plan.get("sub_questions"):
+        errors.append("planner_node research_plan.sub_questions is required")
+    tasks = plan.get("tasks") or []
+    if not isinstance(tasks, list) or not tasks:
+        errors.append("planner_node research_plan.tasks is required")
+    for index, task in enumerate(tasks, start=1):
+        if not isinstance(task, dict):
+            errors.append(f"planner_node task {index} is not an object")
+            continue
+        for key in ("query_context", "url", "source_type", "extraction_goal"):
+            if not clean_text(task.get(key)):
+                errors.append(f"planner_node task {index}.{key} is required")
+    return errors
+
+
+def validate_browser_results(results: list[dict[str, Any]]) -> list[str]:
+    if not isinstance(results, list) or not results:
+        return ["browser_node produced no browser_results"]
+    usable_sources = 0
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        for source in result.get("sources", []) or []:
+            if clean_text(source.get("url")) and clean_text(source.get("full_content")):
+                usable_sources += 1
+    return [] if usable_sources else ["browser_node produced no useful sources"]
+
+
+def validate_change_detection(diff: dict[str, Any]) -> list[str]:
+    if not isinstance(diff, dict) or not diff:
+        return ["change_detection_node produced empty diff"]
+    return [] if clean_text(diff.get("summary")) else ["change_detection_node diff.summary is required"]
+
+
+def validate_rag_index(index: dict[str, Any]) -> list[str]:
+    if not isinstance(index, dict) or not index:
+        return ["rag_index produced empty index summary"]
+    if clean_text(index.get("status")) != "success":
+        return [f"rag_index status is {clean_text(index.get('status')) or 'missing'}"]
+    try:
+        indexed_chunks = int(index.get("indexed_chunks") or 0)
+    except (TypeError, ValueError):
+        indexed_chunks = 0
+    if indexed_chunks <= 0:
+        return ["rag_index indexed zero chunks"]
+    return []
+
+
+def validate_synthesis_payload(payload: dict[str, Any], research_plan: dict[str, Any]) -> list[str]:
+    errors = []
+    if not isinstance(payload, dict) or not payload:
+        return ["synthesis_node produced empty synthesis payload"]
+    if not clean_text(payload.get("objective")):
+        errors.append("synthesis_node payload.objective is required")
+    plan_objective = clean_text(research_plan.get("objective")) if isinstance(research_plan, dict) else ""
+    if plan_objective and clean_text(payload.get("objective")).lower() != plan_objective.lower():
+        errors.append("synthesis_node payload.objective does not match research_plan.objective")
+    if not clean_text(payload.get("synthesis")):
+        errors.append("synthesis_node payload.synthesis is required")
+    if not isinstance(payload.get("sources"), list) or not payload.get("sources"):
+        errors.append("synthesis_node payload.sources is required")
+    return errors
+
+
+def validate_report_payload(payload: dict[str, Any], research_plan: dict[str, Any]) -> list[str]:
+    errors = []
+    if not isinstance(payload, dict) or not payload:
+        return ["report_node produced empty report payload"]
+    plan_objective = clean_text(research_plan.get("objective")) if isinstance(research_plan, dict) else ""
+    if plan_objective and clean_text(payload.get("objective")).lower() != plan_objective.lower():
+        errors.append("report_node payload.objective does not match research_plan.objective")
+    report = clean_text(payload.get("report"))
+    if not report:
+        errors.append("report_node payload.report is required")
+    if "references" not in report.lower():
+        errors.append("report_node report must include a References section")
+    return errors
 
 def build_planner_graph():
     """Build a graph with only the planner node."""
