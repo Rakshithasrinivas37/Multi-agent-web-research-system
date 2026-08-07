@@ -1,5 +1,8 @@
 """LangGraph workflow for the multi-agent research system."""
 
+from functools import wraps
+from inspect import iscoroutinefunction
+from time import perf_counter
 from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -27,7 +30,49 @@ class ResearchState(TypedDict, total=False):
     report: dict[str, Any]
     max_concurrency: int
     errors: list[str]
+    agent_timings: list[dict[str, Any]]
 
+
+def log_agent_step(agent_name: str):
+    """Print node completion time and attach timing metadata to state."""
+
+    def decorator(func):
+        @wraps(func)
+        async def async_wrapper(state: ResearchState) -> ResearchState:
+            started_at = perf_counter()
+            try:
+                result = await func(state)
+            except Exception:
+                elapsed = perf_counter() - started_at
+                print(f"[{agent_name}] failed after {elapsed:.2f}s")
+                raise
+            return add_agent_timing(agent_name, result, elapsed=perf_counter() - started_at)
+
+        @wraps(func)
+        def sync_wrapper(state: ResearchState) -> ResearchState:
+            started_at = perf_counter()
+            try:
+                result = func(state)
+            except Exception:
+                elapsed = perf_counter() - started_at
+                print(f"[{agent_name}] failed after {elapsed:.2f}s")
+                raise
+            return add_agent_timing(agent_name, result, elapsed=perf_counter() - started_at)
+
+        return async_wrapper if iscoroutinefunction(func) else sync_wrapper
+
+    return decorator
+
+
+def add_agent_timing(agent_name: str, state: ResearchState, elapsed: float) -> ResearchState:
+    errors = state.get("errors", []) if isinstance(state, dict) else []
+    status = "completed with errors" if errors else "completed"
+    print(f"[{agent_name}] {status} in {elapsed:.2f}s")
+    timing = {"agent": agent_name, "status": status, "elapsed_seconds": round(elapsed, 2)}
+    return {**state, "agent_timings": [*state.get("agent_timings", []), timing]}
+
+
+@log_agent_step("planner")
 def planner_node(state: ResearchState) -> ResearchState:
     """Create a research plan and write it to shared memory."""
 
@@ -69,6 +114,8 @@ def read_research_plan_from_memory(memory_path: str) -> dict[str, Any]:
     plan = planner_output.get("research_plan", {})
     return plan if isinstance(plan, dict) else {}
 
+
+@log_agent_step("browser")
 async def browser_node(state: ResearchState) -> ResearchState:
     """Read research plan from state or shared memory, then run browser tasks."""
 
@@ -110,6 +157,8 @@ async def browser_node(state: ResearchState) -> ResearchState:
         "errors": [*state.get("errors", []), *result_errors],
     }
 
+
+@log_agent_step("change_detection")
 def change_detection_node(state: ResearchState) -> ResearchState:
     """Compare browser results, persist the diff, and index current content for RAG."""
 
@@ -156,6 +205,8 @@ def change_detection_node(state: ResearchState) -> ResearchState:
         "errors": errors,
     }
 
+
+@log_agent_step("synthesis")
 def synthesis_node(state: ResearchState) -> ResearchState:
     """Retrieve indexed evidence and write report-ready synthesis to memory."""
 
@@ -204,6 +255,8 @@ def synthesis_node(state: ResearchState) -> ResearchState:
         "errors": state.get("errors", []),
     }
 
+
+@log_agent_step("report")
 def report_node(state: ResearchState) -> ResearchState:
     """Generate the final report from synthesis output."""
 
