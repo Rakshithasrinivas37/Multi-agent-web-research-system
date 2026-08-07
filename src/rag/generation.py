@@ -147,11 +147,11 @@ def synthesize_report_from_research_plan(
     if include_planned_source_urls and planned_source_urls:
         source_coverage_results = source_url_coverage_retrieve(
             source_urls=missing_or_weak_source_urls(planned_source_urls, retrieved_context),
-            query=retrieval_queries,
+            query=planner_context_query(research_plan, retrieval_queries),
             chroma_path=chroma_path,
             collection_name=collection_name,
             history_keys=allowed_history_keys,
-            top_k_per_url=source_url_k,
+            top_k_per_url=max(source_url_k, 3),
             scan_limit=bm25_scan_limit,
         )
         retrieved_context = merge_retrieved_context(retrieved_context, source_coverage_results)
@@ -278,6 +278,26 @@ def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
         for question in research_plan.get("sub_questions", [])
         if clean_text(question)
     )
+
+
+def planner_context_query(research_plan: dict[str, Any], fallback_queries: Sequence[str]) -> str:
+    """Compact planner text used to retrieve better chunks from known sources."""
+
+    parts = [
+        research_plan.get("objective"),
+        research_plan.get("synthesis_instruction"),
+        *planner_sub_questions(research_plan),
+    ]
+    for task in research_plan.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        signals = " ".join(clean_text(item) for item in task.get("expected_signals", []) if clean_text(item))
+        parts.extend([task.get("query_context"), task.get("extraction_goal"), signals])
+
+    query = clean_text(" ".join(clean_text(part) for part in parts if clean_text(part)))
+    if query:
+        return query[:4000]
+    return clean_text(" ".join(fallback_queries))[:4000]
 
 
 def resolve_objective_history_scope(
