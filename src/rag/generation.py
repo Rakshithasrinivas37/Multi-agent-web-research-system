@@ -180,7 +180,7 @@ def synthesize_report_from_research_plan(
         max_context_chars=max_context_chars,
         max_tokens=max_tokens,
     )
-    gap_queries = synthesis_gap_retrieval_queries(
+    gap_query_plan = synthesis_gap_retrieval_plan(
         payload.get("synthesis"),
         objective=objective,
         synthesis_instruction=synthesis_instruction,
@@ -188,6 +188,7 @@ def synthesize_report_from_research_plan(
         model=model,
         max_queries=DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
     )
+    gap_queries = gap_query_plan["queries"]
     gap_retry_results = []
     gap_retry_count = 0
     gap_new_chunk_count = 0
@@ -230,6 +231,10 @@ def synthesize_report_from_research_plan(
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
     payload["gap_retrieval_queries"] = gap_queries
+    payload["gap_query_model"] = gap_query_plan["model"]
+    payload["gap_query_source"] = gap_query_plan["source"]
+    payload["llm_gap_query_count"] = len(gap_query_plan["llm_queries"])
+    payload["fallback_gap_query_count"] = len(gap_query_plan["fallback_queries"])
     payload["gap_retrieved_count"] = len(gap_retry_results)
     payload["gap_new_chunk_count"] = gap_new_chunk_count
     payload["gap_retry_count"] = gap_retry_count
@@ -827,9 +832,33 @@ def synthesis_gap_retrieval_queries(
 ) -> list[str]:
     """Build LLM-generated retrieval queries from synthesis coverage gaps."""
 
+    return synthesis_gap_retrieval_plan(
+        synthesis,
+        objective=objective,
+        synthesis_instruction=synthesis_instruction,
+        sources=sources,
+        model=model,
+        max_queries=max_queries,
+    )["queries"]
+
+
+def synthesis_gap_retrieval_plan(
+    synthesis: Any,
+    objective: str = "",
+    synthesis_instruction: str = "",
+    sources: Sequence[dict[str, Any]] | None = None,
+    model: str | None = None,
+    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+) -> dict[str, Any]:
+    """Build gap-retrieval queries plus diagnostics about their origin."""
+
     gaps = synthesis_gap_items(synthesis)
     if not gaps:
-        return []
+        return gap_retrieval_plan(
+            queries=[],
+            llm_queries=[],
+            fallback_queries=[],
+        )
     fallback_queries = fallback_gap_retrieval_queries(
         gaps,
         objective=objective,
@@ -843,7 +872,36 @@ def synthesis_gap_retrieval_queries(
         model=model,
         max_queries=max_queries,
     )
-    return dedupe_preserve_order([*llm_queries, *fallback_queries])[: max(1, max_queries)]
+    queries = dedupe_preserve_order([*llm_queries, *fallback_queries])[: max(1, max_queries)]
+    return gap_retrieval_plan(
+        queries=queries,
+        llm_queries=llm_queries,
+        fallback_queries=fallback_queries,
+    )
+
+
+def gap_retrieval_plan(
+    queries: Sequence[str],
+    llm_queries: Sequence[str],
+    fallback_queries: Sequence[str],
+) -> dict[str, Any]:
+    llm_count = len(llm_queries)
+    fallback_count = len(fallback_queries)
+    if llm_count and fallback_count:
+        source = "mixed"
+    elif llm_count:
+        source = "llm"
+    elif fallback_count:
+        source = "fallback"
+    else:
+        source = "none"
+    return {
+        "queries": list(queries),
+        "llm_queries": list(llm_queries),
+        "fallback_queries": list(fallback_queries),
+        "model": DEFAULT_GAP_QUERY_MODEL,
+        "source": source,
+    }
 
 
 def fallback_gap_retrieval_queries(
@@ -1255,6 +1313,10 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "cited_source_count": len(payload.get("citation_audit", {}).get("valid_referenced_source_indexes", [])),
         "source_coverage_count": payload.get("source_coverage_count", 0),
         "gap_retrieval_query_count": len(payload.get("gap_retrieval_queries", [])),
+        "gap_query_model": payload.get("gap_query_model", ""),
+        "gap_query_source": payload.get("gap_query_source", ""),
+        "llm_gap_query_count": payload.get("llm_gap_query_count", 0),
+        "fallback_gap_query_count": payload.get("fallback_gap_query_count", 0),
         "gap_retrieved_count": payload.get("gap_retrieved_count", 0),
         "gap_new_chunk_count": payload.get("gap_new_chunk_count", 0),
         "gap_retry_count": payload.get("gap_retry_count", 0),
