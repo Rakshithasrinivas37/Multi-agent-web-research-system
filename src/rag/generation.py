@@ -612,6 +612,7 @@ def synthesize_context_for_report(
 
     planner_question_text = format_planner_questions(planner_questions or [])
     instruction = clean_text(synthesis_instruction) or "Synthesize the retrieved evidence into report-ready research notes."
+    instruction_requirement_text = format_instruction_requirements(instruction)
     client = Groq()
     last_error: Exception | None = None
 
@@ -626,6 +627,9 @@ def synthesize_context_for_report(
 Synthesis instruction:
 {instruction}
 
+Instruction requirements to satisfy:
+{instruction_requirement_text}
+
 Planner sub-questions to cover:
 {planner_question_text}
 
@@ -639,20 +643,24 @@ Create a detailed report-agent-ready evidence package using only the retrieved c
 Do not write the final report. Prepare rich notes that another agent can turn into a technical report.
 
 Return Markdown with these sections:
-1. Coverage Map
+1. Instruction Coverage Checklist
+   - For each instruction requirement, mark Covered, Partial, or Missing Evidence.
+   - Cite source markers for Covered/Partial items and name the exact missing facts for Missing Evidence items.
+2. Coverage Map
    - For each planner sub-question, state whether the retrieved context has strong, partial, or missing evidence.
-2. Section Notes By Planner Question
+3. Section Notes By Planner Question
    - Repeat each planner sub-question as a subsection.
    - Include the direct answer, important evidence, equations/formulas/API details when available, and gaps.
    - Keep enough detail for a report agent to write a full section without needing to infer missing facts.
-3. Cross-Source Synthesis
+4. Cross-Source Synthesis
    - Connect repeated ideas across sources and identify how the sources complement each other.
-4. Technical Details To Preserve
+5. Technical Details To Preserve
    - Preserve exact equations, definitions, model components, implementation details, and benchmark values only when present in the retrieved context.
-5. Conflicts Or Gaps
+6. Conflicts Or Gaps
    - List missing evidence, weak citations, source conflicts, or claims that need caution.
-6. Recommended Report Structure
+7. Recommended Report Structure
    - Suggest report sections and which source markers support each section.
+   - Include every Covered/Partial instruction requirement and explicit gap notes for Missing Evidence requirements.
 
 Use only plain ASCII numbered source markers that appear in the retrieved context, exactly like [1], [2], [3].
 Every evidence-backed claim must include at least one source marker.
@@ -663,6 +671,7 @@ Do not compress important technical details into vague summaries.
 Do not use Markdown tables.
 Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inline.
 If a requested equation, number, API detail, or definition is not explicitly present in the retrieved context, mark it as missing evidence and tell the report agent not to add it.
+Before finishing, check the Instruction Coverage Checklist against the Recommended Report Structure so requested items are not silently dropped.
 Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
 
         try:
@@ -707,6 +716,40 @@ def format_planner_questions(questions: Sequence[str]) -> str:
     if not clean_questions:
         return "No planner sub-questions were provided. Cover the research objective directly."
     return "\n".join(f"- {question}" for question in clean_questions)
+
+
+def format_instruction_requirements(instruction: str) -> str:
+    """Return a compact checklist extracted from a free-form synthesis instruction."""
+
+    requirements = instruction_requirement_items(instruction)
+    if not requirements:
+        return "- No explicit synthesis requirements were provided."
+    return "\n".join(f"- {requirement}" for requirement in requirements)
+
+
+def instruction_requirement_items(instruction: str) -> list[str]:
+    text = clean_text(instruction)
+    if not text:
+        return []
+
+    markers = list(re.finditer(r"(?:^|\s)(?:\(\d+\)|\d+[.)])\s+", text))
+    if len(markers) >= 2:
+        items = []
+        for index, marker in enumerate(markers):
+            start = marker.end()
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+            item = clean_text(text[start:end].strip(" ;,."))
+            item = re.sub(r"(?:,\s*)?\band$", "", item).strip(" ;,.")
+            if item:
+                items.append(item)
+        return dedupe_preserve_order(items)
+
+    bullet_items = [
+        clean_text(line.lstrip("-* ").strip())
+        for line in str(instruction or "").splitlines()
+        if line.strip().startswith(("-", "*"))
+    ]
+    return dedupe_preserve_order(item for item in bullet_items if item) or [text]
 
 
 def is_request_too_large_error(error: Exception) -> bool:
