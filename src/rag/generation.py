@@ -181,11 +181,14 @@ def synthesize_report_from_research_plan(
         "synthesis marks a formula, number, API detail, or definition as missing "
         "evidence, do not add it to the report unless it appears in a supporting chunk."
     )
+    citation_audit = audit_synthesis_citations(payload.get("synthesis"), payload.get("sources", []))
+    payload["citation_audit"] = citation_audit
     payload["supporting_chunks"] = report_supporting_chunks(
         retrieved_context,
         payload.get("sources", []),
         max_chunks=supporting_chunk_count,
         max_chars=retrieved_chunk_chars,
+        cited_source_indexes=citation_audit.get("valid_referenced_source_indexes", []),
     )
     payload["diagnostics"] = synthesis_diagnostics(payload, retrieved_context)
     if include_retrieved_chunks:
@@ -838,6 +841,7 @@ def report_supporting_chunks(
     sources: Sequence[dict[str, Any]],
     max_chunks: int = DEFAULT_REPORT_SUPPORTING_CHUNKS,
     max_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+    cited_source_indexes: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Return citation-linked chunks that are safest for the report agent."""
 
@@ -847,15 +851,64 @@ def report_supporting_chunks(
         max_chars=max_chars,
     )
     citation_backed = [chunk for chunk in compact_chunks if chunk.get("source_index") is not None]
+    cited_indexes = {index for index in cited_source_indexes or [] if isinstance(index, int)}
     ordered = sorted(
         citation_backed,
         key=lambda chunk: (
+            0 if chunk.get("source_index") in cited_indexes else 1,
             0 if chunk.get("is_primary_source") else 1,
             chunk.get("source_index") or 10**6,
             -(float(chunk.get("score") or 0.0)),
         ),
     )
-    return ordered[: max(1, max_chunks)]
+    target_count = max(1, max_chunks, len(cited_indexes))
+    return ordered[:target_count]
+
+
+def audit_synthesis_citations(
+    synthesis: Any,
+    sources: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize whether synthesis notes cite only available source markers."""
+
+    referenced_indexes = citation_markers(synthesis)
+    valid_indexes = source_indexes(sources)
+    valid_referenced = [index for index in referenced_indexes if index in valid_indexes]
+    invalid_referenced = [index for index in referenced_indexes if index not in valid_indexes]
+    uncited_sources = [index for index in sorted(valid_indexes) if index not in referenced_indexes]
+    return {
+        "referenced_source_indexes": referenced_indexes,
+        "valid_referenced_source_indexes": valid_referenced,
+        "invalid_source_indexes": invalid_referenced,
+        "uncited_source_indexes": uncited_sources,
+        "source_count": len(valid_indexes),
+        "has_invalid_citations": bool(invalid_referenced),
+    }
+
+
+def citation_markers(text: Any) -> list[int]:
+    """Return unique plain numeric Markdown citation markers in first-seen order."""
+
+    markers = []
+    seen = set()
+    for match in re.finditer(r"\[(\d+)\]", normalize_citation_markers(text)):
+        index = int(match.group(1))
+        if index in seen:
+            continue
+        seen.add(index)
+        markers.append(index)
+    return markers
+
+
+def source_indexes(sources: Sequence[dict[str, Any]]) -> set[int]:
+    indexes = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        index = source.get("index")
+        if isinstance(index, int):
+            indexes.add(index)
+    return indexes
 
 
 def citation_index_by_chunk_id(sources: Sequence[dict[str, Any]]) -> dict[str, int]:
@@ -888,6 +941,8 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "source_count": len(sources) if isinstance(sources, list) else 0,
         "supporting_chunk_count": len(supporting_chunks) if isinstance(supporting_chunks, list) else 0,
         "primary_source_count": primary_source_count,
+        "invalid_citation_count": len(payload.get("citation_audit", {}).get("invalid_source_indexes", [])),
+        "cited_source_count": len(payload.get("citation_audit", {}).get("valid_referenced_source_indexes", [])),
         "source_coverage_count": payload.get("source_coverage_count", 0),
         "allowed_history_key_count": len(allowed_history_keys) if isinstance(allowed_history_keys, list) else 0,
         "similar_previous_objective_count": max(
