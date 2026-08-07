@@ -65,6 +65,7 @@ class ReportAgent:
         synthesis = remap_citation_markers(synthesis, citation_aliases)
         source_text = format_sources(sources)
         evidence_text = format_supporting_evidence(report_context, citation_aliases=citation_aliases)
+        missing_evidence_text = format_missing_evidence_constraints(synthesis)
         citation_policy = clean_text(report_context.get("citation_policy")) or (
             "Use only numbered source markers from the provided sources."
         )
@@ -82,6 +83,9 @@ Citation policy:
 Synthesis-agent notes:
 {synthesis}
 
+Missing-evidence constraints:
+{missing_evidence_text}
+
 Supporting evidence chunks:
 {evidence_text}
 
@@ -98,6 +102,8 @@ Requirements:
 - Include an executive summary.
 - Include technical sections that match the objective and synthesis.
 - Include equations only when they are supported by synthesis or supporting chunks.
+- Do not reproduce formulas, numbers, API signatures, names, or examples listed in Missing-evidence constraints.
+- If a missing item is important, state only that the provided evidence describes it but does not include the exact detail.
 - Cite claims using only plain source markers from Available sources, exactly like [1], [2], [3].
 - For formulas, APIs, benchmark claims, and historical attribution, prefer original papers, official docs, academic sources, or authoritative surveys.
 - Do not cite sources that are not listed.
@@ -130,6 +136,7 @@ Requirements:
                 "source_count": len(sources),
                 "deduped_source_count": len(original_sources or []) - len(sources),
                 "supporting_chunk_count": len(report_context.get("supporting_chunks", []) or []),
+                "missing_evidence_constraint_count": missing_evidence_constraint_count(missing_evidence_text),
                 "report_length": len(report),
             },
         }
@@ -159,6 +166,86 @@ def format_sources(sources: Sequence[Any]) -> str:
         if isinstance(index, int) and url:
             lines.append(f"[{index}] {title}\nURL: {url}")
     return "\n\n".join(lines) or "No sources provided."
+
+
+def format_missing_evidence_constraints(synthesis: str) -> str:
+    """Extract gap notes that the report must not turn into unsupported details."""
+
+    constraints = missing_evidence_constraints(synthesis)
+    if not constraints:
+        return "No missing-evidence constraints were identified."
+    return "\n".join(f"- {constraint}" for constraint in constraints)
+
+
+def missing_evidence_constraints(synthesis: str) -> list[str]:
+    constraints = []
+    for line in clean_markdown(synthesis).splitlines():
+        line_text = clean_text(line)
+        if not line_text:
+            continue
+        table_constraint = missing_evidence_from_table_row(line_text)
+        if table_constraint:
+            constraints.append(table_constraint)
+            continue
+        lowered = line_text.lower()
+        if any(
+            phrase in lowered
+            for phrase in (
+                "missing detail",
+                "missing evidence",
+                "not present in the retrieved",
+                "not present in the cited",
+                "not quoted in the retrieved",
+                "do not add",
+            )
+        ):
+            constraints.append(strip_markdown_markup(line_text))
+    return dedupe_preserve_order(constraints)
+
+
+def missing_evidence_from_table_row(line: str) -> str:
+    if not line.startswith("|") or "---" in line:
+        return ""
+    cells = [strip_markdown_markup(cell) for cell in line.strip("|").split("|")]
+    if len(cells) < 2:
+        return ""
+    first_cell = clean_text(cells[0]).lower()
+    if first_cell in {"requirement", "planner sub-question", "source", "status"}:
+        return ""
+    status = clean_text(cells[1]).lower()
+    notes = clean_text(" ".join(cells[2:]))
+    if (
+        "missing" not in status
+        and "partial" not in status
+        and "missing" not in notes.lower()
+        and "not present" not in notes.lower()
+    ):
+        return ""
+    return clean_text(f"{cells[0]}: {notes}")
+
+
+def missing_evidence_constraint_count(text: str) -> int:
+    return sum(1 for line in clean_markdown(text).splitlines() if line.startswith("- "))
+
+
+def strip_markdown_markup(text: str) -> str:
+    value = re.sub(r"`([^`]*)`", r"\1", str(text or ""))
+    value = re.sub(r"[*_#]+", "", value)
+    value = re.sub(r"\[(\d+)\]", "", value)
+    return clean_text(value)
+
+
+def dedupe_preserve_order(items: Sequence[str]) -> list[str]:
+    seen = set()
+    deduped = []
+    for item in items:
+        text = clean_text(item)
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(text)
+    return deduped
 
 
 def dedupe_sources_by_url(sources: Sequence[Any]) -> tuple[list[dict[str, Any]], dict[int, int]]:
