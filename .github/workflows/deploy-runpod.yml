@@ -97,12 +97,24 @@ jobs:
           set -euo pipefail
           log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
-          if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
-            log "Node.js, npm, and npx are already installed"
+          NODE_MAJOR=""
+          if command -v node >/dev/null 2>&1; then
+            NODE_MAJOR="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
+          fi
+
+          if [ "${NODE_MAJOR:-0}" -ge 20 ] && command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
+            log "Node.js 20+, npm, and npx are already installed"
           else
-            log "Installing Node.js and npm for MCP tools"
+            log "Installing Node.js 20 for MCP tools"
             apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm
+            DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+              | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+            echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+              > /etc/apt/sources.list.d/nodesource.list
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
           fi
 
           log "Node.js version: $(node --version)"

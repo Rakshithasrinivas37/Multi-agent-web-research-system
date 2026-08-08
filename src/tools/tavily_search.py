@@ -13,7 +13,7 @@ from src.tools.text_utils import clean_text
 
 DEFAULT_TAVILY_MCP_COMMAND = "npx"
 DEFAULT_TAVILY_MCP_ARGS = "-y tavily-mcp@latest"
-DEFAULT_TAVILY_MCP_TOOL = "tavily-search"
+DEFAULT_TAVILY_MCP_TOOL = "tavily_search"
 DEFAULT_TAVILY_MCP_TIMEOUT_SECONDS = 30
 
 
@@ -49,9 +49,10 @@ def search_with_tavily_mcp(query: str, max_results: int = 3) -> list[dict[str, A
     if not query:
         return []
 
-    print("[tavily_search] tool call via MCP: tavily-search")
+    tool_name = clean_text(os.environ.get("TAVILY_MCP_TOOL")) or DEFAULT_TAVILY_MCP_TOOL
+    print(f"[tavily_search] tool call via MCP: {tool_name}")
     result = call_mcp_tool(
-        tool_name=clean_text(os.environ.get("TAVILY_MCP_TOOL")) or DEFAULT_TAVILY_MCP_TOOL,
+        tool_name=tool_name,
         arguments={
             "query": query,
             "max_results": max(1, int(max_results)),
@@ -129,7 +130,7 @@ def read_mcp_message(process: subprocess.Popen[bytes], deadline: float) -> dict[
     if process.stdout is None:
         raise RuntimeError("MCP process stdout is unavailable")
 
-    header_bytes = read_until(process.stdout.fileno(), b"\r\n\r\n", deadline)
+    header_bytes = read_until(process, b"\r\n\r\n", deadline)
     if b"\r\n\r\n" in header_bytes:
         header, body = header_bytes.split(b"\r\n\r\n", 1)
     else:
@@ -153,13 +154,17 @@ def read_mcp_message(process: subprocess.Popen[bytes], deadline: float) -> dict[
             raise TimeoutError("MCP response body timed out")
         chunk = os.read(process.stdout.fileno(), content_length - len(body))
         if not chunk:
-            raise RuntimeError("MCP process closed stdout")
+            raise RuntimeError(mcp_process_closed_error(process))
         body += chunk
     return json.loads(body[:content_length].decode("utf-8"))
 
 
-def read_until(fd: int, marker: bytes, deadline: float) -> bytes:
+def read_until(process: subprocess.Popen[bytes], marker: bytes, deadline: float) -> bytes:
+    if process.stdout is None:
+        raise RuntimeError("MCP process stdout is unavailable")
+
     data = b""
+    fd = process.stdout.fileno()
     alternate_marker = b"\n\n"
     while marker not in data and alternate_marker not in data:
         remaining = deadline - time.monotonic()
@@ -170,7 +175,7 @@ def read_until(fd: int, marker: bytes, deadline: float) -> bytes:
             raise TimeoutError("MCP response header timed out")
         chunk = os.read(fd, 1)
         if not chunk:
-            raise RuntimeError("MCP process closed stdout")
+            raise RuntimeError(mcp_process_closed_error(process))
         data += chunk
     return data
 
@@ -229,6 +234,17 @@ def terminate_mcp_process(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         process.kill()
+
+
+def mcp_process_closed_error(process: subprocess.Popen[bytes]) -> str:
+    error = "MCP process closed stdout"
+    if process.stderr is None:
+        return error
+    ready, _, _ = select.select([process.stderr.fileno()], [], [], 0)
+    if not ready:
+        return error
+    stderr = clean_text(os.read(process.stderr.fileno(), 8000).decode("utf-8", errors="replace"))
+    return f"{error}: {stderr}" if stderr else error
 
 
 def tavily_mcp_enabled() -> bool:
