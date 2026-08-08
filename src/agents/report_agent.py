@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from src.memory.shared_memory import SharedMemory
+from src.tools.groq_retry import create_chat_completion_with_retries
 from src.tools.text_utils import clean_text
 
 
@@ -111,7 +112,8 @@ Requirements:
 - End with a References section mapping only used source markers to source URLs.
 - If evidence is incomplete, mention the limitation instead of inventing details."""
 
-        response = Groq().chat.completions.create(
+        response = create_chat_completion_with_retries(
+            Groq(),
             model=self.model,
             temperature=0,
             max_tokens=max(500, self.max_tokens),
