@@ -6,15 +6,20 @@ import select
 import shlex
 import subprocess
 import time
+from itertools import count
 from typing import Any
+
+import httpx
 
 from src.tools.text_utils import clean_text
 
 
 DEFAULT_TAVILY_MCP_COMMAND = "npx"
 DEFAULT_TAVILY_MCP_ARGS = "-y tavily-mcp@latest"
+DEFAULT_TAVILY_MCP_URL = "https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_API_KEY}"
 DEFAULT_TAVILY_MCP_TOOL = "tavily_search"
 DEFAULT_TAVILY_MCP_TIMEOUT_SECONDS = 90
+MCP_REQUEST_IDS = count(1)
 
 
 def search_with_tavily(query: str, max_results: int = 3) -> list[dict[str, Any]]:
@@ -64,6 +69,12 @@ def search_with_tavily_mcp(query: str, max_results: int = 3) -> list[dict[str, A
 
 
 def call_mcp_tool(tool_name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
+    transport = clean_text(os.environ.get("TAVILY_MCP_TRANSPORT")).lower()
+    if transport in {"http", "remote", "streamable_http"}:
+        return call_remote_mcp_tool(tool_name=tool_name, arguments=arguments, timeout=timeout)
+    if transport not in {"", "stdio", "local"} and clean_text(os.environ.get("TAVILY_MCP_URL")):
+        return call_remote_mcp_tool(tool_name=tool_name, arguments=arguments, timeout=timeout)
+
     command = clean_text(os.environ.get("TAVILY_MCP_COMMAND")) or DEFAULT_TAVILY_MCP_COMMAND
     args_text = expand_env_vars(clean_text(os.environ.get("TAVILY_MCP_ARGS")) or DEFAULT_TAVILY_MCP_ARGS)
     process = subprocess.Popen(
@@ -108,6 +119,105 @@ def call_mcp_tool(tool_name: str, arguments: dict[str, Any], timeout: float) -> 
         return tool_response.get("result", {})
     finally:
         terminate_mcp_process(process)
+
+
+def call_remote_mcp_tool(tool_name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
+    endpoint = expand_env_vars(clean_text(os.environ.get("TAVILY_MCP_URL")) or DEFAULT_TAVILY_MCP_URL)
+    session_id = ""
+    headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        initialize_response = post_mcp_json_rpc(
+            client,
+            endpoint,
+            headers,
+            {
+                "jsonrpc": "2.0",
+                "id": next_mcp_request_id(),
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "multi-agent-web-research-system", "version": "0.1.0"},
+                },
+            },
+        )
+        session_id = clean_text(initialize_response.get("session_id"))
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
+
+        post_mcp_notification(
+            client,
+            endpoint,
+            headers,
+            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        )
+        tool_response = post_mcp_json_rpc(
+            client,
+            endpoint,
+            headers,
+            {
+                "jsonrpc": "2.0",
+                "id": next_mcp_request_id(),
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            },
+        )
+
+    print(f"[mcp] tool call completed: {tool_name}")
+    return tool_response.get("result", {})
+
+
+def post_mcp_json_rpc(
+    client: httpx.Client,
+    endpoint: str,
+    headers: dict[str, str],
+    message: dict[str, Any],
+) -> dict[str, Any]:
+    response = client.post(endpoint, headers=headers, json=message)
+    response.raise_for_status()
+    parsed = parse_mcp_http_response(response)
+    if response.headers.get("mcp-session-id"):
+        parsed["session_id"] = response.headers["mcp-session-id"]
+    if parsed.get("error"):
+        raise RuntimeError(clean_text(parsed["error"]))
+    return parsed
+
+
+def post_mcp_notification(
+    client: httpx.Client,
+    endpoint: str,
+    headers: dict[str, str],
+    message: dict[str, Any],
+) -> None:
+    response = client.post(endpoint, headers=headers, json=message)
+    if response.status_code not in {200, 202, 204}:
+        response.raise_for_status()
+
+
+def parse_mcp_http_response(response: httpx.Response) -> dict[str, Any]:
+    content_type = clean_text(response.headers.get("content-type")).lower()
+    if "text/event-stream" in content_type:
+        return parse_mcp_sse_response(response.text)
+    return response.json()
+
+
+def parse_mcp_sse_response(text: str) -> dict[str, Any]:
+    for event in text.split("\n\n"):
+        data_lines = []
+        for line in event.splitlines():
+            if line.startswith("data:"):
+                data_lines.append(line.partition(":")[2].strip())
+        if data_lines:
+            return json.loads("\n".join(data_lines))
+    raise RuntimeError("MCP HTTP response did not include event data")
+
+
+def next_mcp_request_id() -> int:
+    return next(MCP_REQUEST_IDS)
 
 
 def send_mcp_message(process: subprocess.Popen[bytes], message: dict[str, Any]) -> None:
