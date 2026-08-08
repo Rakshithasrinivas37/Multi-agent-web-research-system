@@ -969,7 +969,8 @@ def llm_gap_retrieval_query_result(
     except ImportError as error:
         return llm_gap_query_result([], error=f"groq_import_error: {clean_text(error)}")
 
-    gap_text = "\n".join(f"- {gap}" for gap in clean_gaps[: max(1, max_queries)])
+    prompt_gaps = clean_gaps[: max(1, max_queries)]
+    gap_text = format_gap_items_for_query_prompt(prompt_gaps)
     source_hints = format_gap_query_source_hints(sources or [])
     prompt = f"""Research objective:
 {clean_text(objective)}
@@ -985,13 +986,15 @@ Available source hints:
 
 Generate focused RAG retrieval queries to find the exact missing evidence in indexed chunks.
 Requirements:
-- Return one query per line.
-- Generate at most {max(1, max_queries)} queries.
-- Include literal technical terms, equation tokens, API names, benchmark names, model names, author names, and source titles when useful.
+- Return one query per missing item, using the same item id format: G1: query text.
+- Generate at most {len(prompt_gaps)} queries.
+- Keep each query focused on only that missing item.
+- Include literal technical terms, equation tokens, API names, benchmark names, model names, author names, and source titles that match the item.
 - For missing equations, include likely symbols and variants, such as softmax, tanh, sqrt, QK, K^T, Concat, W^Q, W^K, W^V, W^O, score, alignment, query, key, value.
 - For missing API details, include official class/function names and parameters.
 - Do not answer the research question.
-- Do not add bullets, numbering, quotes, markdown, or explanation."""
+- Do not combine multiple missing items into one broad query.
+- Do not add bullets, markdown tables, quotes, or explanation."""
 
     raw_response = ""
     try:
@@ -1014,6 +1017,8 @@ Requirements:
     if not raw_response:
         return llm_gap_query_result([], error="empty_response")
     queries = parse_gap_query_lines(raw_response, max_queries=max_queries)
+    if len(prompt_gaps) > 1 and len(queries) <= 1:
+        return llm_gap_query_result([], error="insufficient_item_queries", raw_response=raw_response)
     if not queries:
         return llm_gap_query_result([], error="parsed_empty_response", raw_response=raw_response)
     return llm_gap_query_result(queries, raw_response=raw_response)
@@ -1035,10 +1040,18 @@ def parse_gap_query_lines(text: Any, max_queries: int = DEFAULT_GAP_RETRIEVAL_MA
     queries = []
     for line in str(text or "").splitlines():
         query = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+        query = re.sub(r"^G\d+\s*:\s*", "", query, flags=re.IGNORECASE).strip()
         query = clean_text(query.strip("\"'`"))
         if query:
             queries.append(query[:600])
     return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def format_gap_items_for_query_prompt(gaps: Sequence[str]) -> str:
+    lines = []
+    for index, gap in enumerate(gaps, start=1):
+        lines.append(f"G{index}: {clean_text(gap)[:500]}")
+    return "\n".join(lines)
 
 
 def format_gap_query_source_hints(sources: Sequence[dict[str, Any]]) -> str:
