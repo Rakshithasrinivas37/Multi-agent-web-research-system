@@ -13,10 +13,11 @@ from src.tools.text_utils import clean_text
 
 
 DEFAULT_REPORT_AGENT_MODEL = "llama-3.1-8b-instant"
-DEFAULT_REPORT_AGENT_MAX_TOKENS = 3200
+DEFAULT_REPORT_AGENT_MAX_TOKENS = 4200
 DEFAULT_REPORT_AGENT_CONTEXT_CHARS = 30000
 DEFAULT_REPORT_AGENT_CHUNK_CHARS = 1000
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
+REPORT_REPAIR_MAX_ATTEMPTS = 2
 
 
 class ReportAgent:
@@ -101,19 +102,26 @@ Requirements:
 - Return polished Markdown.
 - Include a clear title.
 - Include an executive summary.
-- Include technical sections that match the objective and synthesis.
-- Include equations only when they are supported by synthesis or supporting chunks.
-- Do not reproduce formulas, numbers, API signatures, names, or examples listed in Missing-evidence constraints.
-- If a missing item is important, state only that the provided evidence describes it but does not include the exact detail.
+- Write a detailed technical report, not a short summary.
+- Include technical sections that match the objective, synthesis, and requested output format.
+- Prefer concrete definitions, structured comparisons, measurements, examples, and implementation details when supported by synthesis or supporting chunks.
+- Explain important technical terms or notation when applicable, and use tables when they make comparisons clearer.
+- Include exact technical details only when they are supported by synthesis or supporting chunks.
+- Reconcile Missing-evidence constraints against Supporting evidence chunks before writing.
+- If supporting chunks contain a detail that synthesis previously marked missing, include the supported detail and do not say it is missing.
+- Do not reproduce details listed in Missing-evidence constraints unless they are present in Supporting evidence chunks.
+- If a missing item remains important, state only that the provided evidence describes it but does not include the exact detail.
 - Cite claims using only plain source markers from Available sources, exactly like [1], [2], [3].
-- For formulas, APIs, benchmark claims, and historical attribution, prefer original papers, official docs, academic sources, or authoritative surveys.
+- For precise claims, prefer original papers, official docs, academic sources, or authoritative surveys.
 - Do not cite sources that are not listed.
 - Do not use citation formats like 【1】, footnotes, line citations, or URLs inline.
 - End with a References section mapping only used source markers to source URLs.
-- If evidence is incomplete, mention the limitation instead of inventing details."""
+- If evidence is incomplete, mention the limitation instead of inventing details.
+- Before finalizing, remove contradictions such as saying a detail is missing and then including that detail."""
 
+        client = Groq()
         response = create_chat_completion_with_retries(
-            Groq(),
+            client,
             model=self.model,
             temperature=0,
             max_tokens=max(500, self.max_tokens),
@@ -128,6 +136,19 @@ Requirements:
         report = normalize_citation_markers(response.choices[0].message.content)
         if not clean_text(report):
             raise ValueError("report_agent produced empty report")
+        report, repair_count, report_issues = repair_report_if_needed(
+            client=client,
+            model=self.model,
+            report=report,
+            objective=objective,
+            output_format=clean_text(output_format) or "report",
+            synthesis=synthesis,
+            evidence_text=evidence_text,
+            source_text=source_text,
+            missing_evidence_text=missing_evidence_text,
+            max_tokens=max(500, self.max_tokens),
+            max_context_chars=self.max_context_chars,
+        )
         return {
             "objective": objective,
             "output_format": clean_text(output_format) or "report",
@@ -140,6 +161,8 @@ Requirements:
                 "supporting_chunk_count": len(report_context.get("supporting_chunks", []) or []),
                 "missing_evidence_constraint_count": missing_evidence_constraint_count(missing_evidence_text),
                 "report_length": len(report),
+                "report_repair_count": repair_count,
+                "report_issues": report_issues,
             },
         }
 
@@ -155,6 +178,184 @@ Requirements:
         report_payload = {**report_payload, "report_path": saved_path}
         memory = SharedMemory(memory_path)
         memory.write_agent_output("report", {"final_report": report_payload})
+
+
+def repair_report_if_needed(
+    client: Any,
+    model: str,
+    report: str,
+    objective: str,
+    output_format: str,
+    synthesis: str,
+    evidence_text: str,
+    source_text: str,
+    missing_evidence_text: str,
+    max_tokens: int,
+    max_context_chars: int,
+) -> tuple[str, int, list[str]]:
+    """Ask the model to fix report-level validation issues before returning."""
+
+    repaired = normalize_citation_markers(report)
+    repair_count = 0
+    issues = report_quality_issues(repaired, evidence_text)
+    for _ in range(REPORT_REPAIR_MAX_ATTEMPTS):
+        if not issues:
+            break
+        repair_prompt = f"""Research objective:
+{objective}
+
+Requested output format:
+{output_format}
+
+Current report:
+{repaired}
+
+Detected report issues:
+{format_issue_list(issues)}
+
+Synthesis-agent notes:
+{synthesis}
+
+Missing-evidence constraints:
+{missing_evidence_text}
+
+Supporting evidence chunks:
+{evidence_text}
+
+Available sources:
+{source_text}
+
+Repair the report.
+Requirements:
+- Return only the corrected Markdown report.
+- Keep the report detailed and technical.
+- Remove stale missing-evidence statements when supporting evidence now contains the detail.
+- If a concrete detail appears in supporting evidence, it may be included with a citation.
+- Do not invent unsupported details.
+- Keep only source markers from Available sources.
+- End with a References section mapping used source markers to URLs."""
+
+        response = create_chat_completion_with_retries(
+            client,
+            model=model,
+            temperature=0,
+            max_tokens=max_tokens,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You repair technical reports for evidence consistency, citation validity, and completeness.",
+                },
+                {"role": "user", "content": repair_prompt[:max_context_chars]},
+            ],
+        )
+        candidate = normalize_citation_markers(response.choices[0].message.content)
+        if clean_text(candidate):
+            repaired = candidate
+            repair_count += 1
+        issues = report_quality_issues(repaired, evidence_text)
+    return repaired, repair_count, issues
+
+
+def create_chat_completion_with_retries(client: Any, **kwargs: Any) -> Any:
+    """Local wrapper kept small for the report-agent branch."""
+
+    return client.chat.completions.create(**kwargs)
+
+
+def report_quality_issues(report: str, evidence_text: str) -> list[str]:
+    issues = []
+    text = clean_text(report)
+    if not text:
+        return ["report is empty"]
+    lowered = text.lower()
+    if "references" not in lowered:
+        issues.append("report must include a References section")
+    if stale_missing_detail_statement(report, evidence_text):
+        issues.append("report may contain stale missing-evidence statements contradicted by supporting evidence")
+    return dedupe_preserve_order(issues)
+
+
+def stale_missing_detail_statement(report: str, evidence_text: str) -> bool:
+    if not has_missing_claim(report):
+        return False
+    return bool(overlapping_detail_terms(report_missing_sentences(report), evidence_text))
+
+
+def has_missing_claim(text: str) -> bool:
+    return bool(report_missing_sentences(text))
+
+
+def report_missing_sentences(text: str) -> list[str]:
+    missing_phrases = (
+        "not present",
+        "not provided",
+        "not available",
+        "not included",
+        "not mentioned",
+        "not shown",
+        "not specified",
+        "not contain",
+        "cannot be reproduced",
+        "is missing",
+        "are missing",
+        "missing detail",
+    )
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", clean_text(text))
+    return [
+        sentence
+        for sentence in sentences
+        if any(phrase in sentence.lower() for phrase in missing_phrases)
+    ]
+
+
+def overlapping_detail_terms(missing_sentences: Sequence[str], evidence_text: str) -> set[str]:
+    evidence_terms = detail_terms(evidence_text)
+    overlaps = set()
+    for sentence in missing_sentences:
+        overlaps.update(detail_terms(sentence) & evidence_terms)
+    return overlaps
+
+
+def detail_terms(text: str) -> set[str]:
+    stopwords = {
+        "about",
+        "above",
+        "after",
+        "also",
+        "available",
+        "because",
+        "before",
+        "being",
+        "cannot",
+        "contain",
+        "detail",
+        "details",
+        "does",
+        "evidence",
+        "exact",
+        "from",
+        "included",
+        "missing",
+        "present",
+        "provided",
+        "shown",
+        "that",
+        "their",
+        "there",
+        "these",
+        "this",
+        "with",
+        "would",
+    }
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_.+-]{3,}", clean_text(text))
+        if token.lower() not in stopwords
+    }
+
+
+def format_issue_list(issues: Sequence[str]) -> str:
+    return "\n".join(f"- {clean_text(issue)}" for issue in issues if clean_text(issue)) or "- No issues."
 
 
 def format_sources(sources: Sequence[Any]) -> str:
