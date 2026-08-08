@@ -1,10 +1,35 @@
 """Tavily search tool."""
 
+import json
 import os
+import select
+import shlex
+import subprocess
+import time
 from typing import Any
+
+from src.tools.text_utils import clean_text
+
+
+DEFAULT_TAVILY_MCP_COMMAND = "npx"
+DEFAULT_TAVILY_MCP_ARGS = "-y tavily-mcp@latest"
+DEFAULT_TAVILY_MCP_TOOL = "tavily-search"
+DEFAULT_TAVILY_MCP_TIMEOUT_SECONDS = 30
 
 
 def search_with_tavily(query: str, max_results: int = 3) -> list[dict[str, Any]]:
+    if tavily_mcp_enabled():
+        try:
+            return search_with_tavily_mcp(query, max_results=max_results)
+        except Exception as error:
+            if tavily_mcp_required():
+                raise RuntimeError(f"Tavily MCP search failed: {error}") from error
+            print(f"[tavily_search] Tavily MCP failed; using SDK fallback: {error}")
+
+    return search_with_tavily_sdk(query, max_results=max_results)
+
+
+def search_with_tavily_sdk(query: str, max_results: int = 3) -> list[dict[str, Any]]:
     api_key = os.environ.get("TAVILY_API_KEY")
     if not api_key:
         raise RuntimeError("TAVILY_API_KEY is not set")
@@ -17,3 +42,201 @@ def search_with_tavily(query: str, max_results: int = 3) -> list[dict[str, Any]]
         search_depth="basic",
     )
     return response.get("results", [])
+
+
+def search_with_tavily_mcp(query: str, max_results: int = 3) -> list[dict[str, Any]]:
+    query = clean_text(query)
+    if not query:
+        return []
+
+    print("[tavily_search] tool call via MCP: tavily-search")
+    result = call_mcp_tool(
+        tool_name=clean_text(os.environ.get("TAVILY_MCP_TOOL")) or DEFAULT_TAVILY_MCP_TOOL,
+        arguments={
+            "query": query,
+            "max_results": max(1, int(max_results)),
+            "search_depth": clean_text(os.environ.get("TAVILY_SEARCH_DEPTH")) or "basic",
+        },
+        timeout=float(os.environ.get("TAVILY_MCP_TIMEOUT_SECONDS") or DEFAULT_TAVILY_MCP_TIMEOUT_SECONDS),
+    )
+    return normalize_tavily_mcp_results(result)
+
+
+def call_mcp_tool(tool_name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
+    command = clean_text(os.environ.get("TAVILY_MCP_COMMAND")) or DEFAULT_TAVILY_MCP_COMMAND
+    args_text = clean_text(os.environ.get("TAVILY_MCP_ARGS")) or DEFAULT_TAVILY_MCP_ARGS
+    process = subprocess.Popen(
+        [command, *shlex.split(args_text)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=os.environ.copy(),
+    )
+    try:
+        send_mcp_message(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "multi-agent-web-research-system", "version": "0.1.0"},
+                },
+            },
+        )
+        initialize_response = read_mcp_response(process, request_id=1, timeout=timeout)
+        if initialize_response.get("error"):
+            raise RuntimeError(clean_text(initialize_response["error"]))
+
+        send_mcp_message(process, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        send_mcp_message(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            },
+        )
+        tool_response = read_mcp_response(process, request_id=2, timeout=timeout)
+        if tool_response.get("error"):
+            raise RuntimeError(clean_text(tool_response["error"]))
+        return tool_response.get("result", {})
+    finally:
+        terminate_mcp_process(process)
+
+
+def send_mcp_message(process: subprocess.Popen[bytes], message: dict[str, Any]) -> None:
+    if process.stdin is None:
+        raise RuntimeError("MCP process stdin is unavailable")
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    process.stdin.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body)
+    process.stdin.flush()
+
+
+def read_mcp_response(process: subprocess.Popen[bytes], request_id: int, timeout: float) -> dict[str, Any]:
+    deadline = time.monotonic() + max(1.0, timeout)
+    while time.monotonic() < deadline:
+        message = read_mcp_message(process, deadline=deadline)
+        if message.get("id") == request_id:
+            return message
+    raise TimeoutError(f"MCP response timed out for request {request_id}")
+
+
+def read_mcp_message(process: subprocess.Popen[bytes], deadline: float) -> dict[str, Any]:
+    if process.stdout is None:
+        raise RuntimeError("MCP process stdout is unavailable")
+
+    header_bytes = read_until(process.stdout.fileno(), b"\r\n\r\n", deadline)
+    if b"\r\n\r\n" in header_bytes:
+        header, body = header_bytes.split(b"\r\n\r\n", 1)
+    else:
+        header, body = header_bytes.split(b"\n\n", 1)
+
+    content_length = 0
+    for line in header.decode("utf-8", errors="replace").splitlines():
+        name, _, value = line.partition(":")
+        if name.lower() == "content-length":
+            content_length = int(value.strip())
+            break
+    if content_length <= 0:
+        raise RuntimeError("MCP response missing Content-Length header")
+
+    while len(body) < content_length:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("MCP response body timed out")
+        ready, _, _ = select.select([process.stdout.fileno()], [], [], remaining)
+        if not ready:
+            raise TimeoutError("MCP response body timed out")
+        chunk = os.read(process.stdout.fileno(), content_length - len(body))
+        if not chunk:
+            raise RuntimeError("MCP process closed stdout")
+        body += chunk
+    return json.loads(body[:content_length].decode("utf-8"))
+
+
+def read_until(fd: int, marker: bytes, deadline: float) -> bytes:
+    data = b""
+    alternate_marker = b"\n\n"
+    while marker not in data and alternate_marker not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("MCP response header timed out")
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            raise TimeoutError("MCP response header timed out")
+        chunk = os.read(fd, 1)
+        if not chunk:
+            raise RuntimeError("MCP process closed stdout")
+        data += chunk
+    return data
+
+
+def normalize_tavily_mcp_results(result: dict[str, Any]) -> list[dict[str, Any]]:
+    if result.get("isError"):
+        raise RuntimeError(extract_mcp_text(result) or "Tavily MCP returned an error")
+
+    payload = result.get("structuredContent") or parse_json_text(extract_mcp_text(result))
+    if isinstance(payload, dict):
+        items = payload.get("results") or payload.get("data") or []
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = []
+
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = clean_text(item.get("url"))
+        if not url:
+            continue
+        normalized.append(
+            {
+                "title": clean_text(item.get("title")),
+                "url": url,
+                "content": clean_text(item.get("content") or item.get("snippet")),
+                "score": item.get("score"),
+                "raw_content": clean_text(item.get("raw_content")),
+            }
+        )
+    return normalized
+
+
+def extract_mcp_text(result: dict[str, Any]) -> str:
+    parts = []
+    for item in result.get("content", []) or []:
+        if isinstance(item, dict) and item.get("type") == "text":
+            parts.append(clean_text(item.get("text")))
+    return "\n".join(part for part in parts if part)
+
+
+def parse_json_text(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def terminate_mcp_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
+def tavily_mcp_enabled() -> bool:
+    value = clean_text(os.environ.get("TAVILY_USE_MCP") or os.environ.get("TAVILY_SEARCH_BACKEND")).lower()
+    if value in {"0", "false", "no", "sdk"}:
+        return False
+    return True
+
+
+def tavily_mcp_required() -> bool:
+    return clean_text(os.environ.get("TAVILY_REQUIRE_MCP")).lower() in {"1", "true", "yes"}
