@@ -1038,13 +1038,26 @@ def llm_gap_query_result(
 
 def parse_gap_query_lines(text: Any, max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES) -> list[str]:
     queries = []
-    for line in str(text or "").splitlines():
+    for line in split_gap_query_response(text):
         query = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
         query = re.sub(r"^G\d+\s*:\s*", "", query, flags=re.IGNORECASE).strip()
         query = clean_text(query.strip("\"'`"))
         if query:
             queries.append(query[:600])
     return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def split_gap_query_response(text: Any) -> list[str]:
+    response = str(text or "").strip()
+    if not response:
+        return []
+    inline_items = [
+        match.group(0).strip()
+        for match in re.finditer(r"G\d+\s*:\s*.*?(?=\s+G\d+\s*:|$)", response, flags=re.IGNORECASE | re.DOTALL)
+    ]
+    if len(inline_items) > 1:
+        return inline_items
+    return response.splitlines()
 
 
 def format_gap_items_for_query_prompt(gaps: Sequence[str]) -> str:
