@@ -17,8 +17,9 @@ Configure these repository secrets in GitHub:
 
 Tavily search uses MCP first, with the Tavily SDK as a fallback:
 
-- `TAVILY_MCP_COMMAND=npx`
-- `TAVILY_MCP_ARGS="-y tavily-mcp@latest"`
+- `TAVILY_MCP_COMMAND=tavily-mcp`: RunPod deploy installs this globally
+- `TAVILY_MCP_ARGS=`
+- `TAVILY_MCP_TIMEOUT_SECONDS=90`
 - `TAVILY_USE_MCP=0`: optional, disable MCP and use the Tavily SDK directly
 - `TAVILY_REQUIRE_MCP=1`: optional, fail instead of falling back to the Tavily SDK
 
