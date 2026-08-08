@@ -24,11 +24,12 @@ from src.rag.retrieval import (
     result_source_urls_from_metadata,
     source_url_coverage_retrieve,
 )
+from src.tools.groq_retry import create_chat_completion_with_retries, is_groq_request_too_large_error
 from src.tools.text_utils import clean_text
 
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
-DEFAULT_GAP_QUERY_MODEL = "openai/gpt-oss-20b"
+DEFAULT_GAP_QUERY_MODEL = "llama-3.1-8b-instant"
 DEFAULT_MAX_CONTEXT_CHARS = 18000
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_REPORT_MAX_TOKENS = 1400
@@ -529,7 +530,8 @@ Requirements:
 - Keep it topic-agnostic and useful for semantic search plus BM25 keyword retrieval.
 - Return only the rewritten query text, no bullets, no markdown, no explanation."""
 
-    response = Groq().chat.completions.create(
+    response = create_chat_completion_with_retries(
+        Groq(),
         model=rag_generation_model(model),
         temperature=0,
         max_tokens=350,
@@ -639,7 +641,8 @@ Answer using only the retrieved context. If the context does not contain the ans
 Use only the numbered source markers that appear in the retrieved context, like [1] or [2].
 Do not cite source names, authors, dates, or papers unless they are present in the retrieved context."""
 
-    response = Groq().chat.completions.create(
+    response = create_chat_completion_with_retries(
+        Groq(),
         model=rag_generation_model(model),
         temperature=0,
         max_tokens=max(100, max_tokens),
@@ -747,7 +750,8 @@ Before finishing, check the Instruction Coverage Checklist against the Recommend
 Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
 
         try:
-            response = client.chat.completions.create(
+            response = create_chat_completion_with_retries(
+                client,
                 model=rag_generation_model(model),
                 temperature=0,
                 max_tokens=max(300, token_budget),
@@ -995,7 +999,8 @@ Requirements:
 
     raw_response = ""
     try:
-        response = Groq().chat.completions.create(
+        response = create_chat_completion_with_retries(
+            Groq(),
             model=DEFAULT_GAP_QUERY_MODEL,
             temperature=0,
             max_tokens=500,
@@ -1106,13 +1111,7 @@ def strip_markdown_markup(text: str) -> str:
 
 
 def is_request_too_large_error(error: Exception) -> bool:
-    message = clean_text(error).lower()
-    return (
-        "request too large" in message
-        or "tokens per minute" in message
-        or "rate_limit_exceeded" in message
-        or "tpm" in message
-    )
+    return is_groq_request_too_large_error(error)
 
 
 def build_generation_context(
