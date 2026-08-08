@@ -89,6 +89,27 @@ jobs:
           tar --no-same-owner --no-same-permissions -xzf /tmp/multi-agent-web-research-system.tar.gz -C "$DEPLOY_DIR"
           REMOTE
 
+      - name: Install Node.js and npm on RunPod
+        timeout-minutes: 10
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "bash -s" <<'REMOTE'
+          set -euo pipefail
+          log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+          if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
+            log "Node.js, npm, and npx are already installed"
+          else
+            log "Installing Node.js and npm for MCP tools"
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs npm
+          fi
+
+          log "Node.js version: $(node --version)"
+          log "npm version: $(npm --version)"
+          log "npx version: $(npx --version)"
+          REMOTE
+
       - name: Install Python dependencies on RunPod
         timeout-minutes: 30
         run: |
