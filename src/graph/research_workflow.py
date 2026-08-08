@@ -3,7 +3,7 @@
 from functools import wraps
 from inspect import iscoroutinefunction
 from time import perf_counter
-from typing import Any, TypedDict
+from typing import Any, Sequence, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -15,6 +15,9 @@ from src.agents.synthesis_agent import SynthesisAgent
 from src.memory.shared_memory import SharedMemory
 from src.rag import index_research_results
 from src.tools.text_utils import clean_text
+
+DEFAULT_AGENT_RESPONSE_ATTEMPTS = 3
+
 
 class ResearchState(TypedDict, total=False):
     objective: str
@@ -83,13 +86,25 @@ def planner_node(state: ResearchState) -> ResearchState:
     memory_path = state.get("memory_path") or "data/shared_memory.json"
     model = clean_text(state.get("model"))
     planner = PlannerAgent(use_llm=True, model=model or None)
-    plan = planner.plan(objective)
-    plan_dict = plan.to_dict()
-    errors = validate_research_plan(plan_dict, objective)
+    plan = None
+    plan_dict = {}
+    errors = []
+    for attempt in range(1, DEFAULT_AGENT_RESPONSE_ATTEMPTS + 1):
+        try:
+            plan = planner.plan(objective)
+            plan_dict = plan.to_dict()
+            errors = validate_research_plan(plan_dict, objective)
+        except Exception as error:
+            errors = [clean_text(error)]
+        if not errors:
+            break
+        if attempt < DEFAULT_AGENT_RESPONSE_ATTEMPTS:
+            print_retry_response_error("planner", attempt, errors)
+
     if errors:
         return {
             **state,
-            "objective": plan.objective,
+            "objective": plan.objective if plan else objective,
             "research_plan": plan_dict,
             "memory_path": memory_path,
             "model": planner.model,
@@ -227,16 +242,19 @@ def synthesis_node(state: ResearchState) -> ResearchState:
         model=state.get("model"),
         chroma_path=chroma_path,
     )
-    try:
-        synthesis = synthesis_agent.synthesize(plan)
-    except Exception as error:
-        return {
-            **state,
-            "memory_path": memory_path,
-            "errors": [*state.get("errors", []), clean_text(error)],
-        }
+    synthesis = {}
+    synthesis_errors = []
+    for attempt in range(1, DEFAULT_AGENT_RESPONSE_ATTEMPTS + 1):
+        try:
+            synthesis = synthesis_agent.synthesize(plan)
+            synthesis_errors = validate_synthesis_payload(synthesis, plan)
+        except Exception as error:
+            synthesis_errors = [clean_text(error)]
+        if not synthesis_errors:
+            break
+        if attempt < DEFAULT_AGENT_RESPONSE_ATTEMPTS:
+            print_retry_response_error("synthesis", attempt, synthesis_errors)
 
-    synthesis_errors = validate_synthesis_payload(synthesis, plan)
     if synthesis_errors:
         return {
             **state,
@@ -285,19 +303,22 @@ def report_node(state: ResearchState) -> ResearchState:
         }
 
     report_agent = ReportAgent(model=state.get("model"))
-    try:
-        report = report_agent.generate(
-            report_context,
-            output_format=clean_text(research_plan.get("output_format")) or "report",
-        )
-    except Exception as error:
-        return {
-            **state,
-            "memory_path": memory_path,
-            "errors": [*state.get("errors", []), clean_text(error)],
-        }
+    report = {}
+    report_errors = []
+    output_format = clean_text(research_plan.get("output_format")) or "report"
+    for attempt in range(1, DEFAULT_AGENT_RESPONSE_ATTEMPTS + 1):
+        try:
+            report = report_agent.generate(report_context, output_format=output_format)
+        except Exception as error:
+            report_errors = [clean_text(error)]
+        else:
+            report_errors = validate_report_payload(report, research_plan)
+            if not report_errors:
+                break
 
-    report_errors = validate_report_payload(report, research_plan)
+        if attempt < DEFAULT_AGENT_RESPONSE_ATTEMPTS:
+            print_retry_response_error("report", attempt, report_errors)
+
     if report_errors:
         return {
             **state,
@@ -313,6 +334,12 @@ def report_node(state: ResearchState) -> ResearchState:
         "memory_path": memory_path,
         "errors": state.get("errors", []),
     }
+
+
+def print_retry_response_error(agent_name: str, attempt: int, errors: Sequence[str]) -> None:
+    error_text = "; ".join(clean_text(error) for error in errors if clean_text(error))
+    print(f"[{agent_name}] retrying after response error ({attempt}/{DEFAULT_AGENT_RESPONSE_ATTEMPTS}): {error_text}")
+
 
 def index_rag_after_change_detection(
     browser_results: list[dict[str, Any]],
