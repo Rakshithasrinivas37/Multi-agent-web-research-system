@@ -15,6 +15,13 @@ Configure these repository secrets in GitHub:
 - `FIRECRAWL_API_KEY`
 - `RAG_EMBEDDING_MODEL`: optional, for example `sentence-transformers/all-MiniLM-L6-v2`
 
+Tavily search uses MCP first, with the Tavily SDK as a fallback:
+
+- `TAVILY_MCP_COMMAND=npx`
+- `TAVILY_MCP_ARGS="-y tavily-mcp@latest"`
+- `TAVILY_USE_MCP=0`: optional, disable MCP and use the Tavily SDK directly
+- `TAVILY_REQUIRE_MCP=1`: optional, fail instead of falling back to the Tavily SDK
+
 Trigger deployment by pushing to `main` or manually from the GitHub Actions tab.
 
 The workflow connects as SSH user `root` on SSH port `19805`.

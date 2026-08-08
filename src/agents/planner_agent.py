@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 from src.tools.groq_retry import create_chat_completion_with_retries
+from src.tools.tavily_search import search_with_tavily
 
 
 @dataclass(frozen=True)
@@ -1000,28 +1001,17 @@ def first_existing_url(candidates: list[dict[str, str]], exclude: Optional[set[s
     return ""
 
 def search_candidates_with_tavily(query: str, max_results: int) -> list[dict[str, str]]:
-    api_key = os.environ.get("TAVILY_API_KEY")
-    if not api_key or not query:
+    if not query:
         return []
 
     try:
-        from tavily import TavilyClient
-    except ImportError:
-        print("[planner_agent] tavily-python is not installed; keeping SEARCH task.")
-        return []
-
-    try:
-        response = TavilyClient(api_key=api_key).search(
-            query=query,
-            max_results=max_results,
-            search_depth="basic",
-        )
+        results = search_with_tavily(query, max_results=max_results)
     except Exception as error:
         print(f"[planner_agent] Tavily search failed for {query!r}: {error}")
         return []
 
     candidates = []
-    for item in response.get("results", []):
+    for item in results:
         url = clean_text(item.get("url"))
         if valid_http_url(url):
             candidates.append(
