@@ -65,7 +65,7 @@ def search_with_tavily_mcp(query: str, max_results: int = 3) -> list[dict[str, A
 
 def call_mcp_tool(tool_name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
     command = clean_text(os.environ.get("TAVILY_MCP_COMMAND")) or DEFAULT_TAVILY_MCP_COMMAND
-    args_text = clean_text(os.environ.get("TAVILY_MCP_ARGS")) or DEFAULT_TAVILY_MCP_ARGS
+    args_text = expand_env_vars(clean_text(os.environ.get("TAVILY_MCP_ARGS")) or DEFAULT_TAVILY_MCP_ARGS)
     process = subprocess.Popen(
         [command, *shlex.split(args_text)],
         stdin=subprocess.PIPE,
@@ -225,6 +225,14 @@ def parse_json_text(text: str) -> Any:
         return json.loads(text)
     except (TypeError, json.JSONDecodeError):
         return {}
+
+
+def expand_env_vars(text: str) -> str:
+    value = str(text or "")
+    for name, replacement in os.environ.items():
+        value = value.replace(f"${{{name}}}", replacement)
+        value = value.replace(f"${name}", replacement)
+    return value
 
 
 def terminate_mcp_process(process: subprocess.Popen[bytes]) -> None:
