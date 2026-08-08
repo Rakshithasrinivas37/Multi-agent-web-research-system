@@ -14,7 +14,7 @@ from src.tools.text_utils import clean_text
 DEFAULT_TAVILY_MCP_COMMAND = "npx"
 DEFAULT_TAVILY_MCP_ARGS = "-y tavily-mcp@latest"
 DEFAULT_TAVILY_MCP_TOOL = "tavily_search"
-DEFAULT_TAVILY_MCP_TIMEOUT_SECONDS = 30
+DEFAULT_TAVILY_MCP_TIMEOUT_SECONDS = 90
 
 
 def search_with_tavily(query: str, max_results: int = 3) -> list[dict[str, Any]]:
@@ -104,6 +104,7 @@ def call_mcp_tool(tool_name: str, arguments: dict[str, Any], timeout: float) -> 
         tool_response = read_mcp_response(process, request_id=2, timeout=timeout)
         if tool_response.get("error"):
             raise RuntimeError(clean_text(tool_response["error"]))
+        print(f"[mcp] tool call completed: {tool_name}")
         return tool_response.get("result", {})
     finally:
         terminate_mcp_process(process)
