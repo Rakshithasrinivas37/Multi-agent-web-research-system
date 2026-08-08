@@ -17,7 +17,7 @@ from src.rag.generation import (
     DEFAULT_REPORT_SUPPORTING_CHUNKS,
     DEFAULT_REPORT_SOURCE_URL_K,
     DEFAULT_REPORT_TOP_K,
-    DEFAULT_RAG_GENERATION_MODEL,
+    rag_generation_model,
     synthesize_report_from_research_plan,
 )
 from src.rag.retrieval import (
@@ -66,9 +66,7 @@ class SynthesisAgent:
     ) -> None:
         self.model = (
             clean_text(model)
-            or clean_text(os.environ.get("RESEARCH_PLANNER_MODEL"))
-            or clean_text(os.environ.get("RAG_GENERATION_MODEL"))
-            or DEFAULT_RAG_GENERATION_MODEL
+            or rag_generation_model()
         )
         self.chroma_path = env_text("RAG_CHROMA_PATH", chroma_path, DEFAULT_CHROMA_PATH)
         self.collection_name = env_text("RAG_COLLECTION_NAME", collection_name, DEFAULT_COLLECTION_NAME)

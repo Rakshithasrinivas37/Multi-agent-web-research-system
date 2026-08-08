@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from src.memory.shared_memory import SharedMemory
+from src.tools.groq_retry import create_chat_completion_with_retries
 from src.tools.text_utils import clean_text
 
 
