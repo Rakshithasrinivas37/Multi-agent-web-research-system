@@ -113,6 +113,8 @@ jobs:
               | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
             echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
               > /etc/apt/sources.list.d/nodesource.list
+            DEBIAN_FRONTEND=noninteractive apt-get remove -y nodejs npm libnode-dev libnode72 || true
+            DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
           fi
