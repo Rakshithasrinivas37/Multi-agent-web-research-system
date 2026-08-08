@@ -990,7 +990,9 @@ Requirements:
 - Generate at most {len(prompt_gaps)} queries.
 - Keep each query focused on only that missing item.
 - Include literal technical terms, equation tokens, API names, benchmark names, model names, author names, and source titles that match the item.
-- For missing equations, include likely symbols and variants, such as softmax, tanh, sqrt, QK, K^T, Concat, W^Q, W^K, W^V, W^O, score, alignment, query, key, value.
+- Preserve the target entity from the missing item; do not move benchmarks, formulas, metrics, or limitations from one model/source to another.
+- Do not add assumed values or labels such as "quadratic", "linear", benchmark names, or model names unless they are explicitly present in the missing item.
+- For missing equations, include only symbols and variants that fit the named equation or architecture.
 - For missing API details, include official class/function names and parameters.
 - Do not answer the research question.
 - Do not combine multiple missing items into one broad query.
