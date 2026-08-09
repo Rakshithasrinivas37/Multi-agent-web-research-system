@@ -18,9 +18,9 @@ DEFAULT_REPORT_AGENT_MAX_TOKENS = 4200
 DEFAULT_REPORT_AGENT_CONTEXT_CHARS = 30000
 DEFAULT_REPORT_AGENT_CHUNK_CHARS = 1000
 DEFAULT_REPORT_SECTION_CONTEXT_CHARS = 9000
-DEFAULT_REPORT_SECTION_MAX_TOKENS = 1800
+DEFAULT_REPORT_SECTION_MAX_TOKENS = 2200
 DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS = 9000
-DEFAULT_REPORT_MAX_SECTIONS = 4
+DEFAULT_REPORT_MAX_SECTIONS = 6
 DEFAULT_REPORT_SECTION_CONCURRENCY = 3
 DEFAULT_REPORT_SINGLE_PROMPT_CHARS = 12000
 DEFAULT_REPORT_SINGLE_MAX_TOKENS = 2200
@@ -138,9 +138,7 @@ class ReportAgent:
             section_count = len(sections)
             section_concurrency = min(DEFAULT_REPORT_SECTION_CONCURRENCY, max(1, section_count))
             report_model = summary_model or (section_models[-1] if section_models else self.model)
-        if not clean_text(report):
-            raise ValueError("report_agent produced empty report")
-        report, repair_count, report_issues = repair_report_if_needed(
+        report, repair_count, report_issues = finalize_report(
             client=client,
             model=self.model,
             report=report,
@@ -150,28 +148,10 @@ class ReportAgent:
             evidence_text=evidence_text,
             source_text=source_text,
             missing_evidence_text=missing_evidence_text,
-            max_tokens=min(max(500, self.max_tokens), DEFAULT_REPORT_SECTION_MAX_TOKENS),
-            max_context_chars=min(self.max_context_chars, DEFAULT_REPORT_SECTION_CONTEXT_CHARS),
+            sources=sources,
+            report_max_tokens=min(max(1200, self.max_tokens), DEFAULT_REPORT_AGENT_MAX_TOKENS),
+            report_context_chars=min(self.max_context_chars, DEFAULT_REPORT_SECTION_CONTEXT_CHARS),
         )
-        report = normalize_final_report(report, sources)
-        report_issues = report_quality_issues(report, evidence_text)
-        if report_issues:
-            report, extra_repair_count, report_issues = repair_report_if_needed(
-                client=client,
-                model=self.model,
-                report=report,
-                objective=objective,
-                output_format=output_format_text,
-                synthesis=synthesis,
-                evidence_text=evidence_text,
-                source_text=source_text,
-                missing_evidence_text=missing_evidence_text,
-                max_tokens=min(max(500, self.max_tokens), DEFAULT_REPORT_SECTION_MAX_TOKENS),
-                max_context_chars=min(self.max_context_chars, DEFAULT_REPORT_SECTION_CONTEXT_CHARS),
-            )
-            repair_count += extra_repair_count
-            report = normalize_final_report(report, sources)
-            report_issues = report_quality_issues(report, evidence_text)
         return {
             "objective": objective,
             "output_format": output_format_text,
@@ -264,17 +244,32 @@ Requirements:
 
 
 def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, str]:
+    return groq_chat_text(
+        client=client,
+        model=model,
+        system_prompt="You are a careful report-writing agent. Use only provided synthesis context and evidence.",
+        user_prompt=prompt,
+        max_tokens=DEFAULT_REPORT_SINGLE_MAX_TOKENS,
+        max_context_chars=DEFAULT_REPORT_SINGLE_PROMPT_CHARS,
+    )
+
+
+def groq_chat_text(
+    client: Any,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    max_context_chars: int,
+) -> tuple[str, str]:
     response = groq_chat_completion_with_retries(
         client,
         model=model,
         temperature=0,
-        max_tokens=DEFAULT_REPORT_SINGLE_MAX_TOKENS,
+        max_tokens=max_tokens,
         messages=[
-            {
-                "role": "system",
-                "content": "You are a careful report-writing agent. Use only provided synthesis context and evidence.",
-            },
-            {"role": "user", "content": prompt[:DEFAULT_REPORT_SINGLE_PROMPT_CHARS]},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt[:max_context_chars]},
         ],
     )
     return normalize_citation_markers(response.choices[0].message.content), clean_text(getattr(response, "model", "")) or model
@@ -355,12 +350,13 @@ def generate_one_report_section(
         citation_aliases=citation_aliases,
         instruction=instruction,
         fallback_query=section_query,
-        max_chunks=4,
+        max_chunks=6,
         max_chars=600,
     )
     source_indexes = citation_markers(section_synthesis)
     source_indexes.extend(chunk_source_indexes(section_chunks))
     section_sources = sources_for_indexes(sources, source_indexes, max_sources=10) or list(sources[:8])
+    available_citations = source_index_set(section_sources)
     section_evidence_text = format_chunk_blocks(section_chunks) or "No section-specific supporting chunks were found."
     prompt = build_section_prompt(
         objective=objective,
@@ -374,20 +370,15 @@ def generate_one_report_section(
         section_source_text=format_sources(section_sources),
         diagnostics=compact_markdown(diagnostics, max_chars=800),
     )
-    response = groq_chat_completion_with_retries(
-        client,
+    section, response_model = groq_chat_text(
+        client=client,
         model=model,
-        temperature=0,
+        system_prompt="You write one section of a technical report using only provided synthesis context and evidence.",
+        user_prompt=prompt,
         max_tokens=DEFAULT_REPORT_SECTION_MAX_TOKENS,
-        messages=[
-            {
-                "role": "system",
-                "content": "You write one section of a technical report using only provided synthesis context and evidence.",
-            },
-            {"role": "user", "content": prompt[:DEFAULT_REPORT_SECTION_CONTEXT_CHARS]},
-        ],
+        max_context_chars=DEFAULT_REPORT_SECTION_CONTEXT_CHARS,
     )
-    section = strip_references_section(normalize_citation_markers(response.choices[0].message.content))
+    section = strip_references_section(section)
     section = ensure_section_heading(section, title)
     section, section_repair_model = repair_section_if_needed(
         client=client,
@@ -396,8 +387,8 @@ def generate_one_report_section(
         title=title,
         instruction=instruction,
         prompt=prompt,
+        available_citations=available_citations,
     )
-    response_model = clean_text(getattr(response, "model", "")) or model
     if section_repair_model:
         response_model = section_repair_model
     return section, response_model
@@ -410,11 +401,12 @@ def repair_section_if_needed(
     title: str,
     instruction: str,
     prompt: str,
+    available_citations: set[int],
 ) -> tuple[str, str]:
     repaired = ensure_section_heading(section, title)
     repair_model = ""
     for _ in range(SECTION_REPAIR_MAX_ATTEMPTS):
-        issues = section_quality_issues(repaired, instruction)
+        issues = section_quality_issues(repaired, instruction, available_citations=available_citations)
         if not issues:
             break
         repair_prompt = f"""Original section prompt:
@@ -432,27 +424,24 @@ Requirements:
 - Start with exactly this heading: ## {title}
 - Finish all sentences, lists, tables, code blocks, and math blocks.
 - Cover every item in the section instruction using the provided evidence, or state that the provided evidence is incomplete.
+- Use only citation markers listed in the section sources.
+- Remove unsupported or unavailable citation markers instead of inventing references.
 - Do not include the report title, executive summary, conclusion, or References section."""
-        response = groq_chat_completion_with_retries(
-            client,
+        candidate, response_model = groq_chat_text(
+            client=client,
             model=model,
-            temperature=0,
+            system_prompt="You repair one technical report section for completeness and evidence consistency.",
+            user_prompt=repair_prompt,
             max_tokens=DEFAULT_REPORT_SECTION_MAX_TOKENS,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You repair one technical report section for completeness and evidence consistency.",
-                },
-                {"role": "user", "content": repair_prompt[:DEFAULT_REPORT_SECTION_CONTEXT_CHARS]},
-            ],
+            max_context_chars=DEFAULT_REPORT_SECTION_CONTEXT_CHARS,
         )
         candidate = ensure_section_heading(
-            strip_references_section(normalize_citation_markers(response.choices[0].message.content)),
+            strip_references_section(candidate),
             title,
         )
         if clean_text(candidate):
             repaired = candidate
-            repair_model = clean_text(getattr(response, "model", "")) or model
+            repair_model = response_model
     return repaired, repair_model
 
 
@@ -506,15 +495,23 @@ Requirements:
 - Include exact technical details only when they are present in the synthesis notes or supporting chunks.
 - If evidence is incomplete, state the limitation instead of inventing details.
 - Cite claims using only plain source markers listed above, like [1] or [2].
+- Do not use citation markers that are absent from the section source list.
 - Do not include the report title, executive summary, conclusion, or References section."""
 
 
-def section_quality_issues(section: str, instruction: str) -> list[str]:
+def section_quality_issues(
+    section: str,
+    instruction: str,
+    available_citations: set[int] | None = None,
+) -> list[str]:
     issues = []
     text = clean_markdown(section)
     if not text:
         return ["section is empty"]
     issues.extend(markdown_completion_issues(text))
+    invalid_citations = unavailable_citation_markers(text, available_citations or set())
+    if invalid_citations:
+        issues.append(f"section uses unavailable citations: {format_citation_indexes(invalid_citations)}")
     missing_items = missing_instruction_items(text, instruction)
     if missing_items:
         issues.append(f"section is missing requested coverage: {', '.join(missing_items[:3])}")
@@ -637,21 +634,16 @@ Requirements:
 - Cite source-backed claims with only the available source markers.
 - Do not include a References section."""
 
-    response = groq_chat_completion_with_retries(
-        client,
+    summary, response_model = groq_chat_text(
+        client=client,
         model=model,
-        temperature=0,
+        system_prompt="You summarize completed report sections without adding unsupported claims.",
+        user_prompt=prompt,
         max_tokens=700,
-        messages=[
-            {
-                "role": "system",
-                "content": "You summarize completed report sections without adding unsupported claims.",
-            },
-            {"role": "user", "content": prompt[:DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS]},
-        ],
+        max_context_chars=DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS,
     )
-    summary = strip_references_section(normalize_citation_markers(response.choices[0].message.content))
-    return ensure_section_heading(summary, "Executive Summary"), clean_text(getattr(response, "model", "")) or model
+    summary = strip_references_section(summary)
+    return ensure_section_heading(summary, "Executive Summary"), response_model
 
 
 def assemble_report(
@@ -814,14 +806,12 @@ def relevant_text_for_section(text: str, query: str, max_chars: int) -> str:
     if not blocks:
         return "No synthesis notes were provided for this section."
     query_terms = detail_terms(query)
-    ranked = sorted(
-        enumerate(blocks),
-        key=lambda item: (
-            -len(detail_terms(item[1]) & query_terms),
-            item[0],
-        ),
-    )
-    selected = [block for _, block in ranked if detail_terms(block) & query_terms]
+    ranked = []
+    for index, block in enumerate(blocks):
+        score = len(detail_terms(block) & query_terms)
+        ranked.append((score, index, block))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    selected = [block for score, _, block in ranked if score > 0]
     if not selected:
         selected = blocks[:3]
     return truncate_blocks(selected, max_chars=max_chars)
@@ -846,7 +836,8 @@ def relevant_supporting_chunks(
         if not content:
             continue
         source_index = chunk_source_index(chunk, citation_aliases)
-        score = len(detail_terms(content) & query_terms)
+        content_terms = detail_terms(content)
+        score = len(content_terms & query_terms)
         if chunk.get("is_primary_source"):
             score += 1
         ranked.append((score, index, {**chunk, "source_index": source_index, "content": content[:max_chars].strip()}))
@@ -1053,6 +1044,47 @@ def references_section(markdown: str, sources: Sequence[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def source_index_set(sources: Sequence[dict[str, Any]]) -> set[int]:
+    return {
+        source["index"]
+        for source in sources
+        if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+
+
+def unavailable_citation_markers(text: Any, available_indexes: set[int]) -> list[int]:
+    if not available_indexes:
+        return []
+    return [index for index in citation_markers(text) if index not in available_indexes]
+
+
+def missing_reference_entries_for_used_citations(report: str, available_indexes: set[int]) -> list[int]:
+    body = strip_all_references_blocks(report)
+    used = {index for index in citation_markers(body) if index in available_indexes}
+    references = reference_entry_indexes(report)
+    return sorted(used - references)
+
+
+def reference_entry_indexes(report: str) -> set[int]:
+    indexes = set()
+    in_references = False
+    for line in clean_markdown(report).splitlines():
+        if is_references_heading(line):
+            in_references = True
+            continue
+        if in_references and line.startswith("## ") and not is_references_heading(line):
+            break
+        if in_references:
+            match = re.match(r"^\[(\d+)\]\s+", line.strip())
+            if match:
+                indexes.add(int(match.group(1)))
+    return indexes
+
+
+def format_citation_indexes(indexes: Sequence[int]) -> str:
+    return ", ".join(f"[{index}]" for index in sorted(set(indexes)))
+
+
 def citation_markers(text: Any) -> list[int]:
     markers = []
     seen = set()
@@ -1089,6 +1121,52 @@ def compact_markdown(value: Any, max_chars: int) -> str:
     return text[:max_chars].rstrip()
 
 
+def finalize_report(
+    client: Any,
+    model: str,
+    report: str,
+    objective: str,
+    output_format: str,
+    synthesis: str,
+    evidence_text: str,
+    source_text: str,
+    missing_evidence_text: str,
+    sources: Sequence[dict[str, Any]],
+    report_max_tokens: int,
+    report_context_chars: int,
+) -> tuple[str, int, list[str]]:
+    if not clean_text(report):
+        raise ValueError("report_agent produced empty report")
+
+    repaired = normalize_final_report(report, sources)
+    issues = report_quality_issues(repaired, evidence_text, sources=sources)
+    total_repair_count = 0
+    for _ in range(REPORT_REPAIR_MAX_ATTEMPTS):
+        if not issues:
+            break
+        repaired, repair_count, issues = repair_report_if_needed(
+            client=client,
+            model=model,
+            report=repaired,
+            objective=objective,
+            output_format=output_format,
+            synthesis=synthesis,
+            evidence_text=evidence_text,
+            source_text=source_text,
+            missing_evidence_text=missing_evidence_text,
+            sources=sources,
+            max_tokens=report_max_tokens,
+            max_context_chars=report_context_chars,
+        )
+        total_repair_count += repair_count
+        repaired = normalize_final_report(repaired, sources)
+        issues = report_quality_issues(repaired, evidence_text, sources=sources)
+
+    if issues:
+        raise ValueError(f"report_agent produced invalid report: {'; '.join(issues)}")
+    return repaired, total_repair_count, issues
+
+
 def repair_report_if_needed(
     client: Any,
     model: str,
@@ -1099,18 +1177,19 @@ def repair_report_if_needed(
     evidence_text: str,
     source_text: str,
     missing_evidence_text: str,
+    sources: Sequence[dict[str, Any]],
     max_tokens: int,
     max_context_chars: int,
 ) -> tuple[str, int, list[str]]:
-    """Ask the model to fix report-level validation issues before returning."""
+    """Run one model repair pass for report-level validation issues."""
 
     repaired = normalize_citation_markers(report)
     repair_count = 0
-    issues = report_quality_issues(repaired, evidence_text)
-    for _ in range(REPORT_REPAIR_MAX_ATTEMPTS):
-        if not issues:
-            break
-        repair_prompt = f"""Research objective:
+    issues = report_quality_issues(repaired, evidence_text, sources=sources)
+    if not issues:
+        return repaired, repair_count, issues
+
+    repair_prompt = f"""Research objective:
 {objective}
 
 Requested output format:
@@ -1143,40 +1222,47 @@ Requirements:
 - If a concrete detail appears in supporting evidence, it may be included with a citation.
 - Do not invent unsupported details.
 - Keep only source markers from Available sources.
+- Remove or replace unavailable source markers using only the Available sources and supporting evidence.
 - Do not include section-level References blocks.
 - End with a References section mapping used source markers to URLs."""
 
-        response = groq_chat_completion_with_retries(
-            client,
-            model=model,
-            temperature=0,
-            max_tokens=max_tokens,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You repair technical reports for evidence consistency, citation validity, and completeness.",
-                },
-                {"role": "user", "content": repair_prompt[:max_context_chars]},
-            ],
-        )
-        candidate = normalize_citation_markers(response.choices[0].message.content)
-        if clean_text(candidate):
-            repaired = candidate
-            repair_count += 1
-        issues = report_quality_issues(repaired, evidence_text)
+    candidate, _ = groq_chat_text(
+        client=client,
+        model=model,
+        system_prompt="You repair technical reports for evidence consistency, citation validity, and completeness.",
+        user_prompt=repair_prompt,
+        max_tokens=max_tokens,
+        max_context_chars=max_context_chars,
+    )
+    if clean_text(candidate):
+        repaired = candidate
+        repair_count += 1
+    issues = report_quality_issues(repaired, evidence_text, sources=sources)
     return repaired, repair_count, issues
 
 
-def report_quality_issues(report: str, evidence_text: str) -> list[str]:
+def report_quality_issues(
+    report: str,
+    evidence_text: str,
+    sources: Sequence[dict[str, Any]] | None = None,
+) -> list[str]:
     issues = []
     text = clean_text(report)
     if not text:
         return ["report is empty"]
-    lowered = text.lower()
-    if "references" not in lowered:
+    reference_count = references_heading_count(report)
+    if reference_count == 0:
         issues.append("report must include a References section")
-    if references_heading_count(report) > 1:
+    if reference_count > 1:
         issues.append("report must not include section-level References blocks")
+    source_indexes = source_index_set(sources or [])
+    if source_indexes:
+        invalid_citations = unavailable_citation_markers(report, source_indexes)
+        if invalid_citations:
+            issues.append(f"report uses unavailable citations: {format_citation_indexes(invalid_citations)}")
+        missing_reference_entries = missing_reference_entries_for_used_citations(report, source_indexes)
+        if missing_reference_entries:
+            issues.append(f"report References section is missing cited sources: {format_citation_indexes(missing_reference_entries)}")
     incomplete_sections = incomplete_report_sections(report)
     if incomplete_sections:
         issues.append(f"report contains incomplete sections: {', '.join(incomplete_sections[:3])}")
@@ -1314,11 +1400,12 @@ def detail_terms(text: str) -> set[str]:
         "with",
         "would",
     }
-    return {
-        normalize_detail_term(token)
-        for token in re.findall(r"[A-Za-z][A-Za-z0-9_.+-]{3,}", clean_text(text))
-        if normalize_detail_term(token) not in stopwords
-    }
+    terms = set()
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_.+-]{3,}", clean_text(text)):
+        term = normalize_detail_term(token)
+        if term not in stopwords:
+            terms.add(term)
+    return terms
 
 
 def normalize_detail_term(token: str) -> str:
