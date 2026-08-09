@@ -18,7 +18,7 @@ DEFAULT_REPORT_AGENT_MAX_TOKENS = 4200
 DEFAULT_REPORT_AGENT_CONTEXT_CHARS = 30000
 DEFAULT_REPORT_AGENT_CHUNK_CHARS = 1000
 DEFAULT_REPORT_SECTION_CONTEXT_CHARS = 9000
-DEFAULT_REPORT_SECTION_MAX_TOKENS = 1200
+DEFAULT_REPORT_SECTION_MAX_TOKENS = 1800
 DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS = 9000
 DEFAULT_REPORT_MAX_SECTIONS = 4
 DEFAULT_REPORT_SECTION_CONCURRENCY = 3
@@ -26,6 +26,7 @@ DEFAULT_REPORT_SINGLE_PROMPT_CHARS = 12000
 DEFAULT_REPORT_SINGLE_MAX_TOKENS = 2200
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
 REPORT_REPAIR_MAX_ATTEMPTS = 2
+SECTION_REPAIR_MAX_ATTEMPTS = 2
 
 
 class ReportAgent:
@@ -368,7 +369,71 @@ def generate_one_report_section(
     )
     section = strip_references_section(normalize_citation_markers(response.choices[0].message.content))
     section = ensure_section_heading(section, title)
-    return section, clean_text(getattr(response, "model", "")) or model
+    section, section_repair_model = repair_section_if_needed(
+        client=client,
+        model=model,
+        section=section,
+        title=title,
+        instruction=instruction,
+        prompt=prompt,
+    )
+    response_model = clean_text(getattr(response, "model", "")) or model
+    if section_repair_model:
+        response_model = section_repair_model
+    return section, response_model
+
+
+def repair_section_if_needed(
+    client: Any,
+    model: str,
+    section: str,
+    title: str,
+    instruction: str,
+    prompt: str,
+) -> tuple[str, str]:
+    repaired = ensure_section_heading(section, title)
+    repair_model = ""
+    for _ in range(SECTION_REPAIR_MAX_ATTEMPTS):
+        issues = section_quality_issues(repaired, instruction)
+        if not issues:
+            break
+        repair_prompt = f"""Original section prompt:
+{compact_markdown(prompt, max_chars=5200)}
+
+Current section draft:
+{compact_markdown(repaired, max_chars=2200)}
+
+Detected section issues:
+{format_issue_list(issues)}
+
+Repair only this section.
+Requirements:
+- Return the complete corrected section only.
+- Start with exactly this heading: ## {title}
+- Finish all sentences, lists, tables, code blocks, and math blocks.
+- Cover every item in the section instruction using the provided evidence, or state that the provided evidence is incomplete.
+- Do not include the report title, executive summary, conclusion, or References section."""
+        response = groq_chat_completion_with_retries(
+            client,
+            model=model,
+            temperature=0,
+            max_tokens=DEFAULT_REPORT_SECTION_MAX_TOKENS,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You repair one technical report section for completeness and evidence consistency.",
+                },
+                {"role": "user", "content": repair_prompt[:DEFAULT_REPORT_SECTION_CONTEXT_CHARS]},
+            ],
+        )
+        candidate = ensure_section_heading(
+            strip_references_section(normalize_citation_markers(response.choices[0].message.content)),
+            title,
+        )
+        if clean_text(candidate):
+            repaired = candidate
+            repair_model = clean_text(getattr(response, "model", "")) or model
+    return repaired, repair_model
 
 
 def build_section_prompt(
@@ -422,6 +487,99 @@ Requirements:
 - If evidence is incomplete, state the limitation instead of inventing details.
 - Cite claims using only plain source markers listed above, like [1] or [2].
 - Do not include the report title, executive summary, conclusion, or References section."""
+
+
+def section_quality_issues(section: str, instruction: str) -> list[str]:
+    issues = []
+    text = clean_markdown(section)
+    if not text:
+        return ["section is empty"]
+    issues.extend(markdown_completion_issues(text))
+    missing_items = missing_instruction_items(text, instruction)
+    if missing_items:
+        issues.append(f"section is missing requested coverage: {', '.join(missing_items[:3])}")
+    if section_too_brief_for_instruction(text, instruction):
+        issues.append("section appears too brief for the grouped instruction")
+    return dedupe_preserve_order(issues)
+
+
+def markdown_completion_issues(markdown: str) -> list[str]:
+    text = clean_markdown(markdown)
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ["section is empty"]
+
+    issues = []
+    if text.count("```") % 2:
+        issues.append("section has an unclosed fenced code block")
+    if text.count(r"\[") != text.count(r"\]"):
+        issues.append("section has an unclosed display math block")
+    if text.count(r"\(") != text.count(r"\)"):
+        issues.append("section has an unclosed inline math expression")
+    if text.count("**") % 2:
+        issues.append("section has unclosed bold markdown")
+
+    last_line = lines[-1].strip()
+    if last_line.startswith("|") and not last_line.endswith("|"):
+        issues.append("section ends with an unfinished table row")
+    if re.search(r"<(?:sub|sup)>[^<]*$", last_line, flags=re.IGNORECASE):
+        issues.append("section ends with an unfinished HTML tag")
+    if unfinished_final_line(last_line):
+        issues.append("section appears to stop mid-sentence")
+    return dedupe_preserve_order(issues)
+
+
+def unfinished_final_line(line: str) -> bool:
+    text = clean_text(strip_markdown_markup(line))
+    if not text:
+        return False
+    lowered = text.lower().rstrip()
+    if lowered.endswith((",", ";", ":", "-", " and", " or", " of", " with", " by", " to", " from", " the")):
+        return True
+    if len(text) <= 8:
+        return True
+    if line.startswith("|"):
+        return False
+    return text[-1] not in ".!?)]}`'\""
+
+
+def missing_instruction_items(section: str, instruction: str) -> list[str]:
+    section_terms = detail_terms(section)
+    missing = []
+    for item in section_instruction_items(instruction):
+        item_terms = {
+            term
+            for term in detail_terms(item)
+            if len(term) >= 4
+        }
+        if not item_terms:
+            continue
+        required = min(3, max(1, len(item_terms) // 3))
+        if len(item_terms & section_terms) < required:
+            missing.append(short_issue_label(item))
+    return missing
+
+
+def section_instruction_items(instruction: str) -> list[str]:
+    items = [
+        clean_text(line.lstrip("-* ").strip())
+        for line in str(instruction or "").splitlines()
+        if line.strip().startswith(("-", "*"))
+    ]
+    return dedupe_preserve_order(items) or dedupe_preserve_order([instruction])
+
+
+def short_issue_label(text: str, max_length: int = 80) -> str:
+    value = clean_text(strip_markdown_markup(text))
+    if len(value) <= max_length:
+        return value
+    return value[:max_length].rstrip(" ,.;:") + "..."
+
+
+def section_too_brief_for_instruction(section: str, instruction: str) -> bool:
+    item_count = len(section_instruction_items(instruction))
+    min_chars = 450 if item_count <= 1 else min(1800, 450 * item_count)
+    return len(clean_text(section)) < min_chars
 
 
 def generate_executive_summary(
@@ -864,9 +1022,40 @@ def report_quality_issues(report: str, evidence_text: str) -> list[str]:
     lowered = text.lower()
     if "references" not in lowered:
         issues.append("report must include a References section")
+    incomplete_sections = incomplete_report_sections(report)
+    if incomplete_sections:
+        issues.append(f"report contains incomplete sections: {', '.join(incomplete_sections[:3])}")
     if stale_missing_detail_statement(report, evidence_text):
         issues.append("report may contain stale missing-evidence statements contradicted by supporting evidence")
     return dedupe_preserve_order(issues)
+
+
+def incomplete_report_sections(report: str) -> list[str]:
+    incomplete = []
+    for heading, section_text in h2_sections(report):
+        if normalized_heading(heading) in {"references"}:
+            continue
+        if markdown_completion_issues(section_text):
+            incomplete.append(short_issue_label(heading, max_length=60))
+    return incomplete
+
+
+def h2_sections(markdown: str) -> list[tuple[str, str]]:
+    sections = []
+    heading = ""
+    lines = []
+    for line in clean_markdown(markdown).splitlines():
+        if line.startswith("## "):
+            if heading:
+                sections.append((heading, "\n".join(lines).strip()))
+            heading = line.lstrip("#").strip()
+            lines = [line]
+            continue
+        if heading:
+            lines.append(line)
+    if heading:
+        sections.append((heading, "\n".join(lines).strip()))
+    return sections
 
 
 def stale_missing_detail_statement(report: str, evidence_text: str) -> bool:
