@@ -74,8 +74,11 @@ class ReportAgent:
         original_sources = report_context.get("sources", [])
         sources, citation_aliases = dedupe_sources_by_url(original_sources)
         synthesis = remap_citation_markers(synthesis, citation_aliases)
+        available_source_indexes = source_index_set(sources)
+        synthesis = remove_unavailable_citation_markers(synthesis, available_source_indexes)
         source_text = format_sources(sources)
         evidence_text = format_supporting_evidence(report_context, citation_aliases=citation_aliases)
+        evidence_text = remove_unavailable_citation_markers(evidence_text, available_source_indexes)
         missing_evidence_text = format_missing_evidence_constraints(synthesis)
         citation_policy = clean_text(report_context.get("citation_policy")) or (
             "Use only numbered source markers from the provided sources."
@@ -357,6 +360,8 @@ def generate_one_report_section(
     source_indexes.extend(chunk_source_indexes(section_chunks))
     section_sources = sources_for_indexes(sources, source_indexes, max_sources=10) or list(sources[:8])
     available_citations = source_index_set(section_sources)
+    section_synthesis = remove_unavailable_citation_markers(section_synthesis, available_citations)
+    section_chunks = sanitize_chunk_citations(section_chunks, available_citations)
     section_evidence_text = format_chunk_blocks(section_chunks) or "No section-specific supporting chunks were found."
     prompt = build_section_prompt(
         objective=objective,
@@ -522,7 +527,11 @@ def section_quality_issues(
 
 def markdown_completion_issues(markdown: str) -> list[str]:
     text = clean_markdown(markdown)
-    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    lines = [
+        line.rstrip()
+        for line in text.splitlines()
+        if line.strip() and not re.fullmatch(r"[-*_]{3,}", line.strip())
+    ]
     if not lines:
         return ["section is empty"]
 
@@ -1056,6 +1065,35 @@ def unavailable_citation_markers(text: Any, available_indexes: set[int]) -> list
     if not available_indexes:
         return []
     return [index for index in citation_markers(text) if index not in available_indexes]
+
+
+def remove_unavailable_citation_markers(text: Any, available_indexes: set[int]) -> str:
+    normalized = normalize_citation_markers(text)
+    if not available_indexes:
+        return normalized
+
+    def replace(match: re.Match[str]) -> str:
+        index = int(match.group(1))
+        return match.group(0) if index in available_indexes else ""
+
+    return clean_markdown(re.sub(r"\[(\d+)\]", replace, normalized))
+
+
+def sanitize_chunk_citations(
+    chunks: Sequence[dict[str, Any]],
+    available_indexes: set[int],
+) -> list[dict[str, Any]]:
+    sanitized = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        sanitized_chunk = dict(chunk)
+        sanitized_chunk["content"] = remove_unavailable_citation_markers(
+            sanitized_chunk.get("content"),
+            available_indexes,
+        )
+        sanitized.append(sanitized_chunk)
+    return sanitized
 
 
 def missing_reference_entries_for_used_citations(report: str, available_indexes: set[int]) -> list[int]:
