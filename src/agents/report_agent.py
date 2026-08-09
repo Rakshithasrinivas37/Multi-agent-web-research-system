@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from src.memory.shared_memory import SharedMemory
-from src.tools.groq_retry import create_chat_completion_with_retries
+from src.tools.groq_retry import create_chat_completion_with_retries as groq_chat_completion_with_retries
 from src.tools.text_utils import clean_text
 
 
@@ -16,6 +16,10 @@ DEFAULT_REPORT_AGENT_MODEL = "llama-3.1-8b-instant"
 DEFAULT_REPORT_AGENT_MAX_TOKENS = 4200
 DEFAULT_REPORT_AGENT_CONTEXT_CHARS = 30000
 DEFAULT_REPORT_AGENT_CHUNK_CHARS = 1000
+DEFAULT_REPORT_SECTION_CONTEXT_CHARS = 9000
+DEFAULT_REPORT_SECTION_MAX_TOKENS = 1200
+DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS = 9000
+DEFAULT_REPORT_MAX_SECTIONS = 8
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
 REPORT_REPAIR_MAX_ATTEMPTS = 2
 
@@ -72,68 +76,37 @@ class ReportAgent:
             "Use only numbered source markers from the provided sources."
         )
         diagnostics = report_context.get("diagnostics", {})
-
-        prompt = f"""Research objective:
-{objective}
-
-Requested output format:
-{clean_text(output_format) or "report"}
-
-Citation policy:
-{citation_policy}
-
-Synthesis-agent notes:
-{synthesis}
-
-Missing-evidence constraints:
-{missing_evidence_text}
-
-Supporting evidence chunks:
-{evidence_text}
-
-Available sources:
-{source_text}
-
-Retrieval diagnostics:
-{diagnostics}
-
-Generate the final report using only the synthesis-agent notes, supporting evidence chunks, and available sources above.
-Requirements:
-- Return polished Markdown.
-- Include a clear title.
-- Include an executive summary.
-- Write a detailed technical report, not a short summary.
-- Include technical sections that match the objective, synthesis, and requested output format.
-- Prefer concrete definitions, structured comparisons, measurements, examples, and implementation details when supported by synthesis or supporting chunks.
-- Explain important technical terms or notation when applicable, and use tables when they make comparisons clearer.
-- Include exact technical details only when they are supported by synthesis or supporting chunks.
-- Reconcile Missing-evidence constraints against Supporting evidence chunks before writing.
-- If supporting chunks contain a detail that synthesis previously marked missing, include the supported detail and do not say it is missing.
-- Do not reproduce details listed in Missing-evidence constraints unless they are present in Supporting evidence chunks.
-- If a missing item remains important, state only that the provided evidence describes it but does not include the exact detail.
-- Cite claims using only plain source markers from Available sources, exactly like [1], [2], [3].
-- For precise claims, prefer original papers, official docs, academic sources, or authoritative surveys.
-- Do not cite sources that are not listed.
-- Do not use citation formats like 【1】, footnotes, line citations, or URLs inline.
-- End with a References section mapping only used source markers to source URLs.
-- If evidence is incomplete, mention the limitation instead of inventing details.
-- Before finalizing, remove contradictions such as saying a detail is missing and then including that detail."""
-
         client = Groq()
-        response = create_chat_completion_with_retries(
-            client,
+        section_specs = report_section_specs(report_context, synthesis, output_format)
+        sections, section_models = generate_report_sections(
+            client=client,
             model=self.model,
-            temperature=0,
-            max_tokens=max(500, self.max_tokens),
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a careful report-writing agent. Use only provided synthesis context and evidence.",
-                },
-                {"role": "user", "content": prompt[: self.max_context_chars]},
-            ],
+            objective=objective,
+            output_format=clean_text(output_format) or "report",
+            section_specs=section_specs,
+            report_context=report_context,
+            citation_aliases=citation_aliases,
+            sources=sources,
+            synthesis=synthesis,
+            missing_evidence_text=missing_evidence_text,
+            citation_policy=citation_policy,
+            diagnostics=diagnostics,
         )
-        report = normalize_citation_markers(response.choices[0].message.content)
+        executive_summary, summary_model = generate_executive_summary(
+            client=client,
+            model=self.model,
+            objective=objective,
+            output_format=clean_text(output_format) or "report",
+            sections=sections,
+            sources=sources,
+            citation_policy=citation_policy,
+        )
+        report = assemble_report(
+            objective=objective,
+            executive_summary=executive_summary,
+            sections=sections,
+            sources=sources,
+        )
         if not clean_text(report):
             raise ValueError("report_agent produced empty report")
         report, repair_count, report_issues = repair_report_if_needed(
@@ -146,21 +119,23 @@ Requirements:
             evidence_text=evidence_text,
             source_text=source_text,
             missing_evidence_text=missing_evidence_text,
-            max_tokens=max(500, self.max_tokens),
-            max_context_chars=self.max_context_chars,
+            max_tokens=min(max(500, self.max_tokens), DEFAULT_REPORT_SECTION_MAX_TOKENS),
+            max_context_chars=min(self.max_context_chars, DEFAULT_REPORT_SECTION_CONTEXT_CHARS),
         )
         return {
             "objective": objective,
             "output_format": clean_text(output_format) or "report",
             "report": report,
             "sources": sources,
-            "model": response.model,
+            "model": summary_model or (section_models[-1] if section_models else self.model),
             "diagnostics": {
                 "source_count": len(sources),
                 "deduped_source_count": len(original_sources or []) - len(sources),
                 "supporting_chunk_count": len(report_context.get("supporting_chunks", []) or []),
                 "missing_evidence_constraint_count": missing_evidence_constraint_count(missing_evidence_text),
                 "report_length": len(report),
+                "report_generation_mode": "sectioned",
+                "report_section_count": len(sections),
                 "report_repair_count": repair_count,
                 "report_issues": report_issues,
             },
@@ -178,6 +153,448 @@ Requirements:
         report_payload = {**report_payload, "report_path": saved_path}
         memory = SharedMemory(memory_path)
         memory.write_agent_output("report", {"final_report": report_payload})
+
+
+def generate_report_sections(
+    client: Any,
+    model: str,
+    objective: str,
+    output_format: str,
+    section_specs: Sequence[dict[str, str]],
+    report_context: dict[str, Any],
+    citation_aliases: dict[int, int],
+    sources: Sequence[dict[str, Any]],
+    synthesis: str,
+    missing_evidence_text: str,
+    citation_policy: str,
+    diagnostics: Any,
+) -> tuple[list[str], list[str]]:
+    """Generate final report sections with small prompts to avoid TPM failures."""
+
+    sections = []
+    models = []
+    for spec in section_specs:
+        title = clean_text(spec.get("title")) or "Detailed Findings"
+        instruction = clean_text(spec.get("instruction")) or title
+        section_query = clean_text(f"{title} {instruction}")
+        section_synthesis = relevant_text_for_section(synthesis, section_query, max_chars=3200)
+        section_chunks = relevant_supporting_chunks(
+            report_context=report_context,
+            citation_aliases=citation_aliases,
+            query=section_query,
+            max_chunks=4,
+            max_chars=600,
+        )
+        source_indexes = citation_markers(section_synthesis)
+        source_indexes.extend(chunk_source_indexes(section_chunks))
+        section_sources = sources_for_indexes(sources, source_indexes, max_sources=10) or list(sources[:8])
+        section_source_text = format_sources(section_sources)
+        section_evidence_text = format_chunk_blocks(section_chunks) or "No section-specific supporting chunks were found."
+        section_missing_evidence_text = compact_markdown(missing_evidence_text, max_chars=1200)
+        section_diagnostics = compact_markdown(diagnostics, max_chars=800)
+        prompt = f"""Research objective:
+{objective}
+
+Requested output format:
+{output_format}
+
+Section to write:
+{title}
+
+Section instruction:
+{instruction}
+
+Citation policy:
+{citation_policy}
+
+Relevant synthesis notes:
+{section_synthesis}
+
+Relevant supporting evidence chunks:
+{section_evidence_text}
+
+Missing-evidence constraints:
+{section_missing_evidence_text}
+
+Available sources for this section:
+{section_source_text}
+
+Retrieval diagnostics:
+{section_diagnostics}
+
+Write only this report section.
+Requirements:
+- Start with exactly this heading: ## {title}
+- Write detailed, evidence-backed technical content for this section.
+- Prefer concrete definitions, comparisons, measurements, examples, and implementation details when supported.
+- Include exact technical details only when they are present in the synthesis notes or supporting chunks.
+- If evidence is incomplete, state the limitation instead of inventing details.
+- Cite claims using only plain source markers listed above, like [1] or [2].
+- Do not include the report title, executive summary, conclusion, or References section."""
+
+        response = groq_chat_completion_with_retries(
+            client,
+            model=model,
+            temperature=0,
+            max_tokens=DEFAULT_REPORT_SECTION_MAX_TOKENS,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You write one section of a technical report using only provided synthesis context and evidence.",
+                },
+                {"role": "user", "content": prompt[:DEFAULT_REPORT_SECTION_CONTEXT_CHARS]},
+            ],
+        )
+        section = strip_references_section(normalize_citation_markers(response.choices[0].message.content))
+        section = ensure_section_heading(section, title)
+        if clean_text(section):
+            sections.append(section)
+            models.append(clean_text(getattr(response, "model", "")) or model)
+    if not sections:
+        raise ValueError("report_agent produced no report sections")
+    return sections, models
+
+
+def generate_executive_summary(
+    client: Any,
+    model: str,
+    objective: str,
+    output_format: str,
+    sections: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+    citation_policy: str,
+) -> tuple[str, str]:
+    """Generate a compact executive summary from completed sections."""
+
+    section_preview = compact_markdown("\n\n".join(sections), max_chars=6500)
+    summary_sources = sources_for_indexes(sources, citation_markers(section_preview), max_sources=12)
+    prompt = f"""Research objective:
+{objective}
+
+Requested output format:
+{output_format}
+
+Citation policy:
+{citation_policy}
+
+Generated report sections:
+{section_preview}
+
+Available sources:
+{format_sources(summary_sources)}
+
+Write only the executive summary for the final report.
+Requirements:
+- Start with exactly this heading: ## Executive Summary
+- Summarize the most important findings from the generated sections.
+- Keep it concise but specific.
+- Cite source-backed claims with only the available source markers.
+- Do not include a References section."""
+
+    response = groq_chat_completion_with_retries(
+        client,
+        model=model,
+        temperature=0,
+        max_tokens=700,
+        messages=[
+            {
+                "role": "system",
+                "content": "You summarize completed report sections without adding unsupported claims.",
+            },
+            {"role": "user", "content": prompt[:DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS]},
+        ],
+    )
+    summary = strip_references_section(normalize_citation_markers(response.choices[0].message.content))
+    return ensure_section_heading(summary, "Executive Summary"), clean_text(getattr(response, "model", "")) or model
+
+
+def assemble_report(
+    objective: str,
+    executive_summary: str,
+    sections: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+) -> str:
+    body_parts = [
+        f"# {clean_text(objective).rstrip('?')}",
+        ensure_section_heading(executive_summary, "Executive Summary"),
+        *[strip_references_section(section) for section in sections if clean_text(section)],
+    ]
+    body = clean_markdown("\n\n".join(body_parts))
+    return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
+
+
+def report_section_specs(
+    report_context: dict[str, Any],
+    synthesis: str,
+    output_format: str,
+) -> list[dict[str, str]]:
+    items = []
+    items.extend(instruction_requirement_items(report_context.get("synthesis_instruction")))
+    items.extend(recommended_report_structure_items(synthesis))
+    items.extend(clean_text(question) for question in report_context.get("planner_questions", []) or [])
+    items = dedupe_preserve_order(items)
+    if not items:
+        items = [clean_text(output_format) or "Detailed Findings"]
+    return [
+        {"title": section_title_from_instruction(item, index), "instruction": item}
+        for index, item in enumerate(items[:DEFAULT_REPORT_MAX_SECTIONS], start=1)
+    ]
+
+
+def instruction_requirement_items(instruction: Any) -> list[str]:
+    text = clean_text(instruction)
+    if not text:
+        return []
+
+    markers = list(re.finditer(r"(?:^|\s)(?:\(\d+\)|\d+[.)])\s+", text))
+    if len(markers) >= 2:
+        items = []
+        for index, marker in enumerate(markers):
+            start = marker.end()
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+            item = clean_text(text[start:end].strip(" ;,."))
+            item = re.sub(r"(?:,\s*)?\band$", "", item).strip(" ;,.")
+            if item:
+                items.append(item)
+        return dedupe_preserve_order(items)
+
+    bullet_items = [
+        clean_text(line.lstrip("-* ").strip())
+        for line in str(instruction or "").splitlines()
+        if line.strip().startswith(("-", "*"))
+    ]
+    return dedupe_preserve_order(item for item in bullet_items if item)
+
+
+def recommended_report_structure_items(synthesis: str) -> list[str]:
+    section = markdown_section(synthesis, "Recommended Report Structure")
+    if not section:
+        return []
+    items = []
+    for line in section.splitlines():
+        item = clean_text(re.sub(r"^[-*\d.)\s]+", "", line))
+        if item and len(item) >= 8:
+            items.append(strip_markdown_markup(item))
+    return dedupe_preserve_order(items)
+
+
+def markdown_section(markdown: str, heading: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    target = normalized_heading(heading)
+    capture = False
+    section_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            heading_text = normalized_heading(stripped.lstrip("#").strip())
+            if capture:
+                break
+            capture = heading_text == target
+            continue
+        if capture:
+            section_lines.append(line)
+    return "\n".join(section_lines).strip()
+
+
+def normalized_heading(text: str) -> str:
+    return clean_text(re.sub(r"^\d+[.)]\s*", "", text)).lower()
+
+
+def section_title_from_instruction(instruction: str, index: int) -> str:
+    text = clean_text(strip_markdown_markup(instruction))
+    text = re.sub(r"^(a|an|the)\s+", "", text, flags=re.IGNORECASE)
+    text = re.split(r"\b(?:covering|highlighting|with|from|such as)\b|[:;]", text, maxsplit=1)[0]
+    words = re.findall(r"[A-Za-z0-9+/#_.-]+", text)[:9]
+    if not words:
+        return f"Section {index}"
+    return " ".join(word[:1].upper() + word[1:] for word in words)
+
+
+def relevant_text_for_section(text: str, query: str, max_chars: int) -> str:
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", clean_markdown(text)) if clean_text(block)]
+    if not blocks:
+        return "No synthesis notes were provided for this section."
+    query_terms = detail_terms(query)
+    ranked = sorted(
+        enumerate(blocks),
+        key=lambda item: (
+            -len(detail_terms(item[1]) & query_terms),
+            item[0],
+        ),
+    )
+    selected = [block for _, block in ranked if detail_terms(block) & query_terms]
+    if not selected:
+        selected = blocks[:3]
+    return truncate_blocks(selected, max_chars=max_chars)
+
+
+def relevant_supporting_chunks(
+    report_context: dict[str, Any],
+    citation_aliases: dict[int, int],
+    query: str,
+    max_chunks: int,
+    max_chars: int,
+) -> list[dict[str, Any]]:
+    chunks = report_context.get("supporting_chunks") or report_context.get("retrieved_chunks") or []
+    if not isinstance(chunks, list):
+        return []
+    query_terms = detail_terms(query)
+    ranked = []
+    for index, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict):
+            continue
+        content = clean_text(chunk.get("content"))
+        if not content:
+            continue
+        source_index = chunk_source_index(chunk, citation_aliases)
+        score = len(detail_terms(content) & query_terms)
+        if chunk.get("is_primary_source"):
+            score += 1
+        ranked.append((score, index, {**chunk, "source_index": source_index, "content": content[:max_chars].strip()}))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    selected = [chunk for score, _, chunk in ranked if score > 0][:max_chunks]
+    if not selected:
+        selected = [chunk for _, _, chunk in ranked[:max_chunks]]
+    return selected
+
+
+def chunk_source_index(chunk: dict[str, Any], citation_aliases: dict[int, int]) -> int | None:
+    source_index = chunk.get("source_index")
+    if not isinstance(source_index, int):
+        source_index = chunk.get("index")
+    if isinstance(source_index, int):
+        return citation_aliases.get(source_index, source_index)
+    return None
+
+
+def chunk_source_indexes(chunks: Sequence[dict[str, Any]]) -> list[int]:
+    indexes = []
+    for chunk in chunks:
+        source_index = chunk.get("source_index") if isinstance(chunk, dict) else None
+        if isinstance(source_index, int):
+            indexes.append(source_index)
+    return indexes
+
+
+def format_chunk_blocks(chunks: Sequence[dict[str, Any]]) -> str:
+    blocks = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        source_index = chunk.get("source_index")
+        marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
+        title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Source"
+        url = clean_text(chunk.get("url"))
+        content = clean_text(chunk.get("content"))
+        if content:
+            blocks.append(f"{marker} {title}\nURL: {url}\nEvidence: {content}")
+    return "\n\n".join(blocks)
+
+
+def sources_for_indexes(
+    sources: Sequence[dict[str, Any]],
+    indexes: Sequence[int],
+    max_sources: int,
+) -> list[dict[str, Any]]:
+    wanted = {index for index in indexes if isinstance(index, int)}
+    selected = [
+        source
+        for source in sources
+        if isinstance(source, dict)
+        and isinstance(source.get("index"), int)
+        and source["index"] in wanted
+    ]
+    if len(selected) < min(len(sources), max_sources):
+        selected_indexes = {source["index"] for source in selected}
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            index = source.get("index")
+            if not isinstance(index, int) or index in selected_indexes:
+                continue
+            selected.append(source)
+            selected_indexes.add(index)
+            if len(selected) >= max_sources:
+                break
+    return selected[:max_sources]
+
+
+def ensure_section_heading(markdown: str, title: str) -> str:
+    content = clean_markdown(markdown)
+    expected = f"## {clean_text(title)}"
+    if not content:
+        return expected
+    first_line = content.splitlines()[0].strip()
+    if first_line == expected:
+        return content
+    if first_line.startswith("## "):
+        return "\n".join([expected, *content.splitlines()[1:]]).strip()
+    return f"{expected}\n{content}"
+
+
+def strip_references_section(markdown: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    kept = []
+    for line in lines:
+        if normalized_heading(line.lstrip("#").strip()) == "references" and line.strip().startswith("#"):
+            break
+        kept.append(line)
+    return clean_markdown("\n".join(kept))
+
+
+def references_section(markdown: str, sources: Sequence[dict[str, Any]]) -> str:
+    source_by_index = {
+        source.get("index"): source
+        for source in sources
+        if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+    lines = ["## References"]
+    for index in citation_markers(markdown):
+        source = source_by_index.get(index)
+        if not source:
+            continue
+        url = clean_text(source.get("url"))
+        if url:
+            lines.append(f"[{index}] {url}")
+    if len(lines) == 1:
+        lines.append("No cited source markers were used.")
+    return "\n".join(lines)
+
+
+def citation_markers(text: Any) -> list[int]:
+    markers = []
+    seen = set()
+    for match in re.finditer(r"\[(\d+)\]", normalize_citation_markers(text)):
+        index = int(match.group(1))
+        if index in seen:
+            continue
+        seen.add(index)
+        markers.append(index)
+    return markers
+
+
+def truncate_blocks(blocks: Sequence[str], max_chars: int) -> str:
+    selected = []
+    used_chars = 0
+    for block in blocks:
+        text = clean_text(block)
+        if not text:
+            continue
+        if used_chars + len(text) > max_chars:
+            remaining = max_chars - used_chars
+            if remaining > 400:
+                selected.append(text[:remaining].rstrip())
+            break
+        selected.append(text)
+        used_chars += len(text)
+    return "\n\n".join(selected) or "No relevant notes were found."
+
+
+def compact_markdown(value: Any, max_chars: int) -> str:
+    text = clean_markdown(value)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip()
 
 
 def repair_report_if_needed(
@@ -235,7 +652,7 @@ Requirements:
 - Keep only source markers from Available sources.
 - End with a References section mapping used source markers to URLs."""
 
-        response = create_chat_completion_with_retries(
+        response = groq_chat_completion_with_retries(
             client,
             model=model,
             temperature=0,
@@ -254,12 +671,6 @@ Requirements:
             repair_count += 1
         issues = report_quality_issues(repaired, evidence_text)
     return repaired, repair_count, issues
-
-
-def create_chat_completion_with_retries(client: Any, **kwargs: Any) -> Any:
-    """Local wrapper kept small for the report-agent branch."""
-
-    return client.chat.completions.create(**kwargs)
 
 
 def report_quality_issues(report: str, evidence_text: str) -> list[str]:
