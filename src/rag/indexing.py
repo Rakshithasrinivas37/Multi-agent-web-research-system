@@ -21,7 +21,7 @@ DEFAULT_COLLECTION_NAME = "research_rag"
 DEFAULT_CHROMA_PATH = "data/chroma"
 DEFAULT_CHUNK_SIZE = 700
 DEFAULT_CHUNK_OVERLAP = 100
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
 DEFAULT_METADATA_SCHEMA_VERSION = 3
