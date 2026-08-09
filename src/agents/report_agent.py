@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
 from pathlib import Path
@@ -19,7 +20,10 @@ DEFAULT_REPORT_AGENT_CHUNK_CHARS = 1000
 DEFAULT_REPORT_SECTION_CONTEXT_CHARS = 9000
 DEFAULT_REPORT_SECTION_MAX_TOKENS = 1200
 DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS = 9000
-DEFAULT_REPORT_MAX_SECTIONS = 8
+DEFAULT_REPORT_MAX_SECTIONS = 4
+DEFAULT_REPORT_SECTION_CONCURRENCY = 3
+DEFAULT_REPORT_SINGLE_PROMPT_CHARS = 12000
+DEFAULT_REPORT_SINGLE_MAX_TOKENS = 2200
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
 REPORT_REPAIR_MAX_ATTEMPTS = 2
 
@@ -77,36 +81,62 @@ class ReportAgent:
         )
         diagnostics = report_context.get("diagnostics", {})
         client = Groq()
-        section_specs = report_section_specs(report_context, synthesis, output_format)
-        sections, section_models = generate_report_sections(
-            client=client,
-            model=self.model,
+        output_format_text = clean_text(output_format) or "report"
+        single_prompt = build_single_report_prompt(
             objective=objective,
-            output_format=clean_text(output_format) or "report",
-            section_specs=section_specs,
-            report_context=report_context,
-            citation_aliases=citation_aliases,
-            sources=sources,
+            output_format=output_format_text,
+            citation_policy=citation_policy,
             synthesis=synthesis,
             missing_evidence_text=missing_evidence_text,
-            citation_policy=citation_policy,
+            evidence_text=evidence_text,
+            source_text=source_text,
             diagnostics=diagnostics,
         )
-        executive_summary, summary_model = generate_executive_summary(
-            client=client,
-            model=self.model,
-            objective=objective,
-            output_format=clean_text(output_format) or "report",
-            sections=sections,
-            sources=sources,
-            citation_policy=citation_policy,
-        )
-        report = assemble_report(
-            objective=objective,
-            executive_summary=executive_summary,
-            sections=sections,
-            sources=sources,
-        )
+        generation_mode = "single"
+        section_count = 0
+        section_concurrency = 0
+        report_model = self.model
+        if len(single_prompt) <= min(self.max_context_chars, DEFAULT_REPORT_SINGLE_PROMPT_CHARS):
+            report, report_model = generate_single_report(
+                client=client,
+                model=self.model,
+                prompt=single_prompt,
+            )
+        else:
+            section_specs = report_section_specs(report_context, synthesis, output_format)
+            sections, section_models = generate_report_sections(
+                client_factory=Groq,
+                model=self.model,
+                objective=objective,
+                output_format=output_format_text,
+                section_specs=section_specs,
+                report_context=report_context,
+                citation_aliases=citation_aliases,
+                sources=sources,
+                synthesis=synthesis,
+                missing_evidence_text=missing_evidence_text,
+                citation_policy=citation_policy,
+                diagnostics=diagnostics,
+            )
+            executive_summary, summary_model = generate_executive_summary(
+                client=client,
+                model=self.model,
+                objective=objective,
+                output_format=output_format_text,
+                sections=sections,
+                sources=sources,
+                citation_policy=citation_policy,
+            )
+            report = assemble_report(
+                objective=objective,
+                executive_summary=executive_summary,
+                sections=sections,
+                sources=sources,
+            )
+            generation_mode = "sectioned_parallel"
+            section_count = len(sections)
+            section_concurrency = min(DEFAULT_REPORT_SECTION_CONCURRENCY, max(1, section_count))
+            report_model = summary_model or (section_models[-1] if section_models else self.model)
         if not clean_text(report):
             raise ValueError("report_agent produced empty report")
         report, repair_count, report_issues = repair_report_if_needed(
@@ -114,7 +144,7 @@ class ReportAgent:
             model=self.model,
             report=report,
             objective=objective,
-            output_format=clean_text(output_format) or "report",
+            output_format=output_format_text,
             synthesis=synthesis,
             evidence_text=evidence_text,
             source_text=source_text,
@@ -124,18 +154,19 @@ class ReportAgent:
         )
         return {
             "objective": objective,
-            "output_format": clean_text(output_format) or "report",
+            "output_format": output_format_text,
             "report": report,
             "sources": sources,
-            "model": summary_model or (section_models[-1] if section_models else self.model),
+            "model": report_model,
             "diagnostics": {
                 "source_count": len(sources),
                 "deduped_source_count": len(original_sources or []) - len(sources),
                 "supporting_chunk_count": len(report_context.get("supporting_chunks", []) or []),
                 "missing_evidence_constraint_count": missing_evidence_constraint_count(missing_evidence_text),
                 "report_length": len(report),
-                "report_generation_mode": "sectioned",
-                "report_section_count": len(sections),
+                "report_generation_mode": generation_mode,
+                "report_section_count": section_count,
+                "report_section_concurrency": section_concurrency,
                 "report_repair_count": repair_count,
                 "report_issues": report_issues,
             },
@@ -155,8 +186,82 @@ class ReportAgent:
         memory.write_agent_output("report", {"final_report": report_payload})
 
 
+def build_single_report_prompt(
+    objective: str,
+    output_format: str,
+    citation_policy: str,
+    synthesis: str,
+    missing_evidence_text: str,
+    evidence_text: str,
+    source_text: str,
+    diagnostics: Any,
+) -> str:
+    return f"""Research objective:
+{objective}
+
+Requested output format:
+{output_format}
+
+Citation policy:
+{citation_policy}
+
+Synthesis-agent notes:
+{synthesis}
+
+Missing-evidence constraints:
+{missing_evidence_text}
+
+Supporting evidence chunks:
+{evidence_text}
+
+Available sources:
+{source_text}
+
+Retrieval diagnostics:
+{diagnostics}
+
+Generate the final report using only the synthesis-agent notes, supporting evidence chunks, and available sources above.
+Requirements:
+- Return polished Markdown.
+- Include a clear title.
+- Include an executive summary.
+- Write a detailed technical report, not a short summary.
+- Include technical sections that match the objective, synthesis, and requested output format.
+- Prefer concrete definitions, structured comparisons, measurements, examples, and implementation details when supported by synthesis or supporting chunks.
+- Explain important technical terms or notation when applicable, and use tables when they make comparisons clearer.
+- Include exact technical details only when they are supported by synthesis or supporting chunks.
+- Reconcile Missing-evidence constraints against Supporting evidence chunks before writing.
+- If supporting chunks contain a detail that synthesis previously marked missing, include the supported detail and do not say it is missing.
+- Do not reproduce details listed in Missing-evidence constraints unless they are present in Supporting evidence chunks.
+- If a missing item remains important, state only that the provided evidence describes it but does not include the exact detail.
+- Cite claims using only plain source markers from Available sources, exactly like [1], [2], [3].
+- For precise claims, prefer original papers, official docs, academic sources, or authoritative surveys.
+- Do not cite sources that are not listed.
+- Do not use citation formats like 【1】, footnotes, line citations, or URLs inline.
+- End with a References section mapping only used source markers to source URLs.
+- If evidence is incomplete, mention the limitation instead of inventing details.
+- Before finalizing, remove contradictions such as saying a detail is missing and then including that detail."""
+
+
+def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, str]:
+    response = groq_chat_completion_with_retries(
+        client,
+        model=model,
+        temperature=0,
+        max_tokens=DEFAULT_REPORT_SINGLE_MAX_TOKENS,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a careful report-writing agent. Use only provided synthesis context and evidence.",
+            },
+            {"role": "user", "content": prompt[:DEFAULT_REPORT_SINGLE_PROMPT_CHARS]},
+        ],
+    )
+    return normalize_citation_markers(response.choices[0].message.content), clean_text(getattr(response, "model", "")) or model
+
+
 def generate_report_sections(
-    client: Any,
+    client_factory: Any,
     model: str,
     objective: str,
     output_format: str,
@@ -171,28 +276,114 @@ def generate_report_sections(
 ) -> tuple[list[str], list[str]]:
     """Generate final report sections with small prompts to avoid TPM failures."""
 
+    max_workers = min(DEFAULT_REPORT_SECTION_CONCURRENCY, max(1, len(section_specs)))
+    generated: dict[int, tuple[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                generate_one_report_section,
+                client=client_factory(),
+                model=model,
+                objective=objective,
+                output_format=output_format,
+                spec=spec,
+                report_context=report_context,
+                citation_aliases=citation_aliases,
+                sources=sources,
+                synthesis=synthesis,
+                missing_evidence_text=missing_evidence_text,
+                citation_policy=citation_policy,
+                diagnostics=diagnostics,
+            ): index
+            for index, spec in enumerate(section_specs)
+        }
+        for future in as_completed(futures):
+            generated[futures[future]] = future.result()
+
     sections = []
     models = []
-    for spec in section_specs:
-        title = clean_text(spec.get("title")) or "Detailed Findings"
-        instruction = clean_text(spec.get("instruction")) or title
-        section_query = clean_text(f"{title} {instruction}")
-        section_synthesis = relevant_text_for_section(synthesis, section_query, max_chars=3200)
-        section_chunks = relevant_supporting_chunks(
-            report_context=report_context,
-            citation_aliases=citation_aliases,
-            query=section_query,
-            max_chunks=4,
-            max_chars=600,
-        )
-        source_indexes = citation_markers(section_synthesis)
-        source_indexes.extend(chunk_source_indexes(section_chunks))
-        section_sources = sources_for_indexes(sources, source_indexes, max_sources=10) or list(sources[:8])
-        section_source_text = format_sources(section_sources)
-        section_evidence_text = format_chunk_blocks(section_chunks) or "No section-specific supporting chunks were found."
-        section_missing_evidence_text = compact_markdown(missing_evidence_text, max_chars=1200)
-        section_diagnostics = compact_markdown(diagnostics, max_chars=800)
-        prompt = f"""Research objective:
+    for index in sorted(generated):
+        section, section_model = generated[index]
+        if clean_text(section):
+            sections.append(section)
+            models.append(section_model)
+    if not sections:
+        raise ValueError("report_agent produced no report sections")
+    return sections, models
+
+
+def generate_one_report_section(
+    client: Any,
+    model: str,
+    objective: str,
+    output_format: str,
+    spec: dict[str, str],
+    report_context: dict[str, Any],
+    citation_aliases: dict[int, int],
+    sources: Sequence[dict[str, Any]],
+    synthesis: str,
+    missing_evidence_text: str,
+    citation_policy: str,
+    diagnostics: Any,
+) -> tuple[str, str]:
+    title = clean_text(spec.get("title")) or "Detailed Findings"
+    instruction = clean_text(spec.get("instruction")) or title
+    section_query = clean_text(f"{title} {instruction}")
+    section_synthesis = relevant_text_for_section(synthesis, section_query, max_chars=3200)
+    section_chunks = relevant_supporting_chunks(
+        report_context=report_context,
+        citation_aliases=citation_aliases,
+        query=section_query,
+        max_chunks=4,
+        max_chars=600,
+    )
+    source_indexes = citation_markers(section_synthesis)
+    source_indexes.extend(chunk_source_indexes(section_chunks))
+    section_sources = sources_for_indexes(sources, source_indexes, max_sources=10) or list(sources[:8])
+    section_evidence_text = format_chunk_blocks(section_chunks) or "No section-specific supporting chunks were found."
+    prompt = build_section_prompt(
+        objective=objective,
+        output_format=output_format,
+        title=title,
+        instruction=instruction,
+        citation_policy=citation_policy,
+        section_synthesis=section_synthesis,
+        section_evidence_text=section_evidence_text,
+        missing_evidence_text=compact_markdown(missing_evidence_text, max_chars=1200),
+        section_source_text=format_sources(section_sources),
+        diagnostics=compact_markdown(diagnostics, max_chars=800),
+    )
+    response = groq_chat_completion_with_retries(
+        client,
+        model=model,
+        temperature=0,
+        max_tokens=DEFAULT_REPORT_SECTION_MAX_TOKENS,
+        messages=[
+            {
+                "role": "system",
+                "content": "You write one section of a technical report using only provided synthesis context and evidence.",
+            },
+            {"role": "user", "content": prompt[:DEFAULT_REPORT_SECTION_CONTEXT_CHARS]},
+        ],
+    )
+    section = strip_references_section(normalize_citation_markers(response.choices[0].message.content))
+    section = ensure_section_heading(section, title)
+    return section, clean_text(getattr(response, "model", "")) or model
+
+
+def build_section_prompt(
+    objective: str,
+    output_format: str,
+    title: str,
+    instruction: str,
+    citation_policy: str,
+    section_synthesis: str,
+    section_evidence_text: str,
+    missing_evidence_text: str,
+    section_source_text: str,
+    diagnostics: str,
+) -> str:
+    return f"""Research objective:
 {objective}
 
 Requested output format:
@@ -214,13 +405,13 @@ Relevant supporting evidence chunks:
 {section_evidence_text}
 
 Missing-evidence constraints:
-{section_missing_evidence_text}
+{missing_evidence_text}
 
 Available sources for this section:
 {section_source_text}
 
 Retrieval diagnostics:
-{section_diagnostics}
+{diagnostics}
 
 Write only this report section.
 Requirements:
@@ -231,28 +422,6 @@ Requirements:
 - If evidence is incomplete, state the limitation instead of inventing details.
 - Cite claims using only plain source markers listed above, like [1] or [2].
 - Do not include the report title, executive summary, conclusion, or References section."""
-
-        response = groq_chat_completion_with_retries(
-            client,
-            model=model,
-            temperature=0,
-            max_tokens=DEFAULT_REPORT_SECTION_MAX_TOKENS,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You write one section of a technical report using only provided synthesis context and evidence.",
-                },
-                {"role": "user", "content": prompt[:DEFAULT_REPORT_SECTION_CONTEXT_CHARS]},
-            ],
-        )
-        section = strip_references_section(normalize_citation_markers(response.choices[0].message.content))
-        section = ensure_section_heading(section, title)
-        if clean_text(section):
-            sections.append(section)
-            models.append(clean_text(getattr(response, "model", "")) or model)
-    if not sections:
-        raise ValueError("report_agent produced no report sections")
-    return sections, models
 
 
 def generate_executive_summary(
@@ -336,9 +505,23 @@ def report_section_specs(
     if not items:
         items = [clean_text(output_format) or "Detailed Findings"]
     return [
-        {"title": section_title_from_instruction(item, index), "instruction": item}
-        for index, item in enumerate(items[:DEFAULT_REPORT_MAX_SECTIONS], start=1)
+        {
+            "title": section_title_from_instruction(group[0], index),
+            "instruction": "\n".join(f"- {item}" for item in group),
+        }
+        for index, group in enumerate(group_report_items(items, DEFAULT_REPORT_MAX_SECTIONS), start=1)
     ]
+
+
+def group_report_items(items: Sequence[str], max_groups: int) -> list[list[str]]:
+    clean_items = dedupe_preserve_order(items)
+    if not clean_items:
+        return []
+    group_count = min(max(1, max_groups), len(clean_items))
+    groups = [[] for _ in range(group_count)]
+    for index, item in enumerate(clean_items):
+        groups[min(group_count - 1, index * group_count // len(clean_items))].append(item)
+    return [group for group in groups if group]
 
 
 def instruction_requirement_items(instruction: Any) -> list[str]:
