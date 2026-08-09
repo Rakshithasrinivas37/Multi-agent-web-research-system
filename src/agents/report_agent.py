@@ -153,6 +153,25 @@ class ReportAgent:
             max_tokens=min(max(500, self.max_tokens), DEFAULT_REPORT_SECTION_MAX_TOKENS),
             max_context_chars=min(self.max_context_chars, DEFAULT_REPORT_SECTION_CONTEXT_CHARS),
         )
+        report = normalize_final_report(report, sources)
+        report_issues = report_quality_issues(report, evidence_text)
+        if report_issues:
+            report, extra_repair_count, report_issues = repair_report_if_needed(
+                client=client,
+                model=self.model,
+                report=report,
+                objective=objective,
+                output_format=output_format_text,
+                synthesis=synthesis,
+                evidence_text=evidence_text,
+                source_text=source_text,
+                missing_evidence_text=missing_evidence_text,
+                max_tokens=min(max(500, self.max_tokens), DEFAULT_REPORT_SECTION_MAX_TOKENS),
+                max_context_chars=min(self.max_context_chars, DEFAULT_REPORT_SECTION_CONTEXT_CHARS),
+            )
+            repair_count += extra_repair_count
+            report = normalize_final_report(report, sources)
+            report_issues = report_quality_issues(report, evidence_text)
         return {
             "objective": objective,
             "output_format": output_format_text,
@@ -331,10 +350,11 @@ def generate_one_report_section(
     instruction = clean_text(spec.get("instruction")) or title
     section_query = clean_text(f"{title} {instruction}")
     section_synthesis = relevant_text_for_section(synthesis, section_query, max_chars=3200)
-    section_chunks = relevant_supporting_chunks(
+    section_chunks = relevant_supporting_chunks_for_instruction(
         report_context=report_context,
         citation_aliases=citation_aliases,
-        query=section_query,
+        instruction=instruction,
+        fallback_query=section_query,
         max_chunks=4,
         max_chars=600,
     )
@@ -536,8 +556,6 @@ def unfinished_final_line(line: str) -> bool:
     lowered = text.lower().rstrip()
     if lowered.endswith((",", ";", ":", "-", " and", " or", " of", " with", " by", " to", " from", " the")):
         return True
-    if len(text) <= 8:
-        return True
     if line.startswith("|"):
         return False
     return text[-1] not in ".!?)]}`'\""
@@ -615,6 +633,7 @@ Requirements:
 - Start with exactly this heading: ## Executive Summary
 - Summarize the most important findings from the generated sections.
 - Keep it concise but specific.
+- If a generated section says a detail is missing, not reproduced, or not supported, do not include that detail as a fact in the summary.
 - Cite source-backed claims with only the available source markers.
 - Do not include a References section."""
 
@@ -644,9 +663,14 @@ def assemble_report(
     body_parts = [
         f"# {clean_text(objective).rstrip('?')}",
         ensure_section_heading(executive_summary, "Executive Summary"),
-        *[strip_references_section(section) for section in sections if clean_text(section)],
+        *[strip_section_local_references(section) for section in sections if clean_text(section)],
     ]
     body = clean_markdown("\n\n".join(body_parts))
+    return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
+
+
+def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> str:
+    body = strip_all_references_blocks(report)
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
 
 
@@ -655,16 +679,16 @@ def report_section_specs(
     synthesis: str,
     output_format: str,
 ) -> list[dict[str, str]]:
-    items = []
-    items.extend(instruction_requirement_items(report_context.get("synthesis_instruction")))
-    items.extend(recommended_report_structure_items(synthesis))
-    items.extend(clean_text(question) for question in report_context.get("planner_questions", []) or [])
+    instruction_items = instruction_requirement_items(report_context.get("synthesis_instruction"))
+    structure_items = recommended_report_structure_items(synthesis)
+    planner_items = [clean_text(question) for question in report_context.get("planner_questions", []) or []]
+    items = [*instruction_items, *structure_items] if instruction_items else [*structure_items, *planner_items]
     items = dedupe_preserve_order(items)
     if not items:
         items = [clean_text(output_format) or "Detailed Findings"]
     return [
         {
-            "title": section_title_from_instruction(group[0], index),
+            "title": section_title_from_instruction(" ".join(group), index),
             "instruction": "\n".join(f"- {item}" for item in group),
         }
         for index, group in enumerate(group_report_items(items, DEFAULT_REPORT_MAX_SECTIONS), start=1)
@@ -704,7 +728,41 @@ def instruction_requirement_items(instruction: Any) -> list[str]:
         for line in str(instruction or "").splitlines()
         if line.strip().startswith(("-", "*"))
     ]
-    return dedupe_preserve_order(item for item in bullet_items if item)
+    if bullet_items:
+        return dedupe_preserve_order(item for item in bullet_items if item)
+
+    listed_text = re.sub(r"^.*?\b(?:include|cover|covering)\s*:\s*", "", text, flags=re.IGNORECASE)
+    listed_text = re.sub(r"\.\s*(?:cite|ensure|use)\b.*$", "", listed_text, flags=re.IGNORECASE)
+    listed_items = split_instruction_list(listed_text)
+    if len(listed_items) >= 3:
+        return dedupe_preserve_order(listed_items)
+    return []
+
+
+def split_instruction_list(text: str) -> list[str]:
+    items = []
+    current = []
+    depth = 0
+    for char in str(text or ""):
+        if char == "(":
+            depth += 1
+        elif char == ")" and depth:
+            depth -= 1
+        if char in {",", ";"} and depth == 0:
+            item = clean_text("".join(current).strip(" .;:,"))
+            if item:
+                items.append(item)
+            current = []
+            continue
+        current.append(char)
+    item = clean_text("".join(current).strip(" .;:,"))
+    if item:
+        items.append(item)
+    if len(items) > 1:
+        last = items[-1]
+        if last.lower().startswith("and "):
+            items[-1] = clean_text(last[4:])
+    return [item for item in items if item]
 
 
 def recommended_report_structure_items(synthesis: str) -> list[str]:
@@ -743,9 +801,9 @@ def normalized_heading(text: str) -> str:
 
 def section_title_from_instruction(instruction: str, index: int) -> str:
     text = clean_text(strip_markdown_markup(instruction))
-    text = re.sub(r"^(a|an|the)\s+", "", text, flags=re.IGNORECASE)
-    text = re.split(r"\b(?:covering|highlighting|with|from|such as)\b|[:;]", text, maxsplit=1)[0]
-    words = re.findall(r"[A-Za-z0-9+/#_.-]+", text)[:9]
+    text = re.sub(r"\b(what|which|how|why|does|do|did|are|is|was|were|the|a|an)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(in|of|on|for|to|from|with|and|or|as|by|used|using|include|includes|have|has|been)\b", " ", text, flags=re.IGNORECASE)
+    words = re.findall(r"[A-Za-z0-9+/#_.-]+", clean_text(text))[:8]
     if not words:
         return f"Section {index}"
     return " ".join(word[:1].upper() + word[1:] for word in words)
@@ -797,6 +855,44 @@ def relevant_supporting_chunks(
     if not selected:
         selected = [chunk for _, _, chunk in ranked[:max_chunks]]
     return selected
+
+
+def relevant_supporting_chunks_for_instruction(
+    report_context: dict[str, Any],
+    citation_aliases: dict[int, int],
+    instruction: str,
+    fallback_query: str,
+    max_chunks: int,
+    max_chars: int,
+) -> list[dict[str, Any]]:
+    selected = []
+    seen_ids = set()
+    queries = section_instruction_items(instruction) or [fallback_query]
+    per_query_limit = max(1, min(2, max_chunks))
+    for query in queries:
+        for chunk in relevant_supporting_chunks(
+            report_context=report_context,
+            citation_aliases=citation_aliases,
+            query=query,
+            max_chunks=per_query_limit,
+            max_chars=max_chars,
+        ):
+            key = clean_text(chunk.get("id")) or clean_text(chunk.get("url")) or clean_text(chunk.get("content"))[:80]
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            selected.append(chunk)
+            if len(selected) >= max_chunks:
+                return selected
+    if selected:
+        return selected
+    return relevant_supporting_chunks(
+        report_context=report_context,
+        citation_aliases=citation_aliases,
+        query=fallback_query,
+        max_chunks=max_chunks,
+        max_chars=max_chars,
+    )
 
 
 def chunk_source_index(chunk: dict[str, Any], citation_aliases: dict[int, int]) -> int | None:
@@ -877,10 +973,65 @@ def strip_references_section(markdown: str) -> str:
     lines = clean_markdown(markdown).splitlines()
     kept = []
     for line in lines:
-        if normalized_heading(line.lstrip("#").strip()) == "references" and line.strip().startswith("#"):
+        if is_references_heading(line):
             break
         kept.append(line)
     return clean_markdown("\n".join(kept))
+
+
+def strip_section_local_references(markdown: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    kept = []
+    skip = False
+    for line in lines:
+        if is_references_heading(line):
+            remove_trailing_separators(kept)
+            skip = True
+            continue
+        if skip and line.startswith("## "):
+            skip = False
+        if not skip:
+            kept.append(line)
+    return trim_trailing_separators(clean_markdown("\n".join(kept)))
+
+
+def strip_all_references_blocks(markdown: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    kept = []
+    skip = False
+    for line in lines:
+        if is_references_heading(line):
+            remove_trailing_separators(kept)
+            skip = True
+            continue
+        if skip and line.startswith("## ") and not is_references_heading(line):
+            skip = False
+        if not skip:
+            kept.append(line)
+    return trim_trailing_separators(clean_markdown("\n".join(kept)))
+
+
+def trim_trailing_separators(markdown: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    remove_trailing_separators(lines)
+    return clean_markdown("\n".join(lines))
+
+
+def remove_trailing_separators(lines: list[str]) -> None:
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and re.fullmatch(r"[-*_]{3,}", lines[-1].strip()):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+
+def is_references_heading(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    text = normalized_heading(strip_markdown_markup(stripped).strip()).rstrip(":")
+    return text in {"references", "reference"}
 
 
 def references_section(markdown: str, sources: Sequence[dict[str, Any]]) -> str:
@@ -988,9 +1139,11 @@ Requirements:
 - Return only the corrected Markdown report.
 - Keep the report detailed and technical.
 - Remove stale missing-evidence statements when supporting evidence now contains the detail.
+- Remove exact formulas, examples, numbers, or complexity notation from sentences that say those details are missing or unsupported.
 - If a concrete detail appears in supporting evidence, it may be included with a citation.
 - Do not invent unsupported details.
 - Keep only source markers from Available sources.
+- Do not include section-level References blocks.
 - End with a References section mapping used source markers to URLs."""
 
         response = groq_chat_completion_with_retries(
@@ -1022,12 +1175,20 @@ def report_quality_issues(report: str, evidence_text: str) -> list[str]:
     lowered = text.lower()
     if "references" not in lowered:
         issues.append("report must include a References section")
+    if references_heading_count(report) > 1:
+        issues.append("report must not include section-level References blocks")
     incomplete_sections = incomplete_report_sections(report)
     if incomplete_sections:
         issues.append(f"report contains incomplete sections: {', '.join(incomplete_sections[:3])}")
+    if missing_statement_contains_unsupported_detail(report):
+        issues.append("report includes exact details inside missing-evidence statements")
     if stale_missing_detail_statement(report, evidence_text):
         issues.append("report may contain stale missing-evidence statements contradicted by supporting evidence")
     return dedupe_preserve_order(issues)
+
+
+def references_heading_count(report: str) -> int:
+    return sum(1 for line in clean_markdown(report).splitlines() if is_references_heading(line))
 
 
 def incomplete_report_sections(report: str) -> list[str]:
@@ -1070,6 +1231,7 @@ def has_missing_claim(text: str) -> bool:
 
 def report_missing_sentences(text: str) -> list[str]:
     missing_phrases = (
+        "not explicitly",
         "not present",
         "not provided",
         "not available",
@@ -1078,10 +1240,17 @@ def report_missing_sentences(text: str) -> list[str]:
         "not shown",
         "not specified",
         "not contain",
+        "not reproduced",
+        "cannot be cited",
+        "cannot be supplied",
         "cannot be reproduced",
+        "no explicit statement",
+        "no explicit evidence",
+        "no precise citation",
         "is missing",
         "are missing",
         "missing detail",
+        "evidence is incomplete",
     )
     sentences = re.split(r"(?<=[.!?])\s+|\n+", clean_text(text))
     return [
@@ -1097,6 +1266,21 @@ def overlapping_detail_terms(missing_sentences: Sequence[str], evidence_text: st
     for sentence in missing_sentences:
         overlaps.update(detail_terms(sentence) & evidence_terms)
     return overlaps
+
+
+def missing_statement_contains_unsupported_detail(report: str) -> bool:
+    for sentence in report_missing_sentences(report):
+        if has_exact_detail_signal(sentence):
+            return True
+    return False
+
+
+def has_exact_detail_signal(text: str) -> bool:
+    value = str(text or "")
+    return bool(
+        re.search(r"\\\(|\\\[|=[^=]|\\sum|\\frac|O\(", value)
+        or re.search(r"\be\.g\.\s*,", value, flags=re.IGNORECASE)
+    )
 
 
 def detail_terms(text: str) -> set[str]:
@@ -1131,10 +1315,23 @@ def detail_terms(text: str) -> set[str]:
         "would",
     }
     return {
-        token.lower()
+        normalize_detail_term(token)
         for token in re.findall(r"[A-Za-z][A-Za-z0-9_.+-]{3,}", clean_text(text))
-        if token.lower() not in stopwords
+        if normalize_detail_term(token) not in stopwords
     }
+
+
+def normalize_detail_term(token: str) -> str:
+    value = token.lower().strip("._+-")
+    if value.endswith("ically") and len(value) > 9:
+        return value[:-6] + "ic"
+    if value.endswith("ally") and len(value) > 7:
+        return value[:-4]
+    if value.endswith("ies") and len(value) > 5:
+        return value[:-3] + "y"
+    if value.endswith("s") and len(value) > 5:
+        return value[:-1]
+    return value
 
 
 def format_issue_list(issues: Sequence[str]) -> str:
