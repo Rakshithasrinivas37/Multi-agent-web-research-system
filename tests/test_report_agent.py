@@ -1,6 +1,6 @@
 import unittest
 
-from src.agents.report_agent import report_quality_issues
+from src.agents.report_agent import markdown_completion_issues, remove_unavailable_citation_markers, report_quality_issues
 
 
 class ReportAgentValidationTests(unittest.TestCase):
@@ -57,6 +57,24 @@ This sentence mentions references but has no reference section.
         issues = report_quality_issues(report, "")
 
         self.assertIn("report must include a References section", issues)
+
+    def test_remove_unavailable_citation_markers_keeps_valid_markers(self):
+        text = "Valid source [1], duplicate style 【2】, and unavailable source [9]."
+
+        sanitized = remove_unavailable_citation_markers(text, {1, 2})
+
+        self.assertIn("[1]", sanitized)
+        self.assertIn("[2]", sanitized)
+        self.assertNotIn("[9]", sanitized)
+
+    def test_markdown_completion_ignores_trailing_horizontal_rule(self):
+        section = """## Section
+This section is complete.
+
+---
+"""
+
+        self.assertEqual(markdown_completion_issues(section), [])
 
 
 if __name__ == "__main__":
