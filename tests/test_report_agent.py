@@ -206,6 +206,40 @@ No cited source markers were used.
         self.assertIn("### Child Section", normalized)
         self.assertEqual(report_quality_issues(normalized, ""), [])
 
+    def test_normalize_final_report_moves_summary_to_executive_summary(self):
+        report = """**Deep Dive**
+
+### 1. Details
+This section is complete.
+
+### 10. Summary
+This is the generated summary.
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("## Executive Summary", normalized)
+        self.assertIn("This is the generated summary.", normalized)
+        self.assertNotIn("### 10. Summary", normalized)
+
+    def test_normalize_final_report_inserts_executive_summary_when_missing(self):
+        report = """# Topic
+
+## Details
+This section explains the available evidence.
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("## Executive Summary", normalized)
+        self.assertIn("This section explains the available evidence.", normalized)
+
     def test_report_generation_token_caps_stay_under_budget(self):
         self.assertLessEqual(
             report_generation_token_cap(),
