@@ -69,6 +69,23 @@ No cited source markers were used.
 
         self.assertIn("report contains incomplete sections: Executive Summary", issues)
 
+    def test_report_quality_does_not_flag_h2_container_with_h3_content(self):
+        report = """# Topic
+
+## 3.2 Mathematical Formulation
+The formulation has two parts:
+
+### 3.2.1 Scaled Dot Product
+This subsection is complete.
+
+## References
+No cited source markers were used.
+"""
+
+        issues = report_quality_issues(report, "")
+
+        self.assertNotIn("report contains incomplete sections: 3.2 Mathematical Formulation", issues)
+
     def test_report_quality_requires_references_heading(self):
         report = """# Topic
 
@@ -113,6 +130,22 @@ Valid claim [1]. Bad copied marker [9].
 
         self.assertIn("[1] https://example.com/one", normalized)
         self.assertNotIn("[9]", normalized)
+
+    def test_normalize_final_report_trims_incomplete_section_tail(self):
+        report = """# Topic
+
+## Executive Summary
+This sentence is complete.
+This final generated line stops with
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("This sentence is complete.", normalized)
+        self.assertNotIn("This final generated line stops with", normalized)
 
     def test_report_generation_token_caps_stay_under_budget(self):
         self.assertLessEqual(
