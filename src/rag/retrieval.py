@@ -647,6 +647,7 @@ def merge_ranked_results(
             + (bm25_weight * bm25_score)
             + (authority_weight * authority_score)
             + (DEFAULT_FEATURE_WEIGHT * query_feature_score(query, item.document))
+            + metadata_signal_score(query, item.metadata)
         )
         merged.append(
             RetrievalResult(
@@ -688,6 +689,21 @@ def query_feature_score(query: str, document: str) -> float:
     term_overlap = len(query_terms & document_terms) / max(1, min(len(query_terms), len(document_terms)))
     phrase_overlap = query_phrase_overlap(query, document)
     return min(1.0, (0.75 * term_overlap) + (0.25 * phrase_overlap))
+
+
+def metadata_signal_score(query: str, metadata: Any) -> float:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    query_text = clean_text(query).lower()
+    score = 0.0
+    if metadata.get("chunk_kind") == "signal":
+        score += 0.03
+    if metadata.get("has_formula_signal") and formula_context_needed(query_text):
+        score += 0.12
+    if metadata.get("has_api_signal") and re.search(r"\b(api|sdk|pytorch|tensorflow|torch\.|tf\.|keras\.)\b", query_text):
+        score += 0.10
+    if metadata.get("has_benchmark_signal") and re.search(r"\b(benchmark|score|accuracy|bleu|glue|imagenet|metric)\b", query_text):
+        score += 0.10
+    return min(score, 0.20)
 
 
 def query_phrase_overlap(query: str, document: str) -> float:
