@@ -1240,9 +1240,20 @@ def finalize_report(
         repaired = normalize_final_report(repaired, sources)
         issues = report_quality_issues(repaired, evidence_text, sources=sources)
 
-    if issues:
-        raise ValueError(f"report_agent produced invalid report: {'; '.join(issues)}")
+    blocking_issues = hard_report_issues(issues)
+    if blocking_issues:
+        raise ValueError(f"report_agent produced invalid report: {'; '.join(blocking_issues)}")
     return repaired, total_repair_count, issues
+
+
+def hard_report_issues(issues: Sequence[str]) -> list[str]:
+    """Keep heuristic evidence warnings visible without failing an otherwise usable report."""
+
+    return [
+        issue
+        for issue in issues
+        if clean_text(issue) != "report may contain stale missing-evidence statements contradicted by supporting evidence"
+    ]
 
 
 def repair_report_if_needed(

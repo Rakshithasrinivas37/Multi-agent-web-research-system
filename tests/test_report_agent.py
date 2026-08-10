@@ -3,6 +3,7 @@ import unittest
 from src.agents.report_agent import (
     DEFAULT_REPORT_MAX_SECTIONS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+    hard_report_issues,
     markdown_completion_issues,
     normalize_final_report,
     remove_unavailable_citation_markers,
@@ -211,6 +212,14 @@ No cited source markers were used.
             report_generation_token_cap("sectioned_parallel", DEFAULT_REPORT_MAX_SECTIONS),
             DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
         )
+
+    def test_hard_report_issues_treats_stale_missing_evidence_as_warning(self):
+        issues = [
+            "report may contain stale missing-evidence statements contradicted by supporting evidence",
+            "report must include a References section",
+        ]
+
+        self.assertEqual(hard_report_issues(issues), ["report must include a References section"])
 
 
 if __name__ == "__main__":
