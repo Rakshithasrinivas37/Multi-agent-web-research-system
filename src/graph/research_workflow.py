@@ -455,6 +455,16 @@ def validate_report_payload(payload: dict[str, Any], research_plan: dict[str, An
         errors.append("report_node report must include a References section")
     return errors
 
+
+def next_node_or_end(next_node: str):
+    """Route to the next node only when the previous node completed without errors."""
+
+    def route(state: ResearchState) -> str:
+        return END if state.get("errors") else next_node
+
+    return route
+
+
 def build_planner_graph():
     """Build a graph with only the planner node."""
 
@@ -472,12 +482,12 @@ def build_research_graph():
     graph.add_node("browser", browser_node)
     graph.add_node("change_detection", change_detection_node)
     graph.set_entry_point("planner")
-    graph.add_edge("planner", "browser")
-    graph.add_edge("browser", "change_detection")
     graph.add_node("synthesis", synthesis_node)
     graph.add_node("report", report_node)
-    graph.add_edge("change_detection", "synthesis")
-    graph.add_edge("synthesis", "report")
+    graph.add_conditional_edges("planner", next_node_or_end("browser"))
+    graph.add_conditional_edges("browser", next_node_or_end("change_detection"))
+    graph.add_conditional_edges("change_detection", next_node_or_end("synthesis"))
+    graph.add_conditional_edges("synthesis", next_node_or_end("report"))
     graph.add_edge("report", END)
     return graph.compile()
 
