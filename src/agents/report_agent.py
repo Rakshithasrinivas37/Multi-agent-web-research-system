@@ -192,7 +192,7 @@ Generate the final report using only the synthesis-agent notes, supporting evide
 Requirements:
 - Return polished Markdown.
 - Include a clear title.
-- Include an executive summary.
+- Include an executive summary under the exact heading "## Executive Summary".
 - Write a detailed technical report, not a short summary.
 - Include technical sections that match the objective, synthesis, and requested output format.
 - Answer every planner sub-question explicitly using the available evidence.
@@ -200,8 +200,10 @@ Requirements:
 - Use synthesis-agent notes and supporting chunks as the only factual basis; do not fill gaps from model prior knowledge.
 - Explain important technical terms or notation when applicable, and use tables when they make comparisons clearer.
 - Include exact technical details only when they are supported by synthesis or supporting chunks.
+- Include supported equations, API signatures, and code snippets when they appear in synthesis or supporting chunks.
 - Reconcile Missing-evidence constraints against Supporting evidence chunks before writing.
 - If supporting chunks contain a detail that synthesis previously marked missing, include the supported detail and do not say it is missing.
+- Do not generalize a missing detail to a broader topic; include supported parts and name only the exact unsupported detail.
 - Do not reproduce details listed in Missing-evidence constraints unless they are present in Supporting evidence chunks.
 - If a missing item remains important, state only that the provided evidence describes it but does not include the exact detail.
 - Include a brief "Evidence Gaps" section when Missing-evidence constraints identify partial or missing required items.
@@ -285,6 +287,79 @@ def rewrite_missing_sub_question_queries(objective: str, questions: Sequence[str
         if query:
             queries.append(query[:600])
     return dedupe_preserve_order(queries)
+
+
+def report_context_gap_items(report_context: dict[str, Any], research_plan: dict[str, Any]) -> list[str]:
+    """Find missing or partial evidence items before the final report call."""
+
+    if not isinstance(report_context, dict):
+        return []
+    synthesis = clean_markdown(report_context.get("synthesis"))
+    if not synthesis:
+        return []
+    planner_questions = report_context.get("planner_questions") or research_plan.get("sub_questions") or []
+    planner_questions = [clean_text(question) for question in planner_questions if clean_text(question)]
+    explicit_constraints = missing_evidence_constraints(synthesis)
+    question_gaps = planner_question_gap_items(synthesis, planner_questions)
+    uncovered_questions = missing_sub_question_coverage(synthesis, planner_questions)
+    return dedupe_preserve_order([*question_gaps, *uncovered_questions, *explicit_constraints])
+
+
+def report_context_gap_queries(report_context: dict[str, Any], research_plan: dict[str, Any]) -> list[str]:
+    objective = clean_text(research_plan.get("objective")) or clean_text(report_context.get("objective"))
+    return rewrite_missing_sub_question_queries(
+        objective,
+        report_context_gap_items(report_context, research_plan),
+    )
+
+
+def planner_question_gap_items(synthesis: str, planner_questions: Sequence[str]) -> list[str]:
+    questions = [clean_text(question) for question in planner_questions if clean_text(question)]
+    if not questions:
+        return []
+    current_heading = ""
+    gap_items = []
+    for line in clean_markdown(synthesis).splitlines():
+        line_text = clean_text(line)
+        if not line_text:
+            continue
+        if line_text.startswith("#"):
+            current_heading = strip_markdown_markup(line_text)
+            continue
+        if not line_mentions_gap(line_text):
+            continue
+        for question in questions:
+            if question_matches_gap_context(question, f"{current_heading} {line_text}"):
+                gap_items.append(f"{question}: {strip_markdown_markup(line_text)}")
+                break
+    return dedupe_preserve_order(gap_items)
+
+
+def line_mentions_gap(line: str) -> bool:
+    lowered = clean_text(strip_markdown_markup(line)).lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "partial",
+            "missing",
+            "gap",
+            "none in the retrieved",
+            "not present",
+            "not extracted",
+            "does not contain",
+        )
+    )
+
+
+def question_matches_gap_context(question: str, context: str) -> bool:
+    question_terms = detail_terms(question)
+    context_terms = detail_terms(context)
+    if not question_terms or not context_terms:
+        return False
+    common_question_words = {"what", "when", "where", "which", "whose", "does", "used"}
+    specific_terms = {term for term in question_terms if term not in common_question_words}
+    required = min(2, max(1, len(specific_terms) // 3))
+    return len(specific_terms & context_terms) >= required
 
 
 def estimated_tokens(char_count: int) -> int:
