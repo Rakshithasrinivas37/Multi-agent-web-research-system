@@ -441,7 +441,74 @@ def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> st
     body = remove_unavailable_citation_markers(body, source_index_set(sources))
     body = trim_incomplete_section_tails(body)
     body = remove_empty_sections(body)
+    body = ensure_executive_summary_section(body)
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
+
+
+def ensure_executive_summary_section(markdown: str) -> str:
+    text = clean_markdown(markdown)
+    if has_h2_executive_summary(text):
+        return text
+
+    lines = text.splitlines()
+    summary_bounds = find_summary_section_bounds(lines)
+    if summary_bounds:
+        start, end = summary_bounds
+        summary_lines = ["## Executive Summary", *nonempty_lines(lines[start + 1 : end])]
+        remaining = lines[:start] + lines[end:]
+    else:
+        summary_lines = ["## Executive Summary", fallback_executive_summary(lines)]
+        remaining = lines
+
+    insert_at = executive_summary_insert_index(remaining)
+    updated = [*remaining[:insert_at], "", *summary_lines, "", *remaining[insert_at:]]
+    return clean_markdown("\n".join(updated))
+
+
+def has_h2_executive_summary(markdown: str) -> bool:
+    return any(
+        line.startswith("## ") and normalized_heading(line.lstrip("#").strip()) == "executive summary"
+        for line in clean_markdown(markdown).splitlines()
+    )
+
+
+def find_summary_section_bounds(lines: Sequence[str]) -> tuple[int, int] | None:
+    for index, line in enumerate(lines):
+        match = re.match(r"^(#{2,3})\s+(.+)$", line)
+        if not match or normalized_heading(match.group(2)) not in {"summary", "executive summary"}:
+            continue
+        level = len(match.group(1))
+        end = len(lines)
+        for next_index, next_line in enumerate(lines[index + 1 :], start=index + 1):
+            next_match = re.match(r"^(#{2,3})\s+", next_line)
+            if next_match and len(next_match.group(1)) <= level:
+                end = next_index
+                break
+        return index, end
+    return None
+
+
+def nonempty_lines(lines: Sequence[str]) -> list[str]:
+    return [line for line in lines if clean_text(line)]
+
+
+def executive_summary_insert_index(lines: Sequence[str]) -> int:
+    for index, line in enumerate(lines):
+        if not clean_text(line):
+            continue
+        if line.startswith("# ") or (line.startswith("**") and line.endswith("**")):
+            return index + 1
+        return index
+    return 0
+
+
+def fallback_executive_summary(lines: Sequence[str]) -> str:
+    for line in lines:
+        text = clean_text(strip_markdown_markup(line))
+        if not text or line.startswith("#") or line.startswith("|") or re.fullmatch(r"[-*_]{3,}", line.strip()):
+            continue
+        return text[:500].rstrip()
+    return "This report summarizes the available evidence for the research objective."
 
 
 def normalized_heading(text: str) -> str:
