@@ -217,6 +217,7 @@ Requirements:
 
 
 def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, str]:
+    print(f"Generating single report with model {model}...")
     return groq_chat_text(
         client=client,
         model=model,
@@ -662,9 +663,7 @@ def finalize_report(
     if not clean_text(report):
         raise ValueError("report_agent produced empty report")
 
-    repaired = normalize_final_report(report, sources)
-    repaired = remove_conflicting_missing_evidence_statements(repaired, evidence_text)
-    repaired = normalize_final_report(repaired, sources)
+    repaired = normalize_report_for_validation(report, sources, evidence_text)
     issues = report_quality_issues(repaired, evidence_text, sources=sources)
     total_repair_count = 0
     for _ in range(REPORT_REPAIR_MAX_ATTEMPTS):
@@ -685,9 +684,7 @@ def finalize_report(
             max_context_chars=report_context_chars,
         )
         total_repair_count += repair_count
-        repaired = normalize_final_report(repaired, sources)
-        repaired = remove_conflicting_missing_evidence_statements(repaired, evidence_text)
-        repaired = normalize_final_report(repaired, sources)
+        repaired = normalize_report_for_validation(repaired, sources, evidence_text)
         issues = report_quality_issues(repaired, evidence_text, sources=sources)
 
     blocking_issues = hard_report_issues(issues)
@@ -702,6 +699,17 @@ def hard_report_issues(issues: Sequence[str]) -> list[str]:
     return [issue for issue in issues if clean_text(issue)]
 
 
+def normalize_report_for_validation(
+    report: str,
+    sources: Sequence[dict[str, Any]],
+    evidence_text: str,
+) -> str:
+    normalized = normalize_final_report(report, sources)
+    cleaned = remove_conflicting_missing_evidence_statements(normalized, evidence_text)
+    normalized = normalize_final_report(cleaned, sources)
+    return remove_conflicting_missing_evidence_statements(normalized, evidence_text)
+
+
 def remove_conflicting_missing_evidence_statements(report: str, evidence_text: str) -> str:
     """Drop missing-evidence sentences contradicted by supplied evidence."""
 
@@ -711,7 +719,8 @@ def remove_conflicting_missing_evidence_statements(report: str, evidence_text: s
     cleaned_lines = []
     for line in clean_markdown(report).splitlines():
         if is_references_heading(line) or line.lstrip().startswith("#"):
-            cleaned_lines.append(line)
+            if not conflicting_missing_sentence(strip_markdown_markup(line), evidence_terms):
+                cleaned_lines.append(line)
             continue
         sentences = split_sentences_preserving_markdown(line)
         kept = [
@@ -720,6 +729,8 @@ def remove_conflicting_missing_evidence_statements(report: str, evidence_text: s
             if not conflicting_missing_sentence(sentence, evidence_terms)
         ]
         cleaned_line = clean_text(" ".join(kept))
+        if conflicting_missing_sentence(cleaned_line, evidence_terms):
+            cleaned_line = ""
         if cleaned_line or not clean_text(line):
             cleaned_lines.append(cleaned_line)
     return clean_markdown("\n".join(cleaned_lines))

@@ -334,6 +334,24 @@ No cited source markers were used.
 
         self.assertIn("TensorFlow API details are not present", cleaned)
 
+    def test_remove_conflicting_missing_evidence_statements_drops_heading_gap(self):
+        report = r"""# Topic
+
+## Executive Summary
+Supported detail is available.
+
+### Formula \(Attention(Q,K,V)=softmax(QK^T)V\) is missing
+
+## References
+No cited source markers were used.
+"""
+        evidence = r"Evidence includes \(Attention(Q,K,V)=softmax(QK^T)V\)."
+
+        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
+
+        self.assertNotIn("Formula", cleaned)
+        self.assertNotIn("is missing", cleaned)
+
     def test_report_contract_requires_executive_summary_with_evidence(self):
         report = """# Topic
 
