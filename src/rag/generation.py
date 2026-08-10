@@ -24,10 +24,13 @@ from src.rag.retrieval import (
     result_source_urls_from_metadata,
     source_url_coverage_retrieve,
 )
+from src.tools.groq_retry import create_chat_completion_with_retries, is_groq_request_too_large_error
+from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
+DEFAULT_GAP_QUERY_MODEL = "llama-3.1-8b-instant"
 DEFAULT_MAX_CONTEXT_CHARS = 18000
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_REPORT_MAX_TOKENS = 1400
@@ -39,6 +42,9 @@ DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
 DEFAULT_CONTEXT_BLOCK_CHARS = 750
 DEFAULT_REPORT_SOURCE_URL_K = 2
 DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
+DEFAULT_GAP_RETRIEVAL_TOP_K = 12
+DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
+DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
@@ -67,6 +73,16 @@ OBJECTIVE_STOPWORDS = {
     "what",
     "with",
 }
+
+
+def rag_generation_model(model: str | None = None) -> str:
+    """Use the same default model selection as the planner agent."""
+
+    return (
+        clean_text(model)
+        or clean_text(os.environ.get("RESEARCH_PLANNER_MODEL"))
+        or DEFAULT_RAG_GENERATION_MODEL
+    )
 
 
 def synthesize_report_from_research_plan(
@@ -105,6 +121,13 @@ def synthesize_report_from_research_plan(
         raise ValueError("research_plan.objective is required")
 
     queries = planner_tasks_to_rag_queries(research_plan)
+    emit_progress(
+        "tool_called",
+        "Synthesis retrieving evidence from RAG index",
+        agent="synthesis",
+        tool="rag-retrieval",
+        metadata={"query_count": len(queries)},
+    )
     current_history_key = clean_text(history_key) or objective_key(objective, research_plan)
     objective_scope = resolve_objective_history_scope(
         objective=objective,
@@ -147,27 +170,85 @@ def synthesize_report_from_research_plan(
     if include_planned_source_urls and planned_source_urls:
         source_coverage_results = source_url_coverage_retrieve(
             source_urls=missing_or_weak_source_urls(planned_source_urls, retrieved_context),
-            query=retrieval_queries,
+            query=planner_context_query(research_plan, retrieval_queries),
             chroma_path=chroma_path,
             collection_name=collection_name,
             history_keys=allowed_history_keys,
-            top_k_per_url=source_url_k,
+            top_k_per_url=max(source_url_k, 3),
             scan_limit=bm25_scan_limit,
         )
         retrieved_context = merge_retrieved_context(retrieved_context, source_coverage_results)
 
+    synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
     payload = synthesize_context_for_report(
         objective=objective,
         retrieved_context=retrieved_context,
-        synthesis_instruction=clean_text(research_plan.get("synthesis_instruction")),
+        synthesis_instruction=synthesis_instruction,
         planner_questions=planner_sub_questions(research_plan),
         model=model,
         max_context_chars=max_context_chars,
         max_tokens=max_tokens,
     )
+    gap_query_plan = synthesis_gap_retrieval_plan(
+        payload.get("synthesis"),
+        objective=objective,
+        synthesis_instruction=synthesis_instruction,
+        sources=payload.get("sources", []),
+        model=model,
+        max_queries=DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+    )
+    gap_queries = gap_query_plan["queries"]
+    gap_retry_results = []
+    gap_retry_count = 0
+    gap_new_chunk_count = 0
+    if gap_queries:
+        gap_retry_results = multi_query_hybrid_retrieve(
+            queries=gap_queries,
+            chroma_path=chroma_path,
+            collection_name=collection_name,
+            top_k=DEFAULT_GAP_RETRIEVAL_TOP_K,
+            per_query_k=DEFAULT_GAP_RETRIEVAL_PER_QUERY_K,
+            semantic_k=semantic_k,
+            bm25_k=max(bm25_k, DEFAULT_GAP_RETRIEVAL_TOP_K),
+            history_keys=allowed_history_keys,
+            semantic_weight=semantic_weight,
+            bm25_weight=bm25_weight,
+            authority_weight=authority_weight,
+            bm25_scan_limit=bm25_scan_limit,
+            embedding_device=embedding_device,
+            diversify_urls=False,
+            rerank=rerank,
+            reranker_model=reranker_model,
+            rerank_k=rerank_k,
+            rerank_weight=rerank_weight,
+        )
+        retry_context = merge_retrieved_context(gap_retry_results, retrieved_context)
+        gap_new_chunk_count = max(0, len(retry_context) - len(retrieved_context))
+        if gap_new_chunk_count:
+            retrieved_context = retry_context
+            gap_retry_count = 1
+            payload = synthesize_context_for_report(
+                objective=objective,
+                retrieved_context=retrieved_context,
+                synthesis_instruction=synthesis_instruction,
+                planner_questions=planner_sub_questions(research_plan),
+                model=model,
+                max_context_chars=max_context_chars,
+                max_tokens=max_tokens,
+            )
     payload["queries"] = queries
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
+    payload["gap_retrieval_queries"] = gap_queries
+    payload["gap_query_model"] = gap_query_plan["model"]
+    payload["gap_query_source"] = gap_query_plan["source"]
+    payload["llm_gap_query_count"] = len(gap_query_plan["llm_queries"])
+    payload["fallback_gap_query_count"] = len(gap_query_plan["fallback_queries"])
+    payload["gap_query_error"] = gap_query_plan["llm_error"]
+    payload["llm_gap_query_raw_response"] = gap_query_plan["llm_raw_response"]
+    payload["gap_retrieved_count"] = len(gap_retry_results)
+    payload["gap_new_chunk_count"] = gap_new_chunk_count
+    payload["gap_retry_count"] = gap_retry_count
     payload["history_key"] = current_history_key
     payload["allowed_history_keys"] = allowed_history_keys
     payload["objective_scope"] = objective_scope
@@ -181,11 +262,14 @@ def synthesize_report_from_research_plan(
         "synthesis marks a formula, number, API detail, or definition as missing "
         "evidence, do not add it to the report unless it appears in a supporting chunk."
     )
+    citation_audit = audit_synthesis_citations(payload.get("synthesis"), payload.get("sources", []))
+    payload["citation_audit"] = citation_audit
     payload["supporting_chunks"] = report_supporting_chunks(
         retrieved_context,
         payload.get("sources", []),
         max_chunks=supporting_chunk_count,
         max_chars=retrieved_chunk_chars,
+        cited_source_indexes=citation_audit.get("valid_referenced_source_indexes", []),
     )
     payload["diagnostics"] = synthesis_diagnostics(payload, retrieved_context)
     if include_retrieved_chunks:
@@ -275,6 +359,26 @@ def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
         for question in research_plan.get("sub_questions", [])
         if clean_text(question)
     )
+
+
+def planner_context_query(research_plan: dict[str, Any], fallback_queries: Sequence[str]) -> str:
+    """Compact planner text used to retrieve better chunks from known sources."""
+
+    parts = [
+        research_plan.get("objective"),
+        research_plan.get("synthesis_instruction"),
+        *planner_sub_questions(research_plan),
+    ]
+    for task in research_plan.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        signals = " ".join(clean_text(item) for item in task.get("expected_signals", []) if clean_text(item))
+        parts.extend([task.get("query_context"), task.get("extraction_goal"), signals])
+
+    query = clean_text(" ".join(clean_text(part) for part in parts if clean_text(part)))
+    if query:
+        return query[:4000]
+    return clean_text(" ".join(fallback_queries))[:4000]
 
 
 def resolve_objective_history_scope(
@@ -434,8 +538,9 @@ Requirements:
 - Keep it topic-agnostic and useful for semantic search plus BM25 keyword retrieval.
 - Return only the rewritten query text, no bullets, no markdown, no explanation."""
 
-    response = Groq().chat.completions.create(
-        model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
+    response = create_chat_completion_with_retries(
+        Groq(),
+        model=rag_generation_model(model),
         temperature=0,
         max_tokens=350,
         messages=[
@@ -544,8 +649,16 @@ Answer using only the retrieved context. If the context does not contain the ans
 Use only the numbered source markers that appear in the retrieved context, like [1] or [2].
 Do not cite source names, authors, dates, or papers unless they are present in the retrieved context."""
 
-    response = Groq().chat.completions.create(
-        model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
+    emit_progress(
+        "tool_called",
+        "RAG generation calling Groq",
+        agent="synthesis",
+        tool="groq",
+        metadata={"model": rag_generation_model(model)},
+    )
+    response = create_chat_completion_with_retries(
+        Groq(),
+        model=rag_generation_model(model),
         temperature=0,
         max_tokens=max(100, max_tokens),
         messages=[
@@ -589,6 +702,7 @@ def synthesize_context_for_report(
 
     planner_question_text = format_planner_questions(planner_questions or [])
     instruction = clean_text(synthesis_instruction) or "Synthesize the retrieved evidence into report-ready research notes."
+    instruction_requirement_text = format_instruction_requirements(instruction)
     client = Groq()
     last_error: Exception | None = None
 
@@ -603,6 +717,9 @@ def synthesize_context_for_report(
 Synthesis instruction:
 {instruction}
 
+Instruction requirements to satisfy:
+{instruction_requirement_text}
+
 Planner sub-questions to cover:
 {planner_question_text}
 
@@ -616,20 +733,24 @@ Create a detailed report-agent-ready evidence package using only the retrieved c
 Do not write the final report. Prepare rich notes that another agent can turn into a technical report.
 
 Return Markdown with these sections:
-1. Coverage Map
+1. Instruction Coverage Checklist
+   - For each instruction requirement, mark Covered, Partial, or Missing Evidence.
+   - Cite source markers for Covered/Partial items and name the exact missing facts for Missing Evidence items.
+2. Coverage Map
    - For each planner sub-question, state whether the retrieved context has strong, partial, or missing evidence.
-2. Section Notes By Planner Question
+3. Section Notes By Planner Question
    - Repeat each planner sub-question as a subsection.
    - Include the direct answer, important evidence, equations/formulas/API details when available, and gaps.
    - Keep enough detail for a report agent to write a full section without needing to infer missing facts.
-3. Cross-Source Synthesis
+4. Cross-Source Synthesis
    - Connect repeated ideas across sources and identify how the sources complement each other.
-4. Technical Details To Preserve
+5. Technical Details To Preserve
    - Preserve exact equations, definitions, model components, implementation details, and benchmark values only when present in the retrieved context.
-5. Conflicts Or Gaps
+6. Conflicts Or Gaps
    - List missing evidence, weak citations, source conflicts, or claims that need caution.
-6. Recommended Report Structure
+7. Recommended Report Structure
    - Suggest report sections and which source markers support each section.
+   - Include every Covered/Partial instruction requirement and explicit gap notes for Missing Evidence requirements.
 
 Use only plain ASCII numbered source markers that appear in the retrieved context, exactly like [1], [2], [3].
 Every evidence-backed claim must include at least one source marker.
@@ -640,11 +761,20 @@ Do not compress important technical details into vague summaries.
 Do not use Markdown tables.
 Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inline.
 If a requested equation, number, API detail, or definition is not explicitly present in the retrieved context, mark it as missing evidence and tell the report agent not to add it.
+Before finishing, check the Instruction Coverage Checklist against the Recommended Report Structure so requested items are not silently dropped.
 Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
 
         try:
-            response = client.chat.completions.create(
-                model=clean_text(model or os.environ.get("RAG_GENERATION_MODEL")) or DEFAULT_RAG_GENERATION_MODEL,
+            emit_progress(
+                "tool_called",
+                "Synthesis calling Groq to create report context",
+                agent="synthesis",
+                tool="groq",
+                metadata={"model": rag_generation_model(model), "attempt": attempt + 1},
+            )
+            response = create_chat_completion_with_retries(
+                client,
+                model=rag_generation_model(model),
                 temperature=0,
                 max_tokens=max(300, token_budget),
                 messages=[
@@ -686,14 +816,352 @@ def format_planner_questions(questions: Sequence[str]) -> str:
     return "\n".join(f"- {question}" for question in clean_questions)
 
 
-def is_request_too_large_error(error: Exception) -> bool:
-    message = clean_text(error).lower()
-    return (
-        "request too large" in message
-        or "tokens per minute" in message
-        or "rate_limit_exceeded" in message
-        or "tpm" in message
+def format_instruction_requirements(instruction: str) -> str:
+    """Return a compact checklist extracted from a free-form synthesis instruction."""
+
+    requirements = instruction_requirement_items(instruction)
+    if not requirements:
+        return "- No explicit synthesis requirements were provided."
+    return "\n".join(f"- {requirement}" for requirement in requirements)
+
+
+def instruction_requirement_items(instruction: str) -> list[str]:
+    text = clean_text(instruction)
+    if not text:
+        return []
+
+    markers = list(re.finditer(r"(?:^|\s)(?:\(\d+\)|\d+[.)])\s+", text))
+    if len(markers) >= 2:
+        items = []
+        for index, marker in enumerate(markers):
+            start = marker.end()
+            end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+            item = clean_text(text[start:end].strip(" ;,."))
+            item = re.sub(r"(?:,\s*)?\band$", "", item).strip(" ;,.")
+            if item:
+                items.append(item)
+        return dedupe_preserve_order(items)
+
+    bullet_items = [
+        clean_text(line.lstrip("-* ").strip())
+        for line in str(instruction or "").splitlines()
+        if line.strip().startswith(("-", "*"))
+    ]
+    return dedupe_preserve_order(item for item in bullet_items if item) or [text]
+
+
+def synthesis_gap_retrieval_queries(
+    synthesis: Any,
+    objective: str = "",
+    synthesis_instruction: str = "",
+    sources: Sequence[dict[str, Any]] | None = None,
+    model: str | None = None,
+    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+) -> list[str]:
+    """Build LLM-generated retrieval queries from synthesis coverage gaps."""
+
+    return synthesis_gap_retrieval_plan(
+        synthesis,
+        objective=objective,
+        synthesis_instruction=synthesis_instruction,
+        sources=sources,
+        model=model,
+        max_queries=max_queries,
+    )["queries"]
+
+
+def synthesis_gap_retrieval_plan(
+    synthesis: Any,
+    objective: str = "",
+    synthesis_instruction: str = "",
+    sources: Sequence[dict[str, Any]] | None = None,
+    model: str | None = None,
+    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+) -> dict[str, Any]:
+    """Build gap-retrieval queries plus diagnostics about their origin."""
+
+    gaps = synthesis_gap_items(synthesis)
+    if not gaps:
+        return gap_retrieval_plan(
+            queries=[],
+            llm_queries=[],
+            fallback_queries=[],
+        )
+    fallback_queries = fallback_gap_retrieval_queries(
+        gaps,
+        objective=objective,
+        max_queries=max_queries,
     )
+    llm_result = llm_gap_retrieval_query_result(
+        gaps,
+        objective=objective,
+        synthesis_instruction=synthesis_instruction,
+        sources=sources or [],
+        model=model,
+        max_queries=max_queries,
+    )
+    llm_queries = llm_result["queries"]
+    queries = dedupe_preserve_order([*llm_queries, *fallback_queries])[: max(1, max_queries)]
+    return gap_retrieval_plan(
+        queries=queries,
+        llm_queries=llm_queries,
+        fallback_queries=fallback_queries,
+        llm_error=llm_result["error"],
+        llm_raw_response=llm_result["raw_response"],
+    )
+
+
+def gap_retrieval_plan(
+    queries: Sequence[str],
+    llm_queries: Sequence[str],
+    fallback_queries: Sequence[str],
+    llm_error: str = "",
+    llm_raw_response: str = "",
+) -> dict[str, Any]:
+    llm_count = len(llm_queries)
+    fallback_count = len(fallback_queries)
+    if llm_count and fallback_count:
+        source = "mixed"
+    elif llm_count:
+        source = "llm"
+    elif fallback_count:
+        source = "fallback"
+    else:
+        source = "none"
+    return {
+        "queries": list(queries),
+        "llm_queries": list(llm_queries),
+        "fallback_queries": list(fallback_queries),
+        "model": DEFAULT_GAP_QUERY_MODEL,
+        "source": source,
+        "llm_error": clean_text(llm_error),
+        "llm_raw_response": clean_text(llm_raw_response)[:1000],
+    }
+
+
+def fallback_gap_retrieval_queries(
+    gaps: Sequence[str],
+    objective: str = "",
+    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+) -> list[str]:
+    objective = clean_text(objective)
+    queries = []
+    for gap in gaps:
+        detail_terms = "exact equation formula benchmark number API signature implementation evidence"
+        query = clean_text(f"{objective} {gap} {detail_terms}")
+        if query:
+            queries.append(query[:600])
+    return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def llm_gap_retrieval_queries(
+    gaps: Sequence[str],
+    objective: str = "",
+    synthesis_instruction: str = "",
+    sources: Sequence[dict[str, Any]] | None = None,
+    model: str | None = None,
+    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+) -> list[str]:
+    """Ask the generation LLM for precise RAG queries for missing evidence."""
+
+    return llm_gap_retrieval_query_result(
+        gaps,
+        objective=objective,
+        synthesis_instruction=synthesis_instruction,
+        sources=sources,
+        model=model,
+        max_queries=max_queries,
+    )["queries"]
+
+
+def llm_gap_retrieval_query_result(
+    gaps: Sequence[str],
+    objective: str = "",
+    synthesis_instruction: str = "",
+    sources: Sequence[dict[str, Any]] | None = None,
+    model: str | None = None,
+    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
+) -> dict[str, Any]:
+    """Ask the gap-query model for queries and preserve failure diagnostics."""
+
+    clean_gaps = dedupe_preserve_order(gaps)
+    if not clean_gaps:
+        return llm_gap_query_result([], error="no_gap_items")
+    if not os.environ.get("GROQ_API_KEY"):
+        return llm_gap_query_result([], error="missing_groq_api_key")
+
+    try:
+        from groq import Groq
+    except ImportError as error:
+        return llm_gap_query_result([], error=f"groq_import_error: {clean_text(error)}")
+
+    prompt_gaps = clean_gaps[: max(1, max_queries)]
+    gap_text = format_gap_items_for_query_prompt(prompt_gaps)
+    source_hints = format_gap_query_source_hints(sources or [])
+    prompt = f"""Research objective:
+{clean_text(objective)}
+
+Synthesis instruction:
+{clean_text(synthesis_instruction)}
+
+Missing or partial evidence items:
+{gap_text}
+
+Available source hints:
+{source_hints}
+
+Generate focused RAG retrieval queries to find the exact missing evidence in indexed chunks.
+Requirements:
+- Return one query per missing item, using the same item id format: G1: query text.
+- Generate at most {len(prompt_gaps)} queries.
+- Keep each query focused on only that missing item.
+- Include literal technical terms, equation tokens, API names, benchmark names, model names, author names, and source titles that match the item.
+- Preserve the target entity from the missing item; do not move benchmarks, formulas, metrics, or limitations from one model/source to another.
+- Do not add assumed values or labels such as "quadratic", "linear", benchmark names, or model names unless they are explicitly present in the missing item.
+- For missing equations, include only symbols and variants that fit the named equation or architecture.
+- For missing API details, include official class/function names and parameters.
+- Do not answer the research question.
+- Do not combine multiple missing items into one broad query.
+- Do not add bullets, markdown tables, quotes, or explanation."""
+
+    raw_response = ""
+    try:
+        response = create_chat_completion_with_retries(
+            Groq(),
+            model=DEFAULT_GAP_QUERY_MODEL,
+            temperature=0,
+            max_tokens=500,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You generate concise high-recall RAG retrieval queries for missing evidence. Return only queries.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw_response = clean_text(response.choices[0].message.content)
+    except Exception as error:
+        return llm_gap_query_result([], error=f"groq_api_error: {type(error).__name__}: {clean_text(error)}")
+
+    if not raw_response:
+        return llm_gap_query_result([], error="empty_response")
+    queries = parse_gap_query_lines(raw_response, max_queries=max_queries)
+    if len(prompt_gaps) > 1 and len(queries) <= 1:
+        return llm_gap_query_result([], error="insufficient_item_queries", raw_response=raw_response)
+    if not queries:
+        return llm_gap_query_result([], error="parsed_empty_response", raw_response=raw_response)
+    return llm_gap_query_result(queries, raw_response=raw_response)
+
+
+def llm_gap_query_result(
+    queries: Sequence[str],
+    error: str = "",
+    raw_response: str = "",
+) -> dict[str, Any]:
+    return {
+        "queries": list(queries),
+        "error": clean_text(error),
+        "raw_response": clean_text(raw_response)[:1000],
+    }
+
+
+def parse_gap_query_lines(text: Any, max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES) -> list[str]:
+    queries = []
+    for line in split_gap_query_response(text):
+        query = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+        query = re.sub(r"^G\d+\s*:\s*", "", query, flags=re.IGNORECASE).strip()
+        query = clean_text(query.strip("\"'`"))
+        if query:
+            queries.append(query[:600])
+    return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def split_gap_query_response(text: Any) -> list[str]:
+    response = str(text or "").strip()
+    if not response:
+        return []
+    inline_items = [
+        match.group(0).strip()
+        for match in re.finditer(r"G\d+\s*:\s*.*?(?=\s+G\d+\s*:|$)", response, flags=re.IGNORECASE | re.DOTALL)
+    ]
+    if len(inline_items) > 1:
+        return inline_items
+    return response.splitlines()
+
+
+def format_gap_items_for_query_prompt(gaps: Sequence[str]) -> str:
+    lines = []
+    for index, gap in enumerate(gaps, start=1):
+        lines.append(f"G{index}: {clean_text(gap)[:500]}")
+    return "\n".join(lines)
+
+
+def format_gap_query_source_hints(sources: Sequence[dict[str, Any]]) -> str:
+    lines = []
+    for source in sources[:12]:
+        if not isinstance(source, dict):
+            continue
+        title = clean_text(source.get("title"))
+        url = clean_text(source.get("url"))
+        index = source.get("index")
+        if title or url:
+            marker = f"[{index}] " if isinstance(index, int) else ""
+            lines.append(f"{marker}{title} {url}".strip())
+    return "\n".join(lines) or "No source hints available."
+
+
+def synthesis_gap_items(synthesis: Any) -> list[str]:
+    text = normalize_citation_markers(synthesis)
+    gaps = []
+    for line in text.splitlines():
+        line_text = clean_text(line)
+        if not line_text:
+            continue
+        table_gap = synthesis_gap_from_table_row(line_text)
+        if table_gap:
+            gaps.append(table_gap)
+            continue
+        lowered = line_text.lower()
+        if any(
+            phrase in lowered
+            for phrase in (
+                "missing evidence",
+                "not present in the retrieved",
+                "not present in the cited",
+                "not quoted in the retrieved",
+                "no explicit",
+                "no concrete",
+            )
+        ):
+            gaps.append(strip_markdown_markup(line_text)[:300])
+    return dedupe_preserve_order(gaps)
+
+
+def synthesis_gap_from_table_row(line: str) -> str:
+    if not line.startswith("|") or "---" in line:
+        return ""
+    cells = [strip_markdown_markup(cell) for cell in line.strip("|").split("|")]
+    if len(cells) < 2:
+        return ""
+    first_cell = clean_text(cells[0]).lower()
+    if first_cell in {"requirement", "planner sub-question", "source", "status"}:
+        return ""
+    status = clean_text(cells[1]).lower()
+    notes = clean_text(" ".join(cells[2:]))
+    if "missing" not in status and "partial" not in status and "missing evidence" not in notes.lower():
+        return ""
+    return clean_text(f"{cells[0]} {notes}")
+
+
+def strip_markdown_markup(text: str) -> str:
+    value = re.sub(r"`([^`]*)`", r"\1", str(text or ""))
+    value = re.sub(r"[*_#]+", "", value)
+    value = re.sub(r"\[(\d+)\]", "", value)
+    return clean_text(value)
+
+
+def is_request_too_large_error(error: Exception) -> bool:
+    return is_groq_request_too_large_error(error)
 
 
 def build_generation_context(
@@ -838,6 +1306,7 @@ def report_supporting_chunks(
     sources: Sequence[dict[str, Any]],
     max_chunks: int = DEFAULT_REPORT_SUPPORTING_CHUNKS,
     max_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+    cited_source_indexes: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Return citation-linked chunks that are safest for the report agent."""
 
@@ -847,15 +1316,64 @@ def report_supporting_chunks(
         max_chars=max_chars,
     )
     citation_backed = [chunk for chunk in compact_chunks if chunk.get("source_index") is not None]
+    cited_indexes = {index for index in cited_source_indexes or [] if isinstance(index, int)}
     ordered = sorted(
         citation_backed,
         key=lambda chunk: (
+            0 if chunk.get("source_index") in cited_indexes else 1,
             0 if chunk.get("is_primary_source") else 1,
             chunk.get("source_index") or 10**6,
             -(float(chunk.get("score") or 0.0)),
         ),
     )
-    return ordered[: max(1, max_chunks)]
+    target_count = max(1, max_chunks, len(cited_indexes))
+    return ordered[:target_count]
+
+
+def audit_synthesis_citations(
+    synthesis: Any,
+    sources: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize whether synthesis notes cite only available source markers."""
+
+    referenced_indexes = citation_markers(synthesis)
+    valid_indexes = source_indexes(sources)
+    valid_referenced = [index for index in referenced_indexes if index in valid_indexes]
+    invalid_referenced = [index for index in referenced_indexes if index not in valid_indexes]
+    uncited_sources = [index for index in sorted(valid_indexes) if index not in referenced_indexes]
+    return {
+        "referenced_source_indexes": referenced_indexes,
+        "valid_referenced_source_indexes": valid_referenced,
+        "invalid_source_indexes": invalid_referenced,
+        "uncited_source_indexes": uncited_sources,
+        "source_count": len(valid_indexes),
+        "has_invalid_citations": bool(invalid_referenced),
+    }
+
+
+def citation_markers(text: Any) -> list[int]:
+    """Return unique plain numeric Markdown citation markers in first-seen order."""
+
+    markers = []
+    seen = set()
+    for match in re.finditer(r"\[(\d+)\]", normalize_citation_markers(text)):
+        index = int(match.group(1))
+        if index in seen:
+            continue
+        seen.add(index)
+        markers.append(index)
+    return markers
+
+
+def source_indexes(sources: Sequence[dict[str, Any]]) -> set[int]:
+    indexes = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        index = source.get("index")
+        if isinstance(index, int):
+            indexes.add(index)
+    return indexes
 
 
 def citation_index_by_chunk_id(sources: Sequence[dict[str, Any]]) -> dict[str, int]:
@@ -888,7 +1406,19 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "source_count": len(sources) if isinstance(sources, list) else 0,
         "supporting_chunk_count": len(supporting_chunks) if isinstance(supporting_chunks, list) else 0,
         "primary_source_count": primary_source_count,
+        "invalid_citation_count": len(payload.get("citation_audit", {}).get("invalid_source_indexes", [])),
+        "cited_source_count": len(payload.get("citation_audit", {}).get("valid_referenced_source_indexes", [])),
         "source_coverage_count": payload.get("source_coverage_count", 0),
+        "gap_retrieval_query_count": len(payload.get("gap_retrieval_queries", [])),
+        "gap_query_model": payload.get("gap_query_model", ""),
+        "gap_query_source": payload.get("gap_query_source", ""),
+        "llm_gap_query_count": payload.get("llm_gap_query_count", 0),
+        "fallback_gap_query_count": payload.get("fallback_gap_query_count", 0),
+        "gap_query_error": payload.get("gap_query_error", ""),
+        "llm_gap_query_raw_response": payload.get("llm_gap_query_raw_response", ""),
+        "gap_retrieved_count": payload.get("gap_retrieved_count", 0),
+        "gap_new_chunk_count": payload.get("gap_new_chunk_count", 0),
+        "gap_retry_count": payload.get("gap_retry_count", 0),
         "allowed_history_key_count": len(allowed_history_keys) if isinstance(allowed_history_keys, list) else 0,
         "similar_previous_objective_count": max(
             0,

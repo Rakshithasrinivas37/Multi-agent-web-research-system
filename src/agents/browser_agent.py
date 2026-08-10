@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from src.tools.firecrawl_tool import extract_with_firecrawl_or_httpx
 from src.tools.pdf_tool import extract_pdf_text, is_pdf_url
 from src.tools.playwright_tool import render_with_playwright
+from src.tools.progress import emit_progress
 from src.tools.tavily_search import search_with_tavily
 from src.tools.text_utils import clean_content, clean_list, clean_text
 
@@ -60,6 +61,13 @@ class BrowserAgent:
         query = search_query_for_task(task)
         errors = []
         try:
+            emit_progress(
+                "tool_called",
+                "Browser searching with Tavily",
+                agent="browser",
+                tool="tavily",
+                metadata={"query": query},
+            )
             results = await asyncio.to_thread(search_with_tavily, query)
         except Exception as error:
             errors.append(f"Tavily search failed: {error}")
@@ -108,19 +116,61 @@ class BrowserAgent:
     async def scrape_search_result(self, task: dict[str, Any], url: str) -> dict[str, Any]:
         url = arxiv_pdf_url(url)
         if is_extractable_pdf_url(url):
+            emit_progress(
+                "tool_called",
+                "Browser extracting PDF text",
+                agent="browser",
+                tool="pdf",
+                metadata={"url": url},
+            )
             text = await asyncio.to_thread(extract_pdf_text, url)
             return {"url": url, "title": "", "content": text, "method": "pdf", "errors": [] if text else ["No PDF text extracted."]}
         if use_playwright_for_search_result(task, url):
             try:
+                emit_progress(
+                    "tool_called",
+                    "Browser rendering page with Playwright",
+                    agent="browser",
+                    tool="playwright",
+                    metadata={"url": url},
+                )
                 return await render_with_playwright(url)
             except Exception:
+                emit_progress(
+                    "tool_called",
+                    "Browser extracting page with Firecrawl or HTTPX fallback",
+                    agent="browser",
+                    tool="firecrawl/httpx",
+                    metadata={"url": url},
+                )
                 return await extract_with_firecrawl_or_httpx(url)
+        emit_progress(
+            "tool_called",
+            "Browser extracting page with Firecrawl or HTTPX fallback",
+            agent="browser",
+            tool="firecrawl/httpx",
+            metadata={"url": url},
+        )
         return await extract_with_firecrawl_or_httpx(url)
 
     async def url_task(self, task: dict[str, Any], url: str) -> dict[str, Any]:
         if task.get("use_playwright"):
+            emit_progress(
+                "tool_called",
+                "Browser rendering page with Playwright",
+                agent="browser",
+                tool="playwright",
+                metadata={"url": url},
+            )
             page = await render_with_playwright(url)
         else:
+            emit_progress(
+                "tool_called",
+                "Browser extracting page with Firecrawl or HTTPX fallback",
+                agent="browser",
+                tool="firecrawl/httpx",
+                metadata={"url": url},
+            )
             page = await extract_with_firecrawl_or_httpx(url)
 
         extraction = await self.extract(task, page["url"], page["title"], page["content"])
@@ -131,6 +181,13 @@ class BrowserAgent:
 
     async def pdf_task(self, task: dict[str, Any], url: str) -> dict[str, Any]:
         try:
+            emit_progress(
+                "tool_called",
+                "Browser extracting PDF text",
+                agent="browser",
+                tool="pdf",
+                metadata={"url": url},
+            )
             pdf_text = await asyncio.to_thread(extract_pdf_text, url)
         except Exception as error:
             result = self.failed_result(task, str(error))

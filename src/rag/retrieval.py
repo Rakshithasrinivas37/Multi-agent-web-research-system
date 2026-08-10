@@ -21,6 +21,7 @@ from src.rag.indexing import (
     select_embedding_device,
     to_int,
 )
+from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
@@ -36,7 +37,15 @@ DEFAULT_RERANK_K = 20
 DEFAULT_RERANK_WEIGHT = 0.70
 DEFAULT_SOURCE_URL_K = 1
 DEFAULT_FEATURE_WEIGHT = 0.15
+DEFAULT_FORMULA_NEIGHBOR_WINDOW = 1
 TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
+FORMULA_CONTEXT_PATTERN = re.compile(
+    r"(?i)\b("
+    r"attention\s*\(|multihead|multi-head|scaled\s+dot|dot-product|"
+    r"softmax|sqrt|qk|k\^?t|concat|equation|formula|"
+    r"wq|wk|wv|wo|w\^q|w\^k|w\^v|w\^o"
+    r")\b"
+)
 MIN_SOURCE_COVERAGE_OVERLAP = 0.08
 SOURCE_COVERAGE_STOPWORDS = {
     "and",
@@ -117,6 +126,13 @@ def hybrid_retrieve(
     if not query:
         return []
 
+    emit_progress(
+        "tool_called",
+        "Running hybrid RAG retrieval",
+        agent="synthesis",
+        tool="chromadb/bm25",
+        metadata={"query": query, "top_k": top_k, "semantic_k": semantic_k, "bm25_k": bm25_k},
+    )
     top_k = max(1, top_k)
     semantic_k = max(top_k, semantic_k)
     bm25_k = max(top_k, bm25_k)
@@ -251,7 +267,14 @@ def multi_query_hybrid_retrieve(
     merged = sorted(by_id.values(), key=lambda item: item.score, reverse=True)
     if diversify_urls:
         merged = diversify_by_url(merged, top_k=top_k)
-    return merged[: max(1, top_k)]
+    else:
+        merged = merged[: max(1, top_k)]
+    return expand_formula_neighbor_chunks(
+        results=merged,
+        queries=clean_queries,
+        chroma_path=chroma_path,
+        collection_name=collection_name,
+    )
 
 
 def source_url_coverage_retrieve(
@@ -345,6 +368,109 @@ def source_url_coverage_retrieve(
                 )
             )
     return selected
+
+
+def expand_formula_neighbor_chunks(
+    results: Sequence[RetrievalResult],
+    queries: Sequence[str],
+    chroma_path: Union[str, Path] = DEFAULT_CHROMA_PATH,
+    collection_name: str = DEFAULT_COLLECTION_NAME,
+    neighbor_window: int = DEFAULT_FORMULA_NEIGHBOR_WINDOW,
+) -> list[RetrievalResult]:
+    """Add adjacent chunks when retrieved context likely straddles formulas."""
+
+    selected = list(results)
+    if not selected or not formula_context_needed(" ".join(queries)):
+        return selected
+
+    collection = get_collection(chroma_path, collection_name)
+    by_id = {result.id: result for result in selected}
+    expanded = []
+    for result in selected:
+        neighbors = formula_neighbor_results(collection, result, neighbor_window=neighbor_window)
+        result_chunk_index = result_chunk_index_value(result)
+        for neighbor in [item for item in neighbors if result_chunk_index_value(item) < result_chunk_index]:
+            if neighbor.id in by_id:
+                continue
+            by_id[neighbor.id] = neighbor
+            expanded.append(neighbor)
+        expanded.append(result)
+        for neighbor in [item for item in neighbors if result_chunk_index_value(item) > result_chunk_index]:
+            if neighbor.id in by_id:
+                continue
+            by_id[neighbor.id] = neighbor
+            expanded.append(neighbor)
+    return expanded
+
+
+def formula_neighbor_results(
+    collection: Any,
+    result: RetrievalResult,
+    neighbor_window: int = DEFAULT_FORMULA_NEIGHBOR_WINDOW,
+) -> list[RetrievalResult]:
+    if not formula_context_needed(result.document):
+        return []
+
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    history_key = clean_text(metadata.get("history_key"))
+    url = clean_text(metadata.get("url"))
+    chunk_index = to_int(metadata.get("chunk_index"), -1)
+    chunk_count = to_int(metadata.get("chunk_count"), 0)
+    if not history_key or not url or chunk_index < 0 or chunk_count <= 0:
+        return []
+
+    neighbor_ids = [
+        chunk_id(history_key, url, index)
+        for index in range(
+            max(0, chunk_index - max(1, neighbor_window)),
+            min(chunk_count, chunk_index + max(1, neighbor_window) + 1),
+        )
+        if index != chunk_index
+    ]
+    if not neighbor_ids:
+        return []
+
+    try:
+        raw = collection.get(ids=neighbor_ids, include=["documents", "metadatas"])
+    except Exception:
+        return []
+
+    ids = raw.get("ids", []) if isinstance(raw, dict) else []
+    documents = raw.get("documents", []) if isinstance(raw, dict) else []
+    metadatas = raw.get("metadatas", []) if isinstance(raw, dict) else []
+    neighbors = []
+    for index, item_id in enumerate(ids):
+        document = clean_text(documents[index] if index < len(documents) else "")
+        neighbor_metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
+        if not item_id or not document:
+            continue
+        neighbors.append(
+            RetrievalResult(
+                id=clean_text(item_id),
+                document=document,
+                metadata=neighbor_metadata,
+                score=max(0.0, result.score * 0.98),
+                semantic_score=result.semantic_score,
+                bm25_score=result.bm25_score,
+                authority_score=result.authority_score,
+                rerank_score=result.rerank_score,
+                semantic_rank=result.semantic_rank,
+                bm25_rank=result.bm25_rank,
+            )
+        )
+    return sorted(
+        neighbors,
+        key=lambda item: to_int(item.metadata.get("chunk_index") if isinstance(item.metadata, dict) else None, 0),
+    )
+
+
+def formula_context_needed(text: str) -> bool:
+    return bool(FORMULA_CONTEXT_PATTERN.search(clean_text(text)))
+
+
+def result_chunk_index_value(result: RetrievalResult) -> int:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return to_int(metadata.get("chunk_index"), -1)
 
 
 def semantic_search(
@@ -529,6 +655,7 @@ def merge_ranked_results(
             + (bm25_weight * bm25_score)
             + (authority_weight * authority_score)
             + (DEFAULT_FEATURE_WEIGHT * query_feature_score(query, item.document))
+            + metadata_signal_score(query, item.metadata)
         )
         merged.append(
             RetrievalResult(
@@ -570,6 +697,25 @@ def query_feature_score(query: str, document: str) -> float:
     term_overlap = len(query_terms & document_terms) / max(1, min(len(query_terms), len(document_terms)))
     phrase_overlap = query_phrase_overlap(query, document)
     return min(1.0, (0.75 * term_overlap) + (0.25 * phrase_overlap))
+
+
+def metadata_signal_score(query: str, metadata: Any) -> float:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    query_text = clean_text(query).lower()
+    score = 0.0
+    if metadata.get("chunk_kind") == "signal":
+        score += 0.03
+    if metadata.get("has_formula_signal") and query_needs_formula_signal(query_text):
+        score += 0.12
+    if metadata.get("has_api_signal") and re.search(r"\b(api|sdk|pytorch|tensorflow|torch\.|tf\.|keras\.)\b", query_text):
+        score += 0.10
+    if metadata.get("has_benchmark_signal") and re.search(r"\b(benchmark|score|accuracy|bleu|glue|imagenet|metric)\b", query_text):
+        score += 0.10
+    return min(score, 0.20)
+
+
+def query_needs_formula_signal(query: str) -> bool:
+    return bool(re.search(r"\b(equation|formula|math|mathematical|derive|softmax|sqrt|sum|matrix)\b", query))
 
 
 def query_phrase_overlap(query: str, document: str) -> float:

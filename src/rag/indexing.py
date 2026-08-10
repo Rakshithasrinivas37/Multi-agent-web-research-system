@@ -14,18 +14,28 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
 from src.agents.change_detection_agent import hash_text, normalize_url, objective_key
+from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
 DEFAULT_COLLECTION_NAME = "research_rag"
 DEFAULT_CHROMA_PATH = "data/chroma"
 DEFAULT_CHUNK_SIZE = 700
-DEFAULT_CHUNK_OVERLAP = 100
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_CHUNK_OVERLAP = 180
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
-DEFAULT_METADATA_SCHEMA_VERSION = 3
+DEFAULT_METADATA_SCHEMA_VERSION = 4
 TOKEN_PATTERN = re.compile(r"\S+")
+SPECIAL_SIGNAL_PATTERN = re.compile(
+    r"(?i)("
+    r"\\(?:frac|sum|sqrt|top|operatorname)|"
+    r"\b(?:equation|formula|softmax|sqrt|"
+    r"torch\.|tf\.|keras\.|class\s+\w+|\w+\([^)]*\)|"
+    r"benchmark|accuracy|bleu|glue|imagenet|top-1|f1|auc|latency|tokens?/sec)\b|"
+    r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}"
+    r")"
+)
 
 
 @dataclass(frozen=True)
@@ -123,6 +133,13 @@ def index_research_results(
     useful.
     """
 
+    emit_progress(
+        "tool_called",
+        "Indexing research content into ChromaDB",
+        agent="change_detection",
+        tool="chromadb",
+        metadata={"chroma_path": str(chroma_path), "collection_name": collection_name},
+    )
     collection = get_collection(chroma_path, collection_name)
     change_detection = change_detection if isinstance(change_detection, dict) else {}
     research_plan = research_plan if isinstance(research_plan, dict) else {}
@@ -181,6 +198,13 @@ def index_research_results(
             )
 
         collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+        emit_progress(
+            "tool_called",
+            "Embedded and upserted source chunks",
+            agent="change_detection",
+            tool="sentence-transformers/chromadb",
+            metadata={"url": record.url, "chunks": len(chunk_documents)},
+        )
         indexed_source_count += 1
         indexed_chunk_count += len(chunk_documents)
 
@@ -245,17 +269,34 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
     max_tokens = max(100, chunk_size)
     overlap_tokens = max(0, min(chunk_overlap, max_tokens // 2))
     chunks = token_aware_chunks(document.page_content, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
-    return [
+    chunks = add_inter_chunk_overlap(chunks, overlap_tokens=overlap_tokens)
+    regular_documents = [
         Document(
             page_content=chunk,
             metadata={
                 **document.metadata,
-                "chunking_strategy": "token_aware_v1",
+                "chunking_strategy": "token_aware_v2",
+                "chunk_kind": "regular",
                 "token_count": token_count(chunk),
+                **chunk_signal_metadata(chunk),
             },
         )
         for chunk in chunks
     ]
+    special_documents = [
+        Document(
+            page_content=chunk,
+            metadata={
+                **document.metadata,
+                "chunking_strategy": "token_aware_v2",
+                "chunk_kind": "signal",
+                "token_count": token_count(chunk),
+                **chunk_signal_metadata(chunk),
+            },
+        )
+        for chunk in special_signal_chunks(document.page_content, max_tokens=max(120, max_tokens // 2))
+    ]
+    return dedupe_documents([*regular_documents, *special_documents])
 
 
 def token_aware_chunks(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
@@ -291,6 +332,73 @@ def token_aware_chunks(text: str, max_tokens: int, overlap_tokens: int) -> list[
         chunks.append(join_blocks(current_blocks))
 
     return [chunk for chunk in chunks if clean_text(chunk)]
+
+
+def add_inter_chunk_overlap(chunks: list[str], overlap_tokens: int) -> list[str]:
+    if overlap_tokens <= 0 or len(chunks) <= 1:
+        return chunks
+    overlapped = [chunks[0]]
+    for previous, current in zip(chunks, chunks[1:]):
+        prefix = " ".join(TOKEN_PATTERN.findall(previous)[-overlap_tokens:])
+        overlapped.append(join_blocks([prefix, current]) if prefix else current)
+    return overlapped
+
+
+def special_signal_chunks(text: str, max_tokens: int, context_lines: int = 3) -> list[str]:
+    lines = [line for line in str(text or "").splitlines() if clean_text(line)]
+    chunks = []
+    for index, line in enumerate(lines):
+        if not SPECIAL_SIGNAL_PATTERN.search(line):
+            continue
+        start = max(0, index - context_lines)
+        end = min(len(lines), index + context_lines + 1)
+        chunk = clean_text("\n".join(lines[start:end]))
+        if token_count(chunk) > max_tokens:
+            chunk = " ".join(TOKEN_PATTERN.findall(chunk)[:max_tokens])
+        if chunk:
+            chunks.append(chunk)
+    return dedupe_preserve_order(chunks)
+
+
+def chunk_signal_metadata(chunk: str) -> dict[str, Any]:
+    value = str(chunk or "")
+    lowered = value.lower()
+    return {
+        "has_formula_signal": bool(
+            re.search(r"\\(?:frac|sum|sqrt|top|operatorname)|\b(?:softmax|sqrt)\s*\(", value, flags=re.I)
+            or re.search(r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}", value)
+        ),
+        "has_api_signal": bool(re.search(r"\b(?:torch\.|tf\.|keras\.)[A-Za-z0-9_.]+", value)),
+        "has_benchmark_signal": any(
+            term in lowered
+            for term in ("benchmark", "accuracy", "bleu", "glue", "imagenet", "top-1", "f1", "auc")
+        ),
+    }
+
+
+def dedupe_documents(documents: list[Any]) -> list[Any]:
+    deduped = []
+    seen = set()
+    for document in documents:
+        metadata = document.metadata if isinstance(document.metadata, dict) else {}
+        key = f"{clean_text(metadata.get('chunk_kind'))}:{clean_text(document.page_content)}"
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(document)
+    return deduped
+
+
+def dedupe_preserve_order(items: Iterable[str]) -> list[str]:
+    deduped = []
+    seen = set()
+    for item in items:
+        value = clean_text(item)
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
 
 
 def text_blocks(text: str) -> list[str]:
