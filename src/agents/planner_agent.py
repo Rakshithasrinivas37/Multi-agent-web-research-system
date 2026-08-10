@@ -189,10 +189,7 @@ Rules:
     def plan(self, objective: str) -> ResearchPlan:
         objective = sanitize_objective(objective)
         if self.use_llm:
-            try:
-                return self._plan_with_groq(objective)
-            except Exception as error:
-                print(f"[planner_agent] Groq planner unavailable; using fallback planner: {error}")
+            return self._plan_with_groq(objective)
         return self._fallback_plan(objective)
 
     def write_to_memory(self, plan: ResearchPlan, memory_path: str = "data/shared_memory.json") -> None:
@@ -1093,8 +1090,7 @@ def select_candidate_with_groq(task: ResearchTask, query: str, candidates: list[
         )
         data = parse_json_object(response.choices[0].message.content or "{}")
     except Exception as error:
-        print(f"[planner_agent] Groq URL selection failed for {query!r}: {error}")
-        return ""
+        raise RuntimeError(f"Groq URL selection failed for {query!r}: {error}") from error
 
     selected_url = clean_text(data.get("url"))
     candidate_urls = {candidate["url"] for candidate in candidates}
