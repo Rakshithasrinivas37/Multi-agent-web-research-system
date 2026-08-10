@@ -8,6 +8,7 @@ from src.agents.report_agent import (
     report_context_gap_queries,
     missing_sub_question_coverage,
     normalize_final_report,
+    remove_conflicting_missing_evidence_statements,
     remove_unavailable_citation_markers,
     report_generation_token_cap,
     report_quality_issues,
@@ -301,6 +302,37 @@ No cited source markers were used.
         ]
 
         self.assertEqual(hard_report_issues(issues), issues)
+
+    def test_remove_conflicting_missing_evidence_statements_drops_exact_missing_sentence(self):
+        report = r"""# Topic
+
+## Executive Summary
+The formula \(Attention(Q,K,V)=softmax(QK^T)V\) is missing from the evidence. Keep this sentence.
+
+## References
+No cited source markers were used.
+"""
+        evidence = r"Evidence includes \(Attention(Q,K,V)=softmax(QK^T)V\)."
+
+        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
+
+        self.assertNotIn("is missing from the evidence", cleaned)
+        self.assertIn("Keep this sentence.", cleaned)
+
+    def test_remove_conflicting_missing_evidence_statements_keeps_unresolved_gap(self):
+        report = """# Topic
+
+## Executive Summary
+TensorFlow API details are not present in the evidence.
+
+## References
+No cited source markers were used.
+"""
+        evidence = "Evidence discusses PyTorch only."
+
+        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
+
+        self.assertIn("TensorFlow API details are not present", cleaned)
 
     def test_report_contract_requires_executive_summary_with_evidence(self):
         report = """# Topic

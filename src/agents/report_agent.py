@@ -663,6 +663,8 @@ def finalize_report(
         raise ValueError("report_agent produced empty report")
 
     repaired = normalize_final_report(report, sources)
+    repaired = remove_conflicting_missing_evidence_statements(repaired, evidence_text)
+    repaired = normalize_final_report(repaired, sources)
     issues = report_quality_issues(repaired, evidence_text, sources=sources)
     total_repair_count = 0
     for _ in range(REPORT_REPAIR_MAX_ATTEMPTS):
@@ -684,6 +686,8 @@ def finalize_report(
         )
         total_repair_count += repair_count
         repaired = normalize_final_report(repaired, sources)
+        repaired = remove_conflicting_missing_evidence_statements(repaired, evidence_text)
+        repaired = normalize_final_report(repaired, sources)
         issues = report_quality_issues(repaired, evidence_text, sources=sources)
 
     blocking_issues = hard_report_issues(issues)
@@ -696,6 +700,41 @@ def hard_report_issues(issues: Sequence[str]) -> list[str]:
     """Return report issues that should block saving the final report."""
 
     return [issue for issue in issues if clean_text(issue)]
+
+
+def remove_conflicting_missing_evidence_statements(report: str, evidence_text: str) -> str:
+    """Drop missing-evidence sentences contradicted by supplied evidence."""
+
+    if not clean_text(evidence_text) or not has_missing_claim(report):
+        return report
+    evidence_terms = detail_terms(evidence_text)
+    cleaned_lines = []
+    for line in clean_markdown(report).splitlines():
+        if is_references_heading(line) or line.lstrip().startswith("#"):
+            cleaned_lines.append(line)
+            continue
+        sentences = split_sentences_preserving_markdown(line)
+        kept = [
+            sentence
+            for sentence in sentences
+            if not conflicting_missing_sentence(sentence, evidence_terms)
+        ]
+        cleaned_line = clean_text(" ".join(kept))
+        if cleaned_line or not clean_text(line):
+            cleaned_lines.append(cleaned_line)
+    return clean_markdown("\n".join(cleaned_lines))
+
+
+def split_sentences_preserving_markdown(text: str) -> list[str]:
+    if not clean_text(text):
+        return [""]
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if clean_text(part)]
+
+
+def conflicting_missing_sentence(sentence: str, evidence_terms: set[str]) -> bool:
+    if not report_missing_sentences(sentence):
+        return False
+    return has_exact_detail_signal(sentence) or bool(detail_terms(sentence) & evidence_terms)
 
 
 def repair_report_if_needed(
