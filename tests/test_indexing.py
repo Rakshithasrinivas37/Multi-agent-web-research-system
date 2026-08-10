@@ -1,7 +1,7 @@
 import unittest
 
 from src.rag.indexing import langchain_ingestion_classes, split_document
-from src.rag.retrieval import metadata_signal_score
+from src.rag.retrieval import RetrievalResult, expand_parent_context_results, metadata_signal_score
 
 
 class IndexingChunkingTests(unittest.TestCase):
@@ -26,6 +26,48 @@ ImageNet top-1 accuracy improves by 1.00%.
         self.assertTrue(any(chunk.metadata.get("has_formula_signal") for chunk in signal_chunks))
         self.assertTrue(any(chunk.metadata.get("has_api_signal") for chunk in signal_chunks))
         self.assertTrue(any(chunk.metadata.get("has_benchmark_signal") for chunk in signal_chunks))
+
+    def test_split_document_adds_parent_context_metadata(self):
+        Document, _ = langchain_ingestion_classes()
+        document = Document(
+            page_content="\n\n".join(f"Section {index} has detailed context about attention formulas." for index in range(80)),
+            metadata={"url": "https://example.com", "history_key": "test"},
+        )
+
+        chunks = split_document(document, chunk_size=120, chunk_overlap=20)
+
+        self.assertTrue(chunks)
+        self.assertTrue(all(chunk.metadata.get("parent_id") for chunk in chunks))
+        self.assertTrue(all(chunk.metadata.get("parent_content") for chunk in chunks))
+        self.assertTrue(any(chunk.metadata.get("parent_token_count", 0) > chunk.metadata.get("token_count", 0) for chunk in chunks))
+
+    def test_expand_parent_context_results_dedupes_same_parent(self):
+        parent_content = "Parent context with formula and surrounding explanation. " * 20
+        results = [
+            RetrievalResult(
+                id="child-1",
+                document="formula child",
+                metadata={"parent_id": "parent-1", "parent_content": parent_content},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="child-2",
+                document="nearby child",
+                metadata={"parent_id": "parent-1", "parent_content": parent_content},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            ),
+        ]
+
+        expanded = expand_parent_context_results(results)
+
+        self.assertEqual(len(expanded), 1)
+        self.assertIn("surrounding explanation", expanded[0].document)
+        self.assertTrue(expanded[0].metadata.get("parent_context_expanded"))
+        self.assertNotIn("parent_content", expanded[0].metadata)
 
     def test_metadata_signal_score_boosts_matching_queries(self):
         metadata = {

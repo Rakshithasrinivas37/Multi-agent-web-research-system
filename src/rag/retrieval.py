@@ -208,7 +208,7 @@ def hybrid_retrieve(
         )
     if diversify_urls:
         merged = diversify_by_url(merged, top_k=top_k)
-    return merged[:top_k]
+    return expand_parent_context_results(merged[:top_k])
 
 
 def multi_query_hybrid_retrieve(
@@ -269,12 +269,13 @@ def multi_query_hybrid_retrieve(
         merged = diversify_by_url(merged, top_k=top_k)
     else:
         merged = merged[: max(1, top_k)]
-    return expand_formula_neighbor_chunks(
+    expanded = expand_formula_neighbor_chunks(
         results=merged,
         queries=clean_queries,
         chroma_path=chroma_path,
         collection_name=collection_name,
     )
+    return expand_parent_context_results(expanded)
 
 
 def source_url_coverage_retrieve(
@@ -367,7 +368,44 @@ def source_url_coverage_retrieve(
                     bm25_rank=rank,
                 )
             )
-    return selected
+    return expand_parent_context_results(selected)
+
+
+def expand_parent_context_results(results: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    """Return larger parent context for matched child chunks without changing ranking."""
+
+    expanded = []
+    seen_contexts = set()
+    for result in results:
+        item = expand_parent_context_result(result)
+        context_id = clean_text(item.metadata.get("parent_id")) or item.id
+        if context_id in seen_contexts:
+            continue
+        seen_contexts.add(context_id)
+        expanded.append(item)
+    return expanded
+
+
+def expand_parent_context_result(result: RetrievalResult) -> RetrievalResult:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    parent_content = clean_text(metadata.get("parent_content"))
+    if not parent_content or len(tokenize(parent_content)) <= len(tokenize(result.document)):
+        return result
+
+    expanded_metadata = {key: value for key, value in metadata.items() if key != "parent_content"}
+    expanded_metadata["parent_context_expanded"] = True
+    return RetrievalResult(
+        id=result.id,
+        document=parent_content,
+        metadata=expanded_metadata,
+        score=result.score,
+        semantic_score=result.semantic_score,
+        bm25_score=result.bm25_score,
+        authority_score=result.authority_score,
+        rerank_score=result.rerank_score,
+        semantic_rank=result.semantic_rank,
+        bm25_rank=result.bm25_rank,
+    )
 
 
 def expand_formula_neighbor_chunks(
