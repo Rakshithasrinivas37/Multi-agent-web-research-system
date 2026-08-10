@@ -20,6 +20,7 @@ from src.agents.report_agent import (
 from src.agents.synthesis_agent import SynthesisAgent
 from src.memory.shared_memory import SharedMemory
 from src.rag import index_research_results
+from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 DEFAULT_AGENT_RESPONSE_ATTEMPTS = 3
@@ -50,22 +51,36 @@ def log_agent_step(agent_name: str):
         @wraps(func)
         async def async_wrapper(state: ResearchState) -> ResearchState:
             started_at = perf_counter()
+            emit_progress("agent_started", f"{agent_name} started", agent=agent_name)
             try:
                 result = await func(state)
             except Exception:
                 elapsed = perf_counter() - started_at
                 print(f"[{agent_name}] failed after {elapsed:.2f}s")
+                emit_progress(
+                    "agent_failed",
+                    f"{agent_name} failed after {elapsed:.2f}s",
+                    agent=agent_name,
+                    metadata={"elapsed_seconds": round(elapsed, 2)},
+                )
                 raise
             return add_agent_timing(agent_name, result, elapsed=perf_counter() - started_at)
 
         @wraps(func)
         def sync_wrapper(state: ResearchState) -> ResearchState:
             started_at = perf_counter()
+            emit_progress("agent_started", f"{agent_name} started", agent=agent_name)
             try:
                 result = func(state)
             except Exception:
                 elapsed = perf_counter() - started_at
                 print(f"[{agent_name}] failed after {elapsed:.2f}s")
+                emit_progress(
+                    "agent_failed",
+                    f"{agent_name} failed after {elapsed:.2f}s",
+                    agent=agent_name,
+                    metadata={"elapsed_seconds": round(elapsed, 2)},
+                )
                 raise
             return add_agent_timing(agent_name, result, elapsed=perf_counter() - started_at)
 
@@ -79,6 +94,12 @@ def add_agent_timing(agent_name: str, state: ResearchState, elapsed: float) -> R
     status = "completed with errors" if errors else "completed"
     print(f"[{agent_name}] {status} in {elapsed:.2f}s")
     timing = {"agent": agent_name, "status": status, "elapsed_seconds": round(elapsed, 2)}
+    emit_progress(
+        "agent_completed",
+        f"{agent_name} {status} in {elapsed:.2f}s",
+        agent=agent_name,
+        metadata=timing,
+    )
     return {**state, "agent_timings": [*state.get("agent_timings", []), timing]}
 
 

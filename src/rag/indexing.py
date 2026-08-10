@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
 from src.agents.change_detection_agent import hash_text, normalize_url, objective_key
+from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
@@ -132,6 +133,13 @@ def index_research_results(
     useful.
     """
 
+    emit_progress(
+        "tool_called",
+        "Indexing research content into ChromaDB",
+        agent="change_detection",
+        tool="chromadb",
+        metadata={"chroma_path": str(chroma_path), "collection_name": collection_name},
+    )
     collection = get_collection(chroma_path, collection_name)
     change_detection = change_detection if isinstance(change_detection, dict) else {}
     research_plan = research_plan if isinstance(research_plan, dict) else {}
@@ -190,6 +198,13 @@ def index_research_results(
             )
 
         collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+        emit_progress(
+            "tool_called",
+            "Embedded and upserted source chunks",
+            agent="change_detection",
+            tool="sentence-transformers/chromadb",
+            metadata={"url": record.url, "chunks": len(chunk_documents)},
+        )
         indexed_source_count += 1
         indexed_chunk_count += len(chunk_documents)
 

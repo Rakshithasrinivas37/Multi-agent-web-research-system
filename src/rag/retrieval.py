@@ -21,6 +21,7 @@ from src.rag.indexing import (
     select_embedding_device,
     to_int,
 )
+from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
@@ -125,6 +126,13 @@ def hybrid_retrieve(
     if not query:
         return []
 
+    emit_progress(
+        "tool_called",
+        "Running hybrid RAG retrieval",
+        agent="synthesis",
+        tool="chromadb/bm25",
+        metadata={"query": query, "top_k": top_k, "semantic_k": semantic_k, "bm25_k": bm25_k},
+    )
     top_k = max(1, top_k)
     semantic_k = max(top_k, semantic_k)
     bm25_k = max(top_k, bm25_k)

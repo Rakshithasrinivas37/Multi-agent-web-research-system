@@ -25,6 +25,7 @@ from src.rag.retrieval import (
     source_url_coverage_retrieve,
 )
 from src.tools.groq_retry import create_chat_completion_with_retries, is_groq_request_too_large_error
+from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
@@ -120,6 +121,13 @@ def synthesize_report_from_research_plan(
         raise ValueError("research_plan.objective is required")
 
     queries = planner_tasks_to_rag_queries(research_plan)
+    emit_progress(
+        "tool_called",
+        "Synthesis retrieving evidence from RAG index",
+        agent="synthesis",
+        tool="rag-retrieval",
+        metadata={"query_count": len(queries)},
+    )
     current_history_key = clean_text(history_key) or objective_key(objective, research_plan)
     objective_scope = resolve_objective_history_scope(
         objective=objective,
@@ -641,6 +649,13 @@ Answer using only the retrieved context. If the context does not contain the ans
 Use only the numbered source markers that appear in the retrieved context, like [1] or [2].
 Do not cite source names, authors, dates, or papers unless they are present in the retrieved context."""
 
+    emit_progress(
+        "tool_called",
+        "RAG generation calling Groq",
+        agent="synthesis",
+        tool="groq",
+        metadata={"model": rag_generation_model(model)},
+    )
     response = create_chat_completion_with_retries(
         Groq(),
         model=rag_generation_model(model),
@@ -750,6 +765,13 @@ Before finishing, check the Instruction Coverage Checklist against the Recommend
 Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
 
         try:
+            emit_progress(
+                "tool_called",
+                "Synthesis calling Groq to create report context",
+                agent="synthesis",
+                tool="groq",
+                metadata={"model": rag_generation_model(model), "attempt": attempt + 1},
+            )
             response = create_chat_completion_with_retries(
                 client,
                 model=rag_generation_model(model),

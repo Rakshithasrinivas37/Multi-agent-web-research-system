@@ -1,6 +1,7 @@
 groq
 chromadb
 firecrawl-py
+fastapi
 httpx
 langgraph
 langchain-chroma
@@ -15,6 +16,8 @@ numpy<2
 ragas
 rank-bm25
 sentence-transformers
+streamlit
 tavily-python
 torch>=2.2,<3
 transformers<5
+uvicorn[standard]
