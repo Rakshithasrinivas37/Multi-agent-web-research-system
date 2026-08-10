@@ -66,9 +66,21 @@ def log_agent_step(agent_name: str):
 
 def add_agent_timing(agent_name: str, state: ResearchState, elapsed: float) -> ResearchState:
     errors = state.get("errors", []) if isinstance(state, dict) else []
-    status = "completed with errors" if errors else "completed"
+    status = "failed" if errors else "completed"
     print(f"[{agent_name}] {status} in {elapsed:.2f}s")
+    if errors:
+        for error in errors:
+            print(f"[{agent_name}] error: {clean_text(error)}")
     timing = {"agent": agent_name, "status": status, "elapsed_seconds": round(elapsed, 2)}
+<<<<<<< Updated upstream
+=======
+    emit_progress(
+        "agent_failed" if errors else "agent_completed",
+        f"{agent_name} {status} in {elapsed:.2f}s",
+        agent=agent_name,
+        metadata={**timing, "errors": errors},
+    )
+>>>>>>> Stashed changes
     return {**state, "agent_timings": [*state.get("agent_timings", []), timing]}
 
 
