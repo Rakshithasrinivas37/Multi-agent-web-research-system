@@ -1,9 +1,9 @@
-import asyncio
+import json
 import os
-from datetime import datetime
 from pathlib import Path
 import sys
 
+import httpx
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -11,14 +11,12 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.agents.report_agent import slugify_filename
-from src.graph.research_workflow import run_research_graph
-
 
 load_dotenv(PROJECT_ROOT / ".env")
 
 DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+DEFAULT_BACKEND_URL = "http://127.0.0.1:8000"
 
 
 def main() -> None:
@@ -72,6 +70,10 @@ def configure_sidebar() -> None:
             index=device_index(os.environ.get("RAG_EMBEDDING_DEVICE", "auto")),
         )
         max_concurrency = st.number_input("Max concurrency", min_value=1, max_value=10, value=3)
+        backend_url = st.text_input(
+            "Backend URL",
+            value=os.environ.get("RESEARCH_BACKEND_URL", DEFAULT_BACKEND_URL),
+        )
 
     st.session_state["research_config"] = {
         "groq_api_key": groq_api_key.strip(),
@@ -81,6 +83,7 @@ def configure_sidebar() -> None:
         "embedding_model": embedding_model.strip() or DEFAULT_EMBEDDING_MODEL,
         "embedding_device": embedding_device,
         "max_concurrency": int(max_concurrency),
+        "backend_url": backend_url.strip().rstrip("/") or DEFAULT_BACKEND_URL,
     }
 
 
@@ -93,50 +96,106 @@ def run_research(objective: str) -> None:
             st.error(error)
         return
 
-    apply_runtime_config(config)
     clear_previous_report()
 
-    memory_path = PROJECT_ROOT / "data" / "streamlit_shared_memory.json"
-    history_db_path = PROJECT_ROOT / "data" / "browser_history.db"
-    chroma_path = PROJECT_ROOT / "data" / "chroma"
-
     with st.status("Running research workflow...", expanded=True) as status:
-        st.write("Planning research tasks")
-        st.write("Collecting and indexing evidence")
-        st.write("Generating cited report")
+        current_agent_slot = st.empty()
+        tool_log_slot = st.empty()
+        tools_by_agent: dict[str, list[str]] = {}
+        payload: dict[str, object] = {}
         try:
-            state = asyncio.run(
-                run_research_graph(
-                    objective=objective,
-                    memory_path=str(memory_path),
-                    history_db_path=str(history_db_path),
-                    chroma_path=str(chroma_path),
-                    max_concurrency=config["max_concurrency"],
-                    model=config["model"],
-                )
-            )
+            for event in stream_research_backend(objective, config):
+                payload = handle_progress_event(event, status, current_agent_slot, tool_log_slot, tools_by_agent, payload)
         except Exception as error:
             status.update(label="Research failed", state="error")
             st.error(str(error))
             return
 
-        workflow_errors = state.get("errors") or []
-        if workflow_errors:
-            status.update(label="Research completed with errors", state="error")
-            for error in workflow_errors:
-                st.error(str(error))
-            return
-
-        report_payload = state.get("report") or {}
-        report_markdown = str(report_payload.get("report") or "").strip()
+        report_markdown = str(payload.get("report") or "").strip()
         if not report_markdown:
             status.update(label="Research completed without a report", state="error")
             st.error("The workflow completed, but no report content was returned.")
             return
 
         st.session_state["generated_report"] = report_markdown
-        st.session_state["generated_report_filename"] = report_filename(objective)
+        st.session_state["generated_report_filename"] = payload.get("filename") or "research-report.md"
         status.update(label="Report generated", state="complete")
+
+
+def stream_research_backend(objective: str, config: dict[str, object]):
+    backend_url = str(config["backend_url"])
+    request_payload = {
+        "objective": objective,
+        "groq_api_key": config["groq_api_key"],
+        "tavily_api_key": config["tavily_api_key"],
+        "firecrawl_api_key": config["firecrawl_api_key"],
+        "model": config["model"],
+        "embedding_model": config["embedding_model"],
+        "embedding_device": config["embedding_device"],
+        "max_concurrency": config["max_concurrency"],
+    }
+    with httpx.Client(timeout=None) as client:
+        with client.stream("POST", f"{backend_url}/research/stream", json=request_payload) as response:
+            if response.is_error:
+                raise RuntimeError(backend_error_message(response))
+            for line in response.iter_lines():
+                if line:
+                    yield json.loads(line)
+
+
+def handle_progress_event(
+    event: dict[str, object],
+    status,
+    current_agent_slot,
+    tool_log_slot,
+    tools_by_agent: dict[str, list[str]],
+    payload: dict[str, object],
+) -> dict[str, object]:
+    event_type = str(event.get("event") or "")
+    agent = str(event.get("agent") or "")
+    tool = str(event.get("tool") or "")
+    message = str(event.get("message") or "")
+
+    if event_type == "workflow_started":
+        status.update(label="Research workflow started", state="running")
+        current_agent_slot.info("Starting research workflow")
+    elif event_type == "agent_started":
+        status.update(label=f"Running {agent} agent", state="running")
+        current_agent_slot.info(f"Current agent: {agent}")
+    elif event_type == "agent_completed":
+        current_agent_slot.success(message or f"{agent} completed")
+    elif event_type == "tool_called":
+        agent_name = agent or "workflow"
+        tool_text = f"{tool}: {message}" if tool else message
+        tools_by_agent.setdefault(agent_name, []).append(tool_text)
+        current_agent_slot.info(f"Current agent: {agent_name}")
+        render_tool_log(tool_log_slot, tools_by_agent)
+    elif event_type == "report":
+        payload = event
+        current_agent_slot.success("Report generated")
+    elif event_type == "workflow_completed":
+        status.update(label="Research workflow completed", state="complete")
+    elif event_type == "error":
+        raise RuntimeError(message or str(event.get("errors") or "Research failed"))
+
+    return payload
+
+
+def render_tool_log(tool_log_slot, tools_by_agent: dict[str, list[str]]) -> None:
+    lines = ["**Tools called**"]
+    for agent, tools in tools_by_agent.items():
+        lines.append(f"\n**{agent}**")
+        for tool_call in tools[-12:]:
+            lines.append(f"- `{tool_call}`")
+    tool_log_slot.markdown("\n".join(lines))
+
+
+def backend_error_message(response: httpx.Response) -> str:
+    try:
+        detail = response.json().get("detail")
+    except ValueError:
+        detail = response.text
+    return f"Backend request failed ({response.status_code}): {detail}"
 
 
 def render_report_download() -> None:
@@ -168,25 +227,9 @@ def validate_inputs(objective: str, config: dict[str, object]) -> list[str]:
     return errors
 
 
-def apply_runtime_config(config: dict[str, object]) -> None:
-    os.environ["GROQ_API_KEY"] = str(config["groq_api_key"])
-    os.environ["TAVILY_API_KEY"] = str(config["tavily_api_key"])
-    if config.get("firecrawl_api_key"):
-        os.environ["FIRECRAWL_API_KEY"] = str(config["firecrawl_api_key"])
-    os.environ["RESEARCH_PLANNER_MODEL"] = str(config["model"])
-    os.environ["RAG_GENERATION_MODEL"] = str(config["model"])
-    os.environ["RAG_EMBEDDING_MODEL"] = str(config["embedding_model"])
-    os.environ["RAG_EMBEDDING_DEVICE"] = str(config["embedding_device"])
-
-
 def clear_previous_report() -> None:
     for key in ("generated_report", "generated_report_filename"):
         st.session_state.pop(key, None)
-
-
-def report_filename(objective: str) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"{slugify_filename(objective)}-{timestamp}.md"
 
 
 def device_index(value: str) -> int:

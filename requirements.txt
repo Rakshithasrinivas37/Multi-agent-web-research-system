@@ -1,6 +1,7 @@
 groq
 chromadb
 firecrawl-py
+fastapi
 httpx
 langgraph
 langchain-chroma
@@ -19,3 +20,4 @@ streamlit
 tavily-python
 torch>=2.2,<3
 transformers<5
+uvicorn[standard]

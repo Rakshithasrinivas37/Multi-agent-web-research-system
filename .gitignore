@@ -7,6 +7,7 @@ __pycache__/
 .env
 data/shared_memory.json
 data/streamlit_shared_memory.json
+data/backend_shared_memory.json
 data/browser_results.json
 data/research_plan.json
 data/browser_history.db

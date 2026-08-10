@@ -9,6 +9,7 @@ from typing import Any, Sequence
 
 from src.memory.shared_memory import SharedMemory
 from src.tools.groq_retry import create_chat_completion_with_retries as groq_chat_completion_with_retries
+from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
@@ -92,6 +93,13 @@ class ReportAgent:
             evidence_text=evidence_text,
             source_text=source_text,
             diagnostics=diagnostics,
+        )
+        emit_progress(
+            "tool_called",
+            "Report agent calling Groq to generate final report",
+            agent="report",
+            tool="groq",
+            metadata={"model": self.model},
         )
         report, report_model = generate_single_report(
             client=client,
