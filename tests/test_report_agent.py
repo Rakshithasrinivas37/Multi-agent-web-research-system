@@ -4,6 +4,8 @@ from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     hard_report_issues,
     markdown_completion_issues,
+    report_context_gap_items,
+    report_context_gap_queries,
     missing_sub_question_coverage,
     normalize_final_report,
     remove_unavailable_citation_markers,
@@ -229,6 +231,34 @@ No cited source markers were used.
 
         self.assertEqual(len(queries), 1)
         self.assertIn("applications", queries[0])
+
+    def test_report_context_gap_items_detects_missing_synthesis_coverage(self):
+        report_context = {
+            "synthesis": """# Notes
+
+### What are the equations for scaled dot-product attention?
+- Evidence: None in the retrieved set.
+- Gaps: Need the scaled dot-product formula.
+""",
+            "planner_questions": ["What are the equations for scaled dot-product attention?"],
+        }
+        research_plan = {"objective": "What is attention?", "sub_questions": report_context["planner_questions"]}
+
+        gaps = report_context_gap_items(report_context, research_plan)
+
+        self.assertTrue(any("scaled dot-product" in gap for gap in gaps))
+
+    def test_report_context_gap_queries_rewrites_preflight_gaps(self):
+        report_context = {
+            "synthesis": "| Requirement | Status | Notes |\n| Formula | Missing | Need exact equation. |",
+            "planner_questions": [],
+        }
+        research_plan = {"objective": "What is attention?"}
+
+        queries = report_context_gap_queries(report_context, research_plan)
+
+        self.assertEqual(len(queries), 1)
+        self.assertIn("exact equation", queries[0])
 
     def test_hard_report_issues_treats_stale_missing_evidence_as_warning(self):
         issues = [

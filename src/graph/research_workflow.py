@@ -11,7 +11,12 @@ from langgraph.graph import END, StateGraph
 from src.agents.browser_agent import BrowserAgent
 from src.agents.change_detection_agent import ChangeDetectionAgent
 from src.agents.planner_agent import PlannerAgent
-from src.agents.report_agent import ReportAgent, rewrite_missing_sub_question_queries
+from src.agents.report_agent import (
+    ReportAgent,
+    report_context_gap_items,
+    report_context_gap_queries,
+    rewrite_missing_sub_question_queries,
+)
 from src.agents.synthesis_agent import SynthesisAgent
 from src.memory.shared_memory import SharedMemory
 from src.rag import index_research_results
@@ -311,9 +316,20 @@ def report_node(state: ResearchState) -> ResearchState:
     output_format = clean_text(research_plan.get("output_format")) or "report"
     for attempt in range(1, DEFAULT_REPORT_RESPONSE_ATTEMPTS + 1):
         try:
+            preflight_gap_items = report_context_gap_items(report_context, research_plan)
+            if preflight_gap_items and not report_context_gap_retry_used(report_context):
+                report_context = refresh_synthesis_for_report_gaps(
+                    state=state,
+                    research_plan=research_plan,
+                    report_context=report_context,
+                    missing_questions=preflight_gap_items,
+                    retry_queries=report_context_gap_queries(report_context, research_plan),
+                    memory_path=memory_path,
+                    chroma_path=chroma_path,
+                )
             report = report_agent.generate(report_context, output_format=output_format)
             missing_questions = report_missing_sub_questions(report)
-            if missing_questions:
+            if missing_questions and not report_context_gap_retry_used(report_context):
                 report_diagnostics = report.get("diagnostics", {}) if isinstance(report, dict) else {}
                 report_context = refresh_synthesis_for_report_gaps(
                     state=state,
@@ -370,6 +386,11 @@ def report_missing_question_errors(report: dict[str, Any]) -> list[str]:
     return [f"report_node report does not answer planner sub-questions: {missing_text}"]
 
 
+def report_context_gap_retry_used(report_context: dict[str, Any]) -> bool:
+    diagnostics = report_context.get("diagnostics", {}) if isinstance(report_context, dict) else {}
+    return bool(isinstance(diagnostics, dict) and diagnostics.get("report_gap_retry"))
+
+
 def refresh_synthesis_for_report_gaps(
     state: ResearchState,
     research_plan: dict[str, Any],
@@ -386,7 +407,7 @@ def refresh_synthesis_for_report_gaps(
             clean_text(research_plan.get("objective")),
             missing_questions,
         )
-    print(f"[report] refreshing synthesis for {len(missing_questions)} missing planner question(s)")
+    print(f"[report] refreshing synthesis for {len(missing_questions)} coverage gap(s)")
     gap_plan = research_plan_for_report_gaps(research_plan, missing_questions, retry_queries)
     synthesis_agent = SynthesisAgent(model=state.get("model"), chroma_path=chroma_path)
     refreshed = synthesis_agent.synthesize(gap_plan)
