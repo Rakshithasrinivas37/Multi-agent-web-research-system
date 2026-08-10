@@ -1,14 +1,15 @@
 import unittest
 
 from src.agents.report_agent import (
-    DEFAULT_REPORT_MAX_SECTIONS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     hard_report_issues,
     markdown_completion_issues,
+    missing_sub_question_coverage,
     normalize_final_report,
     remove_unavailable_citation_markers,
     report_generation_token_cap,
     report_quality_issues,
+    rewrite_missing_sub_question_queries,
 )
 
 
@@ -205,13 +206,29 @@ No cited source markers were used.
 
     def test_report_generation_token_caps_stay_under_budget(self):
         self.assertLessEqual(
-            report_generation_token_cap("single", 0),
+            report_generation_token_cap(),
             DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
         )
-        self.assertLessEqual(
-            report_generation_token_cap("sectioned_parallel", DEFAULT_REPORT_MAX_SECTIONS),
-            DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+
+    def test_missing_sub_question_coverage_flags_unanswered_questions(self):
+        report = "The report defines attention and explains neural network scoring."
+        questions = [
+            "What is the definition of attention mechanism?",
+            "What are the applications and benefits of attention mechanisms?",
+        ]
+
+        missing = missing_sub_question_coverage(report, questions)
+
+        self.assertEqual(missing, [questions[1]])
+
+    def test_rewrite_missing_sub_question_queries_keeps_queries_focused(self):
+        queries = rewrite_missing_sub_question_queries(
+            "What is attention mechanism?",
+            ["What are the applications and benefits?"],
         )
+
+        self.assertEqual(len(queries), 1)
+        self.assertIn("applications", queries[0])
 
     def test_hard_report_issues_treats_stale_missing_evidence_as_warning(self):
         issues = [

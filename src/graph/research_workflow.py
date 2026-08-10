@@ -2,6 +2,7 @@
 
 from functools import wraps
 from inspect import iscoroutinefunction
+import re
 from time import perf_counter
 from typing import Any, Sequence, TypedDict
 
@@ -10,7 +11,7 @@ from langgraph.graph import END, StateGraph
 from src.agents.browser_agent import BrowserAgent
 from src.agents.change_detection_agent import ChangeDetectionAgent
 from src.agents.planner_agent import PlannerAgent
-from src.agents.report_agent import ReportAgent
+from src.agents.report_agent import ReportAgent, rewrite_missing_sub_question_queries
 from src.agents.synthesis_agent import SynthesisAgent
 from src.memory.shared_memory import SharedMemory
 from src.rag import index_research_results
@@ -280,8 +281,9 @@ def report_node(state: ResearchState) -> ResearchState:
     """Generate the final report from synthesis output."""
 
     memory_path = state.get("memory_path") or "data/shared_memory.json"
+    chroma_path = state.get("chroma_path") or "data/chroma"
     if state.get("errors"):
-        return {**state, "memory_path": memory_path}
+        return {**state, "memory_path": memory_path, "chroma_path": chroma_path}
 
     report_context = state.get("synthesis")
     if not report_context:
@@ -310,10 +312,24 @@ def report_node(state: ResearchState) -> ResearchState:
     for attempt in range(1, DEFAULT_REPORT_RESPONSE_ATTEMPTS + 1):
         try:
             report = report_agent.generate(report_context, output_format=output_format)
+            missing_questions = report_missing_sub_questions(report)
+            if missing_questions:
+                report_diagnostics = report.get("diagnostics", {}) if isinstance(report, dict) else {}
+                report_context = refresh_synthesis_for_report_gaps(
+                    state=state,
+                    research_plan=research_plan,
+                    report_context=report_context,
+                    missing_questions=missing_questions,
+                    retry_queries=report_diagnostics.get("report_retry_queries", []),
+                    memory_path=memory_path,
+                    chroma_path=chroma_path,
+                )
+                report = report_agent.generate(report_context, output_format=output_format)
+            report_errors = report_missing_question_errors(report)
         except Exception as error:
             report_errors = [clean_text(error)]
         else:
-            report_errors = validate_report_payload(report, research_plan)
+            report_errors = report_errors or validate_report_payload(report, research_plan)
             if not report_errors:
                 break
 
@@ -325,6 +341,7 @@ def report_node(state: ResearchState) -> ResearchState:
             **state,
             "report": report,
             "memory_path": memory_path,
+            "chroma_path": chroma_path,
             "errors": [*state.get("errors", []), *report_errors],
         }
 
@@ -333,8 +350,165 @@ def report_node(state: ResearchState) -> ResearchState:
         **state,
         "report": report,
         "memory_path": memory_path,
+        "chroma_path": chroma_path,
+        "synthesis": report_context,
         "errors": state.get("errors", []),
     }
+
+
+def report_missing_sub_questions(report: dict[str, Any]) -> list[str]:
+    diagnostics = report.get("diagnostics", {}) if isinstance(report, dict) else {}
+    questions = diagnostics.get("report_missing_sub_questions", []) if isinstance(diagnostics, dict) else []
+    return [clean_text(question) for question in questions if clean_text(question)]
+
+
+def report_missing_question_errors(report: dict[str, Any]) -> list[str]:
+    missing_questions = report_missing_sub_questions(report)
+    if not missing_questions:
+        return []
+    missing_text = "; ".join(missing_questions[:3])
+    return [f"report_node report does not answer planner sub-questions: {missing_text}"]
+
+
+def refresh_synthesis_for_report_gaps(
+    state: ResearchState,
+    research_plan: dict[str, Any],
+    report_context: dict[str, Any],
+    missing_questions: Sequence[str],
+    retry_queries: Sequence[str],
+    memory_path: str,
+    chroma_path: str,
+) -> dict[str, Any]:
+    """Rerun synthesis with rewritten queries for report coverage gaps."""
+
+    if not retry_queries:
+        retry_queries = rewrite_missing_sub_question_queries(
+            clean_text(research_plan.get("objective")),
+            missing_questions,
+        )
+    print(f"[report] refreshing synthesis for {len(missing_questions)} missing planner question(s)")
+    gap_plan = research_plan_for_report_gaps(research_plan, missing_questions, retry_queries)
+    synthesis_agent = SynthesisAgent(model=state.get("model"), chroma_path=chroma_path)
+    refreshed = synthesis_agent.synthesize(gap_plan)
+    merged = merge_report_context(report_context, refreshed)
+    synthesis_agent.write_to_memory(merged, memory_path)
+    return merged
+
+
+def research_plan_for_report_gaps(
+    research_plan: dict[str, Any],
+    missing_questions: Sequence[str],
+    retry_queries: Sequence[str],
+) -> dict[str, Any]:
+    objective = clean_text(research_plan.get("objective"))
+    questions = [clean_text(question) for question in missing_questions if clean_text(question)]
+    queries = [clean_text(query) for query in retry_queries if clean_text(query)] or questions
+    tasks = [
+        {
+            "query_context": question,
+            "url": clean_text(queries[index]) if index < len(queries) else question,
+            "source_type": "rag",
+            "extraction_goal": f"Retrieve evidence needed to answer: {question}",
+        }
+        for index, question in enumerate(questions)
+    ]
+    return {
+        **research_plan,
+        "objective": objective,
+        "sub_questions": questions,
+        "tasks": tasks,
+        "synthesis_instruction": (
+            "Retrieve and synthesize only the evidence needed to answer the report's missing planner "
+            "sub-questions. Preserve citations and mark gaps instead of guessing."
+        ),
+    }
+
+
+def merge_report_context(original: dict[str, Any], refreshed: dict[str, Any]) -> dict[str, Any]:
+    """Append targeted synthesis evidence to the original report context."""
+
+    original_synthesis = clean_text(original.get("synthesis"))
+    sources, citation_map = append_reindexed_sources(
+        original.get("sources", []),
+        refreshed.get("sources", []),
+    )
+    refreshed_synthesis = remap_report_gap_citations(clean_text(refreshed.get("synthesis")), citation_map)
+    synthesis = clean_text(
+        f"{original_synthesis}\n\n## Targeted Evidence Refresh\n{refreshed_synthesis}"
+    )
+    chunks = list(original.get("supporting_chunks", []) or [])
+    chunks.extend(reindex_supporting_chunks(refreshed.get("supporting_chunks", []) or [], citation_map))
+    diagnostics = {
+        **(original.get("diagnostics", {}) if isinstance(original.get("diagnostics"), dict) else {}),
+        "report_gap_retry": True,
+        "report_gap_retry_queries": refreshed.get("retrieval_queries", []),
+    }
+    return {
+        **original,
+        "synthesis": synthesis,
+        "sources": sources,
+        "supporting_chunks": chunks,
+        "diagnostics": diagnostics,
+    }
+
+
+def append_reindexed_sources(
+    original_sources: Sequence[dict[str, Any]],
+    refreshed_sources: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[int, int]]:
+    merged = [dict(source) for source in original_sources or [] if isinstance(source, dict)]
+    existing_by_url = {clean_text(source.get("url")).lower(): source_index(source, index) for index, source in enumerate(merged, start=1)}
+    next_index = max([source_index(source, index) for index, source in enumerate(merged, start=1)] or [0]) + 1
+    citation_map = {}
+    for fallback_index, source in enumerate(refreshed_sources or [], start=1):
+        if not isinstance(source, dict):
+            continue
+        old_index = source_index(source, fallback_index)
+        url_key = clean_text(source.get("url")).lower()
+        if url_key and url_key in existing_by_url:
+            citation_map[old_index] = existing_by_url[url_key]
+            continue
+        copied = dict(source)
+        copied["index"] = next_index
+        citation_map[old_index] = next_index
+        merged.append(copied)
+        if url_key:
+            existing_by_url[url_key] = next_index
+        next_index += 1
+    return merged, citation_map
+
+
+def source_index(source: dict[str, Any], fallback: int) -> int:
+    try:
+        return int(source.get("index") or fallback)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def remap_report_gap_citations(text: str, citation_map: dict[int, int]) -> str:
+    if not citation_map:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        old_index = int(match.group(1))
+        return f"[{citation_map.get(old_index, old_index)}]"
+
+    return re.sub(r"\[(\d+)\]", replace, text)
+
+
+def reindex_supporting_chunks(chunks: Sequence[dict[str, Any]], citation_map: dict[int, int]) -> list[dict[str, Any]]:
+    reindexed = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        copied = dict(chunk)
+        old_index = copied.get("source_index")
+        try:
+            copied["source_index"] = citation_map.get(int(old_index), old_index)
+        except (TypeError, ValueError):
+            pass
+        reindexed.append(copied)
+    return reindexed
 
 
 def print_retry_response_error(agent_name: str, attempt: int, errors: Sequence[str]) -> None:
