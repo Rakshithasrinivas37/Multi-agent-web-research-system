@@ -6,7 +6,9 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 data/shared_memory.json
+data/streamlit_shared_memory.json
 data/browser_results.json
 data/research_plan.json
 data/browser_history.db
 data/chroma/
+data/reports/
