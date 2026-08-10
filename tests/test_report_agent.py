@@ -1,6 +1,11 @@
 import unittest
 
-from src.agents.report_agent import markdown_completion_issues, remove_unavailable_citation_markers, report_quality_issues
+from src.agents.report_agent import (
+    markdown_completion_issues,
+    normalize_final_report,
+    remove_unavailable_citation_markers,
+    report_quality_issues,
+)
 
 
 class ReportAgentValidationTests(unittest.TestCase):
@@ -75,6 +80,22 @@ This section is complete.
 """
 
         self.assertEqual(markdown_completion_issues(section), [])
+
+    def test_normalize_final_report_strips_unavailable_citations_before_references(self):
+        report = """# Topic
+
+## Executive Summary
+Valid claim [1]. Bad copied marker [9].
+
+## References
+[9] https://example.com/bad
+"""
+        sources = [{"index": 1, "url": "https://example.com/one"}]
+
+        normalized = normalize_final_report(report, sources)
+
+        self.assertIn("[1] https://example.com/one", normalized)
+        self.assertNotIn("[9]", normalized)
 
 
 if __name__ == "__main__":

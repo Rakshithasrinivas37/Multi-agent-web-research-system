@@ -25,8 +25,9 @@ DEFAULT_REPORT_SECTION_CONCURRENCY = 3
 DEFAULT_REPORT_SINGLE_PROMPT_CHARS = 12000
 DEFAULT_REPORT_SINGLE_MAX_TOKENS = 2200
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
-REPORT_REPAIR_MAX_ATTEMPTS = 2
-SECTION_REPAIR_MAX_ATTEMPTS = 2
+DEFAULT_REPORT_DIAGNOSTICS_CHARS = 1200
+REPORT_REPAIR_MAX_ATTEMPTS = 1
+SECTION_REPAIR_MAX_ATTEMPTS = 1
 
 
 class ReportAgent:
@@ -83,7 +84,7 @@ class ReportAgent:
         citation_policy = clean_text(report_context.get("citation_policy")) or (
             "Use only numbered source markers from the provided sources."
         )
-        diagnostics = report_context.get("diagnostics", {})
+        diagnostics = compact_markdown(report_context.get("diagnostics", {}), max_chars=DEFAULT_REPORT_DIAGNOSTICS_CHARS)
         client = Groq()
         output_format_text = clean_text(output_format) or "report"
         single_prompt = build_single_report_prompt(
@@ -414,6 +415,11 @@ def repair_section_if_needed(
         issues = section_quality_issues(repaired, instruction, available_citations=available_citations)
         if not issues:
             break
+        if unavailable_citation_markers(repaired, available_citations):
+            repaired = remove_unavailable_citation_markers(repaired, available_citations)
+            issues = section_quality_issues(repaired, instruction, available_citations=available_citations)
+            if not issues:
+                break
         repair_prompt = f"""Original section prompt:
 {compact_markdown(prompt, max_chars=5200)}
 
@@ -672,6 +678,7 @@ def assemble_report(
 
 def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> str:
     body = strip_all_references_blocks(report)
+    body = remove_unavailable_citation_markers(body, source_index_set(sources))
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
 
 
