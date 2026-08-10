@@ -711,6 +711,7 @@ def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> st
     body = strip_all_references_blocks(report)
     body = remove_unavailable_citation_markers(body, source_index_set(sources))
     body = trim_incomplete_section_tails(body)
+    body = remove_empty_sections(body)
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
 
 
@@ -1423,6 +1424,32 @@ def last_content_line_index(lines: Sequence[str], start: int, end: int) -> int:
     while index > start and (not lines[index].strip() or re.fullmatch(r"[-*_]{3,}", lines[index].strip())):
         index -= 1
     return index
+
+
+def remove_empty_sections(markdown: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    for start, level, _ in reversed([
+        (index, len(match.group(1)), line.lstrip("#").strip())
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(#{2,3})\s+", line))
+    ]):
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            match = re.match(r"^(#{2,3})\s+", lines[index])
+            if match and len(match.group(1)) <= level:
+                end = index
+                break
+        if not section_has_content(lines[start + 1 : end]):
+            del lines[start:end]
+    return clean_markdown("\n".join(lines))
+
+
+def section_has_content(lines: Sequence[str]) -> bool:
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not re.fullmatch(r"[-*_]{3,}", stripped):
+            return True
+    return False
 
 
 def stale_missing_detail_statement(report: str, evidence_text: str) -> bool:
