@@ -708,6 +708,7 @@ def assemble_report(
 def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> str:
     body = strip_all_references_blocks(report)
     body = remove_unavailable_citation_markers(body, source_index_set(sources))
+    body = trim_incomplete_section_tails(body)
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
 
 
@@ -1363,21 +1364,55 @@ def incomplete_report_sections(report: str) -> list[str]:
 
 
 def h2_sections(markdown: str) -> list[tuple[str, str]]:
+    return [(heading, text) for _, heading, text in markdown_sections(markdown)]
+
+
+def markdown_sections(markdown: str) -> list[tuple[int, str, str]]:
     sections = []
-    heading = ""
-    lines = []
-    for line in clean_markdown(markdown).splitlines():
-        if re.match(r"^#{2,3}\s+", line):
-            if heading:
-                sections.append((heading, "\n".join(lines).strip()))
-            heading = line.lstrip("#").strip()
-            lines = [line]
-            continue
-        if heading:
-            lines.append(line)
-    if heading:
-        sections.append((heading, "\n".join(lines).strip()))
+    lines = clean_markdown(markdown).splitlines()
+    headings = [
+        (index, len(match.group(1)), line.lstrip("#").strip())
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(#{2,3})\s+", line))
+    ]
+    for heading_index, (start, level, heading) in enumerate(headings):
+        end = len(lines)
+        for next_start, next_level, _ in headings[heading_index + 1 :]:
+            if next_level <= level:
+                end = next_start
+                break
+        sections.append((level, heading, "\n".join(lines[start:end]).strip()))
     return sections
+
+
+def trim_incomplete_section_tails(markdown: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    for start, level, _ in reversed([
+        (index, len(match.group(1)), line.lstrip("#").strip())
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(#{2,3})\s+", line))
+    ]):
+        end = len(lines)
+        for index in range(start + 1, len(lines)):
+            match = re.match(r"^(#{2,3})\s+", lines[index])
+            if match and len(match.group(1)) <= level:
+                end = index
+                break
+        trim_incomplete_tail_line(lines, start, end)
+    return clean_markdown("\n".join(lines))
+
+
+def trim_incomplete_tail_line(lines: list[str], start: int, end: int) -> None:
+    index = end - 1
+    while index > start and (not lines[index].strip() or re.fullmatch(r"[-*_]{3,}", lines[index].strip())):
+        index -= 1
+    if index <= start:
+        return
+    line = lines[index].strip()
+    if line.startswith("|") or line.startswith("```") or line.startswith(r"\]"):
+        return
+    if unfinished_final_line(line):
+        lines[index] = ""
 
 
 def stale_missing_detail_statement(report: str, evidence_text: str) -> bool:
