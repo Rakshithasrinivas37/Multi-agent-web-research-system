@@ -238,6 +238,7 @@ Requirements:
 - Write a detailed technical report, not a short summary.
 - Include technical sections that match the objective, synthesis, and requested output format.
 - Prefer concrete definitions, structured comparisons, measurements, examples, and implementation details when supported by synthesis or supporting chunks.
+- Use synthesis-agent notes and supporting chunks as the only factual basis; do not fill gaps from model prior knowledge.
 - Explain important technical terms or notation when applicable, and use tables when they make comparisons clearer.
 - Include exact technical details only when they are supported by synthesis or supporting chunks.
 - Reconcile Missing-evidence constraints against Supporting evidence chunks before writing.
@@ -527,6 +528,7 @@ Requirements:
 - Start with exactly this heading: ## {title}
 - Write detailed, evidence-backed technical content for this section.
 - Prefer concrete definitions, comparisons, measurements, examples, and implementation details when supported.
+- Use only the relevant synthesis notes and supporting chunks as the factual basis for this section.
 - Include exact technical details only when they are present in the synthesis notes or supporting chunks.
 - If evidence is incomplete, state the limitation instead of inventing details.
 - Cite claims using only plain source markers listed above, like [1] or [2].
@@ -1398,21 +1400,29 @@ def trim_incomplete_section_tails(markdown: str) -> str:
             if match and len(match.group(1)) <= level:
                 end = index
                 break
-        trim_incomplete_tail_line(lines, start, end)
+        trim_incomplete_tail_lines(lines, start, end)
     return clean_markdown("\n".join(lines))
 
 
-def trim_incomplete_tail_line(lines: list[str], start: int, end: int) -> None:
+def trim_incomplete_tail_lines(lines: list[str], start: int, end: int, max_removed_lines: int = 8) -> None:
+    current_end = end
+    for _ in range(max_removed_lines):
+        section_text = "\n".join(lines[start:current_end]).strip()
+        issues = markdown_completion_issues(section_text)
+        if not issues or issues == ["section is empty"]:
+            return
+        index = last_content_line_index(lines, start, current_end)
+        if index <= start:
+            return
+        lines[index] = ""
+        current_end = index
+
+
+def last_content_line_index(lines: Sequence[str], start: int, end: int) -> int:
     index = end - 1
     while index > start and (not lines[index].strip() or re.fullmatch(r"[-*_]{3,}", lines[index].strip())):
         index -= 1
-    if index <= start:
-        return
-    line = lines[index].strip()
-    if line.startswith("|") or line.startswith("```") or line.startswith(r"\]"):
-        return
-    if unfinished_final_line(line):
-        lines[index] = ""
+    return index
 
 
 def stale_missing_detail_statement(report: str, evidence_text: str) -> bool:
