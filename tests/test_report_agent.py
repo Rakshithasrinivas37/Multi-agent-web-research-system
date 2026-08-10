@@ -1,9 +1,12 @@
 import unittest
 
 from src.agents.report_agent import (
+    DEFAULT_REPORT_MAX_SECTIONS,
+    DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     markdown_completion_issues,
     normalize_final_report,
     remove_unavailable_citation_markers,
+    report_generation_token_cap,
     report_quality_issues,
 )
 
@@ -43,6 +46,20 @@ Supported claim [1].
 
 ## Executive Summary
 This section stops with
+
+## References
+No cited source markers were used.
+"""
+
+        issues = report_quality_issues(report, "")
+
+        self.assertIn("report contains incomplete sections: Executive Summary", issues)
+
+    def test_report_quality_flags_incomplete_h3_sections(self):
+        report = """# Topic
+
+### Executive Summary
+This h3 section stops with
 
 ## References
 No cited source markers were used.
@@ -96,6 +113,16 @@ Valid claim [1]. Bad copied marker [9].
 
         self.assertIn("[1] https://example.com/one", normalized)
         self.assertNotIn("[9]", normalized)
+
+    def test_report_generation_token_caps_stay_under_budget(self):
+        self.assertLessEqual(
+            report_generation_token_cap("single", 0),
+            DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+        )
+        self.assertLessEqual(
+            report_generation_token_cap("sectioned_parallel", DEFAULT_REPORT_MAX_SECTIONS),
+            DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+        )
 
 
 if __name__ == "__main__":
