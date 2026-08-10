@@ -29,7 +29,7 @@ TOKEN_PATTERN = re.compile(r"\S+")
 SPECIAL_SIGNAL_PATTERN = re.compile(
     r"(?i)("
     r"\\(?:frac|sum|sqrt|top|operatorname)|"
-    r"\b(?:equation|formula|softmax|attention\s*\(|multihead|multi-head|scaled\s+dot|"
+    r"\b(?:equation|formula|softmax|sqrt|"
     r"torch\.|tf\.|keras\.|class\s+\w+|\w+\([^)]*\)|"
     r"benchmark|accuracy|bleu|glue|imagenet|top-1|f1|auc|latency|tokens?/sec)\b|"
     r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}"
@@ -350,7 +350,7 @@ def chunk_signal_metadata(chunk: str) -> dict[str, Any]:
     lowered = value.lower()
     return {
         "has_formula_signal": bool(
-            re.search(r"\\(?:frac|sum|sqrt|top|operatorname)|\bsoftmax\s*\(|\battention\s*\(", value, flags=re.I)
+            re.search(r"\\(?:frac|sum|sqrt|top|operatorname)|\b(?:softmax|sqrt)\s*\(", value, flags=re.I)
             or re.search(r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}", value)
         ),
         "has_api_signal": bool(re.search(r"\b(?:torch\.|tf\.|keras\.)[A-Za-z0-9_.]+", value)),
