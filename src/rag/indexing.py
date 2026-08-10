@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional, Union
+from typing import Any, Iterable, Optional, Sequence, Union
 
 from src.agents.change_detection_agent import hash_text, normalize_url, objective_key
 from src.tools.text_utils import clean_text
@@ -21,15 +21,17 @@ DEFAULT_COLLECTION_NAME = "research_rag"
 DEFAULT_CHROMA_PATH = "data/chroma"
 DEFAULT_CHUNK_SIZE = 700
 DEFAULT_CHUNK_OVERLAP = 180
+DEFAULT_PARENT_CHUNK_SIZE = 1800
+DEFAULT_PARENT_CHUNK_OVERLAP = 240
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
-DEFAULT_METADATA_SCHEMA_VERSION = 4
+DEFAULT_METADATA_SCHEMA_VERSION = 5
 TOKEN_PATTERN = re.compile(r"\S+")
 SPECIAL_SIGNAL_PATTERN = re.compile(
     r"(?i)("
     r"\\(?:frac|sum|sqrt|top|operatorname)|"
-    r"\b(?:equation|formula|softmax|sqrt|"
+    r"\b(?:equation|formula|softmax|sqrt|formulation"
     r"torch\.|tf\.|keras\.|class\s+\w+|\w+\([^)]*\)|"
     r"benchmark|accuracy|bleu|glue|imagenet|top-1|f1|auc|latency|tokens?/sec)\b|"
     r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}"
@@ -253,6 +255,7 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
     Document, _ = langchain_ingestion_classes()
     max_tokens = max(100, chunk_size)
     overlap_tokens = max(0, min(chunk_overlap, max_tokens // 2))
+    parent_chunks = parent_context_chunks(document.page_content)
     chunks = token_aware_chunks(document.page_content, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
     chunks = add_inter_chunk_overlap(chunks, overlap_tokens=overlap_tokens)
     regular_documents = [
@@ -260,6 +263,7 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
             page_content=chunk,
             metadata={
                 **document.metadata,
+                **parent_child_metadata(chunk, parent_chunks, document.metadata),
                 "chunking_strategy": "token_aware_v2",
                 "chunk_kind": "regular",
                 "token_count": token_count(chunk),
@@ -273,6 +277,7 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
             page_content=chunk,
             metadata={
                 **document.metadata,
+                **parent_child_metadata(chunk, parent_chunks, document.metadata),
                 "chunking_strategy": "token_aware_v2",
                 "chunk_kind": "signal",
                 "token_count": token_count(chunk),
@@ -282,6 +287,44 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
         for chunk in special_signal_chunks(document.page_content, max_tokens=max(120, max_tokens // 2))
     ]
     return dedupe_documents([*regular_documents, *special_documents])
+
+
+def parent_context_chunks(text: str) -> list[str]:
+    """Build larger parent contexts that child chunks can expand to after retrieval."""
+
+    chunks = token_aware_chunks(
+        text,
+        max_tokens=DEFAULT_PARENT_CHUNK_SIZE,
+        overlap_tokens=DEFAULT_PARENT_CHUNK_OVERLAP,
+    )
+    return chunks or ([clean_text(text)] if clean_text(text) else [])
+
+
+def parent_child_metadata(chunk: str, parent_chunks: Sequence[str], metadata: dict[str, Any]) -> dict[str, Any]:
+    parent_index, parent_content = best_parent_context(chunk, parent_chunks)
+    history_key = clean_text(metadata.get("history_key")) if isinstance(metadata, dict) else ""
+    url = clean_text(metadata.get("url")) if isinstance(metadata, dict) else ""
+    parent_digest = hashlib.sha256(f"{history_key}:{url}:{parent_index}:{parent_content}".encode("utf-8")).hexdigest()[:16]
+    return {
+        "parent_id": f"parent-{parent_digest}",
+        "parent_index": parent_index,
+        "parent_token_count": token_count(parent_content),
+        "parent_content": parent_content,
+    }
+
+
+def best_parent_context(chunk: str, parent_chunks: Sequence[str]) -> tuple[int, str]:
+    if not parent_chunks:
+        return 0, clean_text(chunk)
+    chunk_terms = set(TOKEN_PATTERN.findall(clean_text(chunk).lower()))
+    if not chunk_terms:
+        return 0, clean_text(parent_chunks[0])
+    scored = [
+        (len(chunk_terms & set(TOKEN_PATTERN.findall(clean_text(parent).lower()))), index, parent)
+        for index, parent in enumerate(parent_chunks)
+    ]
+    _, index, parent = max(scored, key=lambda item: (item[0], -item[1]))
+    return index, clean_text(parent)
 
 
 def token_aware_chunks(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
