@@ -17,17 +17,19 @@ DEFAULT_REPORT_AGENT_MODEL = "llama-3.1-8b-instant"
 DEFAULT_REPORT_AGENT_MAX_TOKENS = 4200
 DEFAULT_REPORT_AGENT_CONTEXT_CHARS = 30000
 DEFAULT_REPORT_AGENT_CHUNK_CHARS = 1000
-DEFAULT_REPORT_SECTION_CONTEXT_CHARS = 9000
-DEFAULT_REPORT_SECTION_MAX_TOKENS = 2200
-DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS = 9000
-DEFAULT_REPORT_MAX_SECTIONS = 6
-DEFAULT_REPORT_SECTION_CONCURRENCY = 3
-DEFAULT_REPORT_SINGLE_PROMPT_CHARS = 12000
-DEFAULT_REPORT_SINGLE_MAX_TOKENS = 2200
+DEFAULT_REPORT_TOTAL_TOKEN_BUDGET = 10000
+DEFAULT_REPORT_SECTION_CONTEXT_CHARS = 3500
+DEFAULT_REPORT_SECTION_MAX_TOKENS = 850
+DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS = 2500
+DEFAULT_REPORT_SUMMARY_MAX_TOKENS = 450
+DEFAULT_REPORT_MAX_SECTIONS = 3
+DEFAULT_REPORT_SECTION_CONCURRENCY = 2
+DEFAULT_REPORT_SINGLE_PROMPT_CHARS = 5000
+DEFAULT_REPORT_SINGLE_MAX_TOKENS = 1600
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
 DEFAULT_REPORT_DIAGNOSTICS_CHARS = 1200
-REPORT_REPAIR_MAX_ATTEMPTS = 1
-SECTION_REPAIR_MAX_ATTEMPTS = 1
+REPORT_REPAIR_MAX_ATTEMPTS = 0
+SECTION_REPAIR_MAX_ATTEMPTS = 0
 
 
 class ReportAgent:
@@ -131,6 +133,7 @@ class ReportAgent:
                 sections=sections,
                 sources=sources,
                 citation_policy=citation_policy,
+                missing_evidence_text=missing_evidence_text,
             )
             report = assemble_report(
                 objective=objective,
@@ -142,6 +145,7 @@ class ReportAgent:
             section_count = len(sections)
             section_concurrency = min(DEFAULT_REPORT_SECTION_CONCURRENCY, max(1, section_count))
             report_model = summary_model or (section_models[-1] if section_models else self.model)
+        estimated_token_cap = report_generation_token_cap(generation_mode, section_count)
         report, repair_count, report_issues = finalize_report(
             client=client,
             model=self.model,
@@ -173,6 +177,8 @@ class ReportAgent:
                 "report_section_concurrency": section_concurrency,
                 "report_repair_count": repair_count,
                 "report_issues": report_issues,
+                "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+                "report_estimated_token_cap": estimated_token_cap,
             },
         }
 
@@ -238,6 +244,7 @@ Requirements:
 - If supporting chunks contain a detail that synthesis previously marked missing, include the supported detail and do not say it is missing.
 - Do not reproduce details listed in Missing-evidence constraints unless they are present in Supporting evidence chunks.
 - If a missing item remains important, state only that the provided evidence describes it but does not include the exact detail.
+- Include a brief "Evidence Gaps" section when Missing-evidence constraints identify partial or missing required items.
 - Cite claims using only plain source markers from Available sources, exactly like [1], [2], [3].
 - For precise claims, prefer original papers, official docs, academic sources, or authoritative surveys.
 - Do not cite sources that are not listed.
@@ -256,6 +263,23 @@ def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, s
         max_tokens=DEFAULT_REPORT_SINGLE_MAX_TOKENS,
         max_context_chars=DEFAULT_REPORT_SINGLE_PROMPT_CHARS,
     )
+
+
+def report_generation_token_cap(generation_mode: str, section_count: int) -> int:
+    """Estimate worst-case report-agent model tokens from configured prompt/output caps."""
+
+    if generation_mode == "single":
+        return estimated_tokens(DEFAULT_REPORT_SINGLE_PROMPT_CHARS) + DEFAULT_REPORT_SINGLE_MAX_TOKENS
+    sections = max(0, section_count)
+    section_tokens = sections * (
+        estimated_tokens(DEFAULT_REPORT_SECTION_CONTEXT_CHARS) + DEFAULT_REPORT_SECTION_MAX_TOKENS
+    )
+    summary_tokens = estimated_tokens(DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS) + DEFAULT_REPORT_SUMMARY_MAX_TOKENS
+    return section_tokens + summary_tokens
+
+
+def estimated_tokens(char_count: int) -> int:
+    return max(1, (max(0, char_count) + 3) // 4)
 
 
 def groq_chat_text(
@@ -620,6 +644,7 @@ def generate_executive_summary(
     sections: Sequence[str],
     sources: Sequence[dict[str, Any]],
     citation_policy: str,
+    missing_evidence_text: str = "",
 ) -> tuple[str, str]:
     """Generate a compact executive summary from completed sections."""
 
@@ -637,6 +662,9 @@ Citation policy:
 Generated report sections:
 {section_preview}
 
+Missing-evidence constraints:
+{compact_markdown(missing_evidence_text, max_chars=1200)}
+
 Available sources:
 {format_sources(summary_sources)}
 
@@ -646,6 +674,7 @@ Requirements:
 - Summarize the most important findings from the generated sections.
 - Keep it concise but specific.
 - If a generated section says a detail is missing, not reproduced, or not supported, do not include that detail as a fact in the summary.
+- If unresolved Missing-evidence constraints remain, mention the most important gap briefly instead of implying full coverage.
 - Cite source-backed claims with only the available source markers.
 - Do not include a References section."""
 
@@ -654,7 +683,7 @@ Requirements:
         model=model,
         system_prompt="You summarize completed report sections without adding unsupported claims.",
         user_prompt=prompt,
-        max_tokens=700,
+        max_tokens=DEFAULT_REPORT_SUMMARY_MAX_TOKENS,
         max_context_chars=DEFAULT_REPORT_SUMMARY_CONTEXT_CHARS,
     )
     summary = strip_references_section(summary)
@@ -1266,6 +1295,7 @@ Requirements:
 - Remove exact formulas, examples, numbers, or complexity notation from sentences that say those details are missing or unsupported.
 - If a concrete detail appears in supporting evidence, it may be included with a citation.
 - Do not invent unsupported details.
+- Preserve unresolved Missing-evidence constraints in a brief "Evidence Gaps" section instead of writing unsupported facts.
 - Keep only source markers from Available sources.
 - Remove or replace unavailable source markers using only the Available sources and supporting evidence.
 - Do not include section-level References blocks.
@@ -1337,7 +1367,7 @@ def h2_sections(markdown: str) -> list[tuple[str, str]]:
     heading = ""
     lines = []
     for line in clean_markdown(markdown).splitlines():
-        if line.startswith("## "):
+        if re.match(r"^#{2,3}\s+", line):
             if heading:
                 sections.append((heading, "\n".join(lines).strip()))
             heading = line.lstrip("#").strip()

@@ -17,6 +17,7 @@ from src.rag import index_research_results
 from src.tools.text_utils import clean_text
 
 DEFAULT_AGENT_RESPONSE_ATTEMPTS = 3
+DEFAULT_REPORT_RESPONSE_ATTEMPTS = 1
 
 
 class ResearchState(TypedDict, total=False):
@@ -306,7 +307,7 @@ def report_node(state: ResearchState) -> ResearchState:
     report = {}
     report_errors = []
     output_format = clean_text(research_plan.get("output_format")) or "report"
-    for attempt in range(1, DEFAULT_AGENT_RESPONSE_ATTEMPTS + 1):
+    for attempt in range(1, DEFAULT_REPORT_RESPONSE_ATTEMPTS + 1):
         try:
             report = report_agent.generate(report_context, output_format=output_format)
         except Exception as error:
@@ -316,7 +317,7 @@ def report_node(state: ResearchState) -> ResearchState:
             if not report_errors:
                 break
 
-        if attempt < DEFAULT_AGENT_RESPONSE_ATTEMPTS:
+        if attempt < DEFAULT_REPORT_RESPONSE_ATTEMPTS:
             print_retry_response_error("report", attempt, report_errors)
 
     if report_errors:
