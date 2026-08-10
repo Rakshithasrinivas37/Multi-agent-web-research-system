@@ -166,6 +166,42 @@ No cited source markers were used.
         self.assertNotIn("| Broken | Row", normalized)
         self.assertEqual(report_quality_issues(normalized, ""), [])
 
+    def test_normalize_final_report_removes_empty_sections(self):
+        report = """# Topic
+
+## Complete Section
+This section is complete.
+
+## Empty Generated Section
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("## Complete Section", normalized)
+        self.assertNotIn("## Empty Generated Section", normalized)
+        self.assertEqual(report_quality_issues(normalized, ""), [])
+
+    def test_normalize_final_report_keeps_parent_sections_with_child_content(self):
+        report = """# Topic
+
+## Parent Section
+
+### Child Section
+This child content is complete.
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("## Parent Section", normalized)
+        self.assertIn("### Child Section", normalized)
+        self.assertEqual(report_quality_issues(normalized, ""), [])
+
     def test_report_generation_token_caps_stay_under_budget(self):
         self.assertLessEqual(
             report_generation_token_cap("single", 0),
