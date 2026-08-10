@@ -72,10 +72,10 @@ No cited source markers were used.
     def test_report_quality_does_not_flag_h2_container_with_h3_content(self):
         report = """# Topic
 
-## 3.2 Mathematical Formulation
-The formulation has two parts:
+## Parent Section
+This section has two parts:
 
-### 3.2.1 Scaled Dot Product
+### Child Section
 This subsection is complete.
 
 ## References
@@ -84,7 +84,7 @@ No cited source markers were used.
 
         issues = report_quality_issues(report, "")
 
-        self.assertNotIn("report contains incomplete sections: 3.2 Mathematical Formulation", issues)
+        self.assertNotIn("report contains incomplete sections: Parent Section", issues)
 
     def test_report_quality_requires_references_heading(self):
         report = """# Topic
@@ -146,6 +146,25 @@ No cited source markers were used.
 
         self.assertIn("This sentence is complete.", normalized)
         self.assertNotIn("This final generated line stops with", normalized)
+
+    def test_normalize_final_report_trims_incomplete_table_tail(self):
+        report = """# Topic
+
+## Data Summary
+| Field | Value |
+|------|---------|
+| Complete | Row |
+| Broken | Row
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("| Complete | Row |", normalized)
+        self.assertNotIn("| Broken | Row", normalized)
+        self.assertEqual(report_quality_issues(normalized, ""), [])
 
     def test_report_generation_token_caps_stay_under_budget(self):
         self.assertLessEqual(
