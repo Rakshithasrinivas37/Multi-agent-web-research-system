@@ -8,9 +8,9 @@ class IndexingChunkingTests(unittest.TestCase):
     def test_split_document_adds_signal_chunks_for_precise_evidence(self):
         Document, _ = langchain_ingestion_classes()
         document = Document(
-            page_content="""Attention paper notes.
+            page_content="""Technical paper notes.
 
-The formula is Attention(Q,K,V)=softmax(QK^T/sqrt(d_k))V.
+The formula is score=softmax(logits/sqrt(width)).
 
 PyTorch exposes torch.nn.MultiheadAttention(embed_dim, num_heads).
 
@@ -35,7 +35,7 @@ ImageNet top-1 accuracy improves by 1.00%.
             "has_benchmark_signal": True,
         }
 
-        self.assertGreater(metadata_signal_score("scaled dot-product attention equation softmax", metadata), 0)
+        self.assertGreater(metadata_signal_score("equation formula softmax", metadata), 0)
         self.assertGreater(metadata_signal_score("PyTorch API usage", metadata), 0)
         self.assertGreater(metadata_signal_score("ImageNet benchmark accuracy", metadata), 0)
 

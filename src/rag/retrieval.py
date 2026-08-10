@@ -697,13 +697,17 @@ def metadata_signal_score(query: str, metadata: Any) -> float:
     score = 0.0
     if metadata.get("chunk_kind") == "signal":
         score += 0.03
-    if metadata.get("has_formula_signal") and formula_context_needed(query_text):
+    if metadata.get("has_formula_signal") and query_needs_formula_signal(query_text):
         score += 0.12
     if metadata.get("has_api_signal") and re.search(r"\b(api|sdk|pytorch|tensorflow|torch\.|tf\.|keras\.)\b", query_text):
         score += 0.10
     if metadata.get("has_benchmark_signal") and re.search(r"\b(benchmark|score|accuracy|bleu|glue|imagenet|metric)\b", query_text):
         score += 0.10
     return min(score, 0.20)
+
+
+def query_needs_formula_signal(query: str) -> bool:
+    return bool(re.search(r"\b(equation|formula|math|mathematical|derive|softmax|sqrt|sum|matrix)\b", query))
 
 
 def query_phrase_overlap(query: str, document: str) -> float:
