@@ -626,13 +626,9 @@ def finalize_report(
 
 
 def hard_report_issues(issues: Sequence[str]) -> list[str]:
-    """Keep heuristic evidence warnings visible without failing an otherwise usable report."""
+    """Return report issues that should block saving the final report."""
 
-    return [
-        issue
-        for issue in issues
-        if clean_text(issue) != "report may contain stale missing-evidence statements contradicted by supporting evidence"
-    ]
+    return [issue for issue in issues if clean_text(issue)]
 
 
 def repair_report_if_needed(
@@ -735,11 +731,46 @@ def report_quality_issues(
     incomplete_sections = incomplete_report_sections(report)
     if incomplete_sections:
         issues.append(f"report contains incomplete sections: {', '.join(incomplete_sections[:3])}")
+    issues.extend(report_contract_issues(report, evidence_text))
     if missing_statement_contains_unsupported_detail(report):
         issues.append("report includes exact details inside missing-evidence statements")
     if stale_missing_detail_statement(report, evidence_text):
         issues.append("report may contain stale missing-evidence statements contradicted by supporting evidence")
     return dedupe_preserve_order(issues)
+
+
+def report_contract_issues(report: str, evidence_text: str) -> list[str]:
+    """Generic final-report contract derived from available evidence."""
+
+    if not clean_text(evidence_text):
+        return []
+    issues = []
+    if "executive summary" not in {normalized_heading(heading) for heading, _ in h2_sections(report)}:
+        issues.append("report must include an Executive Summary section")
+    if evidence_has_formula_signal(evidence_text) and not evidence_has_formula_signal(report):
+        issues.append("report omits supported equations or formulas")
+    if evidence_has_code_signal(evidence_text) and not evidence_has_code_signal(report):
+        issues.append("report omits supported code snippets")
+    if evidence_has_api_signal(evidence_text) and not evidence_has_api_signal(report):
+        issues.append("report omits supported API details")
+    return issues
+
+
+def evidence_has_formula_signal(text: str) -> bool:
+    value = str(text or "")
+    return bool(
+        re.search(r"\\(?:frac|sum|sqrt|top|operatorname)|\bsoftmax\s*\(|\bAttention\s*\(", value)
+        or re.search(r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}", value)
+    )
+
+
+def evidence_has_code_signal(text: str) -> bool:
+    value = str(text or "")
+    return "```" in value or bool(re.search(r"\b(import|from|def|class)\s+[A-Za-z_]", value))
+
+
+def evidence_has_api_signal(text: str) -> bool:
+    return bool(re.search(r"\b(?:torch\.|tf\.|keras\.|sklearn\.|transformers\.)[A-Za-z0-9_.]+", str(text or "")))
 
 
 def references_heading_count(report: str) -> int:

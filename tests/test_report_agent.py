@@ -260,13 +260,42 @@ No cited source markers were used.
         self.assertEqual(len(queries), 1)
         self.assertIn("exact equation", queries[0])
 
-    def test_hard_report_issues_treats_stale_missing_evidence_as_warning(self):
+    def test_hard_report_issues_blocks_stale_missing_evidence(self):
         issues = [
             "report may contain stale missing-evidence statements contradicted by supporting evidence",
             "report must include a References section",
         ]
 
-        self.assertEqual(hard_report_issues(issues), ["report must include a References section"])
+        self.assertEqual(hard_report_issues(issues), issues)
+
+    def test_report_contract_requires_executive_summary_with_evidence(self):
+        report = """# Topic
+
+## Details
+Supported claim [1].
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_quality_issues(report, "Evidence: supported claim [1].")
+
+        self.assertIn("report must include an Executive Summary section", issues)
+
+    def test_report_contract_requires_supported_formula_preservation(self):
+        report = """# Topic
+
+## Executive Summary
+Attention uses weighted values [1].
+
+## References
+[1] https://example.com
+"""
+        evidence = r"Evidence: \[Attention(Q,K,V)=\operatorname{softmax}(QK^\top/\sqrt{d_k})V\] [1]."
+
+        issues = report_quality_issues(report, evidence)
+
+        self.assertIn("report omits supported equations or formulas", issues)
 
 
 if __name__ == "__main__":
