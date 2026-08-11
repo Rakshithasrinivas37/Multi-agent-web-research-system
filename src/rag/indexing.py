@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Union
@@ -23,10 +24,11 @@ DEFAULT_CHUNK_SIZE = 700
 DEFAULT_CHUNK_OVERLAP = 180
 DEFAULT_PARENT_CHUNK_SIZE = 1800
 DEFAULT_PARENT_CHUNK_OVERLAP = 240
+DEFAULT_PARENT_STORE_NAME = "parent_chunks.sqlite3"
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
-DEFAULT_METADATA_SCHEMA_VERSION = 5
+DEFAULT_METADATA_SCHEMA_VERSION = 6
 TOKEN_PATTERN = re.compile(r"\S+")
 SPECIAL_SIGNAL_PATTERN = re.compile(
     r"(?i)("
@@ -147,6 +149,7 @@ def index_research_results(
     index_all = bool(change_detection.get("first_run")) or collection_is_empty(collection)
     indexed_source_count = 0
     indexed_chunk_count = 0
+    indexed_parent_chunk_count = 0
     deleted_changed_source_count = 0
     skipped_source_count = 0
 
@@ -172,19 +175,22 @@ def index_research_results(
 
         if existing_content_hash and (existing_content_hash != record.content_hash or metadata_is_stale):
             delete_source_chunks(collection, history_key, record.url)
+            delete_source_parent_chunks(chroma_path, history_key, record.url)
             if existing_content_hash != record.content_hash:
                 deleted_changed_source_count += 1
 
+        indexed_parent_chunk_count += upsert_parent_chunks(chroma_path, parent_rows_from_documents(chunk_documents))
         ids = []
         documents = []
         metadatas = []
         for chunk_index, chunk_document_item in enumerate(chunk_documents):
             ids.append(chunk_id(history_key, record.url, chunk_index))
             documents.append(chunk_document_item.page_content)
+            metadata = strip_parent_content_metadata(chunk_document_item.metadata)
             metadatas.append(
                 clean_metadata(
                     {
-                        **chunk_document_item.metadata,
+                        **metadata,
                         "chunk_index": chunk_index,
                         "chunk_count": len(chunk_documents),
                     }
@@ -202,6 +208,8 @@ def index_research_results(
         "history_key": history_key,
         "indexed_sources": indexed_source_count,
         "indexed_chunks": indexed_chunk_count,
+        "indexed_parent_chunks": indexed_parent_chunk_count,
+        "parent_store_path": str(parent_store_path(chroma_path)),
         "deleted_changed_sources": deleted_changed_source_count,
         "preserved_removed_sources": len(removed_urls),
         "skipped_sources": skipped_source_count,
@@ -311,6 +319,109 @@ def parent_child_metadata(chunk: str, parent_chunks: Sequence[str], metadata: di
         "parent_token_count": token_count(parent_content),
         "parent_content": parent_content,
     }
+
+
+def strip_parent_content_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in (metadata or {}).items() if key != "parent_content"}
+
+
+def parent_rows_from_documents(documents: Sequence[Any]) -> list[dict[str, Any]]:
+    rows_by_id = {}
+    for document in documents:
+        metadata = getattr(document, "metadata", {}) if document is not None else {}
+        if not isinstance(metadata, dict):
+            continue
+        parent_id = clean_text(metadata.get("parent_id"))
+        parent_content = clean_text(metadata.get("parent_content"))
+        if not parent_id or not parent_content:
+            continue
+        rows_by_id[parent_id] = {
+            "parent_id": parent_id,
+            "history_key": clean_text(metadata.get("history_key")),
+            "url": clean_text(metadata.get("url")),
+            "parent_index": to_int(metadata.get("parent_index"), 0),
+            "token_count": to_int(metadata.get("parent_token_count"), token_count(parent_content)),
+            "content_hash": hash_text(parent_content),
+            "content": parent_content,
+        }
+    return list(rows_by_id.values())
+
+
+def parent_store_path(chroma_path: Union[str, Path]) -> Path:
+    path = Path(chroma_path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path / DEFAULT_PARENT_STORE_NAME
+
+
+def parent_store_connection(chroma_path: Union[str, Path]) -> sqlite3.Connection:
+    connection = sqlite3.connect(parent_store_path(chroma_path))
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS parent_chunks (
+            parent_id TEXT PRIMARY KEY,
+            history_key TEXT NOT NULL,
+            url TEXT NOT NULL,
+            parent_index INTEGER NOT NULL,
+            token_count INTEGER NOT NULL,
+            content_hash TEXT NOT NULL,
+            content TEXT NOT NULL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_parent_chunks_source ON parent_chunks(history_key, url)")
+    return connection
+
+
+def upsert_parent_chunks(chroma_path: Union[str, Path], rows: Sequence[dict[str, Any]]) -> int:
+    clean_rows = [row for row in rows if clean_text(row.get("parent_id")) and clean_text(row.get("content"))]
+    if not clean_rows:
+        return 0
+    with parent_store_connection(chroma_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO parent_chunks (
+                parent_id, history_key, url, parent_index, token_count, content_hash, content, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(parent_id) DO UPDATE SET
+                history_key=excluded.history_key,
+                url=excluded.url,
+                parent_index=excluded.parent_index,
+                token_count=excluded.token_count,
+                content_hash=excluded.content_hash,
+                content=excluded.content,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            [
+                (
+                    clean_text(row.get("parent_id")),
+                    clean_text(row.get("history_key")),
+                    clean_text(row.get("url")),
+                    to_int(row.get("parent_index"), 0),
+                    to_int(row.get("token_count"), token_count(row.get("content"))),
+                    clean_text(row.get("content_hash")) or hash_text(clean_text(row.get("content"))),
+                    clean_text(row.get("content")),
+                )
+                for row in clean_rows
+            ],
+        )
+    return len(clean_rows)
+
+
+def parent_content_for_id(chroma_path: Union[str, Path], parent_id: str) -> str:
+    parent_id = clean_text(parent_id)
+    if not parent_id:
+        return ""
+    try:
+        with parent_store_connection(chroma_path) as connection:
+            row = connection.execute(
+                "SELECT content FROM parent_chunks WHERE parent_id = ?",
+                (parent_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        return ""
+    return clean_text(row[0]) if row else ""
 
 
 def best_parent_context(chunk: str, parent_chunks: Sequence[str]) -> tuple[int, str]:
@@ -563,6 +674,17 @@ def delete_source_chunks(collection: Any, history_key: str, url: str) -> None:
     try:
         collection.delete(where={"$and": [{"history_key": history_key}, {"url": url}]})
     except Exception:
+        return
+
+
+def delete_source_parent_chunks(chroma_path: Union[str, Path], history_key: str, url: str) -> None:
+    try:
+        with parent_store_connection(chroma_path) as connection:
+            connection.execute(
+                "DELETE FROM parent_chunks WHERE history_key = ? AND url = ?",
+                (clean_text(history_key), clean_text(url)),
+            )
+    except sqlite3.Error:
         return
 
 

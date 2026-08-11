@@ -18,6 +18,7 @@ from src.rag.indexing import (
     SentenceTransformerEmbeddingFunction,
     chunk_id,
     get_collection,
+    parent_content_for_id,
     select_embedding_device,
     to_int,
 )
@@ -200,7 +201,7 @@ def hybrid_retrieve(
         )
     if diversify_urls:
         merged = diversify_by_url(merged, top_k=top_k)
-    return expand_parent_context_results(merged[:top_k])
+    return expand_parent_context_results(merged[:top_k], chroma_path=chroma_path)
 
 
 def multi_query_hybrid_retrieve(
@@ -267,7 +268,7 @@ def multi_query_hybrid_retrieve(
         chroma_path=chroma_path,
         collection_name=collection_name,
     )
-    return expand_parent_context_results(expanded)
+    return expand_parent_context_results(expanded, chroma_path=chroma_path)
 
 
 def source_url_coverage_retrieve(
@@ -360,17 +361,21 @@ def source_url_coverage_retrieve(
                     bm25_rank=rank,
                 )
             )
-    return expand_parent_context_results(selected)
+    return expand_parent_context_results(selected, chroma_path=chroma_path)
 
 
-def expand_parent_context_results(results: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+def expand_parent_context_results(
+    results: Sequence[RetrievalResult],
+    chroma_path: Union[str, Path] = DEFAULT_CHROMA_PATH,
+) -> list[RetrievalResult]:
     """Return larger parent context for matched child chunks without changing ranking."""
 
     expanded = []
     seen_contexts = set()
     for result in results:
-        item = expand_parent_context_result(result)
-        context_id = clean_text(item.metadata.get("parent_id")) or item.id
+        item = expand_parent_context_result(result, chroma_path=chroma_path)
+        context_id = clean_text(item.metadata.get("parent_id")) if item.metadata.get("parent_context_expanded") else item.id
+        context_id = context_id or item.id
         if context_id in seen_contexts:
             continue
         seen_contexts.add(context_id)
@@ -378,14 +383,20 @@ def expand_parent_context_results(results: Sequence[RetrievalResult]) -> list[Re
     return expanded
 
 
-def expand_parent_context_result(result: RetrievalResult) -> RetrievalResult:
+def expand_parent_context_result(
+    result: RetrievalResult,
+    chroma_path: Union[str, Path] = DEFAULT_CHROMA_PATH,
+) -> RetrievalResult:
     metadata = result.metadata if isinstance(result.metadata, dict) else {}
-    parent_content = clean_text(metadata.get("parent_content"))
+    parent_id = clean_text(metadata.get("parent_id"))
+    metadata_parent_content = clean_text(metadata.get("parent_content"))
+    parent_content = metadata_parent_content or parent_content_for_id(chroma_path, parent_id)
     if not parent_content or len(tokenize(parent_content)) <= len(tokenize(result.document)):
         return result
 
     expanded_metadata = {key: value for key, value in metadata.items() if key != "parent_content"}
     expanded_metadata["parent_context_expanded"] = True
+    expanded_metadata["parent_context_store"] = "metadata" if metadata_parent_content else "sqlite"
     return RetrievalResult(
         id=result.id,
         document=parent_content,
