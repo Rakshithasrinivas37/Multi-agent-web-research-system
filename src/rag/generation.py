@@ -756,6 +756,7 @@ Use only plain ASCII numbered source markers that appear in the retrieved contex
 Every evidence-backed claim must include at least one source marker.
 For equations, formulas, API signatures, benchmark numbers, and historical attribution, cite original papers, official documentation, academic sources, or authoritative surveys first.
 If a primary/official source and a secondary explainer both support the same technical claim, cite the primary/official source and omit the secondary citation.
+Do not mark a requirement or planner question as Missing Evidence when a primary/official source in the retrieved context contains evidence for it; cite that source and mark it Covered or Partial instead.
 Use secondary explainers only for intuition, examples, or background wording.
 Do not compress important technical details into vague summaries.
 Do not use Markdown tables.
@@ -1529,22 +1530,29 @@ def count_meaningful_evidence_chunks(retrieved_context: Sequence[RetrievalResult
 
 
 def source_balanced_results(retrieved_context: Sequence[RetrievalResult]) -> list[RetrievalResult]:
-    """Interleave results so each source URL gets represented before repeats."""
+    """Interleave results while surfacing primary/official sources first."""
     buckets: dict[str, list[RetrievalResult]] = {}
     source_order = []
+    source_order_index = {}
+    source_priority = {}
 
     for result in retrieved_context:
         metadata = result.metadata if isinstance(result.metadata, dict) else {}
         url = primary_source_url(metadata) or result.id
         if url not in buckets:
             buckets[url] = []
+            source_order_index[url] = len(source_order)
             source_order.append(url)
+            source_priority[url] = primary_source_rank(metadata)
+        else:
+            source_priority[url] = min(source_priority[url], primary_source_rank(metadata))
         buckets[url].append(result)
 
+    ordered_sources = sorted(source_order, key=lambda url: (source_priority.get(url, 1), source_order_index[url]))
     ordered = []
     while True:
         added = False
-        for url in source_order:
+        for url in ordered_sources:
             bucket = buckets[url]
             if not bucket:
                 continue
@@ -1553,6 +1561,10 @@ def source_balanced_results(retrieved_context: Sequence[RetrievalResult]) -> lis
         if not added:
             break
     return ordered
+
+
+def primary_source_rank(metadata: dict[str, Any]) -> int:
+    return 0 if is_primary_source(metadata) else 1
 
 
 def context_block_char_limit(
