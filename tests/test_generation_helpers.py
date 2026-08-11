@@ -1,6 +1,6 @@
 import unittest
 
-from src.rag.generation import audit_synthesis_citations, report_supporting_chunks
+from src.rag.generation import audit_synthesis_citations, precision_retrieval_queries, report_supporting_chunks
 from src.rag.retrieval import RetrievalResult
 
 
@@ -53,6 +53,30 @@ class GenerationHelperTests(unittest.TestCase):
         chunks = report_supporting_chunks(results, sources, max_chunks=1, cited_source_indexes=[1])
 
         self.assertEqual(chunks[0]["source_index"], 1)
+
+    def test_precision_retrieval_queries_adds_exact_evidence_terms(self):
+        plan = {
+            "objective": "Attention mechanism",
+            "sub_questions": [
+                "What are the equations of additive attention?",
+                "What benchmark results demonstrate GLUE and ImageNet performance?",
+                "Where are the official TensorFlow and PyTorch API references?",
+            ],
+            "tasks": [
+                {
+                    "query_context": "What are the equations of additive attention?",
+                    "extraction_goal": "Find the original paper formula.",
+                    "expected_signals": ["equation", "formula"],
+                }
+            ],
+        }
+
+        queries = precision_retrieval_queries(plan)
+        joined = " ".join(queries).lower()
+
+        self.assertIn("exact equation formula", joined)
+        self.assertIn("benchmark table results", joined)
+        self.assertIn("official documentation api signature", joined)
 
 
 if __name__ == "__main__":
