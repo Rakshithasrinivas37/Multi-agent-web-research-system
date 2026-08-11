@@ -1579,6 +1579,8 @@ def missing_evidence_constraints(synthesis: str) -> list[str]:
         if table_constraint:
             constraints.append(table_constraint)
             continue
+        if line_text.startswith("|"):
+            continue
         lowered = line_text.lower()
         if any(
             phrase in lowered
@@ -1605,6 +1607,8 @@ def missing_evidence_from_table_row(line: str) -> str:
     if first_cell in {"requirement", "planner sub-question", "source", "status"}:
         return ""
     status = clean_text(cells[1]).lower()
+    if any(word in status for word in ("covered", "resolved", "available")):
+        return ""
     notes = clean_text(" ".join(cells[2:]))
     if (
         "missing" not in status
@@ -1757,8 +1761,14 @@ def remap_citation_markers(text: str, citation_aliases: dict[int, int]) -> str:
 def clean_markdown(value: Any) -> str:
     """Normalize Markdown spacing without collapsing line breaks."""
 
-    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = strip_thinking_blocks(str(value or "")).replace("\r\n", "\n").replace("\r", "\n").strip()
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
     normalized = "\n".join(lines).strip()
     normalized = re.sub(r"\n{4,}", "\n\n\n", normalized)
     return normalized
+
+
+def strip_thinking_blocks(text: str) -> str:
+    """Remove leaked model reasoning blocks before report planning or validation."""
+
+    return re.sub(r"<think\b[^>]*>.*?</think>", "", str(text or ""), flags=re.IGNORECASE | re.DOTALL)

@@ -7,6 +7,7 @@ from src.agents.report_agent import (
     markdown_completion_issues,
     format_evidence_coverage_brief,
     format_memory_signal_evidence,
+    missing_evidence_constraints,
     report_context_gap_items,
     report_context_gap_queries,
     missing_sub_question_coverage,
@@ -17,6 +18,7 @@ from src.agents.report_agent import (
     report_generation_token_cap,
     report_quality_issues,
     rewrite_missing_sub_question_queries,
+    clean_markdown,
 )
 
 
@@ -49,6 +51,26 @@ Supported claim [1].
         issues = report_quality_issues(report, "", sources=sources)
 
         self.assertIn("report References section is missing cited sources: [1]", issues)
+
+    def test_clean_markdown_strips_leaked_thinking_blocks(self):
+        text = "Useful synthesis.\n<think>private reasoning with missing gap noise</think>\nFinal evidence."
+
+        cleaned = clean_markdown(text)
+
+        self.assertIn("Useful synthesis.", cleaned)
+        self.assertIn("Final evidence.", cleaned)
+        self.assertNotIn("private reasoning", cleaned)
+
+    def test_missing_evidence_constraints_ignores_covered_table_rows(self):
+        synthesis = """| Requirement | Status | Notes |
+|---|---|---|
+| Formula | Covered | No missing evidence remains. |
+| Benchmark | Partial | Exact scores are missing. |
+"""
+
+        constraints = missing_evidence_constraints(synthesis)
+
+        self.assertEqual(constraints, ["Benchmark: Exact scores are missing."])
 
     def test_report_quality_flags_incomplete_sections(self):
         report = """# Topic
