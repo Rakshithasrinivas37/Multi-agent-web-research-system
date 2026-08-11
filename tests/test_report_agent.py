@@ -3,6 +3,7 @@ import unittest
 from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     ensure_supported_api_details,
+    format_source_priority_guidance,
     hard_report_issues,
     markdown_completion_issues,
     format_evidence_coverage_brief,
@@ -218,6 +219,26 @@ No cited source markers were used.
         self.assertNotIn("\n|\n", normalized)
         self.assertIn("| Encoder | Reads input. |", normalized)
 
+    def test_normalize_final_report_removes_placeholder_table_rows(self):
+        report = """# Topic
+
+## Executive Summary
+This section is complete.
+
+| Model | Dataset | Score |
+|---|---|---|
+| Transformer | WMT 2014 | 28.4 BLEU |
+| — | — | — |
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("| Transformer | WMT 2014 | 28.4 BLEU |", normalized)
+        self.assertNotIn("| — | — | — |", normalized)
+
     def test_normalize_final_report_removes_empty_math_only_section(self):
         report = """# Topic
 
@@ -405,6 +426,18 @@ No cited source markers were used.
 
         self.assertIn("[1]", evidence)
         self.assertIn("28.4 BLEU", evidence)
+
+    def test_format_source_priority_guidance_prefers_primary_sources(self):
+        sources = [
+            {"index": 1, "title": "Attention Is All You Need", "url": "https://arxiv.org/pdf/1706.03762"},
+            {"index": 2, "title": "Background Article", "url": "https://example.com/attention"},
+        ]
+
+        guidance = format_source_priority_guidance(sources)
+
+        self.assertIn("Primary/official sources: [1] Attention Is All You Need", guidance)
+        self.assertIn("background sources", guidance)
+        self.assertIn("[2] Background Article", guidance)
 
     def test_format_evidence_coverage_brief_separates_supported_and_missing_parts(self):
         evidence = "Evidence: Linformer uses a low-rank approximation and reduces complexity from O(n2) to O(n)."

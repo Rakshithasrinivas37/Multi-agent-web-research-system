@@ -78,6 +78,7 @@ class ReportAgent:
         available_source_indexes = source_index_set(sources)
         synthesis = remove_unavailable_citation_markers(synthesis, available_source_indexes)
         source_text = format_sources(sources)
+        source_priority_text = format_source_priority_guidance(sources)
         evidence_text = format_supporting_evidence(report_context, citation_aliases=citation_aliases)
         memory_evidence_text = format_memory_signal_evidence(report_context, sources, citation_aliases, evidence_text)
         if memory_evidence_text:
@@ -107,6 +108,7 @@ class ReportAgent:
             missing_evidence_text=missing_evidence_text,
             evidence_text=evidence_text,
             source_text=source_text,
+            source_priority_text=source_priority_text,
             diagnostics=diagnostics,
         )
         emit_progress(
@@ -183,6 +185,7 @@ def build_single_report_prompt(
     missing_evidence_text: str,
     evidence_text: str,
     source_text: str,
+    source_priority_text: str,
     diagnostics: Any,
 ) -> str:
     return f"""Research objective:
@@ -206,6 +209,7 @@ Generation requirements:
 - Explain important technical terms or notation when applicable, and use tables when they make comparisons clearer.
 - Include exact technical details only when they are supported by synthesis or supporting chunks.
 - Include supported equations, API signatures, and code snippets when they appear in synthesis or supporting chunks.
+- When multiple sources support the same claim, cite primary/official sources first.
 - Treat partial evidence as usable: write the supported part, then place only the unresolved part in "Evidence Gaps".
 - Reconcile Missing-evidence constraints against Supporting evidence chunks before writing.
 - If supporting chunks contain a detail that synthesis previously marked missing, include the supported detail and do not say it is missing.
@@ -223,6 +227,9 @@ Generation requirements:
 
 Available sources:
 {source_text}
+
+Source priority:
+{source_priority_text}
 
 Planner sub-questions that must be answered:
 {format_planner_questions(planner_questions)}
@@ -925,7 +932,11 @@ def malformed_table_row(line: str) -> bool:
     if not stripped.startswith("|"):
         return False
     cells = [clean_text(cell) for cell in stripped.strip("|").split("|")]
-    return not any(cells)
+    if not any(cells):
+        return True
+    if re.fullmatch(r"\|?\s*:?-{3,}:?(?:\s*\|\s*:?-{3,}:?)*\s*\|?", stripped):
+        return False
+    return all(cell in {"-", "--", "---", "—", "–", "n/a", "na"} for cell in cells)
 
 
 def split_sentences_preserving_markdown(text: str) -> list[str]:
@@ -1438,6 +1449,50 @@ def format_sources(sources: Sequence[Any]) -> str:
         if isinstance(index, int) and url:
             lines.append(f"[{index}] {title}\nURL: {url}")
     return "\n\n".join(lines) or "No sources provided."
+
+
+def format_source_priority_guidance(sources: Sequence[Any]) -> str:
+    primary = []
+    background = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        index = source.get("index")
+        url = clean_text(source.get("url"))
+        title = clean_text(source.get("title")) or url
+        if not isinstance(index, int) or not url:
+            continue
+        item = f"[{index}] {title}"
+        if is_primary_or_official_source(url):
+            primary.append(item)
+        else:
+            background.append(item)
+
+    lines = ["Prefer these sources for equations, benchmarks, APIs, and paper-specific claims when supported."]
+    if primary:
+        lines.append("Primary/official sources: " + ", ".join(primary[:12]))
+    if background:
+        lines.append(
+            "Use background sources only when no primary/official source supports the claim: "
+            + ", ".join(background[:8])
+        )
+    return "\n".join(lines)
+
+
+def is_primary_or_official_source(url: str) -> bool:
+    value = clean_text(url).lower()
+    primary_signals = (
+        "arxiv.org/abs/",
+        "arxiv.org/pdf/",
+        "openreview.net/",
+        "aclanthology.org/",
+        "doi.org/",
+        "pytorch.org/docs",
+        "tensorflow.org/api_docs",
+        ".edu/",
+        ".gov/",
+    )
+    return any(signal in value for signal in primary_signals)
 
 
 def sources_with_browser_results(sources: Sequence[Any], browser_results: Sequence[Any]) -> list[Any]:
