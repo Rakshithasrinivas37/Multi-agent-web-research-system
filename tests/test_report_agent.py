@@ -631,6 +631,32 @@ TensorFlow offers `tf.keras.layers.MultiHeadAttention`.
         self.assertNotIn("TensorFlow API | Signature", normalized)
         self.assertIn("Statistical testing", normalized)
 
+    def test_normalize_report_for_validation_uses_synthesis_covered_rows(self):
+        report = r"""# Topic
+
+## Executive Summary
+This report summarizes attention evidence.
+
+## Evidence Gaps
+| Planner Sub-question | Missing / Partial Detail | Reason |
+|---|---|---|
+| Scaled dot-product formula | Explicit scaling term | Only the unscaled formulation appears. |
+| Vision benchmarks | Accuracy numbers | No supporting vision benchmark evidence is present. |
+
+## References
+No cited source markers were used.
+"""
+        synthesis = """| Requirement | Status | Evidence Source(s) |
+|---|---|---|
+| Scaled-dot-product equation | Covered | [4] |
+| Benchmark impact on vision tasks | Missing | – |
+"""
+
+        normalized = normalize_report_for_validation(report, [], "", synthesis=synthesis)
+
+        self.assertNotIn("Scaled dot-product formula", normalized)
+        self.assertIn("Vision benchmarks", normalized)
+
     def test_normalize_report_for_validation_removes_inline_resolved_gap(self):
         report = """# Topic
 
