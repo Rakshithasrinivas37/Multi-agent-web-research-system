@@ -218,6 +218,29 @@ No cited source markers were used.
         self.assertNotIn("\n|\n", normalized)
         self.assertIn("| Encoder | Reads input. |", normalized)
 
+    def test_normalize_final_report_removes_empty_math_only_section(self):
+        report = """# Topic
+
+## Executive Summary
+This section is complete.
+
+## Bahdanau Attention
+Supported content remains.
+
+### Architecture Evidence Gap
+\\[
+\\]
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("## Bahdanau Attention", normalized)
+        self.assertNotIn("Architecture Evidence Gap", normalized)
+        self.assertNotIn("\\[\n\\]", normalized)
+
     def test_normalize_final_report_removes_empty_sections(self):
         report = """# Topic
 
@@ -512,6 +535,42 @@ This report summarizes implementation evidence.
         self.assertIn("## Implementation APIs", updated)
         self.assertIn("`torch.nn.MultiheadAttention`", updated)
         self.assertIn("[1]", updated)
+
+    def test_ensure_supported_api_details_ignores_incidental_torch_helpers(self):
+        report = """# Topic
+
+## Executive Summary
+This report summarizes evidence.
+
+## References
+No cited source markers were used.
+"""
+        evidence = "Example setup uses torch.manual_seed, torch.nn.Embedding, and torch.Size."
+
+        updated = ensure_supported_api_details(report, evidence)
+
+        self.assertNotIn("## Implementation APIs", updated)
+
+    def test_normalize_report_for_validation_removes_weak_implementation_api_section(self):
+        report = """# Topic
+
+## Executive Summary
+This report summarizes evidence.
+
+## Implementation APIs
+- `torch.manual_seed` is present in the supporting evidence [1].
+- `torch.Size` is present in the supporting evidence.
+
+## References
+[1] https://example.com
+"""
+        sources = [{"index": 1, "url": "https://example.com"}]
+        evidence = "Example setup uses torch.manual_seed and torch.Size."
+
+        normalized = normalize_report_for_validation(report, sources, evidence)
+
+        self.assertNotIn("## Implementation APIs", normalized)
+        self.assertNotIn("torch.manual_seed", normalized)
 
     def test_normalize_report_for_validation_removes_resolved_evidence_gap_rows(self):
         report = r"""# Topic
