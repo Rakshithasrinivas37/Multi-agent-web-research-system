@@ -46,6 +46,7 @@ DEFAULT_GAP_RETRIEVAL_TOP_K = 12
 DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
 DEFAULT_PRECISION_QUERY_LIMIT = 8
+DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 30
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
@@ -183,6 +184,7 @@ def synthesize_report_from_research_plan(
         )
         retrieved_context = merge_retrieved_context(retrieved_context, source_coverage_results)
 
+    print_synthesis_chunks(retrieved_context, label="initial")
     synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
     payload = synthesize_context_for_report(
         objective=objective,
@@ -231,6 +233,7 @@ def synthesize_report_from_research_plan(
         if gap_new_chunk_count:
             retrieved_context = retry_context
             gap_retry_count = 1
+            print_synthesis_chunks(retrieved_context, label="gap-refresh")
             payload = synthesize_context_for_report(
                 objective=objective,
                 retrieved_context=retrieved_context,
@@ -284,6 +287,32 @@ def synthesize_report_from_research_plan(
             max_chars=retrieved_chunk_chars,
         )
     return payload
+
+
+def print_synthesis_chunks(retrieved_context: Sequence[RetrievalResult], label: str = "initial") -> None:
+    """Print final chunks passed to the synthesis LLM after retrieval/reranking."""
+
+    if os.environ.get("RAG_PRINT_SYNTHESIS_CHUNKS", "1").lower() in {"0", "false", "no"}:
+        return
+    try:
+        limit = int(os.environ.get("RAG_PRINT_SYNTHESIS_CHUNKS_LIMIT", DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT))
+    except ValueError:
+        limit = DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT
+    limit = max(1, limit)
+    print(f"[synthesis] chunks passed to synthesizer after reranking ({label}): {len(retrieved_context)}")
+    for rank, result in enumerate(retrieved_context[:limit], start=1):
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        url = primary_source_url(metadata)
+        title = clean_text(metadata.get("title")) or url or "unknown source"
+        source_kind = "primary/paper" if primary_source_url_like(url) else "secondary"
+        preview = clean_text(display_document_preview(result.document, max_chars=180))
+        rerank_note = f", rerank={result.rerank_score:.3f}" if result.rerank_score else ""
+        print(
+            f"[synthesis] chunk {rank}: score={result.score:.3f}{rerank_note}, "
+            f"{source_kind}, url={url}, title={title}, preview={preview}"
+        )
+    if len(retrieved_context) > limit:
+        print(f"[synthesis] ... {len(retrieved_context) - limit} more chunk(s) not printed")
 
 
 def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
