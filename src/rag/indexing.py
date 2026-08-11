@@ -19,14 +19,14 @@ from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
-DEFAULT_COLLECTION_NAME = "research_rag"
+DEFAULT_COLLECTION_NAME = "research_rag_bge_large"
 DEFAULT_CHROMA_PATH = "data/chroma"
 DEFAULT_CHUNK_SIZE = 700
 DEFAULT_CHUNK_OVERLAP = 180
 DEFAULT_PARENT_CHUNK_SIZE = 1800
 DEFAULT_PARENT_CHUNK_OVERLAP = 240
 DEFAULT_PARENT_STORE_NAME = "parent_chunks.sqlite3"
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
 DEFAULT_METADATA_SCHEMA_VERSION = 6

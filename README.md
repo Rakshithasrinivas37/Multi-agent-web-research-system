@@ -61,8 +61,8 @@ FIRECRAWL_API_KEY=your_firecrawl_api_key
 
 RESEARCH_PLANNER_MODEL=openai/gpt-oss-120b
 RAG_GENERATION_MODEL=llama-3.1-8b-instant
-RAG_EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
-RAG_EMBEDDING_DEVICE=auto
+RAG_EMBEDDING_MODEL=BAAI/bge-large-en-v1.5
+RAG_EMBEDDING_DEVICE=cuda
 ```
 
 ## Usage
