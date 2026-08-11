@@ -727,9 +727,50 @@ def normalize_report_for_validation(
     evidence_text: str,
 ) -> str:
     normalized = normalize_final_report(report, sources)
+    normalized = ensure_supported_api_details(normalized, evidence_text)
     cleaned = remove_conflicting_missing_evidence_statements(normalized, evidence_text)
     normalized = normalize_final_report(cleaned, sources)
+    normalized = ensure_supported_api_details(normalized, evidence_text)
     return remove_conflicting_missing_evidence_statements(normalized, evidence_text)
+
+
+def ensure_supported_api_details(report: str, evidence_text: str) -> str:
+    """Add a compact API section when supported API identifiers were omitted."""
+
+    if not evidence_has_api_signal(evidence_text) or evidence_has_api_signal(report):
+        return report
+    items = supported_api_items(evidence_text)
+    if not items:
+        return report
+    lines = ["## Implementation APIs"]
+    for api_name, marker in items[:6]:
+        citation = f" [{marker}]" if marker else ""
+        lines.append(f"- `{api_name}` is present in the supporting evidence{citation}.")
+    return append_section_before_references(report, "\n".join(lines))
+
+
+def supported_api_items(text: str) -> list[tuple[str, str]]:
+    items = []
+    seen = set()
+    for line in clean_markdown(text).splitlines():
+        marker_match = re.search(r"\[(\d+)\]", line)
+        marker = marker_match.group(1) if marker_match else ""
+        for match in re.finditer(r"\b(?:torch\.|tf\.|keras\.|sklearn\.|transformers\.)[A-Za-z0-9_.]+", line):
+            api_name = match.group(0).rstrip(".")
+            key = api_name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append((api_name, marker))
+    return items
+
+
+def append_section_before_references(report: str, section: str) -> str:
+    lines = clean_markdown(report).splitlines()
+    for index, line in enumerate(lines):
+        if is_references_heading(line):
+            return clean_markdown("\n".join([*lines[:index], "", section, "", *lines[index:]]))
+    return clean_markdown(f"{report}\n\n{section}")
 
 
 def remove_conflicting_missing_evidence_statements(report: str, evidence_text: str) -> str:
@@ -776,7 +817,22 @@ def conflicting_missing_line(line: str, evidence_terms: set[str]) -> bool:
     text = strip_markdown_markup(line)
     if line.strip().startswith("|") and table_row_missing_claim(line):
         return bool(detail_terms(text) & evidence_terms)
+    if bullet_missing_claim(line):
+        return bool(detail_terms(text) & evidence_terms)
     return False
+
+
+def line_missing_claim(line: str) -> bool:
+    text = strip_markdown_markup(line)
+    return bool(report_missing_sentences(text)) or bullet_missing_claim(line)
+
+
+def bullet_missing_claim(line: str) -> bool:
+    text = strip_markdown_markup(line).lower()
+    return bool(
+        re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line)
+        and any(phrase in text for phrase in ("missing", "not present", "not provided", "not available", "no explicit"))
+    )
 
 
 def table_row_missing_claim(line: str) -> bool:
@@ -1034,15 +1090,21 @@ def section_has_content(lines: Sequence[str]) -> bool:
 def stale_missing_detail_statement(report: str, evidence_text: str) -> bool:
     if not has_missing_claim(report):
         return False
-    return bool(overlapping_detail_terms(report_missing_sentences(report), evidence_text))
+    return bool(overlapping_detail_terms(missing_claim_texts(report), evidence_text))
 
 
 def has_missing_claim(text: str) -> bool:
-    return bool(report_missing_sentences(text)) or any(
-        table_row_missing_claim(line)
-        for line in clean_markdown(text).splitlines()
-        if line.strip().startswith("|")
-    )
+    return bool(missing_claim_texts(text))
+
+
+def missing_claim_texts(text: str) -> list[str]:
+    claims = list(report_missing_sentences(text))
+    for line in clean_markdown(text).splitlines():
+        if line.strip().startswith("|") and table_row_missing_claim(line):
+            claims.append(strip_markdown_markup(line))
+        elif line_missing_claim(line):
+            claims.append(strip_markdown_markup(line))
+    return dedupe_preserve_order(claims)
 
 
 def report_missing_sentences(text: str) -> list[str]:
@@ -1135,6 +1197,10 @@ def detail_terms(text: str) -> set[str]:
         term = normalize_detail_term(token)
         if term not in stopwords:
             terms.add(term)
+        if term.startswith("torch."):
+            terms.add("pytorch")
+        if term.startswith(("tf.", "keras.")):
+            terms.add("tensorflow")
     return terms
 
 

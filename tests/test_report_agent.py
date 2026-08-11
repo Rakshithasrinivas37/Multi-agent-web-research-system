@@ -2,6 +2,7 @@ import unittest
 
 from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+    ensure_supported_api_details,
     hard_report_issues,
     markdown_completion_issues,
     format_evidence_coverage_brief,
@@ -394,6 +395,42 @@ No cited source markers were used.
 
         self.assertNotIn("BLEU benchmarks", cleaned)
         self.assertIn("GLUE benchmarks", cleaned)
+
+    def test_remove_conflicting_missing_evidence_statements_drops_bullet_gap(self):
+        report = """# Topic
+
+## Executive Summary
+Supported API details are available.
+
+- PyTorch API details are missing.
+- TensorFlow API details are missing.
+
+## References
+No cited source markers were used.
+"""
+        evidence = "Supporting evidence includes torch.nn.MultiheadAttention."
+
+        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
+
+        self.assertNotIn("PyTorch API details are missing", cleaned)
+        self.assertIn("TensorFlow API details are missing", cleaned)
+
+    def test_ensure_supported_api_details_adds_omitted_api_section(self):
+        report = """# Topic
+
+## Executive Summary
+This report summarizes implementation evidence.
+
+## References
+[1] https://docs.example.com
+"""
+        evidence = "[1] Evidence: torch.nn.MultiheadAttention supports multi-head attention."
+
+        updated = ensure_supported_api_details(report, evidence)
+
+        self.assertIn("## Implementation APIs", updated)
+        self.assertIn("`torch.nn.MultiheadAttention`", updated)
+        self.assertIn("[1]", updated)
 
     def test_remove_conflicting_missing_evidence_statements_drops_heading_gap(self):
         report = r"""# Topic
