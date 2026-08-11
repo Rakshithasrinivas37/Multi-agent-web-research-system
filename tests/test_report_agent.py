@@ -11,6 +11,7 @@ from src.agents.report_agent import (
     report_context_gap_queries,
     missing_sub_question_coverage,
     normalize_final_report,
+    normalize_report_for_validation,
     remove_conflicting_missing_evidence_statements,
     remove_unavailable_citation_markers,
     report_generation_token_cap,
@@ -173,6 +174,27 @@ No cited source markers were used.
         self.assertIn("| Complete | Row |", normalized)
         self.assertNotIn("| Broken | Row", normalized)
         self.assertEqual(report_quality_issues(normalized, ""), [])
+
+    def test_normalize_final_report_removes_malformed_table_rows(self):
+        report = """# Topic
+
+## Executive Summary
+This section is complete.
+
+| Component | Role |
+|---|---|
+| Encoder | Reads input. |
+|
+|
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertNotIn("\n|\n", normalized)
+        self.assertIn("| Encoder | Reads input. |", normalized)
 
     def test_normalize_final_report_removes_empty_sections(self):
         report = """# Topic
@@ -468,6 +490,32 @@ This report summarizes implementation evidence.
         self.assertIn("## Implementation APIs", updated)
         self.assertIn("`torch.nn.MultiheadAttention`", updated)
         self.assertIn("[1]", updated)
+
+    def test_normalize_report_for_validation_removes_resolved_evidence_gap_rows(self):
+        report = r"""# Topic
+
+## Executive Summary
+Scaled dot-product attention uses \(\text{softmax}(QK^{\top}/\sqrt{d_k})V\).
+TensorFlow offers `tf.keras.layers.MultiHeadAttention`.
+
+## Evidence Gaps
+| Planner Sub-question | Missing / Partial Detail | Reason |
+|---|---|---|
+| Scaled dot-product formula | Explicit `1/√d_k` scaling term | Only the unscaled formulation appears. |
+| TensorFlow API | Signature and argument semantics | No supporting chunk from TensorFlow is present. |
+| Statistical testing | Confidence intervals | No evidence includes confidence intervals. |
+
+## References
+[1] https://example.com
+"""
+        evidence = "Evidence includes tf.keras.layers.MultiHeadAttention and the formula softmax(QK^T / sqrt(d_k)) V."
+        sources = [{"index": 1, "url": "https://example.com"}]
+
+        normalized = normalize_report_for_validation(report, sources, evidence)
+
+        self.assertNotIn("Scaled dot-product formula | Explicit", normalized)
+        self.assertNotIn("TensorFlow API | Signature", normalized)
+        self.assertIn("Statistical testing", normalized)
 
     def test_remove_conflicting_missing_evidence_statements_drops_heading_gap(self):
         report = r"""# Topic

@@ -2,6 +2,7 @@
 
 from functools import wraps
 from inspect import iscoroutinefunction
+import os
 import re
 from time import perf_counter
 from typing import Any, Sequence, TypedDict
@@ -25,6 +26,7 @@ from src.tools.text_utils import clean_text
 
 DEFAULT_AGENT_RESPONSE_ATTEMPTS = 3
 DEFAULT_REPORT_RESPONSE_ATTEMPTS = 1
+DEFAULT_REPORT_GAP_SYNTHESIS_MODEL = "qwen/qwen3.6-27b"
 
 
 class ResearchState(TypedDict, total=False):
@@ -449,11 +451,15 @@ def refresh_synthesis_for_report_gaps(
         )
     print(f"[report] refreshing synthesis for {len(missing_questions)} coverage gap(s)")
     gap_plan = research_plan_for_report_gaps(research_plan, missing_questions, retry_queries)
-    synthesis_agent = SynthesisAgent(model=state.get("model"), chroma_path=chroma_path)
+    synthesis_agent = SynthesisAgent(model=report_gap_synthesis_model(), chroma_path=chroma_path)
     refreshed = synthesis_agent.synthesize(gap_plan)
     merged = merge_report_context(report_context, refreshed)
     synthesis_agent.write_to_memory(merged, memory_path)
     return merged
+
+
+def report_gap_synthesis_model() -> str:
+    return clean_text(os.environ.get("REPORT_GAP_SYNTHESIS_MODEL")) or DEFAULT_REPORT_GAP_SYNTHESIS_MODEL
 
 
 def research_plan_for_report_gaps(
