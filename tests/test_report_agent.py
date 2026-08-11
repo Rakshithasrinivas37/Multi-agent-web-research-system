@@ -517,6 +517,24 @@ TensorFlow offers `tf.keras.layers.MultiHeadAttention`.
         self.assertNotIn("TensorFlow API | Signature", normalized)
         self.assertIn("Statistical testing", normalized)
 
+    def test_normalize_report_for_validation_removes_inline_resolved_gap(self):
+        report = """# Topic
+
+## Luong Attention
+Luong attention uses multiplicative dot-product scoring and global/local alignment.
+Evidence Gap: No direct citation of the Luong paper is present in the provided sources.
+
+## References
+[1] https://arxiv.org/pdf/1508.04025
+"""
+        evidence = "[1] Luong paper evidence: multiplicative dot-product scoring and global/local alignment."
+        sources = [{"index": 1, "url": "https://arxiv.org/pdf/1508.04025"}]
+
+        normalized = normalize_report_for_validation(report, sources, evidence)
+
+        self.assertIn("Luong attention uses multiplicative", normalized)
+        self.assertNotIn("No direct citation of the Luong paper", normalized)
+
     def test_remove_conflicting_missing_evidence_statements_drops_heading_gap(self):
         report = r"""# Topic
 

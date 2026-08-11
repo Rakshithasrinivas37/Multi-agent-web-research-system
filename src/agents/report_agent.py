@@ -791,23 +791,23 @@ def remove_conflicting_missing_evidence_statements(report: str, evidence_text: s
 
     if not clean_text(evidence_text) or not has_missing_claim(report):
         return report
-    evidence_terms = detail_terms(evidence_text)
+    resolved_terms = detail_terms(evidence_text) | report_body_terms_without_gaps(report)
     cleaned_lines = []
     for line in clean_markdown(report).splitlines():
-        if conflicting_missing_line(line, evidence_terms):
+        if conflicting_missing_line(line, resolved_terms):
             continue
         if is_references_heading(line) or line.lstrip().startswith("#"):
-            if not conflicting_missing_sentence(strip_markdown_markup(line), evidence_terms):
+            if not conflicting_missing_sentence(strip_markdown_markup(line), resolved_terms):
                 cleaned_lines.append(line)
             continue
         sentences = split_sentences_preserving_markdown(line)
         kept = [
             sentence
             for sentence in sentences
-            if not conflicting_missing_sentence(sentence, evidence_terms)
+            if not conflicting_missing_sentence(sentence, resolved_terms)
         ]
         cleaned_line = clean_text(" ".join(kept))
-        if conflicting_missing_sentence(cleaned_line, evidence_terms):
+        if conflicting_missing_sentence(cleaned_line, resolved_terms):
             cleaned_line = ""
         if cleaned_line or not clean_text(line):
             cleaned_lines.append(cleaned_line)
@@ -922,15 +922,15 @@ def conflicting_missing_sentence(sentence: str, evidence_terms: set[str]) -> boo
 def conflicting_missing_line(line: str, evidence_terms: set[str]) -> bool:
     text = strip_markdown_markup(line)
     if line.strip().startswith("|") and table_row_missing_claim(line):
-        return bool(detail_terms(text) & evidence_terms)
+        return resolved_gap_line(line, evidence_terms)
     if bullet_missing_claim(line):
-        return bool(detail_terms(text) & evidence_terms)
+        return resolved_gap_line(line, evidence_terms)
     return False
 
 
 def line_missing_claim(line: str) -> bool:
     text = strip_markdown_markup(line)
-    return bool(report_missing_sentences(text)) or bullet_missing_claim(line)
+    return bool(report_missing_sentences(text)) or bullet_missing_claim(line) or table_row_missing_claim(line)
 
 
 def bullet_missing_claim(line: str) -> bool:
@@ -1258,6 +1258,8 @@ def report_missing_sentences(text: str) -> list[str]:
         "no explicit evidence",
         "no precise citation",
         "no details",
+        "no direct citation",
+        "no direct source",
         "no evidence",
         "no source",
         "is missing",
