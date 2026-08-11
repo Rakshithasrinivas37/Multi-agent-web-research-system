@@ -374,6 +374,27 @@ No cited source markers were used.
 
         self.assertIn("TensorFlow API details are not present", cleaned)
 
+    def test_remove_conflicting_missing_evidence_statements_drops_table_gap_row(self):
+        report = """# Topic
+
+## Executive Summary
+Supported benchmark details are available.
+
+| Topic | Status | Notes |
+|---|---|---|
+| BLEU benchmarks | Missing | No BLEU numbers are present. |
+| GLUE benchmarks | Missing | No GLUE scores are present. |
+
+## References
+No cited source markers were used.
+"""
+        evidence = "The Transformer model achieves 28.4 BLEU on WMT 2014 English-to-German."
+
+        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
+
+        self.assertNotIn("BLEU benchmarks", cleaned)
+        self.assertIn("GLUE benchmarks", cleaned)
+
     def test_remove_conflicting_missing_evidence_statements_drops_heading_gap(self):
         report = r"""# Topic
 

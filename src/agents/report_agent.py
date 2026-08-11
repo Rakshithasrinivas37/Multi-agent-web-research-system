@@ -740,6 +740,8 @@ def remove_conflicting_missing_evidence_statements(report: str, evidence_text: s
     evidence_terms = detail_terms(evidence_text)
     cleaned_lines = []
     for line in clean_markdown(report).splitlines():
+        if conflicting_missing_line(line, evidence_terms):
+            continue
         if is_references_heading(line) or line.lstrip().startswith("#"):
             if not conflicting_missing_sentence(strip_markdown_markup(line), evidence_terms):
                 cleaned_lines.append(line)
@@ -768,6 +770,23 @@ def conflicting_missing_sentence(sentence: str, evidence_terms: set[str]) -> boo
     if not report_missing_sentences(sentence):
         return False
     return has_exact_detail_signal(sentence) or bool(detail_terms(sentence) & evidence_terms)
+
+
+def conflicting_missing_line(line: str, evidence_terms: set[str]) -> bool:
+    text = strip_markdown_markup(line)
+    if line.strip().startswith("|") and table_row_missing_claim(line):
+        return bool(detail_terms(text) & evidence_terms)
+    return False
+
+
+def table_row_missing_claim(line: str) -> bool:
+    cells = [clean_text(strip_markdown_markup(cell)).lower() for cell in line.strip().strip("|").split("|")]
+    if len(cells) < 2 or "---" in line:
+        return False
+    return any(cell in {"missing", "partial"} for cell in cells[1:]) or any(
+        phrase in " ".join(cells)
+        for phrase in ("not present", "not provided", "not available", "not included", "no explicit")
+    )
 
 
 def repair_report_if_needed(
@@ -1019,7 +1038,11 @@ def stale_missing_detail_statement(report: str, evidence_text: str) -> bool:
 
 
 def has_missing_claim(text: str) -> bool:
-    return bool(report_missing_sentences(text))
+    return bool(report_missing_sentences(text)) or any(
+        table_row_missing_claim(line)
+        for line in clean_markdown(text).splitlines()
+        if line.strip().startswith("|")
+    )
 
 
 def report_missing_sentences(text: str) -> list[str]:
