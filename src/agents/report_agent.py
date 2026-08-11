@@ -704,7 +704,7 @@ def finalize_report(
     if not clean_text(report):
         raise ValueError("report_agent produced empty report")
 
-    repaired = normalize_report_for_validation(report, sources, evidence_text)
+    repaired = normalize_report_for_validation(report, sources, evidence_text, synthesis=synthesis)
     issues = report_quality_issues(repaired, evidence_text, sources=sources)
     total_repair_count = 0
     for _ in range(REPORT_REPAIR_MAX_ATTEMPTS):
@@ -725,7 +725,7 @@ def finalize_report(
             max_context_chars=report_context_chars,
         )
         total_repair_count += repair_count
-        repaired = normalize_report_for_validation(repaired, sources, evidence_text)
+        repaired = normalize_report_for_validation(repaired, sources, evidence_text, synthesis=synthesis)
         issues = report_quality_issues(repaired, evidence_text, sources=sources)
 
     blocking_issues = hard_report_issues(issues)
@@ -744,17 +744,19 @@ def normalize_report_for_validation(
     report: str,
     sources: Sequence[dict[str, Any]],
     evidence_text: str,
+    synthesis: str = "",
 ) -> str:
+    resolved_evidence_text = covered_synthesis_signal_text(synthesis, evidence_text)
     normalized = normalize_final_report(report, sources)
     normalized = remove_weak_implementation_api_sections(normalized)
-    normalized = ensure_supported_api_details(normalized, evidence_text)
-    normalized = remove_resolved_evidence_gap_rows(normalized, evidence_text)
-    cleaned = remove_conflicting_missing_evidence_statements(normalized, evidence_text)
+    normalized = ensure_supported_api_details(normalized, resolved_evidence_text)
+    normalized = remove_resolved_evidence_gap_rows(normalized, resolved_evidence_text)
+    cleaned = remove_conflicting_missing_evidence_statements(normalized, resolved_evidence_text)
     normalized = normalize_final_report(cleaned, sources)
     normalized = remove_weak_implementation_api_sections(normalized)
-    normalized = ensure_supported_api_details(normalized, evidence_text)
-    normalized = remove_resolved_evidence_gap_rows(normalized, evidence_text)
-    return remove_conflicting_missing_evidence_statements(normalized, evidence_text)
+    normalized = ensure_supported_api_details(normalized, resolved_evidence_text)
+    normalized = remove_resolved_evidence_gap_rows(normalized, resolved_evidence_text)
+    return remove_conflicting_missing_evidence_statements(normalized, resolved_evidence_text)
 
 
 def ensure_supported_api_details(report: str, evidence_text: str) -> str:
@@ -770,6 +772,40 @@ def ensure_supported_api_details(report: str, evidence_text: str) -> str:
         citation = f" [{marker}]" if marker else ""
         lines.append(f"- `{api_name}` is present in the supporting evidence{citation}.")
     return append_section_before_references(report, "\n".join(lines))
+
+
+def covered_synthesis_signal_text(synthesis: str, evidence_text: str) -> str:
+    """Add synthesis-covered topics to evidence signals used for cleanup."""
+
+    covered = []
+    for line in clean_markdown(synthesis).splitlines():
+        signal = covered_synthesis_table_signal(line)
+        if signal:
+            covered.append(signal)
+    if not covered:
+        return evidence_text
+    return clean_markdown(f"{evidence_text}\n\nSynthesis covered topics:\n" + "\n".join(covered))
+
+
+def covered_synthesis_table_signal(line: str) -> str:
+    if not line.startswith("|") or "---" in line:
+        return ""
+    cells = [clean_text(strip_markdown_markup(cell)) for cell in line.strip("|").split("|")]
+    if len(cells) < 2:
+        return ""
+    topic = cells[0]
+    status = cells[1].lower()
+    if topic.lower() in {"requirement", "planner question", "planner sub-question", "topic"}:
+        return ""
+    if "partial" in status or "missing" in status:
+        return ""
+    if not any(word in status for word in ("covered", "resolved", "available", "strong")):
+        return ""
+    signal = clean_text(" ".join([topic, *cells[2:]]))
+    signal = clean_text(re.sub(r"[-‑–—/]", " ", signal))
+    if "equation" in signal.lower():
+        signal = f"{signal} formula formulation"
+    return signal
 
 
 def supported_api_items(text: str) -> list[tuple[str, str]]:
