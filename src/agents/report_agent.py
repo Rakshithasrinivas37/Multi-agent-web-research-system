@@ -21,6 +21,8 @@ DEFAULT_REPORT_SINGLE_PROMPT_CHARS = 12000
 DEFAULT_REPORT_SINGLE_MAX_TOKENS = 4000
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
 DEFAULT_REPORT_DIAGNOSTICS_CHARS = 1200
+DEFAULT_REPORT_MEMORY_EVIDENCE_CHARS = 3600
+DEFAULT_REPORT_COVERAGE_BRIEF_CHARS = 2400
 REPORT_REPAIR_MAX_ATTEMPTS = 0
 
 
@@ -66,15 +68,27 @@ class ReportAgent:
         if not synthesis:
             raise ValueError("report_context.synthesis is required")
 
-        original_sources = report_context.get("sources", [])
+        original_sources = sources_with_browser_results(
+            report_context.get("sources", []),
+            report_context.get("browser_results", []),
+        )
         sources, citation_aliases = dedupe_sources_by_url(original_sources)
         synthesis = remap_citation_markers(synthesis, citation_aliases)
         available_source_indexes = source_index_set(sources)
         synthesis = remove_unavailable_citation_markers(synthesis, available_source_indexes)
         source_text = format_sources(sources)
         evidence_text = format_supporting_evidence(report_context, citation_aliases=citation_aliases)
+        memory_evidence_text = format_memory_signal_evidence(report_context, sources, citation_aliases, evidence_text)
+        if memory_evidence_text:
+            evidence_text = clean_markdown(f"Memory evidence signals:\n{memory_evidence_text}\n\n{evidence_text}")
         evidence_text = remove_unavailable_citation_markers(evidence_text, available_source_indexes)
         missing_evidence_text = format_missing_evidence_constraints(synthesis)
+        coverage_brief = format_evidence_coverage_brief(
+            planner_questions=[clean_text(question) for question in report_context.get("planner_questions", []) or []],
+            synthesis=synthesis,
+            evidence_text=evidence_text,
+            missing_evidence_text=missing_evidence_text,
+        )
         citation_policy = clean_text(report_context.get("citation_policy")) or (
             "Use only numbered source markers from the provided sources."
         )
@@ -87,6 +101,7 @@ class ReportAgent:
             output_format=output_format_text,
             citation_policy=citation_policy,
             planner_questions=planner_questions,
+            coverage_brief=coverage_brief,
             synthesis=synthesis,
             missing_evidence_text=missing_evidence_text,
             evidence_text=evidence_text,
@@ -155,6 +170,7 @@ def build_single_report_prompt(
     output_format: str,
     citation_policy: str,
     planner_questions: Sequence[str],
+    coverage_brief: str,
     synthesis: str,
     missing_evidence_text: str,
     evidence_text: str,
@@ -170,26 +186,7 @@ Requested output format:
 Citation policy:
 {citation_policy}
 
-Planner sub-questions that must be answered:
-{format_planner_questions(planner_questions)}
-
-Synthesis-agent notes:
-{synthesis}
-
-Missing-evidence constraints:
-{missing_evidence_text}
-
-Supporting evidence chunks:
-{evidence_text}
-
-Available sources:
-{source_text}
-
-Retrieval diagnostics:
-{diagnostics}
-
-Generate the final report using only the synthesis-agent notes, supporting evidence chunks, and available sources above.
-Requirements:
+Generation requirements:
 - Return polished Markdown.
 - Include a clear title.
 - Include an executive summary under the exact heading "## Executive Summary".
@@ -201,6 +198,7 @@ Requirements:
 - Explain important technical terms or notation when applicable, and use tables when they make comparisons clearer.
 - Include exact technical details only when they are supported by synthesis or supporting chunks.
 - Include supported equations, API signatures, and code snippets when they appear in synthesis or supporting chunks.
+- Treat partial evidence as usable: write the supported part, then place only the unresolved part in "Evidence Gaps".
 - Reconcile Missing-evidence constraints against Supporting evidence chunks before writing.
 - If supporting chunks contain a detail that synthesis previously marked missing, include the supported detail and do not say it is missing.
 - Do not generalize a missing detail to a broader topic; include supported parts and name only the exact unsupported detail.
@@ -213,7 +211,31 @@ Requirements:
 - Do not use citation formats like 【1】, footnotes, line citations, or URLs inline.
 - End with a References section mapping only used source markers to source URLs.
 - If evidence is incomplete, mention the limitation instead of inventing details.
-- Before finalizing, remove contradictions such as saying a detail is missing and then including that detail."""
+- Before finalizing, remove contradictions such as saying a detail is missing and then including that detail.
+
+Available sources:
+{source_text}
+
+Planner sub-questions that must be answered:
+{format_planner_questions(planner_questions)}
+
+Evidence coverage brief:
+{compact_markdown(coverage_brief, DEFAULT_REPORT_COVERAGE_BRIEF_CHARS)}
+
+Supporting evidence chunks:
+{compact_markdown(evidence_text, 5000)}
+
+Missing-evidence constraints:
+{compact_markdown(missing_evidence_text, 1400)}
+
+Synthesis-agent notes:
+{compact_markdown(synthesis, 3200)}
+
+
+Retrieval diagnostics:
+{diagnostics}
+
+Generate the final report using only the synthesis-agent notes, supporting evidence chunks, and available sources above."""
 
 
 def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, str]:
@@ -1123,6 +1145,189 @@ def format_sources(sources: Sequence[Any]) -> str:
     return "\n\n".join(lines) or "No sources provided."
 
 
+def sources_with_browser_results(sources: Sequence[Any], browser_results: Sequence[Any]) -> list[Any]:
+    merged = [source for source in sources or [] if isinstance(source, dict)]
+    seen = {normalize_source_key(clean_text(source.get("url"))) for source in merged}
+    next_index = max([source.get("index") for source in merged if isinstance(source.get("index"), int)] or [0]) + 1
+    for source in browser_sources(browser_results):
+        url = clean_text(source.get("url"))
+        key = normalize_source_key(url)
+        if not url or key in seen:
+            continue
+        copied = {
+            "index": next_index,
+            "url": url,
+            "title": clean_text(source.get("title")) or url,
+        }
+        merged.append(copied)
+        seen.add(key)
+        next_index += 1
+    return merged
+
+
+def browser_sources(browser_results: Sequence[Any]) -> list[dict[str, Any]]:
+    sources = []
+    if not isinstance(browser_results, list):
+        return sources
+    for result in browser_results:
+        if not isinstance(result, dict):
+            continue
+        for source in result.get("sources", []) or []:
+            if isinstance(source, dict):
+                sources.append(source)
+    return sources
+
+
+def format_memory_signal_evidence(
+    report_context: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+    citation_aliases: dict[int, int] | None,
+    existing_evidence: str,
+) -> str:
+    citation_aliases = citation_aliases or {}
+    source_index_by_url = {
+        normalize_source_key(clean_text(source.get("url"))): citation_aliases.get(source.get("index"), source.get("index"))
+        for source in sources
+        if isinstance(source, dict) and isinstance(source.get("index"), int) and clean_text(source.get("url"))
+    }
+    existing = clean_text(existing_evidence).lower()
+    topic_terms = detail_terms(
+        " ".join(
+            [
+                clean_text(report_context.get("objective")),
+                *[clean_text(question) for question in report_context.get("planner_questions", []) or []],
+            ]
+        )
+    )
+    candidates = []
+    sequence = 0
+    seen = set()
+    for source in browser_sources(report_context.get("browser_results", [])):
+        marker_index = source_index_by_url.get(normalize_source_key(clean_text(source.get("url"))))
+        if not isinstance(marker_index, int):
+            continue
+        snippets = high_signal_snippets(source.get("full_content") or source.get("content_preview"), existing)
+        for snippet in snippets[:3]:
+            key = clean_text(snippet).lower()
+            if not key or key in seen or key in existing:
+                continue
+            if topic_terms and not (detail_terms(snippet) & topic_terms):
+                continue
+            seen.add(key)
+            sequence += 1
+            candidates.append((signal_priority(snippet), -sequence, f"[{marker_index}] {snippet}"))
+
+    lines = []
+    used_chars = 0
+    for _, _, line in sorted(candidates, reverse=True):
+        if used_chars + len(line) > DEFAULT_REPORT_MEMORY_EVIDENCE_CHARS:
+            continue
+        lines.append(line)
+        used_chars += len(line)
+    return "\n".join(dedupe_preserve_order(lines))
+
+
+def high_signal_snippets(text: Any, existing_evidence: str = "", limit: int = 6) -> list[str]:
+    snippets = []
+    for sentence in evidence_sentences(text):
+        if not has_report_signal(sentence):
+            continue
+        snippet = focused_signal_snippet(sentence)
+        if snippet and snippet.lower() not in existing_evidence:
+            snippets.append(snippet)
+        if len(snippets) >= limit:
+            break
+    return dedupe_preserve_order(snippets)
+
+
+def evidence_sentences(text: Any) -> list[str]:
+    value = clean_text(text)
+    if not value:
+        return []
+    return [
+        clean_text(part)
+        for part in re.split(r"(?<=[.!?])\s+|\n+", value)
+        if clean_text(part)
+    ]
+
+
+def has_report_signal(text: str) -> bool:
+    value = clean_text(text)
+    return bool(
+        evidence_has_formula_signal(value)
+        or evidence_has_api_signal(value)
+        or re.search(r"\b\d+(?:\.\d+)?\s*(?:BLEU|GLUE|accuracy|perplexity|F1|AUC|%|tokens?/sec)\b", value, re.I)
+        or re.search(r"\b(?:benchmark|score|improves?|achieves?|outperform|complexity|low-rank|linear|quadratic)\b", value, re.I)
+        or re.search(r"\bO\([^)]+\)", value)
+    )
+
+
+def signal_priority(text: str) -> int:
+    value = clean_text(text)
+    if re.search(r"\b\d+(?:\.\d+)?\s*(?:BLEU|GLUE|accuracy|perplexity|F1|AUC|%|tokens?/sec)\b", value, re.I):
+        return 5
+    if evidence_has_formula_signal(value) or re.search(r"\bO\([^)]+\)", value):
+        return 4
+    if evidence_has_api_signal(value):
+        return 3
+    if re.search(r"\b(?:complexity|low-rank|linear|quadratic|benchmark|score)\b", value, re.I):
+        return 2
+    return 1
+
+
+def focused_signal_snippet(sentence: str, max_chars: int = 420) -> str:
+    text = clean_text(sentence)
+    if len(text) <= max_chars:
+        return text
+    signal = re.search(
+        r"\b\d+(?:\.\d+)?\s*(?:BLEU|GLUE|accuracy|perplexity|F1|AUC|%|tokens?/sec)\b|"
+        r"\bO\([^)]+\)|\b(?:softmax|torch\.|tf\.|keras\.|low-rank|complexity)\b",
+        text,
+        re.I,
+    )
+    center = signal.start() if signal else 0
+    start = max(0, center - max_chars // 2)
+    end = min(len(text), start + max_chars)
+    return text[start:end].strip(" ,.;")
+
+
+def format_evidence_coverage_brief(
+    planner_questions: Sequence[str],
+    synthesis: str,
+    evidence_text: str,
+    missing_evidence_text: str,
+) -> str:
+    supported_signals = high_signal_snippets(evidence_text, limit=10)
+    lines = [
+        "Use this brief to decide covered, partial, and missing sections before writing.",
+        "If a topic has supported details and unresolved gaps, write the supported details first and put only the unresolved details in Evidence Gaps.",
+    ]
+    if supported_signals:
+        lines.append("Supported evidence signals:")
+        lines.extend(f"- {signal}" for signal in supported_signals[:8])
+    remaining_gaps = unresolved_gap_brief(missing_evidence_text, evidence_text)
+    if remaining_gaps:
+        lines.append("Potential unresolved gaps from synthesis:")
+        lines.extend(f"- {gap}" for gap in remaining_gaps[:6])
+    if planner_questions:
+        lines.append("Planner-question coverage rule: every planner question needs either supported content or a precise unresolved gap.")
+    return clean_markdown("\n".join(lines))
+
+
+def unresolved_gap_brief(missing_evidence_text: str, evidence_text: str) -> list[str]:
+    evidence_terms = detail_terms(evidence_text)
+    gaps = []
+    for line in clean_markdown(missing_evidence_text).splitlines():
+        gap = clean_text(line.lstrip("- "))
+        if not gap:
+            continue
+        overlap = detail_terms(gap) & evidence_terms
+        if overlap and has_report_signal(gap):
+            continue
+        gaps.append(gap)
+    return dedupe_preserve_order(gaps)
+
+
 def format_missing_evidence_constraints(synthesis: str) -> str:
     """Extract gap notes that the report must not turn into unsupported details."""
 
@@ -1226,7 +1431,11 @@ def dedupe_sources_by_url(sources: Sequence[Any]) -> tuple[list[dict[str, Any]],
 
 
 def normalize_source_key(url: str) -> str:
-    return clean_text(url).lower().rstrip("/")
+    key = clean_text(url).lower().rstrip("/")
+    arxiv_match = re.search(r"arxiv\.org/(?:abs|pdf)/([^?#/]+)", key)
+    if arxiv_match:
+        return f"arxiv.org/abs/{arxiv_match.group(1).removesuffix('.pdf')}"
+    return key
 
 
 def write_report_file(
