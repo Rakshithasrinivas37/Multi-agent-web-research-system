@@ -324,6 +324,7 @@ def report_node(state: ResearchState) -> ResearchState:
             "memory_path": memory_path,
             "errors": [*state.get("errors", []), "report_node requires synthesis.report_context"],
         }
+    report_context = report_context_with_browser_memory(report_context, state, memory_path)
 
     research_plan = state.get("research_plan") or read_research_plan_from_memory(memory_path)
     context_errors = validate_synthesis_payload(report_context, research_plan)
@@ -413,6 +414,21 @@ def report_missing_question_errors(report: dict[str, Any]) -> list[str]:
 def report_context_gap_retry_used(report_context: dict[str, Any]) -> bool:
     diagnostics = report_context.get("diagnostics", {}) if isinstance(report_context, dict) else {}
     return bool(isinstance(diagnostics, dict) and diagnostics.get("report_gap_retry"))
+
+
+def report_context_with_browser_memory(
+    report_context: dict[str, Any],
+    state: ResearchState,
+    memory_path: str,
+) -> dict[str, Any]:
+    if not isinstance(report_context, dict) or report_context.get("browser_results"):
+        return report_context
+    browser_results = state.get("browser_results")
+    if not browser_results:
+        browser_results = SharedMemory(memory_path).read_agent_output("browser").get("results", [])
+    if not browser_results:
+        return report_context
+    return {**report_context, "browser_results": browser_results}
 
 
 def refresh_synthesis_for_report_gaps(

@@ -4,6 +4,8 @@ from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     hard_report_issues,
     markdown_completion_issues,
+    format_evidence_coverage_brief,
+    format_memory_signal_evidence,
     report_context_gap_items,
     report_context_gap_queries,
     missing_sub_question_coverage,
@@ -294,6 +296,44 @@ No cited source markers were used.
 
         self.assertEqual(len(queries), 1)
         self.assertIn("exact equation", queries[0])
+
+    def test_format_memory_signal_evidence_adds_browser_benchmark_signal(self):
+        report_context = {
+            "browser_results": [
+                {
+                    "sources": [
+                        {
+                            "url": "https://arxiv.org/abs/1706.03762",
+                            "full_content": (
+                                "The model achieves 28.4 BLEU on WMT 2014 English-to-German "
+                                "and 41.8 BLEU on English-to-French."
+                            ),
+                        }
+                    ]
+                }
+            ]
+        }
+        sources = [{"index": 1, "url": "https://arxiv.org/pdf/1706.03762"}]
+
+        evidence = format_memory_signal_evidence(report_context, sources, {}, "No selected benchmark chunk.")
+
+        self.assertIn("[1]", evidence)
+        self.assertIn("28.4 BLEU", evidence)
+
+    def test_format_evidence_coverage_brief_separates_supported_and_missing_parts(self):
+        evidence = "Evidence: Linformer uses a low-rank approximation and reduces complexity from O(n2) to O(n)."
+        missing = "- Efficient variants: Linformer is partial, Performer details are not present."
+
+        brief = format_evidence_coverage_brief(
+            ["What efficient attention variants are covered?"],
+            "",
+            evidence,
+            missing,
+        )
+
+        self.assertIn("Supported evidence signals", brief)
+        self.assertIn("low-rank", brief)
+        self.assertIn("Performer", brief)
 
     def test_hard_report_issues_blocks_stale_missing_evidence(self):
         issues = [
