@@ -45,6 +45,7 @@ DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
 DEFAULT_GAP_RETRIEVAL_TOP_K = 12
 DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
+DEFAULT_PRECISION_QUERY_LIMIT = 8
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
@@ -144,7 +145,10 @@ def synthesize_report_from_research_plan(
     if print_rewritten_query and rewritten_query:
         print("Rewritten retrieval query:")
         print(rewritten_query)
-    retrieval_queries = [rewritten_query] if rewritten_query else queries
+    precision_queries = precision_retrieval_queries(research_plan, objective=objective)
+    retrieval_queries = dedupe_preserve_order(
+        ([rewritten_query] if rewritten_query else queries) + precision_queries
+    )
     retrieved_context = multi_query_hybrid_retrieve(
         queries=retrieval_queries,
         chroma_path=chroma_path,
@@ -239,6 +243,7 @@ def synthesize_report_from_research_plan(
     payload["queries"] = queries
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
+    payload["precision_retrieval_queries"] = precision_queries
     payload["gap_retrieval_queries"] = gap_queries
     payload["gap_query_model"] = gap_query_plan["model"]
     payload["gap_query_source"] = gap_query_plan["source"]
@@ -322,6 +327,49 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     if objective:
         queries.append(objective)
     return dedupe_preserve_order(queries)
+
+
+def precision_retrieval_queries(
+    research_plan: dict[str, Any],
+    objective: str = "",
+    max_queries: int = DEFAULT_PRECISION_QUERY_LIMIT,
+) -> list[str]:
+    """Build deterministic high-signal queries for exact evidence retrieval."""
+
+    objective_text = clean_text(objective or research_plan.get("objective"))
+    synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
+    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
+    candidates = [
+        *planner_sub_questions(research_plan),
+        *instruction_requirement_items(synthesis_instruction),
+    ]
+    queries = []
+    for item in dedupe_preserve_order(candidates):
+        base = clean_text(f"{objective_text} {item} {matching_task_details(item, tasks)}")
+        suffixes = precision_query_suffixes(item)
+        if not base or not suffixes:
+            continue
+        for suffix in suffixes:
+            queries.append(clean_text(f"{base} {suffix}")[:700])
+            if len(queries) >= max(1, max_queries):
+                return dedupe_preserve_order(queries)
+    return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def precision_query_suffixes(text: str) -> list[str]:
+    lowered = clean_text(text).lower()
+    suffixes = []
+    if re.search(r"\b(equation|formula|mathematical|formulation|derive|scaled|additive|multiplicative)\b", lowered):
+        suffixes.append("exact equation formula derivation symbols softmax sqrt sum matrix alignment")
+    if re.search(r"\b(benchmark|result|score|performance|accuracy|bleu|glue|imagenet|top-1|metric)\b", lowered):
+        suffixes.append("benchmark table results scores metrics accuracy BLEU GLUE ImageNet top-1")
+    if re.search(r"\b(api|implementation|framework|library|pytorch|tensorflow|keras|hugging face|transformers)\b", lowered):
+        suffixes.append("official documentation API signature parameters usage example class function")
+    if re.search(r"\b(complexity|efficient|variant|limitation|memory|time|quadratic|linear|sparse|low-rank)\b", lowered):
+        suffixes.append("computational complexity time memory O(n^2) O(n) algorithm approximation limitation")
+    if re.search(r"\b(paper|contribution|introduced|architecture|method|model|et al)\b", lowered):
+        suffixes.append("original paper method contribution architecture equations results")
+    return dedupe_preserve_order(suffixes)
 
 
 def matching_task_details(question: str, tasks: Sequence[dict[str, Any]]) -> str:
