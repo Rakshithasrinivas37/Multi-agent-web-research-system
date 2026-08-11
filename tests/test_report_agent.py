@@ -210,6 +210,24 @@ No cited source markers were used.
         self.assertIn("### Child Section", normalized)
         self.assertEqual(report_quality_issues(normalized, ""), [])
 
+    def test_normalize_final_report_removes_still_incomplete_sections(self):
+        report = """# Topic
+
+## Executive Summary
+This section is complete.
+
+## TensorFlow/Keras Implementation
+The implementation details start here and
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertNotIn("TensorFlow/Keras Implementation", normalized)
+        self.assertEqual(report_quality_issues(normalized, ""), [])
+
     def test_normalize_final_report_moves_summary_to_executive_summary(self):
         report = """**Deep Dive**
 
@@ -414,6 +432,25 @@ No cited source markers were used.
 
         self.assertNotIn("PyTorch API details are missing", cleaned)
         self.assertIn("TensorFlow API details are missing", cleaned)
+
+    def test_remove_conflicting_missing_evidence_statements_drops_absent_gap(self):
+        report = """# Topic
+
+## Executive Summary
+Supported API details are available.
+
+- PyTorch API details are absent.
+- TensorFlow API details are absent.
+
+## References
+No cited source markers were used.
+"""
+        evidence = "Supporting evidence includes torch.nn.MultiheadAttention."
+
+        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
+
+        self.assertNotIn("PyTorch API details are absent", cleaned)
+        self.assertIn("TensorFlow API details are absent", cleaned)
 
     def test_ensure_supported_api_details_adds_omitted_api_section(self):
         report = """# Topic

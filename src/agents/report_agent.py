@@ -472,6 +472,8 @@ def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> st
     body = remove_unavailable_citation_markers(body, source_index_set(sources))
     body = trim_incomplete_section_tails(body)
     body = remove_empty_sections(body)
+    body = remove_incomplete_sections(body)
+    body = remove_empty_sections(body)
     body = ensure_executive_summary_section(body)
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
 
@@ -1087,6 +1089,28 @@ def remove_empty_sections(markdown: str) -> str:
     return clean_markdown("\n".join(lines))
 
 
+def remove_incomplete_sections(markdown: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    headings = [
+        (index, len(match.group(1)), line.lstrip("#").strip())
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(#{2,3})\s+", line))
+    ]
+    for heading_pos, (start, level, heading) in reversed(list(enumerate(headings))):
+        if normalized_heading(heading) == "references":
+            continue
+        end = len(lines)
+        for next_start, next_level, _ in headings[heading_pos + 1 :]:
+            if next_level <= level:
+                end = next_start
+                break
+        section_text = "\n".join(lines[start:end]).strip()
+        issues = markdown_completion_issues(section_text)
+        if issues and issues != ["section is empty"]:
+            del lines[start:end]
+    return clean_markdown("\n".join(lines))
+
+
 def section_has_content(lines: Sequence[str]) -> bool:
     for line in lines:
         stripped = line.strip()
@@ -1123,6 +1147,10 @@ def report_missing_sentences(text: str) -> list[str]:
         "not available",
         "not included",
         "not mentioned",
+        "not found",
+        "not retrieved",
+        "not covered",
+        "not supported",
         "not shown",
         "not specified",
         "not contain",
@@ -1133,8 +1161,14 @@ def report_missing_sentences(text: str) -> list[str]:
         "no explicit statement",
         "no explicit evidence",
         "no precise citation",
+        "no details",
+        "no evidence",
+        "no source",
         "is missing",
         "are missing",
+        "is absent",
+        "are absent",
+        "unavailable",
         "missing detail",
         "evidence is incomplete",
     )
