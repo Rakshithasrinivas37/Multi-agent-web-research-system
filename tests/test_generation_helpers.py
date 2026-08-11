@@ -1,6 +1,14 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from unittest.mock import patch
 
-from src.rag.generation import audit_synthesis_citations, precision_retrieval_queries, report_supporting_chunks
+from src.rag.generation import (
+    audit_synthesis_citations,
+    precision_retrieval_queries,
+    print_synthesis_chunks,
+    report_supporting_chunks,
+)
 from src.rag.retrieval import RetrievalResult
 
 
@@ -77,6 +85,28 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertIn("exact equation formula", joined)
         self.assertIn("benchmark table results", joined)
         self.assertIn("official documentation api signature", joined)
+
+    def test_print_synthesis_chunks_shows_primary_source_after_reranking(self):
+        result = RetrievalResult(
+            id="paper",
+            document="Attention evidence from the original paper with enough preview text.",
+            metadata={"title": "Paper", "url": "https://arxiv.org/pdf/1706.03762"},
+            score=0.87,
+            semantic_score=0.5,
+            bm25_score=0.4,
+            rerank_score=1.0,
+        )
+        buffer = StringIO()
+
+        with patch.dict("os.environ", {"RAG_PRINT_SYNTHESIS_CHUNKS_LIMIT": "1"}, clear=False):
+            with redirect_stdout(buffer):
+                print_synthesis_chunks([result], label="test")
+
+        output = buffer.getvalue()
+        self.assertIn("chunks passed to synthesizer after reranking (test): 1", output)
+        self.assertIn("primary/paper", output)
+        self.assertIn("https://arxiv.org/pdf/1706.03762", output)
+        self.assertIn("rerank=1.000", output)
 
 
 if __name__ == "__main__":
