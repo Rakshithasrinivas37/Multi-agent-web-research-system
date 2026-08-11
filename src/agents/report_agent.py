@@ -470,6 +470,7 @@ def short_issue_label(text: str, max_length: int = 80) -> str:
 def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> str:
     body = strip_all_references_blocks(report)
     body = remove_unavailable_citation_markers(body, source_index_set(sources))
+    body = remove_empty_math_blocks(body)
     body = remove_malformed_table_rows(body)
     body = trim_incomplete_section_tails(body)
     body = remove_empty_sections(body)
@@ -738,10 +739,12 @@ def normalize_report_for_validation(
     evidence_text: str,
 ) -> str:
     normalized = normalize_final_report(report, sources)
+    normalized = remove_weak_implementation_api_sections(normalized)
     normalized = ensure_supported_api_details(normalized, evidence_text)
     normalized = remove_resolved_evidence_gap_rows(normalized, evidence_text)
     cleaned = remove_conflicting_missing_evidence_statements(normalized, evidence_text)
     normalized = normalize_final_report(cleaned, sources)
+    normalized = remove_weak_implementation_api_sections(normalized)
     normalized = ensure_supported_api_details(normalized, evidence_text)
     normalized = remove_resolved_evidence_gap_rows(normalized, evidence_text)
     return remove_conflicting_missing_evidence_statements(normalized, evidence_text)
@@ -768,7 +771,7 @@ def supported_api_items(text: str) -> list[tuple[str, str]]:
     for line in clean_markdown(text).splitlines():
         marker_match = re.search(r"\[(\d+)\]", line)
         marker = marker_match.group(1) if marker_match else ""
-        for match in re.finditer(r"\b(?:torch\.|tf\.|keras\.|sklearn\.|transformers\.)[A-Za-z0-9_.]+", line):
+        for match in attention_api_matches(line):
             api_name = match.group(0).rstrip(".")
             key = api_name.lower()
             if key in seen:
@@ -776,6 +779,24 @@ def supported_api_items(text: str) -> list[tuple[str, str]]:
             seen.add(key)
             items.append((api_name, marker))
     return items
+
+
+def remove_weak_implementation_api_sections(report: str) -> str:
+    """Drop API sections that only contain incidental helper APIs."""
+
+    lines = clean_markdown(report).splitlines()
+    for level, heading, _ in reversed(markdown_sections(report)):
+        if normalized_heading(heading) != "implementation apis":
+            continue
+        start = section_start_index(lines, level, heading)
+        if start < 0:
+            continue
+        end = section_end_index(lines, start, level)
+        section_text = "\n".join(lines[start:end])
+        if attention_api_signal(section_text):
+            continue
+        del lines[start:end]
+    return clean_markdown("\n".join(lines))
 
 
 def append_section_before_references(report: str, section: str) -> str:
@@ -1090,7 +1111,24 @@ def evidence_has_code_signal(text: str) -> bool:
 
 
 def evidence_has_api_signal(text: str) -> bool:
-    return bool(re.search(r"\b(?:torch\.|tf\.|keras\.|sklearn\.|transformers\.)[A-Za-z0-9_.]+", str(text or "")))
+    return attention_api_signal(text)
+
+
+def attention_api_signal(text: Any) -> bool:
+    return bool(attention_api_matches(str(text or "")))
+
+
+def attention_api_matches(text: str) -> list[re.Match[str]]:
+    pattern = (
+        r"\b(?:"
+        r"torch\.nn\.MultiheadAttention|"
+        r"torch\.nn\.functional\.scaled_dot_product_attention|"
+        r"tf\.keras\.layers\.MultiHeadAttention|"
+        r"keras\.layers\.MultiHeadAttention|"
+        r"transformers\.[A-Za-z0-9_.]*(?:Attention|Model)"
+        r")\b"
+    )
+    return list(re.finditer(pattern, str(text or "")))
 
 
 def references_heading_count(report: str) -> int:
@@ -1127,6 +1165,22 @@ def markdown_sections(markdown: str) -> list[tuple[int, str, str]]:
                 break
         sections.append((level, heading, "\n".join(lines[start:end]).strip()))
     return sections
+
+
+def section_start_index(lines: Sequence[str], level: int, heading: str) -> int:
+    pattern = re.compile(rf"^#{{{level}}}\s+{re.escape(heading)}\s*$")
+    for index, line in enumerate(lines):
+        if pattern.match(line):
+            return index
+    return -1
+
+
+def section_end_index(lines: Sequence[str], start: int, level: int) -> int:
+    for index in range(start + 1, len(lines)):
+        match = re.match(r"^(#{2,3})\s+", lines[index])
+        if match and len(match.group(1)) <= level:
+            return index
+    return len(lines)
 
 
 def trim_incomplete_section_tails(markdown: str) -> str:
@@ -1183,6 +1237,15 @@ def remove_empty_sections(markdown: str) -> str:
         if not section_has_content(lines[start + 1 : end]):
             del lines[start:end]
     return clean_markdown("\n".join(lines))
+
+
+def remove_empty_math_blocks(markdown: str) -> str:
+    """Remove display math blocks that contain no formula content."""
+
+    text = clean_markdown(markdown)
+    text = re.sub(r"\\\[\s*\\\]", "", text, flags=re.DOTALL)
+    text = re.sub(r"\$\$\s*\$\$", "", text, flags=re.DOTALL)
+    return clean_markdown(text)
 
 
 def remove_incomplete_sections(markdown: str) -> str:
