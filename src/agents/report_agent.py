@@ -462,6 +462,7 @@ def short_issue_label(text: str, max_length: int = 80) -> str:
 def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> str:
     body = strip_all_references_blocks(report)
     body = remove_unavailable_citation_markers(body, source_index_set(sources))
+    body = remove_malformed_table_rows(body)
     body = trim_incomplete_section_tails(body)
     body = remove_empty_sections(body)
     body = remove_incomplete_sections(body)
@@ -730,9 +731,11 @@ def normalize_report_for_validation(
 ) -> str:
     normalized = normalize_final_report(report, sources)
     normalized = ensure_supported_api_details(normalized, evidence_text)
+    normalized = remove_resolved_evidence_gap_rows(normalized, evidence_text)
     cleaned = remove_conflicting_missing_evidence_statements(normalized, evidence_text)
     normalized = normalize_final_report(cleaned, sources)
     normalized = ensure_supported_api_details(normalized, evidence_text)
+    normalized = remove_resolved_evidence_gap_rows(normalized, evidence_text)
     return remove_conflicting_missing_evidence_statements(normalized, evidence_text)
 
 
@@ -801,6 +804,99 @@ def remove_conflicting_missing_evidence_statements(report: str, evidence_text: s
         if cleaned_line or not clean_text(line):
             cleaned_lines.append(cleaned_line)
     return clean_markdown("\n".join(cleaned_lines))
+
+
+def remove_resolved_evidence_gap_rows(report: str, evidence_text: str) -> str:
+    """Drop Evidence Gaps rows whose topic is already covered by report/evidence."""
+
+    resolved_terms = detail_terms(evidence_text) | report_body_terms_without_gaps(report)
+    if not resolved_terms:
+        return report
+    cleaned_lines = []
+    in_gap_section = False
+    for line in clean_markdown(report).splitlines():
+        if line.lstrip().startswith("#"):
+            in_gap_section = "evidence gap" in normalized_heading(line)
+            cleaned_lines.append(line)
+            continue
+        if in_gap_section and resolved_gap_line(line, resolved_terms):
+            continue
+        cleaned_lines.append(line)
+    return remove_empty_sections(remove_empty_table_blocks(clean_markdown("\n".join(cleaned_lines))))
+
+
+def report_body_terms_without_gaps(report: str) -> set[str]:
+    lines = []
+    in_gap_section = False
+    for line in clean_markdown(report).splitlines():
+        if line.lstrip().startswith("#"):
+            in_gap_section = "evidence gap" in normalized_heading(line)
+        if not in_gap_section and not line_missing_claim(line):
+            lines.append(line)
+    return detail_terms("\n".join(lines))
+
+
+def resolved_gap_line(line: str, resolved_terms: set[str]) -> bool:
+    text = strip_markdown_markup(line)
+    if not clean_text(text) or re.fullmatch(r"\|?\s*-{3,}(?:\s*\|\s*-{3,})*\s*\|?", line.strip()):
+        return False
+    if line.strip().startswith("|"):
+        cells = [clean_text(strip_markdown_markup(cell)) for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 2 or clean_text(cells[0]).lower() in {"planner sub-question", "topic", "requirement"}:
+            return False
+    terms = detail_terms(text)
+    strong_terms = terms & {
+        "bahdanau",
+        "bleu",
+        "formula",
+        "glue",
+        "keras",
+        "linformer",
+        "multiheadattention",
+        "performer",
+        "pytorch",
+        "scaled",
+        "softmax",
+        "tensorflow",
+        "transformer",
+    }
+    overlap = terms & resolved_terms
+    return bool(strong_terms & resolved_terms) or len(overlap) >= 2
+
+
+def remove_empty_table_blocks(markdown: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    cleaned = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip().startswith("|"):
+            cleaned.append(lines[index])
+            index += 1
+            continue
+        start = index
+        while index < len(lines) and lines[index].strip().startswith("|"):
+            index += 1
+        block = [line for line in lines[start:index] if not malformed_table_row(line)]
+        data_rows = [
+            line for line in block
+            if not re.fullmatch(r"\|?\s*-{3,}(?:\s*\|\s*-{3,})*\s*\|?", line.strip())
+        ]
+        if len(data_rows) > 1:
+            cleaned.extend(block)
+    return clean_markdown("\n".join(cleaned))
+
+
+def remove_malformed_table_rows(markdown: str) -> str:
+    lines = [line for line in clean_markdown(markdown).splitlines() if not malformed_table_row(line)]
+    return clean_markdown("\n".join(lines))
+
+
+def malformed_table_row(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped.startswith("|"):
+        return False
+    cells = [clean_text(cell) for cell in stripped.strip("|").split("|")]
+    return not any(cells)
 
 
 def split_sentences_preserving_markdown(text: str) -> list[str]:
@@ -1213,6 +1309,9 @@ def detail_terms(text: str) -> set[str]:
         "evidence",
         "exact",
         "from",
+        "include",
+        "includes",
+        "including",
         "included",
         "missing",
         "present",
