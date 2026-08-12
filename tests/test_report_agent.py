@@ -207,6 +207,44 @@ No cited source markers were used.
         self.assertIn("Vision Transformers use image patches.", normalized)
         self.assertNotIn("Evidence Gap", normalized)
 
+    def test_normalize_final_report_rewrites_topic_citation_to_matching_source(self):
+        report = """# Topic
+
+## Executive Summary
+Linformer reduces self-attention complexity [2].
+
+## References
+[2] https://arxiv.org/pdf/2010.11929
+"""
+        sources = [
+            {"index": 2, "url": "https://arxiv.org/pdf/2010.11929", "title": "ViT"},
+            {"index": 22, "url": "https://arxiv.org/pdf/2006.04768", "title": "Linformer"},
+        ]
+
+        normalized = normalize_final_report(report, sources)
+
+        self.assertIn("Linformer reduces self-attention complexity [22].", normalized)
+        self.assertIn("[22] https://arxiv.org/pdf/2006.04768", normalized)
+        self.assertNotIn("[2] https://arxiv.org/pdf/2010.11929", normalized)
+
+    def test_normalize_final_report_removes_unsupported_topic_citation_line(self):
+        report = """# Topic
+
+## Executive Summary
+Attention has applications in many modalities.
+Conformer combines convolution and self-attention for speech [8].
+
+## References
+[8] https://arxiv.org/pdf/2009.06732
+"""
+        sources = [{"index": 8, "url": "https://arxiv.org/pdf/2009.06732", "title": "Efficient Transformers"}]
+
+        normalized = normalize_final_report(report, sources)
+
+        self.assertIn("Attention has applications in many modalities.", normalized)
+        self.assertNotIn("Conformer", normalized)
+        self.assertNotIn("[8]", normalized)
+
     def test_normalize_final_report_trims_incomplete_section_tail(self):
         report = """# Topic
 
@@ -401,7 +439,7 @@ No cited source markers were used.
 This report covers the available evidence.
 
 ## Evidence Gaps
-These gaps are noted for completeness; the report includes all verifiable information from the supplied evidence.
+These gaps are acknowledged to avoid overstating unsupported details.
 
 ## References
 No cited source markers were used.
