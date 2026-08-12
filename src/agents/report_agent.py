@@ -25,7 +25,7 @@ DEFAULT_REPORT_DIAGNOSTICS_CHARS = 1200
 DEFAULT_REPORT_MEMORY_EVIDENCE_CHARS = 3600
 DEFAULT_REPORT_COVERAGE_BRIEF_CHARS = 2400
 DEFAULT_REPORT_EVIDENCE_PACKET_CHARS = 3600
-REPORT_REPAIR_MAX_ATTEMPTS = 0
+DEFAULT_REPORT_MIN_QUESTION_SECTION_WORDS = 30
 
 
 class ReportAgent:
@@ -134,21 +134,16 @@ class ReportAgent:
             prompt=single_prompt,
         )
         estimated_token_cap = report_generation_token_cap()
-        report, repair_count, report_issues = finalize_report(
-            client=client,
-            model=self.model,
+        report, report_issues = finalize_report(
             report=report,
-            objective=objective,
-            output_format=output_format_text,
             synthesis=synthesis,
             evidence_text=evidence_text,
-            source_text=source_text,
-            missing_evidence_text=missing_evidence_text,
             sources=sources,
-            report_max_tokens=min(max(1200, self.max_tokens), DEFAULT_REPORT_AGENT_MAX_TOKENS),
-            report_context_chars=min(self.max_context_chars, DEFAULT_REPORT_SINGLE_PROMPT_CHARS),
         )
         missing_sub_questions = missing_sub_question_coverage(report, planner_questions)
+        if missing_sub_questions:
+            labels = ", ".join(short_issue_label(question, 80) for question in missing_sub_questions[:3])
+            raise ValueError(f"report_agent produced invalid report: report does not cover planner sub-questions: {labels}")
         return {
             "objective": objective,
             "output_format": output_format_text,
@@ -162,7 +157,7 @@ class ReportAgent:
                 "missing_evidence_constraint_count": missing_evidence_constraint_count(missing_evidence_text),
                 "report_length": len(report),
                 "report_generation_mode": "single",
-                "report_repair_count": repair_count,
+                "report_repair_count": 0,
                 "report_issues": report_issues,
                 "report_missing_sub_questions": missing_sub_questions,
                 "report_retry_queries": rewrite_missing_sub_question_queries(objective, missing_sub_questions),
@@ -213,14 +208,16 @@ Generation requirements:
 - Include a clear title.
 - Include an executive summary under the exact heading "## Executive Summary".
 - Write a detailed technical report, not a short summary.
-- For every major topic and planner sub-question, explain the concept in detail from the provided synthesis and evidence: what it is, how it works, why it matters, and any supported equations, metrics, limitations, or examples.
-- Include technical sections that match the objective, synthesis, and requested output format.
-- Answer every planner sub-question explicitly using the available evidence.
+- Build the main body as one "##" section per planner sub-question, in the same order as the Report section outline.
+- For every planner sub-question, explain the concept in prose first: what it is, how it works, why it matters, and the evidence-backed details.
+- Do not make the report equation-heavy. Include equations only when the planner sub-question asks for a formula, equation, math, mathematical formulation, score function, or core formulation.
+- If a planner sub-question does not ask for equations, summarize any math briefly in prose and focus on applications, architecture, benchmarks, limitations, comparisons, or implementation details as requested.
+- Answer every planner sub-question explicitly using the available evidence; do not let the executive summary be the only coverage for a topic.
 - Prefer concrete definitions, structured comparisons, measurements, examples, and implementation details when supported by synthesis or supporting chunks.
 - Use synthesis-agent notes and supporting chunks as the only factual basis; do not fill gaps from model prior knowledge.
 - Explain important technical terms or notation when applicable, and use tables when they make comparisons clearer.
 - Include exact technical details only when they are supported by synthesis or supporting chunks.
-- Include supported equations, API signatures, and code snippets when they appear in synthesis or supporting chunks.
+- Include supported API signatures and code snippets when they appear in synthesis or supporting chunks.
 - When multiple sources support the same claim, cite primary/official sources first.
 - Treat partial evidence as usable: write the supported part, then place only the unresolved part in "Evidence Gaps".
 - Treat the Planner evidence packet below as the source of truth for covered, partial, and missing topics.
@@ -253,6 +250,9 @@ Source priority:
 
 Planner sub-questions that must be answered:
 {format_planner_questions(planner_questions)}
+
+Report section outline:
+{format_report_section_outline(planner_questions)}
 
 Planner evidence packet:
 {compact_markdown(evidence_packet, DEFAULT_REPORT_EVIDENCE_PACKET_CHARS)}
@@ -301,25 +301,87 @@ def format_planner_questions(questions: Sequence[str]) -> str:
     return "\n".join(f"- {question}" for question in clean_questions)
 
 
+def format_report_section_outline(questions: Sequence[str]) -> str:
+    clean_questions = [clean_text(question) for question in questions if clean_text(question)]
+    if not clean_questions:
+        return "- Use clear sections that directly answer the research objective."
+    lines = []
+    for index, question in enumerate(clean_questions, start=1):
+        equation_policy = (
+            "include supported equations"
+            if question_requests_equations(question)
+            else "use prose; avoid equations unless essential to the answer"
+        )
+        lines.append(f"## {index}. {short_issue_label(question, 100)}")
+        lines.append(f"   - Explain the topic in detail from evidence; {equation_policy}.")
+    return "\n".join(lines)
+
+
+def question_requests_equations(question: str) -> bool:
+    lowered = clean_text(question).lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "equation",
+            "formula",
+            "mathematical",
+            "math",
+            "formulation",
+            "score function",
+            "core formulation",
+        )
+    )
+
+
 def missing_sub_question_coverage(report: str, planner_questions: Sequence[str]) -> list[str]:
     """Return planner questions whose specific terms are not reflected in the report."""
 
     questions = [clean_text(question) for question in planner_questions if clean_text(question)]
     if not questions:
         return []
-    report_terms = detail_terms(report)
     common_terms = common_question_terms(questions)
-    question_terms = {"what", "when", "where", "which", "whose", "why", "does", "used"}
+    question_terms = {"what", "when", "where", "which", "whose", "why", "does", "used", "have", "been", "e.g", "eg"}
     missing = []
+    has_sections = bool(h2_sections(report))
     for question in questions:
         terms = [term for term in detail_terms(question) if term not in common_terms and term not in question_terms]
         if not terms:
             continue
-        overlap_count = sum(1 for term in set(terms) if report_has_question_term(report_terms, term))
-        required_overlap = 1
-        if overlap_count < required_overlap:
+        section_text = best_question_section_text(report, terms)
+        if not section_text:
+            missing.append(question)
+            continue
+        section_terms = detail_terms(section_text)
+        named_terms = named_topic_candidates_from_text(question)
+        overlap_count = sum(1 for term in set(terms) if report_has_question_term(section_terms, term))
+        required_overlap = min(2, len(set(terms))) if has_sections else 1
+        too_short = has_sections and meaningful_word_count(section_text) < DEFAULT_REPORT_MIN_QUESTION_SECTION_WORDS
+        missing_named_terms = has_sections and any(not topic_in_text(term, section_text) for term in named_terms)
+        if overlap_count < required_overlap or too_short or missing_named_terms:
             missing.append(question)
     return missing
+
+
+def best_question_section_text(report: str, terms: Sequence[str]) -> str:
+    sections = h2_sections(report)
+    if not sections:
+        report_terms = detail_terms(report)
+        return report if any(report_has_question_term(report_terms, term) for term in terms) else ""
+    best_text = ""
+    best_score = 0
+    for heading, section_text in sections:
+        if normalized_heading(heading) in {"executive summary", "references", "evidence gaps"}:
+            continue
+        section_terms = detail_terms(f"{heading} {section_text}")
+        score = sum(1 for term in set(terms) if report_has_question_term(section_terms, term))
+        if score > best_score:
+            best_score = score
+            best_text = section_text
+    return best_text if best_score else ""
+
+
+def meaningful_word_count(text: str) -> int:
+    return len(re.findall(r"\b[A-Za-z][A-Za-z0-9-]*\b", strip_markdown_markup(text)))
 
 
 def report_has_question_term(report_terms: set[str], term: str) -> bool:
@@ -815,50 +877,20 @@ def compact_markdown(value: Any, max_chars: int) -> str:
 
 
 def finalize_report(
-    client: Any,
-    model: str,
     report: str,
-    objective: str,
-    output_format: str,
     synthesis: str,
     evidence_text: str,
-    source_text: str,
-    missing_evidence_text: str,
     sources: Sequence[dict[str, Any]],
-    report_max_tokens: int,
-    report_context_chars: int,
-) -> tuple[str, int, list[str]]:
+) -> tuple[str, list[str]]:
     if not clean_text(report):
         raise ValueError("report_agent produced empty report")
 
     repaired = normalize_report_for_validation(report, sources, evidence_text, synthesis=synthesis)
     issues = report_quality_issues(repaired, evidence_text, sources=sources)
-    total_repair_count = 0
-    for _ in range(REPORT_REPAIR_MAX_ATTEMPTS):
-        if not issues:
-            break
-        repaired, repair_count, issues = repair_report_if_needed(
-            client=client,
-            model=model,
-            report=repaired,
-            objective=objective,
-            output_format=output_format,
-            synthesis=synthesis,
-            evidence_text=evidence_text,
-            source_text=source_text,
-            missing_evidence_text=missing_evidence_text,
-            sources=sources,
-            max_tokens=report_max_tokens,
-            max_context_chars=report_context_chars,
-        )
-        total_repair_count += repair_count
-        repaired = normalize_report_for_validation(repaired, sources, evidence_text, synthesis=synthesis)
-        issues = report_quality_issues(repaired, evidence_text, sources=sources)
-
     blocking_issues = hard_report_issues(issues)
     if blocking_issues:
         raise ValueError(f"report_agent produced invalid report: {'; '.join(blocking_issues)}")
-    return repaired, total_repair_count, issues
+    return repaired, issues
 
 
 def hard_report_issues(issues: Sequence[str]) -> list[str]:
@@ -876,31 +908,10 @@ def normalize_report_for_validation(
     resolved_evidence_text = covered_synthesis_signal_text(synthesis, evidence_text)
     normalized = normalize_final_report(report, sources)
     normalized = remove_weak_implementation_api_sections(normalized)
-    normalized = ensure_supported_api_details(normalized, resolved_evidence_text)
     normalized = remove_unsupported_named_topic_lines(normalized, resolved_evidence_text, sources)
     normalized = remove_resolved_evidence_gap_rows(normalized, resolved_evidence_text)
-    cleaned = remove_conflicting_missing_evidence_statements(normalized, resolved_evidence_text)
-    normalized = normalize_final_report(cleaned, sources)
-    normalized = remove_weak_implementation_api_sections(normalized)
-    normalized = ensure_supported_api_details(normalized, resolved_evidence_text)
-    normalized = remove_unsupported_named_topic_lines(normalized, resolved_evidence_text, sources)
-    normalized = remove_resolved_evidence_gap_rows(normalized, resolved_evidence_text)
-    return remove_conflicting_missing_evidence_statements(normalized, resolved_evidence_text)
-
-
-def ensure_supported_api_details(report: str, evidence_text: str) -> str:
-    """Add a compact API section when supported API identifiers were omitted."""
-
-    if not evidence_has_api_signal(evidence_text) or evidence_has_api_signal(report):
-        return report
-    items = supported_api_items(evidence_text)
-    if not items:
-        return report
-    lines = ["## Implementation APIs"]
-    for api_name, marker in items[:6]:
-        citation = f" [{marker}]" if marker else ""
-        lines.append(f"- `{api_name}` is present in the supporting evidence{citation}.")
-    return append_section_before_references(report, "\n".join(lines))
+    normalized = remove_conflicting_missing_evidence_statements(normalized, resolved_evidence_text)
+    return normalize_final_report(normalized, sources)
 
 
 def covered_synthesis_signal_text(synthesis: str, evidence_text: str) -> str:
@@ -937,22 +948,6 @@ def covered_synthesis_table_signal(line: str) -> str:
     return signal
 
 
-def supported_api_items(text: str) -> list[tuple[str, str]]:
-    items = []
-    seen = set()
-    for line in clean_markdown(text).splitlines():
-        marker_match = re.search(r"\[(\d+)\]", line)
-        marker = marker_match.group(1) if marker_match else ""
-        for match in attention_api_matches(line):
-            api_name = match.group(0).rstrip(".")
-            key = api_name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append((api_name, marker))
-    return items
-
-
 def remove_weak_implementation_api_sections(report: str) -> str:
     """Drop API sections that only contain incidental helper APIs."""
 
@@ -969,15 +964,6 @@ def remove_weak_implementation_api_sections(report: str) -> str:
             continue
         del lines[start:end]
     return clean_markdown("\n".join(lines))
-
-
-def append_section_before_references(report: str, section: str) -> str:
-    lines = clean_markdown(report).splitlines()
-    for index, line in enumerate(lines):
-        if is_references_heading(line):
-            return clean_markdown("\n".join([*lines[:index], "", section, "", *lines[index:]]))
-    return clean_markdown(f"{report}\n\n{section}")
-
 
 def remove_conflicting_missing_evidence_statements(report: str, evidence_text: str) -> str:
     """Drop missing-evidence sentences contradicted by supplied evidence."""
@@ -1148,81 +1134,6 @@ def table_row_missing_claim(line: str) -> bool:
     )
 
 
-def repair_report_if_needed(
-    client: Any,
-    model: str,
-    report: str,
-    objective: str,
-    output_format: str,
-    synthesis: str,
-    evidence_text: str,
-    source_text: str,
-    missing_evidence_text: str,
-    sources: Sequence[dict[str, Any]],
-    max_tokens: int,
-    max_context_chars: int,
-) -> tuple[str, int, list[str]]:
-    """Run one model repair pass for report-level validation issues."""
-
-    repaired = normalize_citation_markers(report)
-    repair_count = 0
-    issues = report_quality_issues(repaired, evidence_text, sources=sources)
-    if not issues:
-        return repaired, repair_count, issues
-
-    repair_prompt = f"""Research objective:
-{objective}
-
-Requested output format:
-{output_format}
-
-Current report:
-{repaired}
-
-Detected report issues:
-{format_issue_list(issues)}
-
-Synthesis-agent notes:
-{synthesis}
-
-Missing-evidence constraints:
-{missing_evidence_text}
-
-Supporting evidence chunks:
-{evidence_text}
-
-Available sources:
-{source_text}
-
-Repair the report.
-Requirements:
-- Return only the corrected Markdown report.
-- Keep the report detailed and technical.
-- Remove stale missing-evidence statements when supporting evidence now contains the detail.
-- Remove exact formulas, examples, numbers, or complexity notation from sentences that say those details are missing or unsupported.
-- If a concrete detail appears in supporting evidence, it may be included with a citation.
-- Do not invent unsupported details.
-- Preserve unresolved Missing-evidence constraints in a brief "Evidence Gaps" section instead of writing unsupported facts.
-- Keep only source markers from Available sources.
-- Remove or replace unavailable source markers using only the Available sources and supporting evidence.
-- Do not include section-level References blocks.
-- End with a References section mapping used source markers to URLs."""
-
-    candidate, _ = groq_chat_text(
-        client=client,
-        model=model,
-        system_prompt="You repair technical reports for evidence consistency, citation validity, and completeness.",
-        user_prompt=repair_prompt,
-        max_tokens=max_tokens,
-        max_context_chars=max_context_chars,
-    )
-    if clean_text(candidate):
-        repaired = candidate
-        repair_count += 1
-    issues = report_quality_issues(repaired, evidence_text, sources=sources)
-    return repaired, repair_count, issues
-
-
 def report_quality_issues(
     report: str,
     evidence_text: str,
@@ -1278,20 +1189,12 @@ def unsupported_named_topic_mentions(
     evidence_text: str,
     sources: Sequence[dict[str, Any]],
 ) -> list[str]:
-    evidence_haystack = clean_text(
-        " ".join(
-            [
-                evidence_text,
-                " ".join(f"{source.get('title', '')} {source.get('url', '')}" for source in sources if isinstance(source, dict)),
-            ]
-        )
-    ).lower()
-    unsupported = []
-    for topic in report_named_topic_candidates(report):
-        if topic_in_text(topic, evidence_haystack):
-            continue
-        unsupported.append(topic)
-    return dedupe_preserve_order(unsupported)
+    evidence_haystack = evidence_topic_text(evidence_text, sources)
+    return [
+        topic
+        for topic in report_named_topic_candidates(report)
+        if not topic_in_text(topic, evidence_haystack)
+    ]
 
 
 def remove_unsupported_named_topic_lines(
@@ -1301,9 +1204,17 @@ def remove_unsupported_named_topic_lines(
 ) -> str:
     unsupported = set(unsupported_named_topic_mentions(report, evidence_text, sources))
     lines = []
+    in_evidence_gaps = False
     for line in clean_markdown(report).splitlines():
+        if line.startswith("## "):
+            in_evidence_gaps = normalized_heading(line.lstrip("#").strip()) == "evidence gaps"
         text = strip_markdown_markup(line)
-        if unsupported_inference_line(text) or any(topic_in_text(topic, text) for topic in unsupported):
+        if unsupported_inference_line(text):
+            continue
+        if re.match(r"^#{2,3}\s+", line):
+            lines.append(line)
+            continue
+        if not in_evidence_gaps and any(topic_in_text(topic, text) for topic in unsupported):
             continue
         lines.append(line)
     return clean_markdown("\n".join(lines))
@@ -1323,29 +1234,36 @@ def unsupported_inference_line(text: str) -> bool:
 
 
 def report_named_topic_candidates(report: str) -> list[str]:
-    """Extract likely named methods/models from generated prose."""
+    """Extract likely named methods/models from repeated mentions and table rows."""
 
     counts: dict[str, int] = {}
-    table_topics: set[str] = set()
+    table_candidates: set[str] = set()
+    in_evidence_gaps = False
     for line in strip_all_references_blocks(clean_markdown(report)).splitlines():
-        if not clean_text(line) or line.lstrip().startswith("#"):
+        if line.startswith("## "):
+            in_evidence_gaps = normalized_heading(line.lstrip("#").strip()) == "evidence gaps"
+        text = clean_text(strip_markdown_markup(line))
+        if not text or line.lstrip().startswith("#") or in_evidence_gaps:
             continue
-        is_table_row = line.strip().startswith("|") and "---" not in line
-        for sentence in re.split(r"(?<=[.!?])\s+", strip_markdown_markup(line)):
-            if not named_topic_context(sentence):
-                continue
-            for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)?(?:\s+[A-Z][A-Za-z0-9]+)?\b", sentence):
-                candidate = clean_text(match.group(0))
-                if supported_named_topic_candidate(candidate):
-                    key = candidate.lower()
-                    counts[key] = counts.get(key, 0) + 1
-                    if is_table_row:
-                        table_topics.add(key)
+        if line.strip().startswith("|") and "---" not in line:
+            table_candidates.update(named_topic_candidates_from_text(line))
+        if named_topic_context(text):
+            for candidate in named_topic_candidates_from_text(text):
+                counts[candidate] = counts.get(candidate, 0) + 1
     return [
         topic
-        for topic, count in counts.items()
-        if count > 1 or topic in table_topics or distinctive_named_topic(topic)
+        for topic in dedupe_preserve_order([*table_candidates, *counts])
+        if topic in table_candidates or counts.get(topic, 0) > 1 or distinctive_named_topic(topic)
     ]
+
+
+def evidence_topic_text(evidence_text: str, sources: Sequence[dict[str, Any]]) -> str:
+    source_text = " ".join(
+        f"{source.get('title', '')} {source.get('url', '')}"
+        for source in sources
+        if isinstance(source, dict)
+    )
+    return clean_text(f"{evidence_text} {source_text}").lower()
 
 
 def named_topic_context(text: str) -> bool:
@@ -1372,14 +1290,13 @@ def named_topic_context(text: str) -> bool:
     )
 
 
-def supported_named_topic_candidate(text: str) -> bool:
-    value = clean_text(text)
-    lowered = value.lower()
-    if lowered in named_topic_stopwords():
-        return False
-    if len(value) < 4:
-        return False
-    return bool(distinctive_named_topic(value) or re.fullmatch(r"[A-Z][a-z]{3,}(?:\s+[A-Z][a-z]{3,})?", value))
+def named_topic_candidates_from_text(text: str) -> list[str]:
+    candidates = []
+    for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)?(?:\s+[A-Z][A-Za-z0-9]+)?\b", strip_markdown_markup(text)):
+        candidate = clean_text(match.group(0))
+        if len(candidate) >= 4 and candidate.lower() not in named_topic_stopwords():
+            candidates.append(candidate.lower())
+    return dedupe_preserve_order(candidates)
 
 
 def distinctive_named_topic(text: str) -> bool:
@@ -1399,6 +1316,11 @@ def named_topic_stopwords() -> set[str]:
         "section",
         "table",
         "figure",
+        "field",
+        "value",
+        "complete",
+        "broken",
+        "row",
         "detail",
         "details",
         "reference",
@@ -1435,6 +1357,7 @@ def named_topic_stopwords() -> set[str]:
         "starting",
         "modern",
         "while",
+        "what",
         "this",
         "proposed",
         "each",
@@ -1860,10 +1783,6 @@ def normalize_detail_term(token: str) -> str:
     if value.endswith("s") and len(value) > 5:
         return value[:-1]
     return value
-
-
-def format_issue_list(issues: Sequence[str]) -> str:
-    return "\n".join(f"- {clean_text(issue)}" for issue in issues if clean_text(issue)) or "- No issues."
 
 
 def format_sources(sources: Sequence[Any]) -> str:
