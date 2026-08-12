@@ -8,6 +8,7 @@ from src.agents.report_agent import (
     markdown_completion_issues,
     format_evidence_coverage_brief,
     format_memory_signal_evidence,
+    format_planner_evidence_packet,
     missing_evidence_constraints,
     report_context_gap_items,
     report_context_gap_queries,
@@ -79,6 +80,85 @@ Supported claim [1].
         constraints = missing_evidence_constraints(synthesis)
 
         self.assertEqual(constraints, ["Benchmark: Exact scores are missing."])
+
+    def test_format_planner_evidence_packet_marks_supported_questions_covered(self):
+        report_context = {
+            "supporting_chunks": [
+                {
+                    "source_index": 7,
+                    "url": "https://arxiv.org/pdf/1409.0473",
+                    "title": "Bahdanau attention",
+                    "content": "The context vector c_i is computed as a weighted sum c_i = sum_j alpha_ij h_j, where alpha_ij is computed with softmax from the alignment model e_ij.",
+                }
+            ]
+        }
+        sources = [{"index": 7, "url": "https://arxiv.org/pdf/1409.0473", "title": "Bahdanau attention"}]
+
+        packet = format_planner_evidence_packet(
+            report_context,
+            ["What are the equations behind Bahdanau additive attention?"],
+            sources,
+        )
+
+        self.assertIn("Status: Covered", packet)
+        self.assertIn("Allowed Evidence Gaps: none", packet)
+        self.assertIn("[7]", packet)
+
+    def test_format_planner_evidence_packet_marks_missing_subtopics(self):
+        report_context = {
+            "supporting_chunks": [
+                {
+                    "source_index": 8,
+                    "url": "https://docs.pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html",
+                    "title": "PyTorch MultiheadAttention",
+                    "content": "torch.nn.MultiheadAttention implements multi-head attention with embed_dim and num_heads.",
+                }
+            ]
+        }
+        sources = [
+            {
+                "index": 8,
+                "url": "https://docs.pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html",
+                "title": "PyTorch MultiheadAttention",
+            }
+        ]
+
+        packet = format_planner_evidence_packet(
+            report_context,
+            ["What are the standard implementations and APIs for attention in PyTorch and TensorFlow?"],
+            sources,
+        )
+
+        self.assertIn("Status: Partial", packet)
+        self.assertIn("Covered topics: pytorch", packet)
+        self.assertIn("Allowed Evidence Gaps: tensorflow", packet)
+
+    def test_normalize_report_for_validation_removes_stale_evidence_status_when_packet_covers_topic(self):
+        report = """# Topic
+
+## Executive Summary
+Bahdanau attention computes a context vector with softmax-normalized alignment weights.
+
+## Bahdanau Attention
+The context vector is computed as \\(c_i = \\sum_j \\alpha_{ij}h_j\\).
+Evidence status: the provided sources do not include the explicit equations.
+
+## References
+[7] https://arxiv.org/pdf/1409.0473
+"""
+        sources = [{"index": 7, "url": "https://arxiv.org/pdf/1409.0473"}]
+        evidence = """Planner evidence packet:
+Question: What are the equations behind Bahdanau additive attention?
+Status: Covered
+Best evidence:
+- [7] The context vector c_i is computed as a weighted sum c_i = sum_j alpha_ij h_j, with alpha_ij computed by softmax from e_ij.
+Allowed Evidence Gaps: none for this question
+"""
+
+        normalized = normalize_report_for_validation(report, sources, evidence)
+
+        self.assertIn("context vector", normalized)
+        self.assertNotIn("do not include the explicit equations", normalized)
 
     def test_report_quality_flags_incomplete_sections(self):
         report = """# Topic
