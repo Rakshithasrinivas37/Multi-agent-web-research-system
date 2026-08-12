@@ -204,6 +204,22 @@ No cited source markers were used.
 
         self.assertIn("report mentions unsupported named topics: longformer", issues)
 
+    def test_report_quality_ignores_sentence_adverbs_as_named_topics(self):
+        report = """# Topic
+
+## Executive Summary
+Formally, attention computes a weighted combination of value vectors.
+Formally, the weights are normalized before the values are combined.
+
+## References
+No cited source markers were used.
+"""
+        evidence = "Attention computes a weighted combination of value vectors."
+
+        issues = report_quality_issues(report, evidence)
+
+        self.assertNotIn("report mentions unsupported named topics: formally", issues)
+
     def test_remove_placeholder_citations_strips_uncited_markers(self):
         report = "The equation appears in the uncited excerpt [uncited]."
 

@@ -1396,6 +1396,14 @@ def named_topic_stopwords() -> set[str]:
         "german",
         "bleu",
         "comparable",
+        "formally",
+        "intuitively",
+        "specifically",
+        "typically",
+        "generally",
+        "overall",
+        "therefore",
+        "however",
     }
 
 
