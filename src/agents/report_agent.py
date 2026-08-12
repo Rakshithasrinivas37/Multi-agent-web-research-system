@@ -238,6 +238,8 @@ Generation requirements:
 - Do not cite sources that are not listed.
 - Before using a citation marker, verify that the cited source title or URL matches the named concept in the sentence.
 - Do not use citation formats like 【1】, footnotes, line citations, or URLs inline.
+- Do not write placeholder citations such as [uncited], [citation needed], or [source needed].
+- Do not add named methods, models, papers, or variants unless they appear in the synthesis notes, supporting evidence, or source list.
 - Do not write placeholder citation markers like [Evidence Gap]; cite a listed source or state the exact unresolved gap in prose.
 - End with a References section mapping only used source markers to source URLs.
 - If evidence is incomplete, mention the limitation instead of inventing details.
@@ -498,6 +500,7 @@ def short_issue_label(text: str, max_length: int = 80) -> str:
 def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> str:
     body = strip_all_references_blocks(report)
     body = remove_evidence_gap_placeholders(body)
+    body = remove_placeholder_citations(body)
     body = remove_unavailable_citation_markers(body, source_index_set(sources))
     body = correct_mismatched_topic_citations(body, sources)
     body = remove_empty_math_blocks(body)
@@ -1247,11 +1250,159 @@ def report_quality_issues(
     if incomplete_sections:
         issues.append(f"report contains incomplete sections: {', '.join(incomplete_sections[:3])}")
     issues.extend(report_contract_issues(report, evidence_text))
+    if placeholder_citation_markers(report):
+        issues.append("report contains placeholder citation markers")
+    unsupported_topics = unsupported_named_topic_mentions(report, evidence_text, sources or [])
+    if unsupported_topics:
+        issues.append(f"report mentions unsupported named topics: {', '.join(unsupported_topics[:5])}")
     if missing_statement_contains_unsupported_detail(report):
         issues.append("report includes exact details inside missing-evidence statements")
     if stale_missing_detail_statement(report, evidence_text):
         issues.append("report may contain stale missing-evidence statements contradicted by supporting evidence")
     return dedupe_preserve_order(issues)
+
+
+def placeholder_citation_markers(text: str) -> list[str]:
+    matches = re.findall(
+        r"\[\s*(uncited|citation needed|source needed|needs citation|no citation)\s*\]",
+        clean_markdown(text),
+        flags=re.IGNORECASE,
+    )
+    return dedupe_preserve_order([clean_text(match).lower() for match in matches])
+
+
+def unsupported_named_topic_mentions(
+    report: str,
+    evidence_text: str,
+    sources: Sequence[dict[str, Any]],
+) -> list[str]:
+    evidence_haystack = clean_text(
+        " ".join(
+            [
+                evidence_text,
+                " ".join(f"{source.get('title', '')} {source.get('url', '')}" for source in sources if isinstance(source, dict)),
+            ]
+        )
+    ).lower()
+    unsupported = []
+    for topic in report_named_topic_candidates(report):
+        if topic_in_text(topic, evidence_haystack):
+            continue
+        unsupported.append(topic)
+    return dedupe_preserve_order(unsupported)
+
+
+def report_named_topic_candidates(report: str) -> list[str]:
+    """Extract likely named methods/models from generated prose."""
+
+    counts: dict[str, int] = {}
+    for line in strip_all_references_blocks(clean_markdown(report)).splitlines():
+        if not clean_text(line) or line.lstrip().startswith("#"):
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", strip_markdown_markup(line)):
+            if not named_topic_context(sentence):
+                continue
+            for match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)?(?:\s+[A-Z][A-Za-z0-9]+)?\b", sentence):
+                candidate = clean_text(match.group(0))
+                if supported_named_topic_candidate(candidate):
+                    key = candidate.lower()
+                    counts[key] = counts.get(key, 0) + 1
+    return [
+        topic
+        for topic, count in counts.items()
+        if count > 1 or distinctive_named_topic(topic)
+    ]
+
+
+def named_topic_context(text: str) -> bool:
+    lowered = clean_text(text).lower()
+    return any(
+        word in lowered
+        for word in (
+            "model",
+            "architecture",
+            "variant",
+            "method",
+            "paper",
+            "mechanism",
+            "attention",
+            "uses",
+            "reduces",
+            "combines",
+            "introduced",
+            "proposed",
+            "implements",
+            "outperforms",
+            "achieves",
+        )
+    )
+
+
+def supported_named_topic_candidate(text: str) -> bool:
+    value = clean_text(text)
+    lowered = value.lower()
+    if lowered in named_topic_stopwords():
+        return False
+    if len(value) < 4:
+        return False
+    return bool(distinctive_named_topic(value) or re.fullmatch(r"[A-Z][a-z]{3,}(?:\s+[A-Z][a-z]{3,})?", value))
+
+
+def distinctive_named_topic(text: str) -> bool:
+    value = clean_text(text)
+    if value.lower() in named_topic_stopwords():
+        return False
+    return bool(re.search(r"[A-Z]", value[1:]) or re.search(r"\d", value) or re.fullmatch(r"[A-Z]{2,}s?", value))
+
+
+def named_topic_stopwords() -> set[str]:
+    return {
+        "attention",
+        "evidence",
+        "references",
+        "summary",
+        "executive summary",
+        "section",
+        "table",
+        "figure",
+        "source",
+        "sources",
+        "api",
+        "apis",
+        "model",
+        "models",
+        "method",
+        "methods",
+        "architecture",
+        "variant",
+        "variants",
+        "transformer",
+        "neural",
+        "language",
+        "image",
+        "translation",
+        "classification",
+        "benchmark",
+        "benchmarks",
+        "starting",
+        "modern",
+        "while",
+        "this",
+        "proposed",
+        "each",
+        "task",
+        "self",
+        "transformers",
+        "english",
+        "german",
+        "bleu",
+        "comparable",
+    }
+
+
+def topic_in_text(topic: str, text: str) -> bool:
+    pattern = re.escape(topic).replace(r"\ ", r"\s+")
+    return bool(re.search(rf"\b{pattern}\b", clean_markdown(text), flags=re.IGNORECASE))
 
 
 def report_contract_issues(report: str, evidence_text: str) -> list[str]:
@@ -1418,6 +1569,25 @@ def remove_evidence_gap_placeholders(markdown: str) -> str:
 
     text = clean_markdown(markdown)
     text = re.sub(r"\s*\[\s*[-–—]*\s*Evidence\s+Gap\s*[-–—]*\s*\]", "", text, flags=re.IGNORECASE)
+    return clean_markdown(text)
+
+
+def remove_placeholder_citations(markdown: str) -> str:
+    """Remove non-source citation placeholders from generated Markdown."""
+
+    text = clean_markdown(markdown)
+    text = re.sub(
+        r"\s*\[\s*(?:uncited|citation needed|source needed|needs citation|no citation)\s*\]",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\s+(?:and reproduced )?in (?:the )?uncited excerpt\.?",
+        ".",
+        text,
+        flags=re.IGNORECASE,
+    )
     return clean_markdown(text)
 
 

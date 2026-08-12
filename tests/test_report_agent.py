@@ -16,6 +16,7 @@ from src.agents.report_agent import (
     normalize_final_report,
     normalize_report_for_validation,
     remove_conflicting_missing_evidence_statements,
+    remove_placeholder_citations,
     remove_unavailable_citation_markers,
     report_generation_token_cap,
     report_quality_issues,
@@ -173,6 +174,44 @@ No cited source markers were used.
         issues = report_quality_issues(report, "")
 
         self.assertIn("report contains incomplete sections: Executive Summary", issues)
+
+    def test_report_quality_flags_placeholder_citations(self):
+        report = """# Topic
+
+## Executive Summary
+Luong attention uses multiplicative scoring [uncited].
+
+## References
+No cited source markers were used.
+"""
+
+        issues = report_quality_issues(report, "")
+
+        self.assertIn("report contains placeholder citation markers", issues)
+
+    def test_report_quality_flags_named_topics_absent_from_evidence(self):
+        report = """# Topic
+
+## Executive Summary
+Longformer uses sparse attention for long documents.
+Longformer reduces memory for long inputs.
+
+## References
+No cited source markers were used.
+"""
+        evidence = "Evidence discusses Transformer and Linformer only."
+
+        issues = report_quality_issues(report, evidence)
+
+        self.assertIn("report mentions unsupported named topics: longformer", issues)
+
+    def test_remove_placeholder_citations_strips_uncited_markers(self):
+        report = "The equation appears in the uncited excerpt [uncited]."
+
+        cleaned = remove_placeholder_citations(report)
+
+        self.assertNotIn("[uncited]", cleaned)
+        self.assertNotIn("uncited excerpt", cleaned.lower())
 
     def test_report_quality_flags_incomplete_h3_sections(self):
         report = """# Topic
