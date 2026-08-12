@@ -2,7 +2,6 @@ import unittest
 
 from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
-    ensure_supported_api_details,
     format_source_priority_guidance,
     hard_report_issues,
     markdown_completion_issues,
@@ -826,7 +825,7 @@ No cited source markers were used.
         self.assertNotIn("PyTorch API details are absent", cleaned)
         self.assertIn("TensorFlow API details are absent", cleaned)
 
-    def test_ensure_supported_api_details_adds_omitted_api_section(self):
+    def test_report_quality_flags_omitted_api_details(self):
         report = """# Topic
 
 ## Executive Summary
@@ -837,26 +836,9 @@ This report summarizes implementation evidence.
 """
         evidence = "[1] Evidence: torch.nn.MultiheadAttention supports multi-head attention."
 
-        updated = ensure_supported_api_details(report, evidence)
+        issues = report_quality_issues(report, evidence)
 
-        self.assertIn("## Implementation APIs", updated)
-        self.assertIn("`torch.nn.MultiheadAttention`", updated)
-        self.assertIn("[1]", updated)
-
-    def test_ensure_supported_api_details_ignores_incidental_torch_helpers(self):
-        report = """# Topic
-
-## Executive Summary
-This report summarizes evidence.
-
-## References
-No cited source markers were used.
-"""
-        evidence = "Example setup uses torch.manual_seed, torch.nn.Embedding, and torch.Size."
-
-        updated = ensure_supported_api_details(report, evidence)
-
-        self.assertNotIn("## Implementation APIs", updated)
+        self.assertIn("report omits supported API details", issues)
 
     def test_normalize_report_for_validation_removes_weak_implementation_api_section(self):
         report = """# Topic
