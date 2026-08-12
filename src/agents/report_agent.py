@@ -24,6 +24,7 @@ DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
 DEFAULT_REPORT_DIAGNOSTICS_CHARS = 1200
 DEFAULT_REPORT_MEMORY_EVIDENCE_CHARS = 3600
 DEFAULT_REPORT_COVERAGE_BRIEF_CHARS = 2400
+DEFAULT_REPORT_EVIDENCE_PACKET_CHARS = 3600
 REPORT_REPAIR_MAX_ATTEMPTS = 0
 
 
@@ -84,9 +85,18 @@ class ReportAgent:
         if memory_evidence_text:
             evidence_text = clean_markdown(f"Memory evidence signals:\n{memory_evidence_text}\n\n{evidence_text}")
         evidence_text = remove_unavailable_citation_markers(evidence_text, available_source_indexes)
+        planner_questions = [clean_text(question) for question in report_context.get("planner_questions", []) or []]
+        evidence_packet = format_planner_evidence_packet(
+            report_context=report_context,
+            planner_questions=planner_questions,
+            sources=sources,
+            citation_aliases=citation_aliases,
+        )
+        if evidence_packet:
+            evidence_text = clean_markdown(f"Planner evidence packet:\n{evidence_packet}\n\n{evidence_text}")
         missing_evidence_text = format_missing_evidence_constraints(synthesis)
         coverage_brief = format_evidence_coverage_brief(
-            planner_questions=[clean_text(question) for question in report_context.get("planner_questions", []) or []],
+            planner_questions=planner_questions,
             synthesis=synthesis,
             evidence_text=evidence_text,
             missing_evidence_text=missing_evidence_text,
@@ -97,12 +107,12 @@ class ReportAgent:
         diagnostics = compact_markdown(report_context.get("diagnostics", {}), max_chars=DEFAULT_REPORT_DIAGNOSTICS_CHARS)
         client = Groq()
         output_format_text = clean_text(output_format) or "report"
-        planner_questions = [clean_text(question) for question in report_context.get("planner_questions", []) or []]
         single_prompt = build_single_report_prompt(
             objective=objective,
             output_format=output_format_text,
             citation_policy=citation_policy,
             planner_questions=planner_questions,
+            evidence_packet=evidence_packet,
             coverage_brief=coverage_brief,
             synthesis=synthesis,
             missing_evidence_text=missing_evidence_text,
@@ -180,6 +190,7 @@ def build_single_report_prompt(
     output_format: str,
     citation_policy: str,
     planner_questions: Sequence[str],
+    evidence_packet: str,
     coverage_brief: str,
     synthesis: str,
     missing_evidence_text: str,
@@ -212,6 +223,10 @@ Generation requirements:
 - Include supported equations, API signatures, and code snippets when they appear in synthesis or supporting chunks.
 - When multiple sources support the same claim, cite primary/official sources first.
 - Treat partial evidence as usable: write the supported part, then place only the unresolved part in "Evidence Gaps".
+- Treat the Planner evidence packet below as the source of truth for covered, partial, and missing topics.
+- If the Planner evidence packet marks a topic as Covered, write the supported answer directly and do not repeat missing/partial statements from synthesis for that topic.
+- If the Planner evidence packet marks a topic as Partial, write the supported details first and put only the exact missing subtopic in Evidence Gaps.
+- If the Planner evidence packet marks a topic as Missing, mention it only in Evidence Gaps.
 - Reconcile Missing-evidence constraints against Supporting evidence chunks before writing.
 - If supporting chunks contain a detail that synthesis previously marked missing, include the supported detail and do not say it is missing.
 - Do not generalize a missing detail to a broader topic; include supported parts and name only the exact unsupported detail.
@@ -237,6 +252,9 @@ Source priority:
 Planner sub-questions that must be answered:
 {format_planner_questions(planner_questions)}
 
+Planner evidence packet:
+{compact_markdown(evidence_packet, DEFAULT_REPORT_EVIDENCE_PACKET_CHARS)}
+
 Evidence coverage brief:
 {compact_markdown(coverage_brief, DEFAULT_REPORT_COVERAGE_BRIEF_CHARS)}
 
@@ -253,7 +271,7 @@ Synthesis-agent notes:
 Retrieval diagnostics:
 {diagnostics}
 
-Generate the final report using only the synthesis-agent notes, supporting evidence chunks, and available sources above."""
+Generate the final report using the Planner evidence packet and Supporting evidence chunks as primary truth. Use synthesis-agent notes only as secondary organization context."""
 
 
 def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, str]:
@@ -1512,6 +1530,8 @@ def report_missing_sentences(text: str) -> list[str]:
         "not shown",
         "not specified",
         "not contain",
+        "do not include",
+        "does not include",
         "not reproduced",
         "cannot be cited",
         "cannot be supplied",
@@ -1521,6 +1541,8 @@ def report_missing_sentences(text: str) -> list[str]:
         "no precise citation",
         "no details",
         "no direct citation",
+        "no direct equation",
+        "no direct equations",
         "no direct source",
         "no evidence",
         "no source",
@@ -1763,6 +1785,191 @@ def format_memory_signal_evidence(
         lines.append(line)
         used_chars += len(line)
     return "\n".join(dedupe_preserve_order(lines))
+
+
+def format_planner_evidence_packet(
+    report_context: dict[str, Any],
+    planner_questions: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+    citation_aliases: dict[int, int] | None = None,
+) -> str:
+    """Build a compact source-backed coverage map for final report generation."""
+
+    questions = [clean_text(question) for question in planner_questions if clean_text(question)]
+    if not questions:
+        return ""
+    items = planner_evidence_items(report_context, sources, citation_aliases or {})
+    all_evidence_text = clean_markdown("\n".join(item["text"] for item in items))
+    lines = [
+        "Use this packet as the source of truth. Covered topics must be answered directly; do not repeat stale missing-evidence notes for them.",
+    ]
+    used_chars = len(lines[0])
+    for question in questions:
+        expected_topics = expected_question_topics(question)
+        covered_topics = [
+            topic
+            for topic in expected_topics
+            if topic_has_evidence(topic, all_evidence_text, sources)
+        ]
+        missing_topics = [topic for topic in expected_topics if topic not in covered_topics]
+        matches = ranked_question_evidence(question, items, expected_topics)[:2]
+        if matches:
+            status = "Partial" if missing_topics else "Covered"
+        elif covered_topics:
+            status = "Partial" if missing_topics else "Covered"
+        else:
+            status = "Missing"
+        block_lines = [
+            f"Question: {question}",
+            f"Status: {status}",
+        ]
+        if covered_topics:
+            block_lines.append(f"Covered topics: {', '.join(covered_topics)}")
+        if matches:
+            block_lines.append("Best evidence:")
+            block_lines.extend(f"- {item['marker']} {item['text']}" for item in matches)
+        if missing_topics:
+            block_lines.append(f"Allowed Evidence Gaps: {', '.join(missing_topics)}")
+        elif status == "Covered":
+            block_lines.append("Allowed Evidence Gaps: none for this question")
+        block = "\n".join(block_lines)
+        if used_chars + len(block) > DEFAULT_REPORT_EVIDENCE_PACKET_CHARS:
+            break
+        lines.extend(["", block])
+        used_chars += len(block)
+    return clean_markdown("\n".join(lines))
+
+
+def planner_evidence_items(
+    report_context: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+    citation_aliases: dict[int, int],
+) -> list[dict[str, Any]]:
+    items = []
+    seen = set()
+    for chunk in list(report_context.get("supporting_chunks") or []) + list(report_context.get("retrieved_chunks") or []):
+        if not isinstance(chunk, dict):
+            continue
+        source_index = chunk.get("source_index")
+        if not isinstance(source_index, int):
+            source_index = chunk.get("index")
+        if isinstance(source_index, int):
+            source_index = citation_aliases.get(source_index, source_index)
+        text = focused_signal_snippet(chunk.get("content"), max_chars=360)
+        if not text:
+            text = clean_text(chunk.get("content"))[:360]
+        add_planner_evidence_item(items, seen, source_index, text, chunk.get("title"), chunk.get("url"))
+
+    source_index_by_url = {
+        normalize_source_key(clean_text(source.get("url"))): citation_aliases.get(source.get("index"), source.get("index"))
+        for source in sources
+        if isinstance(source, dict) and isinstance(source.get("index"), int) and clean_text(source.get("url"))
+    }
+    for source in browser_sources(report_context.get("browser_results", [])):
+        source_index = source_index_by_url.get(normalize_source_key(clean_text(source.get("url"))))
+        for snippet in high_signal_snippets(source.get("full_content") or source.get("content_preview"), limit=4):
+            add_planner_evidence_item(items, seen, source_index, snippet, source.get("title"), source.get("url"))
+    return items
+
+
+def add_planner_evidence_item(
+    items: list[dict[str, Any]],
+    seen: set[str],
+    source_index: Any,
+    text: Any,
+    title: Any = "",
+    url: Any = "",
+) -> None:
+    snippet = clean_text(text)
+    if not snippet:
+        return
+    marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
+    key = clean_text(f"{marker} {snippet}").lower()
+    if key in seen:
+        return
+    seen.add(key)
+    items.append(
+        {
+            "marker": marker,
+            "source_index": source_index if isinstance(source_index, int) else None,
+            "title": clean_text(title),
+            "url": clean_text(url),
+            "text": snippet[:420],
+            "terms": detail_terms(f"{title} {url} {snippet}"),
+            "priority": signal_priority(snippet),
+        }
+    )
+
+
+def ranked_question_evidence(
+    question: str,
+    items: Sequence[dict[str, Any]],
+    expected_topics: Sequence[str],
+) -> list[dict[str, Any]]:
+    question_terms = detail_terms(question)
+    ranked = []
+    for item in items:
+        overlap = len(question_terms & set(item.get("terms", set())))
+        topic_bonus = sum(2 for topic in expected_topics if evidence_text_has_topic(clean_text(item.get("text")), topic))
+        score = overlap + topic_bonus + int(item.get("priority", 0))
+        if score <= 1:
+            continue
+        ranked.append((score, item))
+    return [item for _, item in sorted(ranked, key=lambda value: value[0], reverse=True)]
+
+
+def expected_question_topics(question: str) -> list[str]:
+    text = clean_text(question).lower()
+    topic_aliases = {
+        "bahdanau": ("bahdanau", "additive"),
+        "luong": ("luong", "multiplicative"),
+        "transformer": ("transformer", "self-attention", "multi-head", "vaswani"),
+        "pytorch": ("pytorch", "torch"),
+        "tensorflow": ("tensorflow", "tf.keras", "keras"),
+        "glue": ("glue", "superglue"),
+        "wmt": ("wmt", "bleu"),
+        "vit/imagenet": ("vit", "vision transformer", "imagenet"),
+        "linformer": ("linformer",),
+        "performer": ("performer",),
+        "sparse attention": ("sparse",),
+        "relative positional attention": ("relative positional", "positional"),
+    }
+    topics = [
+        topic
+        for topic, aliases in topic_aliases.items()
+        if any(alias in text for alias in aliases)
+    ]
+    return dedupe_preserve_order(topics)
+
+
+def topic_has_evidence(topic: str, evidence_text: str, sources: Sequence[dict[str, Any]]) -> bool:
+    if evidence_text_has_topic(evidence_text, topic):
+        return True
+    signals = packet_topic_signals(topic)
+    return any(source_matches_topic(source, signals) for source in sources)
+
+
+def evidence_text_has_topic(text: str, topic: str) -> bool:
+    value = clean_text(text).lower()
+    return any(signal in value for signal in packet_topic_signals(topic))
+
+
+def packet_topic_signals(topic: str) -> tuple[str, ...]:
+    signals = {
+        "bahdanau": ("bahdanau", "1409.0473", "additive attention"),
+        "luong": ("luong", "1508.04025", "multiplicative attention"),
+        "transformer": ("transformer", "1706.03762", "multi-head", "scaled dot-product"),
+        "pytorch": ("pytorch", "torch.nn.multiheadattention"),
+        "tensorflow": ("tensorflow", "tf.keras", "keras.layers.multiheadattention"),
+        "glue": ("glue", "superglue"),
+        "wmt": ("wmt", "bleu"),
+        "vit/imagenet": ("vision transformer", "2010.11929", "imagenet", "vit"),
+        "linformer": ("linformer",),
+        "performer": ("performer",),
+        "sparse attention": ("sparse attention", "sparse"),
+        "relative positional attention": ("relative positional", "positional bias"),
+    }
+    return signals.get(topic, (topic,))
 
 
 def high_signal_snippets(text: Any, existing_evidence: str = "", limit: int = 6) -> list[str]:
