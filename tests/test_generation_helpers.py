@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from src.rag.generation import (
     audit_synthesis_citations,
+    browser_signal_results,
     precision_retrieval_queries,
     print_synthesis_chunks,
     report_supporting_chunks,
@@ -85,6 +86,29 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertIn("exact equation formula", joined)
         self.assertIn("benchmark table results", joined)
         self.assertIn("official documentation api signature", joined)
+
+    def test_browser_signal_results_promotes_formula_evidence(self):
+        browser_results = [
+            {
+                "sources": [
+                    {
+                        "title": "Primary Paper",
+                        "url": "https://arxiv.org/pdf/1234.56789",
+                        "full_content": (
+                            "Background text. The equation is y = softmax(x) and the benchmark score "
+                            "is 92.1 accuracy on the held-out test set. More surrounding explanation."
+                        ),
+                    }
+                ]
+            }
+        ]
+
+        results = browser_signal_results(browser_results, objective="technical report")
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("equation", results[0].document)
+        self.assertEqual(results[0].metadata["url"], "https://arxiv.org/pdf/1234.56789")
+        self.assertEqual(results[0].metadata["source_quality"], "high_signal_browser")
 
     def test_print_synthesis_chunks_shows_primary_source_after_reranking(self):
         result = RetrievalResult(
