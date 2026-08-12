@@ -482,6 +482,7 @@ def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> st
     body = trim_incomplete_section_tails(body)
     body = remove_empty_sections(body)
     body = remove_incomplete_sections(body)
+    body = remove_empty_evidence_gap_sections(body)
     body = remove_empty_sections(body)
     body = ensure_executive_summary_section(body)
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
@@ -1286,6 +1287,39 @@ def remove_empty_sections(markdown: str) -> str:
     return clean_markdown("\n".join(lines))
 
 
+def remove_empty_evidence_gap_sections(markdown: str) -> str:
+    lines = clean_markdown(markdown).splitlines()
+    for start, level, heading in reversed([
+        (index, len(match.group(1)), line.lstrip("#").strip())
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(#{2,3})\s+", line))
+    ]):
+        if normalized_heading(heading) != "evidence gaps":
+            continue
+        end = section_end_index(lines, start, level)
+        if not evidence_gap_section_has_content(lines[start + 1 : end]):
+            del lines[start:end]
+    return clean_markdown("\n".join(lines))
+
+
+def evidence_gap_section_has_content(lines: Sequence[str]) -> bool:
+    boilerplate_phrases = (
+        "these gaps are noted for completeness",
+        "report includes all verifiable information",
+        "no evidence gaps",
+        "no missing evidence",
+        "no missing-evidence",
+    )
+    for line in lines:
+        text = clean_text(strip_markdown_markup(line)).lower()
+        if not text or re.fullmatch(r"[-*_]{3,}", text):
+            continue
+        if any(phrase in text for phrase in boilerplate_phrases):
+            continue
+        return True
+    return False
+
+
 def remove_empty_math_blocks(markdown: str) -> str:
     """Remove display math blocks that contain no formula content."""
 
@@ -1897,6 +1931,11 @@ def format_supporting_evidence(
 def normalize_citation_markers(text: str) -> str:
     normalized = clean_markdown(text)
     normalized = re.sub(r"【\s*(\d+)(?:[^】]*)?】", r"[\1]", normalized)
+    normalized = re.sub(
+        r"\[\s*(\d+(?:\s*,\s*\d+)+)\s*\]",
+        lambda match: " ".join(f"[{index.strip()}]" for index in match.group(1).split(",")),
+        normalized,
+    )
     normalized = re.sub(r"\[\s*(\d+)\s*\]", r"[\1]", normalized)
     return normalized
 
