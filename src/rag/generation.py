@@ -45,6 +45,7 @@ DEFAULT_REPORT_SOURCE_URL_K = 2
 DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
 DEFAULT_BROWSER_SIGNAL_SOURCES = 6
 DEFAULT_BROWSER_SIGNAL_SNIPPETS = 2
+DEFAULT_BROWSER_SIGNAL_CANDIDATES = 40
 DEFAULT_GAP_RETRIEVAL_TOP_K = 12
 DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
@@ -64,6 +65,20 @@ BROWSER_SIGNAL_PATTERN = re.compile(
     r"api|signature|parameter|argument|class|function|method|"
     r"complexity|memory|runtime|quadratic|linear|o\("
     r")\b"
+)
+BROWSER_FORMULA_SIGNAL_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"\\(?:frac|sum|sqrt|operatorname)|"
+    r"[=∑Σ√αβγδθλµπ]|"
+    r"\b(?:equation|formula|softmax|sqrt|tanh|exp|log|argmax|argmin)\b|"
+    r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^)]{0,80}\)\s*="
+    r")"
+)
+BROWSER_METRIC_SIGNAL_PATTERN = re.compile(
+    r"(?i)\b\d+(?:\.\d+)?\s*(?:%|bleu|rouge|f1|auc|accuracy|precision|recall|ms|s|tokens/s|score)\b"
+)
+BROWSER_API_SIGNAL_PATTERN = re.compile(
+    r"\b[A-Za-z_][A-Za-z0-9_.]*\([^)]{1,120}\)|\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*\b"
 )
 OBJECTIVE_STOPWORDS = {
     "a",
@@ -769,14 +784,28 @@ def browser_result_sources(browser_results: Sequence[Any]) -> list[dict[str, Any
 
 
 def high_signal_browser_snippets(content: str, max_snippets: int = DEFAULT_BROWSER_SIGNAL_SNIPPETS) -> list[str]:
-    snippets = []
+    candidates = []
     for match in BROWSER_SIGNAL_PATTERN.finditer(content):
         snippet = browser_signal_snippet(content, match.start())
         if is_meaningful_evidence(snippet):
-            snippets.append(snippet)
-        if len(snippets) >= max_snippets:
+            candidates.append((browser_signal_score(snippet), match.start(), snippet))
+        if len(candidates) >= DEFAULT_BROWSER_SIGNAL_CANDIDATES:
             break
-    return dedupe_preserve_order(snippets)
+    ranked = sorted(candidates, key=lambda item: (-item[0], item[1]))
+    return dedupe_preserve_order([snippet for _, _, snippet in ranked])[:max_snippets]
+
+
+def browser_signal_score(snippet: str) -> int:
+    value = clean_text(snippet)
+    score = 0
+    score += min(5, len(BROWSER_FORMULA_SIGNAL_PATTERN.findall(value))) * 4
+    score += min(4, len(BROWSER_METRIC_SIGNAL_PATTERN.findall(value))) * 3
+    score += min(3, len(BROWSER_API_SIGNAL_PATTERN.findall(value))) * 2
+    if re.search(r"(?i)\b(?:equation|formula|definition|defined as|theorem|algorithm)\b", value):
+        score += 3
+    if re.search(r"(?i)\b(?:benchmark|score|accuracy|latency|throughput|cost|complexity)\b", value):
+        score += 2
+    return score
 
 
 def browser_signal_snippet(content: str, position: int, max_chars: int = 900) -> str:
