@@ -221,6 +221,7 @@ Generation requirements:
 - For precise claims, prefer original papers, official docs, academic sources, or authoritative surveys.
 - Do not cite sources that are not listed.
 - Do not use citation formats like 【1】, footnotes, line citations, or URLs inline.
+- Do not write placeholder citation markers like [Evidence Gap]; cite a listed source or state the exact unresolved gap in prose.
 - End with a References section mapping only used source markers to source URLs.
 - If evidence is incomplete, mention the limitation instead of inventing details.
 - Before finalizing, remove contradictions such as saying a detail is missing and then including that detail.
@@ -476,6 +477,7 @@ def short_issue_label(text: str, max_length: int = 80) -> str:
 
 def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> str:
     body = strip_all_references_blocks(report)
+    body = remove_evidence_gap_placeholders(body)
     body = remove_unavailable_citation_markers(body, source_index_set(sources))
     body = remove_empty_math_blocks(body)
     body = remove_malformed_table_rows(body)
@@ -1287,6 +1289,14 @@ def remove_empty_sections(markdown: str) -> str:
     return clean_markdown("\n".join(lines))
 
 
+def remove_evidence_gap_placeholders(markdown: str) -> str:
+    """Remove inline placeholder markers that are not real source citations."""
+
+    text = clean_markdown(markdown)
+    text = re.sub(r"\s*\[\s*[-–—]*\s*Evidence\s+Gap\s*[-–—]*\s*\]", "", text, flags=re.IGNORECASE)
+    return clean_markdown(text)
+
+
 def remove_empty_evidence_gap_sections(markdown: str) -> str:
     lines = clean_markdown(markdown).splitlines()
     for start, level, heading in reversed([
@@ -1964,4 +1974,5 @@ def clean_markdown(value: Any) -> str:
 def strip_thinking_blocks(text: str) -> str:
     """Remove leaked model reasoning blocks before report planning or validation."""
 
-    return re.sub(r"<think\b[^>]*>.*?</think>", "", str(text or ""), flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<think\b[^>]*>.*?</think>", "", str(text or ""), flags=re.IGNORECASE | re.DOTALL)
+    return re.sub(r"<think\b[^>]*>.*$", "", value, flags=re.IGNORECASE | re.DOTALL)

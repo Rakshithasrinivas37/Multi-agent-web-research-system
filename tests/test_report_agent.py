@@ -62,6 +62,13 @@ Supported claim [1].
         self.assertIn("Final evidence.", cleaned)
         self.assertNotIn("private reasoning", cleaned)
 
+    def test_clean_markdown_strips_unclosed_thinking_blocks(self):
+        text = "Useful synthesis.\n<think>private reasoning with stale gap notes"
+
+        cleaned = clean_markdown(text)
+
+        self.assertEqual(cleaned, "Useful synthesis.")
+
     def test_missing_evidence_constraints_ignores_covered_table_rows(self):
         synthesis = """| Requirement | Status | Notes |
 |---|---|---|
@@ -184,6 +191,21 @@ Supported implementation details use two sources [2, 26].
         self.assertIn("[2] https://example.com/two", normalized)
         self.assertIn("[26] https://example.com/twenty-six", normalized)
         self.assertNotIn("[2, 26]", normalized)
+
+    def test_normalize_final_report_removes_evidence_gap_placeholders(self):
+        report = """# Topic
+
+## Executive Summary
+Vision Transformers use image patches [— Evidence Gap —].
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("Vision Transformers use image patches.", normalized)
+        self.assertNotIn("Evidence Gap", normalized)
 
     def test_normalize_final_report_trims_incomplete_section_tail(self):
         report = """# Topic
