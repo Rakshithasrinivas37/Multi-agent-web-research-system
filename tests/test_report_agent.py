@@ -163,6 +163,28 @@ Valid claim [1]. Bad copied marker [9].
         self.assertIn("[1] https://example.com/one", normalized)
         self.assertNotIn("[9]", normalized)
 
+    def test_normalize_final_report_splits_combined_citations(self):
+        report = """# Topic
+
+## Executive Summary
+Supported implementation details use two sources [2, 26].
+
+## References
+[2] https://example.com/two
+[26] https://example.com/twenty-six
+"""
+        sources = [
+            {"index": 2, "url": "https://example.com/two"},
+            {"index": 26, "url": "https://example.com/twenty-six"},
+        ]
+
+        normalized = normalize_final_report(report, sources)
+
+        self.assertIn("[2] [26]", normalized)
+        self.assertIn("[2] https://example.com/two", normalized)
+        self.assertIn("[26] https://example.com/twenty-six", normalized)
+        self.assertNotIn("[2, 26]", normalized)
+
     def test_normalize_final_report_trims_incomplete_section_tail(self):
         report = """# Topic
 
@@ -349,6 +371,41 @@ No cited source markers were used.
 
         self.assertIn("## Executive Summary", normalized)
         self.assertIn("This section explains the available evidence.", normalized)
+
+    def test_normalize_final_report_removes_boilerplate_evidence_gaps(self):
+        report = """# Topic
+
+## Executive Summary
+This report covers the available evidence.
+
+## Evidence Gaps
+These gaps are noted for completeness; the report includes all verifiable information from the supplied evidence.
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertNotIn("## Evidence Gaps", normalized)
+
+    def test_normalize_final_report_keeps_substantive_evidence_gaps(self):
+        report = """# Topic
+
+## Executive Summary
+This report covers the available evidence.
+
+## Evidence Gaps
+- Exact benchmark scores were not present in the supplied evidence.
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertIn("## Evidence Gaps", normalized)
+        self.assertIn("Exact benchmark scores", normalized)
 
     def test_report_generation_token_caps_stay_under_budget(self):
         self.assertLessEqual(
