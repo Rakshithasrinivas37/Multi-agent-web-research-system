@@ -279,7 +279,7 @@ def synthesis_node(state: ResearchState) -> ResearchState:
     synthesis_errors = []
     for attempt in range(1, DEFAULT_AGENT_RESPONSE_ATTEMPTS + 1):
         try:
-            synthesis = synthesis_agent.synthesize(plan)
+            synthesis = synthesis_agent.synthesize(plan, browser_results=state.get("browser_results", []))
             synthesis_errors = validate_synthesis_payload(synthesis, plan)
         except Exception as error:
             synthesis_errors = [clean_text(error)]
