@@ -19,6 +19,7 @@ from src.rag.indexing import (
     DEFAULT_COLLECTION_NAME,
     SentenceTransformerEmbeddingFunction,
     chunk_id,
+    clear_embedding_model_memory,
     get_collection,
     parent_content_for_id,
     select_embedding_device,
@@ -102,6 +103,9 @@ class LangChainSentenceTransformerEmbeddings:
 
     def embed_query(self, text: str) -> list[float]:
         return self.embedding_function([text])[0]
+
+    def close(self) -> None:
+        self.embedding_function.close()
 
 
 def hybrid_retrieve(
@@ -564,10 +568,11 @@ def semantic_search(
     where: Optional[dict[str, Any]] = None,
     embedding_device: str = "",
 ) -> list[RetrievalResult]:
+    embeddings = LangChainSentenceTransformerEmbeddings(device=embedding_device)
     vector_store = get_langchain_chroma(
         chroma_path=chroma_path,
         collection_name=collection_name,
-        embedding_device=embedding_device,
+        embedding_function=embeddings,
     )
     try:
         results = vector_store.similarity_search_with_relevance_scores(
@@ -577,6 +582,8 @@ def semantic_search(
         )
     except Exception:
         return []
+    finally:
+        embeddings.close()
 
     rows = []
     for index, (document, score) in enumerate(results):
@@ -1000,6 +1007,7 @@ def rerank_results(
         )
 
     reranked = sorted(reranked, key=lambda item: item.score, reverse=True)
+    clear_embedding_model_memory()
     return reranked + remainder
 
 
@@ -1120,7 +1128,12 @@ def display_document_preview(document: str, max_chars: int = 700) -> str:
     return preview[:max(80, max_chars)].strip()
 
 
-def get_langchain_chroma(chroma_path: Union[str, Path], collection_name: str, embedding_device: str = "") -> Any:
+def get_langchain_chroma(
+    chroma_path: Union[str, Path],
+    collection_name: str,
+    embedding_device: str = "",
+    embedding_function: Optional[LangChainSentenceTransformerEmbeddings] = None,
+) -> Any:
     try:
         from langchain_chroma import Chroma
     except ImportError as error:
@@ -1132,7 +1145,7 @@ def get_langchain_chroma(chroma_path: Union[str, Path], collection_name: str, em
     return Chroma(
         collection_name=collection_name,
         persist_directory=str(chroma_path),
-        embedding_function=LangChainSentenceTransformerEmbeddings(device=embedding_device),
+        embedding_function=embedding_function or LangChainSentenceTransformerEmbeddings(device=embedding_device),
     )
 
 
