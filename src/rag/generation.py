@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
 from typing import Any, Sequence
 
 from src.agents.change_detection_agent import objective_key
@@ -42,6 +43,8 @@ DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
 DEFAULT_CONTEXT_BLOCK_CHARS = 750
 DEFAULT_REPORT_SOURCE_URL_K = 2
 DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
+DEFAULT_BROWSER_SIGNAL_SOURCES = 6
+DEFAULT_BROWSER_SIGNAL_SNIPPETS = 2
 DEFAULT_GAP_RETRIEVAL_TOP_K = 12
 DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
@@ -53,6 +56,15 @@ DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
 DEFAULT_OBJECTIVE_SCOPE_MAX_KEYS = 6
 URL_PATTERN = re.compile(r"https?://[^\s\])}>\"']+")
 OBJECTIVE_TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
+BROWSER_SIGNAL_PATTERN = re.compile(
+    r"(?i)\b("
+    r"definition|defined\s+as|equation|formula|theorem|algorithm|"
+    r"benchmark|score|accuracy|precision|recall|f1|auc|bleu|rouge|"
+    r"latency|throughput|cost|price|rate|table|"
+    r"api|signature|parameter|argument|class|function|method|"
+    r"complexity|memory|runtime|quadratic|linear|o\("
+    r")\b"
+)
 OBJECTIVE_STOPWORDS = {
     "a",
     "an",
@@ -116,6 +128,7 @@ def synthesize_report_from_research_plan(
     include_retrieved_chunks: bool = False,
     retrieved_chunk_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
     supporting_chunk_count: int = DEFAULT_REPORT_SUPPORTING_CHUNKS,
+    browser_results: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Retrieve with planner-derived queries, then synthesize report-ready notes."""
     objective = clean_text(research_plan.get("objective"))
@@ -183,6 +196,10 @@ def synthesize_report_from_research_plan(
             scan_limit=bm25_scan_limit,
         )
         retrieved_context = merge_retrieved_context(retrieved_context, source_coverage_results)
+
+    browser_signal_context = browser_signal_results(browser_results or [], objective=objective)
+    if browser_signal_context:
+        retrieved_context = merge_retrieved_context(browser_signal_context, retrieved_context)
 
     print_synthesis_chunks(retrieved_context, label="initial")
     synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
@@ -262,6 +279,7 @@ def synthesize_report_from_research_plan(
     payload["objective_scope"] = objective_scope
     payload["planned_source_urls"] = planned_source_urls
     payload["source_coverage_count"] = len(source_coverage_results)
+    payload["browser_signal_count"] = len(browser_signal_context)
     payload["retrieved_count"] = len(retrieved_context)
     payload["citation_policy"] = (
         "Use only the numbered source indexes in sources. Prefer primary papers, "
@@ -692,6 +710,88 @@ def merge_retrieved_context(*groups: Sequence[RetrievalResult]) -> list[Retrieva
             seen_ids.add(result.id)
             merged.append(result)
     return merged
+
+
+def browser_signal_results(browser_results: Sequence[Any], objective: str = "") -> list[RetrievalResult]:
+    """Promote high-signal browser excerpts into synthesis context."""
+
+    results = []
+    seen = set()
+    source_count = 0
+    for source in browser_result_sources(browser_results):
+        url = normalize_source_url(source.get("url"))
+        content = clean_text(source.get("full_content") or source.get("content") or source.get("text"))
+        if not url or not content:
+            continue
+        snippets = high_signal_browser_snippets(content, max_snippets=DEFAULT_BROWSER_SIGNAL_SNIPPETS)
+        if not snippets:
+            continue
+        source_count += 1
+        title = clean_text(source.get("title")) or url
+        for snippet_index, snippet in enumerate(snippets):
+            key = (url, snippet.lower()[:240])
+            if key in seen:
+                continue
+            seen.add(key)
+            digest = hashlib.sha256(f"{url}:{snippet_index}:{snippet}".encode("utf-8")).hexdigest()[:24]
+            results.append(
+                RetrievalResult(
+                    id=f"browser-signal-{digest}",
+                    document=snippet,
+                    metadata={
+                        "title": title,
+                        "url": url,
+                        "source_url": url,
+                        "source_type": clean_text(source.get("source_type")) or "browser",
+                        "source_quality": "high_signal_browser",
+                        "query_contexts": clean_text(source.get("query_context") or objective),
+                    },
+                    score=1.0,
+                    semantic_score=0.0,
+                    bm25_score=0.0,
+                    authority_score=0.4,
+                )
+            )
+        if source_count >= DEFAULT_BROWSER_SIGNAL_SOURCES:
+            break
+    return results
+
+
+def browser_result_sources(browser_results: Sequence[Any]) -> list[dict[str, Any]]:
+    sources = []
+    for result in browser_results or []:
+        if not isinstance(result, dict):
+            continue
+        for source in result.get("sources", []) or []:
+            if isinstance(source, dict):
+                sources.append(source)
+    return sources
+
+
+def high_signal_browser_snippets(content: str, max_snippets: int = DEFAULT_BROWSER_SIGNAL_SNIPPETS) -> list[str]:
+    snippets = []
+    for match in BROWSER_SIGNAL_PATTERN.finditer(content):
+        snippet = browser_signal_snippet(content, match.start())
+        if is_meaningful_evidence(snippet):
+            snippets.append(snippet)
+        if len(snippets) >= max_snippets:
+            break
+    return dedupe_preserve_order(snippets)
+
+
+def browser_signal_snippet(content: str, position: int, max_chars: int = 900) -> str:
+    start = max(0, position - max_chars // 2)
+    end = min(len(content), position + max_chars // 2)
+    snippet = clean_text(content[start:end])
+    if start > 0:
+        sentence_start = re.search(r"(?<=[.!?])\s+[A-Z0-9`(]", snippet)
+        if sentence_start:
+            snippet = snippet[sentence_start.end() - 1 :]
+    if end < len(content):
+        sentence_end = list(re.finditer(r"[.!?](?=\s+[A-Z0-9`(]|$)", snippet))
+        if sentence_end:
+            snippet = snippet[: sentence_end[-1].end()]
+    return clean_text(snippet[:max_chars])
 
 
 def generate_answer_from_context(
@@ -1487,6 +1587,7 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "invalid_citation_count": len(payload.get("citation_audit", {}).get("invalid_source_indexes", [])),
         "cited_source_count": len(payload.get("citation_audit", {}).get("valid_referenced_source_indexes", [])),
         "source_coverage_count": payload.get("source_coverage_count", 0),
+        "browser_signal_count": payload.get("browser_signal_count", 0),
         "gap_retrieval_query_count": len(payload.get("gap_retrieval_queries", [])),
         "gap_query_model": payload.get("gap_query_model", ""),
         "gap_query_source": payload.get("gap_query_source", ""),
