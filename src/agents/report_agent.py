@@ -202,6 +202,7 @@ Generation requirements:
 - Include a clear title.
 - Include an executive summary under the exact heading "## Executive Summary".
 - Write a detailed technical report, not a short summary.
+- For every major topic and planner sub-question, explain the concept in detail from the provided synthesis and evidence: what it is, how it works, why it matters, and any supported equations, metrics, limitations, or examples.
 - Include technical sections that match the objective, synthesis, and requested output format.
 - Answer every planner sub-question explicitly using the available evidence.
 - Prefer concrete definitions, structured comparisons, measurements, examples, and implementation details when supported by synthesis or supporting chunks.
@@ -220,6 +221,7 @@ Generation requirements:
 - Cite claims using only plain source markers from Available sources, exactly like [1], [2], [3].
 - For precise claims, prefer original papers, official docs, academic sources, or authoritative surveys.
 - Do not cite sources that are not listed.
+- Before using a citation marker, verify that the cited source title or URL matches the named concept in the sentence.
 - Do not use citation formats like 【1】, footnotes, line citations, or URLs inline.
 - Do not write placeholder citation markers like [Evidence Gap]; cite a listed source or state the exact unresolved gap in prose.
 - End with a References section mapping only used source markers to source URLs.
@@ -479,6 +481,7 @@ def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> st
     body = strip_all_references_blocks(report)
     body = remove_evidence_gap_placeholders(body)
     body = remove_unavailable_citation_markers(body, source_index_set(sources))
+    body = correct_mismatched_topic_citations(body, sources)
     body = remove_empty_math_blocks(body)
     body = remove_malformed_table_rows(body)
     body = trim_incomplete_section_tails(body)
@@ -649,6 +652,106 @@ def missing_reference_entries_for_used_citations(report: str, available_indexes:
     used = {index for index in citation_markers(body) if index in available_indexes}
     references = reference_entry_indexes(report)
     return sorted(used - references)
+
+
+def correct_mismatched_topic_citations(markdown: str, sources: Sequence[dict[str, Any]]) -> str:
+    """Repair cited topic markers when another available source clearly matches."""
+
+    lines = []
+    for line in clean_markdown(markdown).splitlines():
+        updated = line
+        remove_line = False
+        for topic, signals in topic_source_signals().items():
+            updated, unsupported = correct_topic_citation_line(updated, topic, signals, sources)
+            if unsupported:
+                remove_line = True
+                break
+        if not remove_line:
+            lines.append(updated)
+    return clean_markdown("\n".join(lines))
+
+
+def correct_topic_citation_line(
+    line: str,
+    topic: str,
+    signals: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+) -> tuple[str, bool]:
+    pattern = topic_citation_pattern(topic)
+    if not pattern.search(line):
+        return line, False
+    matching_index = matching_topic_source_index(sources, signals)
+    source_by_index = source_by_index_map(sources)
+
+    def replace(match: re.Match[str]) -> str:
+        index = int(match.group("index"))
+        source = source_by_index.get(index)
+        if source_matches_topic(source, signals):
+            return match.group(0)
+        if matching_index:
+            return f"{match.group('prefix')}[{matching_index}]"
+        return ""
+
+    updated = pattern.sub(replace, line)
+    if matching_index:
+        return updated, False
+    return updated, clean_text(updated) != clean_text(line)
+
+
+def topic_citation_mismatches(report: str, sources: Sequence[dict[str, Any]]) -> list[str]:
+    mismatches = []
+    source_by_index = source_by_index_map(sources)
+    for line in clean_markdown(report).splitlines():
+        for topic, signals in topic_source_signals().items():
+            for match in topic_citation_pattern(topic).finditer(line):
+                index = int(match.group("index"))
+                if not source_matches_topic(source_by_index.get(index), signals):
+                    mismatches.append(f"{topic} [{index}]")
+    return dedupe_preserve_order(mismatches)
+
+
+def topic_citation_pattern(topic: str) -> re.Pattern[str]:
+    topic_pattern = re.escape(topic).replace(r"\ ", r"\s+")
+    boundary = r"\b(?:linformer|performer|conformer|bahdanau|luong|deberta|vision\s+transformer|vit)\b"
+    return re.compile(
+        rf"(?P<prefix>\b{topic_pattern}\b(?:(?!{boundary}).){{0,160}}?)\[(?P<index>\d+)\]",
+        flags=re.IGNORECASE,
+    )
+
+
+def topic_source_signals() -> dict[str, tuple[str, ...]]:
+    return {
+        "bahdanau": ("bahdanau", "1409.0473"),
+        "conformer": ("conformer", "2005.08100"),
+        "deberta": ("deberta", "superglue", "syncedreview"),
+        "linformer": ("linformer", "2006.04768"),
+        "luong": ("luong", "1508.04025"),
+        "performer": ("performer", "2009.14794"),
+        "vision transformer": ("vision transformer", "2010.11929", "vit"),
+        "vit": ("vision transformer", "2010.11929", "vit"),
+    }
+
+
+def source_by_index_map(sources: Sequence[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    return {
+        source["index"]: source
+        for source in sources
+        if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+
+
+def matching_topic_source_index(sources: Sequence[dict[str, Any]], signals: Sequence[str]) -> int | None:
+    for source in sources:
+        if source_matches_topic(source, signals) and isinstance(source.get("index"), int):
+            return source["index"]
+    return None
+
+
+def source_matches_topic(source: dict[str, Any] | None, signals: Sequence[str]) -> bool:
+    if not isinstance(source, dict):
+        return False
+    haystack = clean_text(f"{source.get('title', '')} {source.get('url', '')}").lower()
+    return any(signal.lower() in haystack for signal in signals)
 
 
 def reference_entry_indexes(report: str) -> set[int]:
@@ -1119,6 +1222,9 @@ def report_quality_issues(
         missing_reference_entries = missing_reference_entries_for_used_citations(report, source_indexes)
         if missing_reference_entries:
             issues.append(f"report References section is missing cited sources: {format_citation_indexes(missing_reference_entries)}")
+        topic_mismatches = topic_citation_mismatches(report, sources or [])
+        if topic_mismatches:
+            issues.append(f"report cites mismatched sources for named topics: {', '.join(topic_mismatches[:5])}")
     incomplete_sections = incomplete_report_sections(report)
     if incomplete_sections:
         issues.append(f"report contains incomplete sections: {', '.join(incomplete_sections[:3])}")
@@ -1315,6 +1421,8 @@ def remove_empty_evidence_gap_sections(markdown: str) -> str:
 def evidence_gap_section_has_content(lines: Sequence[str]) -> bool:
     boilerplate_phrases = (
         "these gaps are noted for completeness",
+        "these gaps are acknowledged",
+        "avoid overstating unsupported details",
         "report includes all verifiable information",
         "no evidence gaps",
         "no missing evidence",
