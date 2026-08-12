@@ -116,12 +116,20 @@ def clear_embedding_model_memory() -> None:
     except ImportError:
         return
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        if hasattr(torch.cuda, "ipc_collect"):
-            torch.cuda.ipc_collect()
-    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-        torch.mps.empty_cache()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+    try:
+        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if mps_available and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+    except Exception:
+        pass
 
 
 def select_embedding_device(requested_device: str = DEFAULT_EMBEDDING_DEVICE) -> str:
