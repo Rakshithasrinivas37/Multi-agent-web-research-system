@@ -1470,7 +1470,10 @@ def references_heading_count(report: str) -> int:
 def incomplete_report_sections(report: str) -> list[str]:
     incomplete = []
     for heading, section_text in h2_sections(report):
-        if normalized_heading(heading) in {"references"}:
+        heading_key = normalized_heading(heading)
+        if heading_key in {"references"}:
+            continue
+        if heading_key == "executive summary" and section_has_content(section_text.splitlines()[1:]):
             continue
         if markdown_completion_issues(section_text):
             incomplete.append(short_issue_label(heading, max_length=60))

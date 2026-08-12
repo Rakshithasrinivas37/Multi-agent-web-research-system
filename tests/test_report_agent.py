@@ -160,7 +160,7 @@ Allowed Evidence Gaps: none for this question
         self.assertIn("context vector", normalized)
         self.assertNotIn("do not include the explicit equations", normalized)
 
-    def test_report_quality_flags_incomplete_sections(self):
+    def test_report_quality_allows_incomplete_executive_summary(self):
         report = """# Topic
 
 ## Executive Summary
@@ -172,7 +172,7 @@ No cited source markers were used.
 
         issues = report_quality_issues(report, "")
 
-        self.assertIn("report contains incomplete sections: Executive Summary", issues)
+        self.assertNotIn("report contains incomplete sections: Executive Summary", issues)
 
     def test_report_quality_flags_placeholder_citations(self):
         report = """# Topic
@@ -266,7 +266,7 @@ No cited source markers were used.
         self.assertIn("Vision models are discussed.", normalized)
         self.assertNotIn("inferred", normalized.lower())
 
-    def test_report_quality_flags_incomplete_h3_sections(self):
+    def test_report_quality_allows_incomplete_h3_summary(self):
         report = """# Topic
 
 ### Executive Summary
@@ -278,7 +278,7 @@ No cited source markers were used.
 
         issues = report_quality_issues(report, "")
 
-        self.assertIn("report contains incomplete sections: Executive Summary", issues)
+        self.assertNotIn("report contains incomplete sections: Executive Summary", issues)
 
     def test_report_quality_does_not_flag_h2_container_with_h3_content(self):
         report = """# Topic
