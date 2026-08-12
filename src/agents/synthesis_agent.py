@@ -105,7 +105,11 @@ class SynthesisAgent:
             DEFAULT_REPORT_SUPPORTING_CHUNKS,
         )
 
-    def synthesize(self, research_plan: dict[str, Any]) -> dict[str, Any]:
+    def synthesize(
+        self,
+        research_plan: dict[str, Any],
+        browser_results: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """Create report-agent-ready notes from indexed research evidence."""
 
         if not isinstance(research_plan, dict) or not research_plan:
@@ -138,6 +142,7 @@ class SynthesisAgent:
             include_retrieved_chunks=self.include_retrieved_chunks,
             retrieved_chunk_chars=self.retrieved_chunk_chars,
             supporting_chunk_count=self.supporting_chunk_count,
+            browser_results=browser_results or [],
         )
         payload["synthesis_config"] = self.config_summary()
         return payload
