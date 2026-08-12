@@ -213,6 +213,44 @@ No cited source markers were used.
         self.assertNotIn("[uncited]", cleaned)
         self.assertNotIn("uncited excerpt", cleaned.lower())
 
+    def test_normalize_report_removes_unsupported_named_topic_rows(self):
+        report = """# Topic
+
+## Executive Summary
+Linformer is supported.
+
+## Variants
+| Variant | Detail |
+|---|---|
+| Linformer | Low-rank attention. |
+| Longformer | Sliding-window attention. |
+
+## References
+No cited source markers were used.
+"""
+        evidence = "Linformer uses low-rank attention."
+
+        normalized = normalize_report_for_validation(report, [], evidence)
+
+        self.assertIn("Linformer", normalized)
+        self.assertNotIn("Longformer", normalized)
+
+    def test_normalize_report_removes_unsupported_inference_lines(self):
+        report = """# Topic
+
+## Executive Summary
+Vision models are discussed.
+The original paper is not listed but inferred from the repository.
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_report_for_validation(report, [], "Vision models are discussed.")
+
+        self.assertIn("Vision models are discussed.", normalized)
+        self.assertNotIn("inferred", normalized.lower())
+
     def test_report_quality_flags_incomplete_h3_sections(self):
         report = """# Topic
 

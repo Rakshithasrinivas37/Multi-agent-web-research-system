@@ -877,11 +877,13 @@ def normalize_report_for_validation(
     normalized = normalize_final_report(report, sources)
     normalized = remove_weak_implementation_api_sections(normalized)
     normalized = ensure_supported_api_details(normalized, resolved_evidence_text)
+    normalized = remove_unsupported_named_topic_lines(normalized, resolved_evidence_text, sources)
     normalized = remove_resolved_evidence_gap_rows(normalized, resolved_evidence_text)
     cleaned = remove_conflicting_missing_evidence_statements(normalized, resolved_evidence_text)
     normalized = normalize_final_report(cleaned, sources)
     normalized = remove_weak_implementation_api_sections(normalized)
     normalized = ensure_supported_api_details(normalized, resolved_evidence_text)
+    normalized = remove_unsupported_named_topic_lines(normalized, resolved_evidence_text, sources)
     normalized = remove_resolved_evidence_gap_rows(normalized, resolved_evidence_text)
     return remove_conflicting_missing_evidence_statements(normalized, resolved_evidence_text)
 
@@ -1292,13 +1294,43 @@ def unsupported_named_topic_mentions(
     return dedupe_preserve_order(unsupported)
 
 
+def remove_unsupported_named_topic_lines(
+    report: str,
+    evidence_text: str,
+    sources: Sequence[dict[str, Any]],
+) -> str:
+    unsupported = set(unsupported_named_topic_mentions(report, evidence_text, sources))
+    lines = []
+    for line in clean_markdown(report).splitlines():
+        text = strip_markdown_markup(line)
+        if unsupported_inference_line(text) or any(topic_in_text(topic, text) for topic in unsupported):
+            continue
+        lines.append(line)
+    return clean_markdown("\n".join(lines))
+
+
+def unsupported_inference_line(text: str) -> bool:
+    lowered = clean_text(text).lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "not listed but inferred",
+            "inferred from the",
+            "inferred from provided",
+            "not directly provided but inferred",
+        )
+    )
+
+
 def report_named_topic_candidates(report: str) -> list[str]:
     """Extract likely named methods/models from generated prose."""
 
     counts: dict[str, int] = {}
+    table_topics: set[str] = set()
     for line in strip_all_references_blocks(clean_markdown(report)).splitlines():
         if not clean_text(line) or line.lstrip().startswith("#"):
             continue
+        is_table_row = line.strip().startswith("|") and "---" not in line
         for sentence in re.split(r"(?<=[.!?])\s+", strip_markdown_markup(line)):
             if not named_topic_context(sentence):
                 continue
@@ -1307,10 +1339,12 @@ def report_named_topic_candidates(report: str) -> list[str]:
                 if supported_named_topic_candidate(candidate):
                     key = candidate.lower()
                     counts[key] = counts.get(key, 0) + 1
+                    if is_table_row:
+                        table_topics.add(key)
     return [
         topic
         for topic, count in counts.items()
-        if count > 1 or distinctive_named_topic(topic)
+        if count > 1 or topic in table_topics or distinctive_named_topic(topic)
     ]
 
 
@@ -1365,12 +1399,26 @@ def named_topic_stopwords() -> set[str]:
         "section",
         "table",
         "figure",
+        "detail",
+        "details",
+        "reference",
+        "core idea",
+        "typical use",
+        "cases",
+        "number",
+        "dimensionality",
+        "employs",
+        "introduces",
+        "optimizes",
+        "sequence",
         "source",
         "sources",
         "api",
         "apis",
         "model",
         "models",
+        "decoder",
+        "encoder",
         "method",
         "methods",
         "architecture",
