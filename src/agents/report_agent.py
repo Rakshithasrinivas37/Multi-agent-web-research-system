@@ -567,12 +567,14 @@ def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> st
     body = correct_mismatched_topic_citations(body, sources)
     body = remove_empty_math_blocks(body)
     body = remove_malformed_table_rows(body)
+    body = repair_executive_summary_section(body)
     body = trim_incomplete_section_tails(body)
     body = remove_empty_sections(body)
     body = remove_incomplete_sections(body)
     body = remove_empty_evidence_gap_sections(body)
     body = remove_empty_sections(body)
     body = ensure_executive_summary_section(body)
+    body = repair_executive_summary_section(body)
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
 
 
@@ -594,6 +596,32 @@ def ensure_executive_summary_section(markdown: str) -> str:
     insert_at = executive_summary_insert_index(remaining)
     updated = [*remaining[:insert_at], "", *summary_lines, "", *remaining[insert_at:]]
     return clean_markdown("\n".join(updated))
+
+
+def repair_executive_summary_section(markdown: str) -> str:
+    """Make the summary validation-safe without changing report facts."""
+
+    lines = clean_markdown(markdown).splitlines()
+    bounds = find_summary_section_bounds(lines)
+    if not bounds:
+        return markdown
+    start, end = bounds
+    body_lines = lines[start + 1 : end]
+    if not section_has_content(body_lines):
+        lines[start + 1 : end] = [fallback_executive_summary(lines[:start] + lines[end:])]
+        return clean_markdown("\n".join(lines))
+
+    last_index = last_content_line_index(lines, start, end)
+    if last_index > start and markdown_completion_issues("\n".join(lines[start:last_index + 1])) == ["section appears to stop mid-sentence"]:
+        lines[last_index] = complete_sentence(lines[last_index])
+    return clean_markdown("\n".join(lines))
+
+
+def complete_sentence(line: str) -> str:
+    text = line.rstrip()
+    if not text or text[-1] in ".!?)]}`'\"":
+        return text
+    return f"{text}."
 
 
 def has_h2_executive_summary(markdown: str) -> bool:
@@ -638,7 +666,7 @@ def fallback_executive_summary(lines: Sequence[str]) -> str:
         text = clean_text(strip_markdown_markup(line))
         if not text or line.startswith("#") or line.startswith("|") or re.fullmatch(r"[-*_]{3,}", line.strip()):
             continue
-        return text[:500].rstrip()
+        return complete_sentence(text[:500].rstrip())
     return "This report summarizes the available evidence for the research objective."
 
 

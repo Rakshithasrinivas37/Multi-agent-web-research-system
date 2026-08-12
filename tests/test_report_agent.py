@@ -415,7 +415,7 @@ No cited source markers were used.
         normalized = normalize_final_report(report, [])
 
         self.assertIn("This sentence is complete.", normalized)
-        self.assertNotIn("This final generated line stops with", normalized)
+        self.assertIn("This final generated line stops with.", normalized)
 
     def test_normalize_final_report_trims_incomplete_table_tail(self):
         report = """# Topic
@@ -587,6 +587,24 @@ No cited source markers were used.
 
         self.assertIn("## Executive Summary", normalized)
         self.assertIn("This section explains the available evidence.", normalized)
+
+    def test_normalize_final_report_repairs_incomplete_executive_summary_tail(self):
+        report = """# Topic
+
+## Executive Summary
+This report explains the supported evidence but the summary stops with
+
+## Details
+This section explains the available evidence.
+
+## References
+No cited source markers were used.
+"""
+
+        normalized = normalize_final_report(report, [])
+
+        self.assertEqual(report_quality_issues(normalized, ""), [])
+        self.assertIn("This report explains the supported evidence but the summary stops with.", normalized)
 
     def test_normalize_final_report_removes_boilerplate_evidence_gaps(self):
         report = """# Topic
