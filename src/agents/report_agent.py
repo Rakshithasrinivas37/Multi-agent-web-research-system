@@ -162,9 +162,15 @@ Synthesis notes:
 
 Write the final Markdown report.
 
+Grounding requirement (strict — read this first):
+- Use ONLY the information in "Available sources," "Supporting evidence," and "Synthesis notes" above. Treat this as the complete and only knowledge you have access to.
+- Do not use any fact, figure, date, name, definition, or background knowledge from your own training. Even facts you are confident are true must not be included unless they appear in the retrieved context above.
+- If the retrieved context is silent on something a sub-question asks about, do not fill the gap from general knowledge. State the gap explicitly in that section and in Limitations/Open Questions instead.
+- If you find yourself writing a sentence with no source to cite for it, delete the sentence or move it to Limitations/Open Questions as a stated gap — do not soften it into an uncited claim.
+
 Coverage requirement (mandatory):
 - Every planner sub-question above must map to exactly one section under heading 3, using the suggested topic heading or a clearer equivalent.
-- Each of those sections must explicitly answer its sub-question — not just mention the topic. If the evidence only partially answers a sub-question, answer what is supported and name the missing piece in that section AND in Limitations/Open Questions.
+- Each of those sections must explicitly answer its sub-question using only the retrieved context — not just mention the topic. If the evidence only partially answers a sub-question, answer what is supported and name the missing piece in that section AND in Limitations/Open Questions.
 - Do not merge two sub-questions into one section unless they are genuinely the same question asked two ways — if you do this, say so explicitly.
 - Do not add sections that don't map to a sub-question, except the fixed schema sections above.
 
@@ -180,14 +186,14 @@ Writing rules:
 - Keep the Cross-cutting Analysis section genuinely cross-cutting: identify tensions, agreements, or patterns across sections rather than repeating section content.
 
 Before writing References, run this self-check silently and correct any failures before output — do not show this checklist in the final report:
-- [ ] Every planner sub-question has a matching section that directly answers it
+- [ ] Every claim in the report can be traced to a specific line in the retrieved context — none came from outside knowledge
+- [ ] Every planner sub-question has a matching section that directly answers it using only retrieved context
 - [ ] Every claim has an inline citation to a real, relevant source
 - [ ] No invented facts, figures, or attributions
 - [ ] Every evidence gap is named specifically (not "some information was missing" — state exactly what is missing and for which sub-question)
 - [ ] Executive Summary accurately reflects the sections below it, including any major limitations
 
 End with ## References, listing only sources actually cited in the report, numbered to match inline markers."""
-
 
 def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, str]:
     print(f"Generating single report with model {model}...")
