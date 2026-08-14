@@ -53,6 +53,14 @@ Supported [1]. Unsupported [9].
 
         self.assertIn("report uses unavailable citations: [2]", issues)
 
+    def test_report_quality_flags_placeholder_source_markers(self):
+        issues = report_quality_issues(
+            "Claim [— benchmark evidence missing].\n\n## References\n[1] https://example.com",
+            [{"index": 1, "url": "https://example.com"}],
+        )
+
+        self.assertIn("report contains placeholder or non-source citation markers", issues)
+
     def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
         markdown = "### ## 1. Definition\nText."
 

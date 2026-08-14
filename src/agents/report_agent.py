@@ -438,6 +438,10 @@ def normalize_markdown_headings(markdown: str) -> str:
     return "\n".join(lines)
 
 
+def has_placeholder_source_marker(text: str) -> bool:
+    return bool(re.search(r"\[\s*(?:[—-]|uncited|citation needed|source needed)[^\]]*\]", text, flags=re.IGNORECASE))
+
+
 def unsupported_benchmark_metrics(report: str, evidence_text: str) -> list[str]:
     evidence = strip_markdown(evidence_text).lower()
     if not evidence:
