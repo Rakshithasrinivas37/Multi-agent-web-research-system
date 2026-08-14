@@ -419,6 +419,8 @@ def report_quality_issues(
         return ["report is empty"]
     if not any(is_references_heading(line) for line in text.splitlines()):
         issues.append("report must include a References section")
+    if has_placeholder_source_marker(text):
+        issues.append("report contains placeholder or non-source citation markers")
     source_indexes = source_index_set(sources or [])
     invalid = unavailable_citation_markers(report, source_indexes)
     if invalid:

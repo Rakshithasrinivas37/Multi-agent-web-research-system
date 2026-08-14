@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
+import json
 from typing import Any, Sequence
 
 from src.agents.change_detection_agent import objective_key
@@ -31,6 +33,7 @@ from src.tools.text_utils import clean_text
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
 DEFAULT_GAP_QUERY_MODEL = "llama-3.1-8b-instant"
+DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL = "qwen/qwen3.6-27b"
 DEFAULT_MAX_CONTEXT_CHARS = 18000
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_REPORT_MAX_TOKENS = 1400
@@ -42,15 +45,46 @@ DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
 DEFAULT_CONTEXT_BLOCK_CHARS = 750
 DEFAULT_REPORT_SOURCE_URL_K = 2
 DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
+DEFAULT_BROWSER_SIGNAL_SOURCES = 6
+DEFAULT_BROWSER_SIGNAL_SNIPPETS = 2
+DEFAULT_BROWSER_SIGNAL_CANDIDATES = 40
 DEFAULT_GAP_RETRIEVAL_TOP_K = 12
 DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
+DEFAULT_PRECISION_QUERY_LIMIT = 8
+DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
+DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 30
+DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 3
+DEFAULT_SYNTHESIS_MAX_CHUNKS = 18
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
 DEFAULT_OBJECTIVE_SCOPE_MAX_KEYS = 6
 URL_PATTERN = re.compile(r"https?://[^\s\])}>\"']+")
 OBJECTIVE_TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
+BROWSER_SIGNAL_PATTERN = re.compile(
+    r"(?i)\b("
+    r"definition|defined\s+as|equation|formula|theorem|algorithm|"
+    r"benchmark|score|accuracy|precision|recall|f1|auc|bleu|rouge|"
+    r"latency|throughput|cost|price|rate|table|"
+    r"api|signature|parameter|argument|class|function|method|"
+    r"complexity|memory|runtime|quadratic|linear|o\("
+    r")\b"
+)
+BROWSER_FORMULA_SIGNAL_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"\\(?:frac|sum|sqrt|operatorname)|"
+    r"[=∑Σ√αβγδθλµπ]|"
+    r"\b(?:equation|formula|softmax|sqrt|tanh|exp|log|argmax|argmin)\b|"
+    r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^)]{0,80}\)\s*="
+    r")"
+)
+BROWSER_METRIC_SIGNAL_PATTERN = re.compile(
+    r"(?i)\b\d+(?:\.\d+)?\s*(?:%|bleu|rouge|f1|auc|accuracy|precision|recall|ms|s|tokens/s|score)\b"
+)
+BROWSER_API_SIGNAL_PATTERN = re.compile(
+    r"\b[A-Za-z_][A-Za-z0-9_.]*\([^)]{1,120}\)|\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*\b"
+)
 OBJECTIVE_STOPWORDS = {
     "a",
     "an",
@@ -85,6 +119,16 @@ def rag_generation_model(model: str | None = None) -> str:
     )
 
 
+def sub_question_query_rewrite_model(model: str | None = None) -> str:
+    """Model used only for rewriting planner sub-questions into retrieval queries."""
+
+    return (
+        clean_text(os.environ.get("RAG_SUBQUESTION_QUERY_MODEL"))
+        or DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL
+        or rag_generation_model(model)
+    )
+
+
 def synthesize_report_from_research_plan(
     research_plan: dict[str, Any],
     chroma_path: str = DEFAULT_CHROMA_PATH,
@@ -114,6 +158,7 @@ def synthesize_report_from_research_plan(
     include_retrieved_chunks: bool = False,
     retrieved_chunk_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
     supporting_chunk_count: int = DEFAULT_REPORT_SUPPORTING_CHUNKS,
+    browser_results: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Retrieve with planner-derived queries, then synthesize report-ready notes."""
     objective = clean_text(research_plan.get("objective"))
@@ -136,15 +181,20 @@ def synthesize_report_from_research_plan(
         collection_name=collection_name,
     )
     allowed_history_keys = objective_scope["history_keys"]
-    rewritten_query = rewrite_query_from_planner_queries(
-        objective=objective,
-        queries=queries,
+    llm_query_result = llm_sub_question_retrieval_query_result(
+        research_plan=research_plan,
         model=model,
-    ) if rewrite_query else ""
-    if print_rewritten_query and rewritten_query:
-        print("Rewritten retrieval query:")
-        print(rewritten_query)
-    retrieval_queries = [rewritten_query] if rewritten_query else queries
+    ) if rewrite_query else empty_llm_query_result()
+    llm_sub_question_queries = llm_query_result["queries"]
+    if print_rewritten_query and llm_sub_question_queries:
+        print("LLM rewritten sub-question retrieval queries:")
+        for query in llm_sub_question_queries:
+            print(f"- {query}")
+    rewritten_query = "\n".join(llm_sub_question_queries)
+    precision_queries = precision_retrieval_queries(research_plan, objective=objective)
+    retrieval_queries = dedupe_preserve_order(
+        llm_sub_question_queries + queries + precision_queries
+    )
     retrieved_context = multi_query_hybrid_retrieve(
         queries=retrieval_queries,
         chroma_path=chroma_path,
@@ -179,12 +229,19 @@ def synthesize_report_from_research_plan(
         )
         retrieved_context = merge_retrieved_context(retrieved_context, source_coverage_results)
 
+    browser_signal_context = browser_signal_results(browser_results or [], objective=objective)
+    if browser_signal_context:
+        retrieved_context = merge_retrieved_context(browser_signal_context, retrieved_context)
+
     synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
+    planner_questions = planner_sub_questions(research_plan)
+    synthesis_context = select_synthesis_context(retrieved_context, planner_questions)
+    print_synthesis_chunks(synthesis_context, label="initial")
     payload = synthesize_context_for_report(
         objective=objective,
-        retrieved_context=retrieved_context,
+        retrieved_context=synthesis_context,
         synthesis_instruction=synthesis_instruction,
-        planner_questions=planner_sub_questions(research_plan),
+        planner_questions=planner_questions,
         model=model,
         max_context_chars=max_context_chars,
         max_tokens=max_tokens,
@@ -227,11 +284,13 @@ def synthesize_report_from_research_plan(
         if gap_new_chunk_count:
             retrieved_context = retry_context
             gap_retry_count = 1
+            synthesis_context = select_synthesis_context(retrieved_context, planner_questions)
+            print_synthesis_chunks(synthesis_context, label="gap-refresh")
             payload = synthesize_context_for_report(
                 objective=objective,
-                retrieved_context=retrieved_context,
+                retrieved_context=synthesis_context,
                 synthesis_instruction=synthesis_instruction,
-                planner_questions=planner_sub_questions(research_plan),
+                planner_questions=planner_questions,
                 model=model,
                 max_context_chars=max_context_chars,
                 max_tokens=max_tokens,
@@ -239,6 +298,11 @@ def synthesize_report_from_research_plan(
     payload["queries"] = queries
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
+    payload["llm_sub_question_retrieval_queries"] = llm_sub_question_queries
+    payload["llm_sub_question_query_model"] = llm_query_result["model"]
+    payload["llm_sub_question_query_error"] = llm_query_result["error"]
+    payload["llm_sub_question_query_raw_response"] = llm_query_result["raw_response"]
+    payload["precision_retrieval_queries"] = precision_queries
     payload["gap_retrieval_queries"] = gap_queries
     payload["gap_query_model"] = gap_query_plan["model"]
     payload["gap_query_source"] = gap_query_plan["source"]
@@ -254,7 +318,9 @@ def synthesize_report_from_research_plan(
     payload["objective_scope"] = objective_scope
     payload["planned_source_urls"] = planned_source_urls
     payload["source_coverage_count"] = len(source_coverage_results)
+    payload["browser_signal_count"] = len(browser_signal_context)
     payload["retrieved_count"] = len(retrieved_context)
+    payload["synthesis_context_count"] = len(synthesis_context)
     payload["citation_policy"] = (
         "Use only the numbered source indexes in sources. Prefer primary papers, "
         "official documentation, academic sources, and authoritative surveys for "
@@ -281,6 +347,32 @@ def synthesize_report_from_research_plan(
     return payload
 
 
+def print_synthesis_chunks(retrieved_context: Sequence[RetrievalResult], label: str = "initial") -> None:
+    """Print final chunks passed to the synthesis LLM after retrieval/reranking."""
+
+    if os.environ.get("RAG_PRINT_SYNTHESIS_CHUNKS", "1").lower() in {"0", "false", "no"}:
+        return
+    try:
+        limit = int(os.environ.get("RAG_PRINT_SYNTHESIS_CHUNKS_LIMIT", DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT))
+    except ValueError:
+        limit = DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT
+    limit = max(1, limit)
+    print(f"[synthesis] chunks passed to synthesizer after reranking ({label}): {len(retrieved_context)}")
+    for rank, result in enumerate(retrieved_context[:limit], start=1):
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        url = primary_source_url(metadata)
+        title = clean_text(metadata.get("title")) or url or "unknown source"
+        source_kind = "primary/paper" if primary_source_url_like(url) else "secondary"
+        preview = clean_text(display_document_preview(result.document, max_chars=180))
+        rerank_note = f", rerank={result.rerank_score:.3f}" if result.rerank_score else ""
+        print(
+            f"[synthesis] chunk {rank}: score={result.score:.3f}{rerank_note}, "
+            f"{source_kind}, url={url}, title={title}, preview={preview}"
+        )
+    if len(retrieved_context) > limit:
+        print(f"[synthesis] ... {len(retrieved_context) - limit} more chunk(s) not printed")
+
+
 def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     """Build retrieval queries from PlannerAgent output.
 
@@ -294,8 +386,13 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     for sub_question in research_plan.get("sub_questions", []):
         query = clean_text(sub_question)
         if query:
-            details = matching_task_details(query, tasks)
-            sub_question_queries.append(clean_text(f"{query} {details}"))
+            sub_question_queries.extend(
+                sub_question_retrieval_queries(
+                    query,
+                    objective=objective,
+                    task_details=matching_task_details(query, tasks),
+                )
+            )
 
     if sub_question_queries:
         if objective:
@@ -324,6 +421,246 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     return dedupe_preserve_order(queries)
 
 
+def sub_question_retrieval_queries(
+    question: str,
+    objective: str = "",
+    task_details: str = "",
+    max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
+) -> list[str]:
+    """Rewrite one planner sub-question into broad retrieval intents."""
+
+    question = clean_text(question)
+    objective = clean_text(objective)
+    task_details = clean_text(task_details)
+    if not question:
+        return []
+
+    anchor = clean_text(f"{objective} {question}")
+    key_terms = " ".join(query_keywords(question, limit=10))
+    variants = [
+        clean_text(f"{question} {task_details}"),
+        clean_text(f"{objective} {key_terms} overview background concepts methods evidence"),
+        clean_text(f"{anchor} source-backed details examples definitions equations metrics implementation limitations {task_details}"),
+    ]
+    return dedupe_preserve_order(variant[:700] for variant in variants)[: max(1, max_variants)]
+
+
+def llm_sub_question_retrieval_query_result(
+    research_plan: dict[str, Any],
+    model: str | None = None,
+    max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
+) -> dict[str, Any]:
+    """Use the generation model to rewrite planner sub-questions into RAG queries."""
+
+    objective = clean_text(research_plan.get("objective"))
+    questions = planner_sub_questions(research_plan)
+    selected_model = sub_question_query_rewrite_model(model)
+    if not questions:
+        return empty_llm_query_result(model=selected_model)
+    if not os.environ.get("GROQ_API_KEY"):
+        return empty_llm_query_result(model=selected_model, error="GROQ_API_KEY is not set")
+
+    try:
+        from groq import Groq
+    except ImportError as error:
+        return empty_llm_query_result(model=selected_model, error=str(error))
+
+    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
+    prompt = f"""Research objective:
+{objective}
+
+Planner sub-questions and optional task details:
+{format_sub_question_rewrite_items(questions, tasks)}
+
+Rewrite each planner sub-question into 2-3 broad RAG retrieval queries.
+Requirements:
+- Preserve named entities, URLs, model names, datasets, metrics, APIs, equations, and important technical terms.
+- Make each query broad enough for semantic search but still useful for BM25 keyword matching.
+- Include evidence intent words when useful, such as definition, equation, benchmark, implementation, limitation, comparison, or example.
+- Do not answer the question and do not add citations.
+- Never output placeholder text such as "query 1", "query 2", "retrieval query", or "example query".
+- Return JSON only in this shape:
+{{"items":[{{"sub_question":"...","queries":["query 1","query 2"]}}]}}"""
+
+    try:
+        response = create_chat_completion_with_retries(
+            Groq(),
+            model=selected_model,
+            temperature=0,
+            max_tokens=900,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You rewrite research planner sub-questions into high-recall RAG retrieval queries. Return JSON only.",
+                },
+                {"role": "user", "content": prompt[:6000]},
+            ],
+        )
+    except Exception as error:  # pragma: no cover - exercised through integration runs.
+        return empty_llm_query_result(model=selected_model, error=str(error))
+
+    raw_response = clean_text(response.choices[0].message.content)
+    queries = valid_retrieval_queries(parse_llm_retrieval_queries(raw_response), research_plan)
+    max_queries = max(1, len(questions) * max(1, max_variants))
+    if not queries:
+        return {
+            "queries": [],
+            "model": clean_text(getattr(response, "model", "")) or selected_model,
+            "error": "LLM query rewrite returned no usable queries",
+            "raw_response": raw_response[:1000],
+        }
+    return {
+        "queries": dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
+        "model": clean_text(getattr(response, "model", "")) or selected_model,
+        "error": "",
+        "raw_response": raw_response[:1000],
+    }
+
+
+def empty_llm_query_result(model: str = "", error: str = "") -> dict[str, Any]:
+    return {"queries": [], "model": clean_text(model), "error": clean_text(error), "raw_response": ""}
+
+
+def format_sub_question_rewrite_items(questions: Sequence[str], tasks: Sequence[dict[str, Any]]) -> str:
+    lines = []
+    for index, question in enumerate(questions, start=1):
+        details = matching_task_details(question, tasks)
+        detail_text = f"\n   task_details: {details}" if details else ""
+        lines.append(f"{index}. {question}{detail_text}")
+    return "\n".join(lines)
+
+
+def parse_llm_retrieval_queries(raw_response: str) -> list[str]:
+    text = clean_markdown_fence(raw_response)
+    try:
+        parsed = json.loads(json_payload(text))
+    except (TypeError, ValueError):
+        return fallback_json_like_queries(text) or fallback_line_queries(text)
+    return extract_query_strings(parsed)
+
+
+def json_payload(text: str) -> str:
+    text = clean_text(text)
+    if text.startswith("{") or text.startswith("["):
+        return text
+    match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
+    return match.group(1) if match else text
+
+
+def clean_markdown_fence(text: str) -> str:
+    return re.sub(r"^```(?:json)?|```$", "", str(text or "").strip(), flags=re.IGNORECASE).strip()
+
+
+def fallback_json_like_queries(text: str) -> list[str]:
+    """Recover query arrays when a model returns almost-JSON that json.loads rejects."""
+
+    queries = []
+    for match in re.finditer(r'"queries"\s*:\s*\[(.*?)\]', str(text or ""), flags=re.DOTALL | re.IGNORECASE):
+        queries.extend(re.findall(r'"([^"]+)"', match.group(1)))
+    return dedupe_preserve_order(queries)
+
+
+def extract_query_strings(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        queries = []
+        for key, item in value.items():
+            key_name = key.lower()
+            if key_name in {"sub_question", "question"}:
+                continue
+            if key_name in {"query", "text"} and isinstance(item, str):
+                queries.append(item)
+            else:
+                queries.extend(extract_query_strings(item))
+        return dedupe_preserve_order(queries)
+    if isinstance(value, list):
+        queries = []
+        for item in value:
+            queries.extend(extract_query_strings(item))
+        return dedupe_preserve_order(queries)
+    if isinstance(value, str):
+        return fallback_line_queries(value)
+    return []
+
+
+def fallback_line_queries(text: str) -> list[str]:
+    lines = []
+    for line in str(text or "").splitlines():
+        line = re.sub(r"^\s*[-*\d.)]+\s*", "", line).strip().strip('"')
+        if clean_text(line):
+            lines.append(line)
+    return dedupe_preserve_order(lines)
+
+
+def valid_retrieval_queries(queries: Sequence[str], research_plan: dict[str, Any]) -> list[str]:
+    objective_terms = query_tokens(clean_text(research_plan.get("objective")))
+    question_terms = set()
+    for question in planner_sub_questions(research_plan):
+        question_terms.update(query_tokens(question))
+    allowed_terms = objective_terms | question_terms
+    return [
+        query
+        for query in dedupe_preserve_order(queries)
+        if is_valid_retrieval_query(query, allowed_terms)
+    ]
+
+
+def is_valid_retrieval_query(query: str, allowed_terms: set[str]) -> bool:
+    text = clean_text(query)
+    lowered = text.lower()
+    if not text:
+        return False
+    if re.fullmatch(r"(?:query|retrieval query|search query|example query)\s*\d*", lowered):
+        return False
+    if re.fullmatch(r"(?:query|retrieval|search|example)(?:\s+\d+)?", lowered):
+        return False
+    if len(re.findall(r"\S+", text)) < 3:
+        return False
+    return True
+
+
+def precision_retrieval_queries(
+    research_plan: dict[str, Any],
+    objective: str = "",
+    max_queries: int = DEFAULT_PRECISION_QUERY_LIMIT,
+) -> list[str]:
+    """Build deterministic high-signal queries for exact evidence retrieval."""
+
+    objective_text = clean_text(objective or research_plan.get("objective"))
+    synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
+    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
+    candidates = [
+        *planner_sub_questions(research_plan),
+        *instruction_requirement_items(synthesis_instruction),
+    ]
+    queries = []
+    for item in dedupe_preserve_order(candidates):
+        base = clean_text(f"{objective_text} {item} {matching_task_details(item, tasks)}")
+        suffixes = precision_query_suffixes(item)
+        if not base or not suffixes:
+            continue
+        for suffix in suffixes:
+            queries.append(clean_text(f"{base} {suffix}")[:700])
+            if len(queries) >= max(1, max_queries):
+                return dedupe_preserve_order(queries)
+    return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def precision_query_suffixes(text: str) -> list[str]:
+    lowered = clean_text(text).lower()
+    suffixes = []
+    if re.search(r"\b(equation|formula|mathematical|formulation|derive|scaled|additive|multiplicative)\b", lowered):
+        suffixes.append("exact equation formula derivation symbols softmax sqrt sum matrix alignment")
+    if re.search(r"\b(benchmark|result|score|performance|accuracy|bleu|glue|imagenet|top-1|metric)\b", lowered):
+        suffixes.append("benchmark table results scores metrics accuracy BLEU GLUE ImageNet top-1")
+    if re.search(r"\b(api|implementation|framework|library|pytorch|tensorflow|keras|hugging face|transformers)\b", lowered):
+        suffixes.append("official documentation API signature parameters usage example class function")
+    if re.search(r"\b(complexity|efficient|variant|limitation|memory|time|quadratic|linear|sparse|low-rank)\b", lowered):
+        suffixes.append("computational complexity time memory O(n^2) O(n) algorithm approximation limitation")
+    if re.search(r"\b(paper|contribution|introduced|architecture|method|model|et al)\b", lowered):
+        suffixes.append("original paper method contribution architecture equations results")
+    return dedupe_preserve_order(suffixes)
+
+
 def matching_task_details(question: str, tasks: Sequence[dict[str, Any]]) -> str:
     """Return task details that make a planner sub-question more retrievable."""
 
@@ -349,6 +686,16 @@ def query_tokens(text: str) -> set[str]:
         for token in re.findall(r"[A-Za-z0-9_+#.-]+", clean_text(text))
         if len(token) > 2 and token.lower() not in stopwords
     }
+
+
+def query_keywords(text: str, limit: int = 10) -> list[str]:
+    keywords = []
+    for token in re.findall(r"[A-Za-z0-9_+#.-]+", clean_text(text)):
+        lowered = token.lower().strip(".")
+        if len(lowered) <= 2 or lowered in OBJECTIVE_STOPWORDS:
+            continue
+        keywords.append(token.strip(".,;:()[]{}"))
+    return dedupe_preserve_order(keywords)[: max(1, limit)]
 
 
 def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
@@ -617,6 +964,102 @@ def merge_retrieved_context(*groups: Sequence[RetrievalResult]) -> list[Retrieva
     return merged
 
 
+def browser_signal_results(browser_results: Sequence[Any], objective: str = "") -> list[RetrievalResult]:
+    """Promote high-signal browser excerpts into synthesis context."""
+
+    results = []
+    seen = set()
+    source_count = 0
+    for source in browser_result_sources(browser_results):
+        url = normalize_source_url(source.get("url"))
+        content = clean_text(source.get("full_content") or source.get("content") or source.get("text"))
+        if not url or not content:
+            continue
+        snippets = high_signal_browser_snippets(content, max_snippets=DEFAULT_BROWSER_SIGNAL_SNIPPETS)
+        if not snippets:
+            continue
+        source_count += 1
+        title = clean_text(source.get("title")) or url
+        for snippet_index, snippet in enumerate(snippets):
+            key = (url, snippet.lower()[:240])
+            if key in seen:
+                continue
+            seen.add(key)
+            digest = hashlib.sha256(f"{url}:{snippet_index}:{snippet}".encode("utf-8")).hexdigest()[:24]
+            results.append(
+                RetrievalResult(
+                    id=f"browser-signal-{digest}",
+                    document=snippet,
+                    metadata={
+                        "title": title,
+                        "url": url,
+                        "source_url": url,
+                        "source_type": clean_text(source.get("source_type")) or "browser",
+                        "source_quality": "high_signal_browser",
+                        "query_contexts": clean_text(source.get("query_context") or objective),
+                    },
+                    score=1.0,
+                    semantic_score=0.0,
+                    bm25_score=0.0,
+                    authority_score=0.4,
+                )
+            )
+        if source_count >= DEFAULT_BROWSER_SIGNAL_SOURCES:
+            break
+    return results
+
+
+def browser_result_sources(browser_results: Sequence[Any]) -> list[dict[str, Any]]:
+    sources = []
+    for result in browser_results or []:
+        if not isinstance(result, dict):
+            continue
+        for source in result.get("sources", []) or []:
+            if isinstance(source, dict):
+                sources.append(source)
+    return sources
+
+
+def high_signal_browser_snippets(content: str, max_snippets: int = DEFAULT_BROWSER_SIGNAL_SNIPPETS) -> list[str]:
+    candidates = []
+    for match in BROWSER_SIGNAL_PATTERN.finditer(content):
+        snippet = browser_signal_snippet(content, match.start())
+        if is_meaningful_evidence(snippet):
+            candidates.append((browser_signal_score(snippet), match.start(), snippet))
+        if len(candidates) >= DEFAULT_BROWSER_SIGNAL_CANDIDATES:
+            break
+    ranked = sorted(candidates, key=lambda item: (-item[0], item[1]))
+    return dedupe_preserve_order([snippet for _, _, snippet in ranked])[:max_snippets]
+
+
+def browser_signal_score(snippet: str) -> int:
+    value = clean_text(snippet)
+    score = 0
+    score += min(5, len(BROWSER_FORMULA_SIGNAL_PATTERN.findall(value))) * 4
+    score += min(4, len(BROWSER_METRIC_SIGNAL_PATTERN.findall(value))) * 3
+    score += min(3, len(BROWSER_API_SIGNAL_PATTERN.findall(value))) * 2
+    if re.search(r"(?i)\b(?:equation|formula|definition|defined as|theorem|algorithm)\b", value):
+        score += 3
+    if re.search(r"(?i)\b(?:benchmark|score|accuracy|latency|throughput|cost|complexity)\b", value):
+        score += 2
+    return score
+
+
+def browser_signal_snippet(content: str, position: int, max_chars: int = 900) -> str:
+    start = max(0, position - max_chars // 2)
+    end = min(len(content), position + max_chars // 2)
+    snippet = clean_text(content[start:end])
+    if start > 0:
+        sentence_start = re.search(r"(?<=[.!?])\s+[A-Z0-9`(]", snippet)
+        if sentence_start:
+            snippet = snippet[sentence_start.end() - 1 :]
+    if end < len(content):
+        sentence_end = list(re.finditer(r"[.!?](?=\s+[A-Z0-9`(]|$)", snippet))
+        if sentence_end:
+            snippet = snippet[: sentence_end[-1].end()]
+    return clean_text(snippet[:max_chars])
+
+
 def generate_answer_from_context(
     question: str,
     retrieved_context: Sequence[RetrievalResult],
@@ -756,6 +1199,7 @@ Use only plain ASCII numbered source markers that appear in the retrieved contex
 Every evidence-backed claim must include at least one source marker.
 For equations, formulas, API signatures, benchmark numbers, and historical attribution, cite original papers, official documentation, academic sources, or authoritative surveys first.
 If a primary/official source and a secondary explainer both support the same technical claim, cite the primary/official source and omit the secondary citation.
+Do not mark a requirement or planner question as Missing Evidence when a primary/official source in the retrieved context contains evidence for it; cite that source and mark it Covered or Partial instead.
 Use secondary explainers only for intuition, examples, or background wording.
 Do not compress important technical details into vague summaries.
 Do not use Markdown tables.
@@ -1212,6 +1656,101 @@ def build_generation_context(
     return "\n\n".join(blocks), sources
 
 
+def select_synthesis_context(
+    retrieved_context: Sequence[RetrievalResult],
+    planner_questions: Sequence[str] | None = None,
+    max_chunks: int = DEFAULT_SYNTHESIS_MAX_CHUNKS,
+    per_question: int = DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
+) -> list[RetrievalResult]:
+    """Return a compact, topic-balanced context for the synthesis LLM."""
+
+    candidates = meaningful_retrieval_results(retrieved_context)
+    questions = [clean_text(question) for question in planner_questions or [] if clean_text(question)]
+    if not questions:
+        return source_balanced_results(candidates)[:max(1, max_chunks)]
+
+    selected = []
+    seen = set()
+    for question in questions:
+        for result in rank_results_for_question(question, candidates)[:max(1, per_question)]:
+            key = retrieval_result_key(result)
+            if key in seen:
+                continue
+            selected.append(result)
+            seen.add(key)
+            if len(selected) >= max_chunks:
+                return selected
+
+    for result in source_balanced_results(candidates):
+        key = retrieval_result_key(result)
+        if key in seen:
+            continue
+        selected.append(result)
+        seen.add(key)
+        if len(selected) >= max_chunks:
+            break
+    return selected
+
+
+def meaningful_retrieval_results(retrieved_context: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    results = []
+    seen = set()
+    for result in retrieved_context:
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        chunk = retrieved_chunk_preview(result.document, metadata, max_chars=MIN_EVIDENCE_CHARS * 4)
+        if not is_meaningful_evidence(chunk):
+            continue
+        key = retrieval_result_key(result, preview=chunk)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(result)
+    return results
+
+
+def rank_results_for_question(question: str, candidates: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    question_terms = query_tokens(question)
+    ranked = []
+    for position, result in enumerate(candidates):
+        text = retrieval_result_text(result)
+        terms = query_tokens(text)
+        overlap = len(question_terms & terms)
+        score = overlap * 3 + retrieval_result_priority(result)
+        if overlap or score > 0:
+            ranked.append((score, -position, result))
+    return [result for _, _, result in sorted(ranked, reverse=True)]
+
+
+def retrieval_result_text(result: RetrievalResult) -> str:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return clean_text(
+        " ".join(
+            [
+                clean_text(metadata.get("title")),
+                clean_text(primary_source_url(metadata)),
+                clean_text(metadata.get("query_contexts")),
+                retrieved_chunk_preview(result.document, metadata, max_chars=DEFAULT_CONTEXT_BLOCK_CHARS),
+            ]
+        )
+    )
+
+
+def retrieval_result_priority(result: RetrievalResult) -> int:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    priority = 2 if is_primary_source(metadata) else 0
+    if result.score is not None and result.score > 0:
+        priority += 1
+    return priority
+
+
+def retrieval_result_key(result: RetrievalResult, preview: str = "") -> str:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    stable_id = clean_text(metadata.get("parent_id")) or clean_text(result.id)
+    url = primary_source_url(metadata)
+    content = clean_text(preview or result.document)[:240].lower()
+    return clean_text(f"{stable_id}:{url}:{content}") or clean_text(result.id)
+
+
 def build_source_priority_guidance(sources: Sequence[dict[str, Any]]) -> str:
     """Tell the synthesis LLM which retrieved sources are best for technical claims."""
 
@@ -1409,6 +1948,7 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "invalid_citation_count": len(payload.get("citation_audit", {}).get("invalid_source_indexes", [])),
         "cited_source_count": len(payload.get("citation_audit", {}).get("valid_referenced_source_indexes", [])),
         "source_coverage_count": payload.get("source_coverage_count", 0),
+        "browser_signal_count": payload.get("browser_signal_count", 0),
         "gap_retrieval_query_count": len(payload.get("gap_retrieval_queries", [])),
         "gap_query_model": payload.get("gap_query_model", ""),
         "gap_query_source": payload.get("gap_query_source", ""),
@@ -1529,22 +2069,29 @@ def count_meaningful_evidence_chunks(retrieved_context: Sequence[RetrievalResult
 
 
 def source_balanced_results(retrieved_context: Sequence[RetrievalResult]) -> list[RetrievalResult]:
-    """Interleave results so each source URL gets represented before repeats."""
+    """Interleave results while surfacing primary/official sources first."""
     buckets: dict[str, list[RetrievalResult]] = {}
     source_order = []
+    source_order_index = {}
+    source_priority = {}
 
     for result in retrieved_context:
         metadata = result.metadata if isinstance(result.metadata, dict) else {}
         url = primary_source_url(metadata) or result.id
         if url not in buckets:
             buckets[url] = []
+            source_order_index[url] = len(source_order)
             source_order.append(url)
+            source_priority[url] = primary_source_rank(metadata)
+        else:
+            source_priority[url] = min(source_priority[url], primary_source_rank(metadata))
         buckets[url].append(result)
 
+    ordered_sources = sorted(source_order, key=lambda url: (source_priority.get(url, 1), source_order_index[url]))
     ordered = []
     while True:
         added = False
-        for url in source_order:
+        for url in ordered_sources:
             bucket = buckets[url]
             if not bucket:
                 continue
@@ -1553,6 +2100,10 @@ def source_balanced_results(retrieved_context: Sequence[RetrievalResult]) -> lis
         if not added:
             break
     return ordered
+
+
+def primary_source_rank(metadata: dict[str, Any]) -> int:
+    return 0 if is_primary_source(metadata) else 1
 
 
 def context_block_char_limit(

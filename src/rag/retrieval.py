@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -17,6 +19,7 @@ from src.rag.indexing import (
     DEFAULT_COLLECTION_NAME,
     SentenceTransformerEmbeddingFunction,
     chunk_id,
+    clear_embedding_model_memory,
     get_collection,
     parent_content_for_id,
     select_embedding_device,
@@ -39,6 +42,7 @@ DEFAULT_RERANK_WEIGHT = 0.70
 DEFAULT_SOURCE_URL_K = 1
 DEFAULT_FEATURE_WEIGHT = 0.15
 DEFAULT_FORMULA_NEIGHBOR_WINDOW = 1
+DEFAULT_MULTI_QUERY_MAX_WORKERS = 4
 TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
 FORMULA_CONTEXT_PATTERN = re.compile(
     r"(?i)\b("
@@ -99,6 +103,9 @@ class LangChainSentenceTransformerEmbeddings:
 
     def embed_query(self, text: str) -> list[float]:
         return self.embedding_function([text])[0]
+
+    def close(self) -> None:
+        self.embedding_function.close()
 
 
 def hybrid_retrieve(
@@ -239,8 +246,10 @@ def multi_query_hybrid_retrieve(
         return []
 
     by_id: dict[str, RetrievalResult] = {}
-    for query in clean_queries:
-        results = hybrid_retrieve(
+    max_workers = retrieval_max_workers(len(clean_queries), rerank=rerank)
+
+    def retrieve_query(query: str) -> list[RetrievalResult]:
+        return hybrid_retrieve(
             query=query,
             chroma_path=chroma_path,
             collection_name=collection_name,
@@ -255,17 +264,34 @@ def multi_query_hybrid_retrieve(
             bm25_scan_limit=bm25_scan_limit,
             embedding_device=embedding_device,
             diversify_urls=False,
-            rerank=rerank,
+            rerank=False,
             reranker_model=reranker_model,
             rerank_k=rerank_k,
             rerank_weight=rerank_weight,
         )
+
+    if max_workers <= 1:
+        result_groups = [retrieve_query(query) for query in clean_queries]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rag-retrieve") as executor:
+            result_groups = list(executor.map(retrieve_query, clean_queries))
+
+    for results in result_groups:
         for result in results:
             existing = by_id.get(result.id)
             if existing is None or result.score > existing.score:
                 by_id[result.id] = result
 
     merged = sorted(by_id.values(), key=lambda item: item.score, reverse=True)
+    if rerank:
+        merged = rerank_results(
+            query=joined_query_text(clean_queries)[:4000],
+            results=merged,
+            top_n=max(top_k, rerank_k, len(clean_queries) * max(1, per_query_k)),
+            model_name=reranker_model,
+            device=embedding_device,
+            rerank_weight=rerank_weight,
+        )
     if diversify_urls:
         merged = diversify_by_url(merged, top_k=top_k)
     else:
@@ -277,6 +303,18 @@ def multi_query_hybrid_retrieve(
         collection_name=collection_name,
     )
     return expand_parent_context_results(expanded, chroma_path=chroma_path)
+
+
+def retrieval_max_workers(query_count: int, rerank: bool = False) -> int:
+    """Return bounded worker count for independent multi-query retrieval."""
+
+    default_workers = DEFAULT_MULTI_QUERY_MAX_WORKERS
+    value = os.environ.get("RAG_RETRIEVAL_MAX_WORKERS")
+    try:
+        workers = int(value) if value else default_workers
+    except ValueError:
+        workers = default_workers
+    return min(max(1, workers), max(1, query_count))
 
 
 def source_url_coverage_retrieve(
@@ -530,10 +568,11 @@ def semantic_search(
     where: Optional[dict[str, Any]] = None,
     embedding_device: str = "",
 ) -> list[RetrievalResult]:
+    embeddings = LangChainSentenceTransformerEmbeddings(device=embedding_device)
     vector_store = get_langchain_chroma(
         chroma_path=chroma_path,
         collection_name=collection_name,
-        embedding_device=embedding_device,
+        embedding_function=embeddings,
     )
     try:
         results = vector_store.similarity_search_with_relevance_scores(
@@ -543,6 +582,8 @@ def semantic_search(
         )
     except Exception:
         return []
+    finally:
+        embeddings.close()
 
     rows = []
     for index, (document, score) in enumerate(results):
@@ -966,6 +1007,7 @@ def rerank_results(
         )
 
     reranked = sorted(reranked, key=lambda item: item.score, reverse=True)
+    clear_embedding_model_memory()
     return reranked + remainder
 
 
@@ -1086,7 +1128,12 @@ def display_document_preview(document: str, max_chars: int = 700) -> str:
     return preview[:max(80, max_chars)].strip()
 
 
-def get_langchain_chroma(chroma_path: Union[str, Path], collection_name: str, embedding_device: str = "") -> Any:
+def get_langchain_chroma(
+    chroma_path: Union[str, Path],
+    collection_name: str,
+    embedding_device: str = "",
+    embedding_function: Optional[LangChainSentenceTransformerEmbeddings] = None,
+) -> Any:
     try:
         from langchain_chroma import Chroma
     except ImportError as error:
@@ -1098,7 +1145,7 @@ def get_langchain_chroma(chroma_path: Union[str, Path], collection_name: str, em
     return Chroma(
         collection_name=collection_name,
         persist_directory=str(chroma_path),
-        embedding_function=LangChainSentenceTransformerEmbeddings(device=embedding_device),
+        embedding_function=embedding_function or LangChainSentenceTransformerEmbeddings(device=embedding_device),
     )
 
 

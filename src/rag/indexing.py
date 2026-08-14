@@ -6,6 +6,7 @@ results into persistent vector-search chunks.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
 import re
@@ -21,16 +22,30 @@ from src.tools.text_utils import clean_text
 
 DEFAULT_COLLECTION_NAME = "research_rag_bge_large"
 DEFAULT_CHROMA_PATH = "data/chroma"
-DEFAULT_CHUNK_SIZE = 700
+DEFAULT_CHUNK_SIZE = 1200
 DEFAULT_CHUNK_OVERLAP = 180
-DEFAULT_PARENT_CHUNK_SIZE = 1800
+DEFAULT_PARENT_CHUNK_SIZE = 3000
 DEFAULT_PARENT_CHUNK_OVERLAP = 240
 DEFAULT_PARENT_STORE_NAME = "parent_chunks.sqlite3"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
-DEFAULT_METADATA_SCHEMA_VERSION = 6
+DEFAULT_METADATA_SCHEMA_VERSION = 7
 TOKEN_PATTERN = re.compile(r"\S+")
+SECTION_HEADING_PATTERN = re.compile(
+    r"(?i)^\s*(?:#{1,6}\s+|\d+(?:\.\d+)*[.)]\s+)?"
+    r"(abstract|introduction|background|related work|method|methods|methodology|"
+    r"model|architecture|approach|algorithm|implementation|experiments?|evaluation|"
+    r"results?|discussion|analysis|limitations?|conclusion|references?|appendix)\b"
+)
+NOISE_LINE_PATTERN = re.compile(
+    r"(?i)\b("
+    r"accept all|cookie|privacy policy|terms of use|all rights reserved|"
+    r"subscribe|newsletter|sign in|sign up|log in|skip to|share this|"
+    r"advertisement|sponsored|enable javascript|table of contents|"
+    r"download pdf|view pdf|back to top"
+    r")\b"
+)
 SPECIAL_SIGNAL_PATTERN = re.compile(
     r"(?i)("
     r"\\(?:frac|sum|sqrt|top|operatorname)|"
@@ -95,6 +110,41 @@ class SentenceTransformerEmbeddingFunction:
         self._model = SentenceTransformer(self.model_name, device=self.device)
         return self._model
 
+    def close(self) -> None:
+        """Release the loaded embedding model between full graph runs."""
+        if self._model is not None:
+            try:
+                if hasattr(self._model, "to"):
+                    self._model.to("cpu")
+            except Exception:
+                pass
+        self._model = None
+        clear_embedding_model_memory()
+
+
+def clear_embedding_model_memory() -> None:
+    """Best-effort cleanup for torch-backed embedding models."""
+    gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+    try:
+        mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        if mps_available and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
 
 def select_embedding_device(requested_device: str = DEFAULT_EMBEDDING_DEVICE) -> str:
     """Return the embedding device, preferring GPU when requested_device is auto."""
@@ -144,7 +194,8 @@ def index_research_results(
         tool="chromadb",
         metadata={"chroma_path": str(chroma_path), "collection_name": collection_name},
     )
-    collection = get_collection(chroma_path, collection_name)
+    embedding_function = SentenceTransformerEmbeddingFunction()
+    collection = get_collection(chroma_path, collection_name, embedding_function=embedding_function)
     change_detection = change_detection if isinstance(change_detection, dict) else {}
     research_plan = research_plan if isinstance(research_plan, dict) else {}
     objective = clean_text(change_detection.get("objective") or research_plan.get("objective"))
@@ -161,61 +212,65 @@ def index_research_results(
     deleted_changed_source_count = 0
     skipped_source_count = 0
 
-    for record in records:
-        change_status = source_change_status(record.url, added_urls, changed_urls)
-        existing_metadata_schema_version = source_metadata_schema_version_in_collection(collection, history_key, record.url)
-        metadata_is_stale = existing_metadata_schema_version < DEFAULT_METADATA_SCHEMA_VERSION
-        existing_content_hash = source_content_hash_in_collection(collection, history_key, record.url)
-        indexed_content_changed = bool(existing_content_hash and existing_content_hash != record.content_hash)
-        if not index_all and change_status == "unchanged" and not metadata_is_stale and not indexed_content_changed:
-            skipped_source_count += 1
-            continue
+    try:
+        for record in records:
+            change_status = source_change_status(record.url, added_urls, changed_urls)
+            existing_metadata_schema_version = source_metadata_schema_version_in_collection(collection, history_key, record.url)
+            metadata_is_stale = existing_metadata_schema_version < DEFAULT_METADATA_SCHEMA_VERSION
+            existing_content_hash = source_content_hash_in_collection(collection, history_key, record.url)
+            indexed_content_changed = bool(existing_content_hash and existing_content_hash != record.content_hash)
+            if not index_all and change_status == "unchanged" and not metadata_is_stale and not indexed_content_changed:
+                skipped_source_count += 1
+                continue
 
-        if existing_content_hash == record.content_hash and not metadata_is_stale:
-            skipped_source_count += 1
-            continue
+            if existing_content_hash == record.content_hash and not metadata_is_stale:
+                skipped_source_count += 1
+                continue
 
-        source_document = build_langchain_document(record, objective, history_key, change_status if not index_all else "indexed")
-        chunk_documents = split_document(source_document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        if not chunk_documents:
-            skipped_source_count += 1
-            continue
+            source_document = build_langchain_document(record, objective, history_key, change_status if not index_all else "indexed")
+            chunk_documents = split_document(source_document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            if not chunk_documents:
+                skipped_source_count += 1
+                continue
 
-        if existing_content_hash and (existing_content_hash != record.content_hash or metadata_is_stale):
-            delete_source_chunks(collection, history_key, record.url)
-            delete_source_parent_chunks(chroma_path, history_key, record.url)
-            if existing_content_hash != record.content_hash:
-                deleted_changed_source_count += 1
+            if existing_content_hash and (existing_content_hash != record.content_hash or metadata_is_stale):
+                delete_source_chunks(collection, history_key, record.url)
+                delete_source_parent_chunks(chroma_path, history_key, record.url)
+                if existing_content_hash != record.content_hash:
+                    deleted_changed_source_count += 1
 
-        indexed_parent_chunk_count += upsert_parent_chunks(chroma_path, parent_rows_from_documents(chunk_documents))
-        ids = []
-        documents = []
-        metadatas = []
-        for chunk_index, chunk_document_item in enumerate(chunk_documents):
-            ids.append(chunk_id(history_key, record.url, chunk_index))
-            documents.append(chunk_document_item.page_content)
-            metadata = strip_parent_content_metadata(chunk_document_item.metadata)
-            metadatas.append(
-                clean_metadata(
-                    {
-                        **metadata,
-                        "chunk_index": chunk_index,
-                        "chunk_count": len(chunk_documents),
-                    }
+            indexed_parent_chunk_count += upsert_parent_chunks(chroma_path, parent_rows_from_documents(chunk_documents))
+            ids = []
+            documents = []
+            metadatas = []
+            for chunk_index, chunk_document_item in enumerate(chunk_documents):
+                ids.append(chunk_id(history_key, record.url, chunk_index))
+                documents.append(chunk_document_item.page_content)
+                metadata = strip_parent_content_metadata(chunk_document_item.metadata)
+                metadatas.append(
+                    clean_metadata(
+                        {
+                            **metadata,
+                            "chunk_index": chunk_index,
+                            "chunk_count": len(chunk_documents),
+                        }
+                    )
                 )
+
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            emit_progress(
+                "tool_called",
+                "Embedded and upserted source chunks",
+                agent="change_detection",
+                tool="sentence-transformers/chromadb",
+                metadata={"url": record.url, "chunks": len(chunk_documents)},
             )
+            indexed_source_count += 1
+            indexed_chunk_count += len(chunk_documents)
+    finally:
+        embedding_function.close()
 
-        collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-        emit_progress(
-            "tool_called",
-            "Embedded and upserted source chunks",
-            agent="change_detection",
-            tool="sentence-transformers/chromadb",
-            metadata={"url": record.url, "chunks": len(chunk_documents)},
-        )
-        indexed_source_count += 1
-        indexed_chunk_count += len(chunk_documents)
-
+    stored_chunk_count = collection_count(collection)
     return {
         "status": "success",
         "chroma_path": str(chroma_path),
@@ -223,6 +278,7 @@ def index_research_results(
         "history_key": history_key,
         "indexed_sources": indexed_source_count,
         "indexed_chunks": indexed_chunk_count,
+        "stored_chunks": stored_chunk_count,
         "indexed_parent_chunks": indexed_parent_chunk_count,
         "parent_store_path": str(parent_store_path(chroma_path)),
         "deleted_changed_sources": deleted_changed_source_count,
@@ -232,7 +288,11 @@ def index_research_results(
     }
 
 
-def get_collection(chroma_path: Union[str, Path], collection_name: str):
+def get_collection(
+    chroma_path: Union[str, Path],
+    collection_name: str,
+    embedding_function: Optional[SentenceTransformerEmbeddingFunction] = None,
+):
     try:
         import chromadb
     except ImportError as error:
@@ -245,7 +305,7 @@ def get_collection(chroma_path: Union[str, Path], collection_name: str):
     client = chromadb.PersistentClient(path=str(path))
     return client.get_or_create_collection(
         name=collection_name,
-        embedding_function=SentenceTransformerEmbeddingFunction(),
+        embedding_function=embedding_function or SentenceTransformerEmbeddingFunction(),
         metadata={"hnsw:space": "cosine"},
     )
 
@@ -253,7 +313,7 @@ def get_collection(chroma_path: Union[str, Path], collection_name: str):
 def build_langchain_document(record: SourceRecord, objective: str, history_key: str, change_status: str) -> Any:
     Document, _ = langchain_ingestion_classes()
     return Document(
-        page_content=chunk_document(record, record.content),
+        page_content=chunk_document(record, clean_document_text(record.content)),
         metadata=clean_metadata(
             {
                 "history_key": history_key,
@@ -278,8 +338,9 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
     Document, _ = langchain_ingestion_classes()
     max_tokens = max(100, chunk_size)
     overlap_tokens = max(0, min(chunk_overlap, max_tokens // 2))
-    parent_chunks = parent_context_chunks(document.page_content)
-    chunks = token_aware_chunks(document.page_content, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
+    content = clean_document_text(document.page_content)
+    parent_chunks = parent_context_chunks(content)
+    chunks = token_aware_chunks(content, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
     chunks = add_inter_chunk_overlap(chunks, overlap_tokens=overlap_tokens)
     regular_documents = [
         Document(
@@ -307,7 +368,7 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
                 **chunk_signal_metadata(chunk),
             },
         )
-        for chunk in special_signal_chunks(document.page_content, max_tokens=max(120, max_tokens // 2))
+        for chunk in special_signal_chunks(content, max_tokens=max(120, max_tokens // 2))
     ]
     return dedupe_documents([*regular_documents, *special_documents])
 
@@ -315,8 +376,8 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
 def parent_context_chunks(text: str) -> list[str]:
     """Build larger parent contexts that child chunks can expand to after retrieval."""
 
-    chunks = token_aware_chunks(
-        text,
+    chunks = structure_aware_chunks(
+        clean_document_text(text),
         max_tokens=DEFAULT_PARENT_CHUNK_SIZE,
         overlap_tokens=DEFAULT_PARENT_CHUNK_OVERLAP,
     )
@@ -451,6 +512,114 @@ def best_parent_context(chunk: str, parent_chunks: Sequence[str]) -> tuple[int, 
     ]
     _, index, parent = max(scored, key=lambda item: (item[0], -item[1]))
     return index, clean_text(parent)
+
+
+def clean_document_text(text: Any) -> str:
+    """Remove common web/PDF extraction noise before chunking."""
+
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"https?://\S+\.(?:png|jpg|jpeg|gif|svg|webp)\S*", "", value, flags=re.I)
+    value = re.sub(r"[ \t]+", " ", value)
+    lines = []
+    seen_counts: dict[str, int] = {}
+    for raw_line in value.splitlines():
+        line = clean_text(raw_line)
+        if not line:
+            lines.append("")
+            continue
+        normalized = re.sub(r"\W+", " ", line.lower()).strip()
+        if should_drop_noise_line(line, normalized, seen_counts):
+            continue
+        seen_counts[normalized] = seen_counts.get(normalized, 0) + 1
+        lines.append(line)
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def should_drop_noise_line(line: str, normalized: str, seen_counts: dict[str, int]) -> bool:
+    if not normalized:
+        return False
+    if NOISE_LINE_PATTERN.search(line) and token_count(line) <= 18:
+        return True
+    if normalized.startswith(("home ", "menu ", "navigation ", "search ")):
+        return True
+    if len(normalized) <= 4 and seen_counts.get(normalized, 0) >= 1:
+        return True
+    if seen_counts.get(normalized, 0) >= 2 and token_count(line) <= 24:
+        return True
+    return False
+
+
+def structure_aware_chunks(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
+    """Pack section-like blocks into parent chunks while preserving boundaries."""
+
+    blocks = structured_text_blocks(text)
+    chunks = []
+    current_blocks = []
+    current_tokens = 0
+    for block in blocks:
+        block_tokens = token_count(block)
+        if block_tokens <= 0:
+            continue
+        if block_tokens > max_tokens:
+            if current_blocks:
+                chunks.append(join_blocks(current_blocks))
+                current_blocks = []
+                current_tokens = 0
+            chunks.extend(split_large_block(block, max_tokens=max_tokens, overlap_tokens=overlap_tokens))
+            continue
+        if current_blocks and current_tokens + block_tokens > max_tokens:
+            chunks.append(join_blocks(current_blocks))
+            current_blocks = [block]
+            current_tokens = block_tokens
+            continue
+        current_blocks.append(block)
+        current_tokens += block_tokens
+    if current_blocks:
+        chunks.append(join_blocks(current_blocks))
+    return add_inter_chunk_overlap([chunk for chunk in chunks if clean_text(chunk)], overlap_tokens=overlap_tokens)
+
+
+def structured_text_blocks(text: str) -> list[str]:
+    """Split text at headings while keeping tables, equations, and code fences intact."""
+
+    sections = []
+    current = []
+    in_fence = False
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+        starts_new_section = bool(current and not in_fence and is_structure_heading(stripped))
+        if starts_new_section:
+            sections.append("\n".join(current).strip())
+            current = []
+        current.append(line)
+    if current:
+        sections.append("\n".join(current).strip())
+
+    blocks = []
+    for section in sections:
+        section_blocks = text_blocks(section)
+        if token_count(section) <= DEFAULT_PARENT_CHUNK_SIZE:
+            blocks.append(section)
+        else:
+            blocks.extend(section_blocks)
+    return [block for block in blocks if clean_text(block)]
+
+
+def is_structure_heading(line: str) -> bool:
+    if not line or len(line) > 140:
+        return False
+    if line.startswith(("#", "##")):
+        return True
+    if SECTION_HEADING_PATTERN.search(line):
+        return True
+    if re.match(r"^\d+(?:\.\d+)*[.)]\s+[A-Z][A-Za-z0-9 ,:;()/_-]{3,}$", line):
+        return True
+    return False
 
 
 def token_aware_chunks(text: str, max_tokens: int, overlap_tokens: int) -> list[str]:
@@ -610,7 +779,7 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
             if not isinstance(source, dict):
                 continue
             url = normalize_url(clean_text(source.get("url")))
-            content = clean_text(source.get("full_content") or source.get("content_preview"))
+            content = clean_document_text(source.get("full_content") or source.get("content_preview"))
             if not url or not content:
                 continue
 
@@ -734,6 +903,13 @@ def collection_is_empty(collection: Any) -> bool:
         return collection.count() == 0
     except Exception:
         return False
+
+
+def collection_count(collection: Any) -> int:
+    try:
+        return int(collection.count())
+    except Exception:
+        return 0
 
 
 def clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:

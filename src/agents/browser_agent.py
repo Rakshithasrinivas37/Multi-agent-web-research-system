@@ -13,6 +13,7 @@ from src.tools.tavily_search import search_with_tavily
 from src.tools.text_utils import clean_content, clean_list, clean_text
 
 MIN_TASK_OVERLAP = 0.06
+MIN_TRUSTED_DIRECT_CONTENT_LENGTH = 1000
 SOURCE_STOPWORDS = {
     "and",
     "are",
@@ -647,12 +648,14 @@ def source_is_useful(payload: dict[str, Any], task: dict[str, Any]) -> bool:
         return False
     if is_bad_dictionary_source(payload, task) or is_not_found_source(payload):
         return False
+    if is_pricing_task(task):
+        return bool(payload.get("pricing_rows") or payload.get("extracted_facts"))
+    if is_trusted_direct_source(payload, task):
+        return True
     if not source_matches_target(payload, task):
         return False
     if not source_matches_task(payload, task):
         return False
-    if is_pricing_task(task):
-        return bool(payload.get("pricing_rows") or payload.get("extracted_facts"))
     return bool(payload.get("extracted_facts") or payload.get("important_sections") or payload.get("content_length", 0) >= 800)
 
 
@@ -674,13 +677,46 @@ def source_quality_note(payload: dict[str, Any], task: dict[str, Any]) -> str:
         return "dictionary result is not relevant to this research task"
     if is_not_found_source(payload):
         return "source appears to be a not-found or missing page"
+    if is_pricing_task(task) and not (payload.get("pricing_rows") or payload.get("extracted_facts")):
+        return "no pricing rows or pricing facts found"
+    if is_trusted_direct_source(payload, task):
+        return "trusted direct authoritative source"
     if not source_matches_target(payload, task):
         return "source does not match the task target topic"
     if not source_matches_task(payload, task):
         return "source content has low overlap with the task"
-    if is_pricing_task(task) and not (payload.get("pricing_rows") or payload.get("extracted_facts")):
-        return "no pricing rows or pricing facts found"
     return "source passed basic quality checks"
+
+
+def is_trusted_direct_source(payload: dict[str, Any], task: dict[str, Any]) -> bool:
+    task_url = clean_text(task.get("url"))
+    source_url = clean_text(payload.get("url"))
+    if not task_url or task_url.startswith("SEARCH:") or not source_url:
+        return False
+    if payload.get("content_length", 0) < MIN_TRUSTED_DIRECT_CONTENT_LENGTH:
+        return False
+    return same_planned_url(task_url, source_url) and is_authoritative_source_url(source_url)
+
+
+def same_planned_url(task_url: str, source_url: str) -> bool:
+    return normalize_url_key(arxiv_pdf_url(task_url)) == normalize_url_key(arxiv_pdf_url(source_url))
+
+
+def is_authoritative_source_url(url: str) -> bool:
+    parsed = urlparse(clean_text(url))
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.lower()
+    return (
+        host == "arxiv.org"
+        or host == "openreview.net"
+        or host.endswith(".edu")
+        or host.endswith(".gov")
+        or host.endswith("doi.org")
+        or host.startswith("docs.")
+        or "docs." in host
+        or host in {"pytorch.org", "tensorflow.org"}
+        or path.endswith(".pdf")
+    )
 
 
 def blocked_or_empty_source(payload: dict[str, Any]) -> bool:

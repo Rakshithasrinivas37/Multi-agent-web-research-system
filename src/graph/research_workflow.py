@@ -279,7 +279,7 @@ def synthesis_node(state: ResearchState) -> ResearchState:
     synthesis_errors = []
     for attempt in range(1, DEFAULT_AGENT_RESPONSE_ATTEMPTS + 1):
         try:
-            synthesis = synthesis_agent.synthesize(plan)
+            synthesis = synthesis_agent.synthesize(plan, browser_results=state.get("browser_results", []))
             synthesis_errors = validate_synthesis_payload(synthesis, plan)
         except Exception as error:
             synthesis_errors = [clean_text(error)]
@@ -661,7 +661,11 @@ def validate_rag_index(index: dict[str, Any]) -> list[str]:
         indexed_chunks = int(index.get("indexed_chunks") or 0)
     except (TypeError, ValueError):
         indexed_chunks = 0
-    if indexed_chunks <= 0:
+    try:
+        stored_chunks = int(index.get("stored_chunks") or 0)
+    except (TypeError, ValueError):
+        stored_chunks = 0
+    if indexed_chunks <= 0 and stored_chunks <= 0:
         return ["rag_index indexed zero chunks"]
     return []
 
