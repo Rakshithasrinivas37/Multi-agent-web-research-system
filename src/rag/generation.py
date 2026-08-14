@@ -615,9 +615,6 @@ def is_valid_retrieval_query(query: str, allowed_terms: set[str]) -> bool:
         return False
     if len(re.findall(r"\S+", text)) < 3:
         return False
-    query_terms = query_tokens(text)
-    if allowed_terms and not (query_terms & allowed_terms):
-        return False
     return True
 
 
