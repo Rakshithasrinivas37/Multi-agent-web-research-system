@@ -26,6 +26,7 @@ DEFAULT_REPORT_MEMORY_EVIDENCE_CHARS = 3600
 DEFAULT_REPORT_COVERAGE_BRIEF_CHARS = 2400
 DEFAULT_REPORT_EVIDENCE_PACKET_CHARS = 3600
 DEFAULT_REPORT_MIN_QUESTION_SECTION_WORDS = 30
+DEFAULT_REPORT_CHUNKS_PER_QUESTION = 2
 
 
 class ReportAgent:
@@ -80,12 +81,16 @@ class ReportAgent:
         synthesis = remove_unavailable_citation_markers(synthesis, available_source_indexes)
         source_text = format_sources(sources)
         source_priority_text = format_source_priority_guidance(sources)
-        evidence_text = format_supporting_evidence(report_context, citation_aliases=citation_aliases)
+        planner_questions = [clean_text(question) for question in report_context.get("planner_questions", []) or []]
+        evidence_text = format_supporting_evidence(
+            report_context,
+            citation_aliases=citation_aliases,
+            planner_questions=planner_questions,
+        )
         memory_evidence_text = format_memory_signal_evidence(report_context, sources, citation_aliases, evidence_text)
         if memory_evidence_text:
             evidence_text = clean_markdown(f"Memory evidence signals:\n{memory_evidence_text}\n\n{evidence_text}")
         evidence_text = remove_unavailable_citation_markers(evidence_text, available_source_indexes)
-        planner_questions = [clean_text(question) for question in report_context.get("planner_questions", []) or []]
         evidence_packet = format_planner_evidence_packet(
             report_context=report_context,
             planner_questions=planner_questions,
@@ -2616,8 +2621,9 @@ def slugify_filename(text: str, max_length: int = 80) -> str:
 def format_supporting_evidence(
     report_context: dict[str, Any],
     citation_aliases: dict[int, int] | None = None,
+    planner_questions: Sequence[str] | None = None,
 ) -> str:
-    chunks = report_context.get("supporting_chunks") or report_context.get("retrieved_chunks") or []
+    chunks = select_report_evidence_chunks(report_context, planner_questions or [])
     if not isinstance(chunks, list):
         return "No supporting chunks provided."
 
@@ -2645,6 +2651,86 @@ def format_supporting_evidence(
         blocks.append(block)
         used_chars += len(block)
     return "\n\n".join(blocks) or "No supporting chunks provided."
+
+
+def select_report_evidence_chunks(
+    report_context: dict[str, Any],
+    planner_questions: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Keep report evidence focused on planner topics instead of raw retrieval order."""
+
+    chunks = list(report_context.get("supporting_chunks") or []) + list(report_context.get("retrieved_chunks") or [])
+    chunks = dedupe_report_chunks(chunks)
+    questions = [clean_text(question) for question in planner_questions if clean_text(question)]
+    if not questions:
+        return chunks
+
+    selected = []
+    selected_keys = set()
+    for question in questions:
+        ranked = rank_chunks_for_question(question, chunks)
+        for chunk in ranked[:DEFAULT_REPORT_CHUNKS_PER_QUESTION]:
+            key = report_chunk_key(chunk)
+            if key in selected_keys:
+                continue
+            selected.append(chunk)
+            selected_keys.add(key)
+
+    for chunk in sorted(chunks, key=chunk_priority, reverse=True):
+        key = report_chunk_key(chunk)
+        if key not in selected_keys:
+            selected.append(chunk)
+            selected_keys.add(key)
+        if len(selected) >= max(DEFAULT_REPORT_CHUNKS_PER_QUESTION * len(questions), DEFAULT_REPORT_CHUNKS_PER_QUESTION):
+            break
+    return selected
+
+
+def rank_chunks_for_question(question: str, chunks: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    question_terms = detail_terms(question)
+    expected_topics = expected_question_topics(question)
+    ranked = []
+    for position, chunk in enumerate(chunks):
+        text = clean_text(f"{chunk.get('title')} {chunk.get('url')} {chunk.get('content')}")
+        chunk_terms = detail_terms(text)
+        overlap = len(question_terms & chunk_terms)
+        topic_bonus = sum(3 for topic in expected_topics if evidence_text_has_topic(text, topic))
+        score = overlap + topic_bonus + chunk_priority(chunk)
+        if score > 0:
+            ranked.append((score, -position, chunk))
+    return [chunk for _, _, chunk in sorted(ranked, reverse=True)]
+
+
+def chunk_priority(chunk: dict[str, Any]) -> int:
+    if not isinstance(chunk, dict):
+        return 0
+    score = signal_priority(chunk.get("content"))
+    if chunk.get("is_primary_source"):
+        score += 2
+    if isinstance(chunk.get("source_index"), int) or isinstance(chunk.get("index"), int):
+        score += 1
+    return score
+
+
+def dedupe_report_chunks(chunks: Sequence[Any]) -> list[dict[str, Any]]:
+    deduped = []
+    seen = set()
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        key = report_chunk_key(chunk)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(chunk)
+    return deduped
+
+
+def report_chunk_key(chunk: dict[str, Any]) -> str:
+    return clean_text(
+        chunk.get("id")
+        or f"{chunk.get('source_index') or chunk.get('index')}:{chunk.get('url')}:{clean_text(chunk.get('content'))[:120]}"
+    ).lower()
 
 
 def normalize_citation_markers(text: str) -> str:
