@@ -140,6 +140,20 @@ class ReportAgent:
             evidence_text=evidence_text,
             sources=sources,
         )
+        report = ensure_planner_question_sections(
+            report=report,
+            planner_questions=planner_questions,
+            report_context=report_context,
+            sources=sources,
+            citation_aliases=citation_aliases,
+            evidence_text=evidence_text,
+        )
+        report, report_issues = finalize_report(
+            report=report,
+            synthesis=synthesis,
+            evidence_text=evidence_text,
+            sources=sources,
+        )
         missing_sub_questions = missing_sub_question_coverage(report, planner_questions)
         if missing_sub_questions:
             labels = ", ".join(short_issue_label(question, 80) for question in missing_sub_questions[:3])
@@ -209,6 +223,7 @@ Generation requirements:
 - Include an executive summary under the exact heading "## Executive Summary".
 - Write a detailed technical report, not a short summary.
 - Build the main body as one "##" section per planner sub-question, in the same order as the Report section outline.
+- Never skip a Report section outline item. If evidence is partial, still create the section and write the supported part.
 - For every planner sub-question, explain the concept in prose first: what it is, how it works, why it matters, and the evidence-backed details.
 - Do not make the report equation-heavy. Include equations only when the planner sub-question asks for a formula, equation, math, mathematical formulation, score function, or core formulation.
 - If a planner sub-question does not ask for equations, summarize any math briefly in prose and focus on applications, architecture, benchmarks, limitations, comparisons, or implementation details as requested.
@@ -360,6 +375,73 @@ def missing_sub_question_coverage(report: str, planner_questions: Sequence[str])
         if overlap_count < required_overlap or too_short or missing_named_terms:
             missing.append(question)
     return missing
+
+
+def ensure_planner_question_sections(
+    report: str,
+    planner_questions: Sequence[str],
+    report_context: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+    citation_aliases: dict[int, int],
+    evidence_text: str,
+) -> str:
+    """Append evidence-backed sections for planner questions omitted by the model."""
+
+    missing_questions = missing_sub_question_coverage(report, planner_questions)
+    if not missing_questions:
+        return report
+
+    evidence_items = planner_evidence_items(report_context, sources, citation_aliases)
+    sections = []
+    for question in missing_questions:
+        question_index = planner_question_index(planner_questions, question)
+        matches = ranked_question_evidence(question, evidence_items, expected_question_topics(question))[:4]
+        if not matches:
+            continue
+        sections.append(format_fallback_planner_section(question_index, question, matches))
+
+    if not sections:
+        return report
+    body = strip_all_references_blocks(report)
+    return normalize_final_report(clean_markdown(f"{body}\n\n" + "\n\n".join(sections)), sources)
+
+
+def planner_question_index(planner_questions: Sequence[str], question: str) -> int:
+    target = clean_text(question).lower()
+    for index, item in enumerate(planner_questions, start=1):
+        if clean_text(item).lower() == target:
+            return index
+    return len([item for item in planner_questions if clean_text(item)])
+
+
+def format_fallback_planner_section(
+    question_index: int,
+    question: str,
+    evidence_items: Sequence[dict[str, Any]],
+) -> str:
+    heading = f"## {question_index}. {short_issue_label(question, 120)}"
+    lines = [
+        heading,
+        (
+            f"This section addresses the planner question: {question}. "
+            "The available source-backed evidence supports the following points."
+        ),
+    ]
+    for item in evidence_items:
+        marker = clean_text(item.get("marker"))
+        text = clean_text(item.get("text"))
+        if not text:
+            continue
+        prefix = f"{marker} " if re.fullmatch(r"\[\d+\]", marker) else ""
+        lines.append(f"- {prefix}{complete_sentence(text)}")
+    lines.append(
+        "Together, these cited points cover the requested topic from the available evidence. "
+        "Any detail not represented in the cited chunks should remain an evidence gap rather than be inferred."
+    )
+    section = clean_markdown("\n".join(lines))
+    if meaningful_word_count(section) < DEFAULT_REPORT_MIN_QUESTION_SECTION_WORDS:
+        lines.append("This fallback section is intentionally concise because only the cited evidence was used.")
+    return clean_markdown("\n".join(lines))
 
 
 def best_question_section_text(report: str, terms: Sequence[str]) -> str:
