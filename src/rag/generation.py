@@ -535,7 +535,7 @@ def parse_llm_retrieval_queries(raw_response: str) -> list[str]:
     try:
         parsed = json.loads(json_payload(text))
     except (TypeError, ValueError):
-        return fallback_line_queries(text)
+        return fallback_json_like_queries(text) or fallback_line_queries(text)
     return extract_query_strings(parsed)
 
 
@@ -549,6 +549,15 @@ def json_payload(text: str) -> str:
 
 def clean_markdown_fence(text: str) -> str:
     return re.sub(r"^```(?:json)?|```$", "", str(text or "").strip(), flags=re.IGNORECASE).strip()
+
+
+def fallback_json_like_queries(text: str) -> list[str]:
+    """Recover query arrays when a model returns almost-JSON that json.loads rejects."""
+
+    queries = []
+    for match in re.finditer(r'"queries"\s*:\s*\[(.*?)\]', str(text or ""), flags=re.DOTALL | re.IGNORECASE):
+        queries.extend(re.findall(r'"([^"]+)"', match.group(1)))
+    return dedupe_preserve_order(queries)
 
 
 def extract_query_strings(value: Any) -> list[str]:
