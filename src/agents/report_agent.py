@@ -52,7 +52,7 @@ class ReportAgent:
             raise RuntimeError("groq package is not installed. Install it with `pip install -r requirements.txt`.") from error
 
         objective = clean_text(report_context.get("objective"))
-        synthesis = normalize_citation_markers(report_context.get("synthesis"))
+        synthesis = clean_markdown(normalize_citation_markers(report_context.get("synthesis")))
         if not objective:
             raise ValueError("report_context.objective is required")
         if not synthesis:
@@ -596,7 +596,9 @@ def headings_match(expected: str, actual: str) -> bool:
     actual_terms = detail_terms(actual)
     if not expected_terms:
         return False
-    required = min(4, max(2, len(expected_terms) // 2))
+    if len(expected_terms & actual_terms) >= min(3, len(expected_terms)):
+        return True
+    required = min(3, max(2, len(expected_terms) // 3))
     return len(expected_terms & actual_terms) >= required
 
 
