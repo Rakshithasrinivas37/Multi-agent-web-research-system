@@ -152,6 +152,7 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertFalse(is_valid_retrieval_query("query 1", {"attention"}))
         self.assertFalse(is_valid_retrieval_query("example query", {"attention"}))
         self.assertTrue(is_valid_retrieval_query("attention mechanism definition equation", {"attention"}))
+        self.assertTrue(is_valid_retrieval_query("official implementation signature batched projections", {"attention"}))
 
     @patch.dict("os.environ", {}, clear=True)
     def test_llm_sub_question_retrieval_query_result_defaults_to_qwen(self):
