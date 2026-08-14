@@ -3,7 +3,12 @@ from unittest.mock import patch
 
 from langgraph.graph import END
 
-from src.graph.research_workflow import DEFAULT_REPORT_GAP_SYNTHESIS_MODEL, next_node_or_end, report_gap_synthesis_model
+from src.graph.research_workflow import (
+    DEFAULT_REPORT_GAP_SYNTHESIS_MODEL,
+    next_node_or_end,
+    report_gap_synthesis_model,
+    validate_rag_index,
+)
 
 
 class ResearchWorkflowRoutingTests(unittest.TestCase):
@@ -24,6 +29,16 @@ class ResearchWorkflowRoutingTests(unittest.TestCase):
     @patch.dict("os.environ", {"REPORT_GAP_SYNTHESIS_MODEL": "custom/model"}, clear=True)
     def test_report_gap_synthesis_model_allows_env_override(self):
         self.assertEqual(report_gap_synthesis_model(), "custom/model")
+
+    def test_validate_rag_index_allows_reused_existing_chunks(self):
+        index = {"status": "success", "indexed_chunks": 0, "stored_chunks": 12, "skipped_sources": 3}
+
+        self.assertEqual(validate_rag_index(index), [])
+
+    def test_validate_rag_index_rejects_empty_new_and_stored_chunks(self):
+        index = {"status": "success", "indexed_chunks": 0, "stored_chunks": 0}
+
+        self.assertEqual(validate_rag_index(index), ["rag_index indexed zero chunks"])
 
 
 if __name__ == "__main__":

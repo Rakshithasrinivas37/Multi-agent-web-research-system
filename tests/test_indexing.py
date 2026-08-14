@@ -2,10 +2,13 @@ import tempfile
 import unittest
 
 from src.rag.indexing import (
+    clean_document_text,
     langchain_ingestion_classes,
     parent_content_for_id,
+    parent_context_chunks,
     parent_rows_from_documents,
     split_document,
+    structure_aware_chunks,
     strip_parent_content_metadata,
     upsert_parent_chunks,
 )
@@ -13,6 +16,54 @@ from src.rag.retrieval import RetrievalResult, expand_parent_context_results, me
 
 
 class IndexingChunkingTests(unittest.TestCase):
+    def test_clean_document_text_removes_common_web_noise(self):
+        text = """Skip to content
+Accept all cookies
+Useful technical paragraph with an equation y = softmax(x).
+Subscribe to our newsletter
+Useful technical paragraph with an equation y = softmax(x).
+Useful technical paragraph with an equation y = softmax(x).
+"""
+
+        cleaned = clean_document_text(text)
+
+        self.assertNotIn("Accept all cookies", cleaned)
+        self.assertNotIn("Subscribe to our newsletter", cleaned)
+        self.assertEqual(cleaned.count("Useful technical paragraph"), 2)
+
+    def test_structure_aware_chunks_preserve_sections_for_parent_context(self):
+        text = """# Abstract
+This section summarizes the document.
+
+## Method
+The method keeps equations near their explanation.
+y = softmax(x)
+
+## Results
+The results section keeps benchmark text together.
+Accuracy is 91.0%.
+"""
+
+        chunks = structure_aware_chunks(text, max_tokens=18, overlap_tokens=0)
+
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertTrue(any("## Method" in chunk and "y = softmax(x)" in chunk for chunk in chunks))
+        self.assertTrue(any("## Results" in chunk and "Accuracy is 91.0%" in chunk for chunk in chunks))
+
+    def test_parent_context_chunks_use_structure_boundaries(self):
+        text = "\n\n".join(
+            [
+                "## Setup\n" + "Setup details. " * 80,
+                "## API\n" + "torch.example_call(arg=True). " * 80,
+                "## Metrics\n" + "Accuracy is 91.0%. " * 80,
+            ]
+        )
+
+        parents = parent_context_chunks(text)
+
+        self.assertTrue(parents)
+        self.assertTrue(any("## API" in parent for parent in parents))
+
     def test_split_document_adds_signal_chunks_for_precise_evidence(self):
         Document, _ = langchain_ingestion_classes()
         document = Document(
