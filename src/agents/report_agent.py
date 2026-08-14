@@ -166,6 +166,7 @@ Grounding requirement (strict — read this first):
 - Use ONLY the information in "Available sources," "Supporting evidence," and "Synthesis notes" above. Treat this as the complete and only knowledge you have access to.
 - Do not use any fact, figure, date, name, definition, or background knowledge from your own training. Even facts you are confident are true must not be included unless they appear in the retrieved context above.
 - If the retrieved context is silent on something a sub-question asks about, do not fill the gap from general knowledge. State the gap explicitly in that section and in Limitations/Open Questions instead.
+- Do not include "outside evidence scope" explanations. A gap statement is enough when evidence is missing.
 - If you find yourself writing a sentence with no source to cite for it, delete the sentence or move it to Limitations/Open Questions as a stated gap — do not soften it into an uncited claim.
 
 Coverage requirement (mandatory):
@@ -300,6 +301,8 @@ def sources_with_browser_results(sources: Sequence[Any], browser_results: Sequen
 def dedupe_sources(sources: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped = []
     seen = set()
+    used_indexes = set()
+    next_index = 1
     for source in sources or []:
         url = normalize_url(source.get("url"))
         if url and url in seen:
@@ -307,7 +310,13 @@ def dedupe_sources(sources: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         if url:
             seen.add(url)
         item = dict(source)
-        item["index"] = len(deduped) + 1
+        index = item.get("index")
+        if not isinstance(index, int) or index in used_indexes:
+            while next_index in used_indexes:
+                next_index += 1
+            index = next_index
+        item["index"] = index
+        used_indexes.add(index)
         deduped.append(item)
     return deduped
 
@@ -383,11 +392,11 @@ def report_schema_issues(report: str, planner_questions: Sequence[str]) -> list[
     }
     issues = []
     for label, aliases in required.items():
-        if not any(alias in headings for alias in aliases):
+        if not any(normalize_heading(alias) in headings for alias in aliases):
             issues.append(f"missing schema section: {label}")
     for question in planner_questions:
         heading = normalize_heading(planner_question_heading(question))
-        if heading and heading not in headings:
+        if heading and not any(headings_match(heading, actual) for actual in headings):
             issues.append(f"missing planner topic section: {planner_question_heading(question)}")
     return issues
 
@@ -401,7 +410,7 @@ def report_self_critique(report_issues: Sequence[str], coverage_check: dict[str,
 
 def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None = None) -> list[str]:
     issues = []
-    text = clean_text(report)
+    text = clean_markdown(report)
     if not text:
         return ["report is empty"]
     if not any(is_references_heading(line) for line in text.splitlines()):
@@ -516,7 +525,18 @@ def source_index_set(sources: Sequence[dict[str, Any]]) -> set[int]:
 
 
 def h2_headings(markdown: str) -> list[str]:
-    return [match.group(1).strip() for match in re.finditer(r"(?m)^##\s+(.+)$", clean_markdown(markdown))]
+    headings = []
+    in_fence = False
+    for line in clean_markdown(markdown).splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if match:
+            headings.append(match.group(1).strip())
+    return headings
 
 
 def is_references_heading(line: str) -> bool:
@@ -524,7 +544,21 @@ def is_references_heading(line: str) -> bool:
 
 
 def normalize_heading(text: Any) -> str:
-    return clean_text(re.sub(r"^\d+[.)]\s*", "", strip_markdown(text))).lower().rstrip(":")
+    value = strip_markdown(text).replace("‑", "-").replace("–", "-").replace("—", "-")
+    value = re.sub(r"^\d+[.)]\s*", "", value)
+    value = re.sub(r"[^a-zA-Z0-9]+", " ", value)
+    return clean_text(value).lower()
+
+
+def headings_match(expected: str, actual: str) -> bool:
+    if expected == actual or expected in actual or actual in expected:
+        return True
+    expected_terms = detail_terms(expected)
+    actual_terms = detail_terms(actual)
+    if not expected_terms:
+        return False
+    required = min(4, max(2, len(expected_terms) // 2))
+    return len(expected_terms & actual_terms) >= required
 
 
 def detail_terms(text: Any) -> set[str]:
