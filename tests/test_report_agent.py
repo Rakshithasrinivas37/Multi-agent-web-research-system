@@ -2,6 +2,7 @@ import unittest
 
 from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+    ensure_planner_question_sections,
     format_source_priority_guidance,
     hard_report_issues,
     markdown_completion_issues,
@@ -673,6 +674,53 @@ No cited source markers were used.
         missing = missing_sub_question_coverage(report, questions)
 
         self.assertEqual(missing, [questions[1]])
+
+    def test_ensure_planner_question_sections_appends_supported_missing_topics(self):
+        questions = [
+            "What is attention?",
+            "What is the official PyTorch API for multi-head attention and how is it used?",
+            "How are attention mechanisms applied in Vision Transformers (ViT) for image data?",
+        ]
+        report = """# Topic
+
+## Executive Summary
+Attention is summarized.
+
+## 1. What is attention?
+Attention weights source information and combines values in a context-aware way.
+
+## References
+[1] https://example.com/attention
+"""
+        sources = [
+            {"index": 1, "url": "https://example.com/attention"},
+            {"index": 2, "url": "https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html"},
+            {"index": 3, "url": "https://arxiv.org/pdf/2010.11929"},
+        ]
+        report_context = {
+            "supporting_chunks": [
+                {
+                    "source_index": 2,
+                    "url": sources[1]["url"],
+                    "title": "PyTorch MultiheadAttention",
+                    "content": "torch.nn.MultiheadAttention is the official PyTorch module for multi-head attention and uses query, key, and value tensors.",
+                },
+                {
+                    "source_index": 3,
+                    "url": sources[2]["url"],
+                    "title": "Vision Transformer",
+                    "content": "Vision Transformer (ViT) applies attention to image data by splitting images into patches and processing patch embeddings with a Transformer encoder.",
+                },
+            ]
+        }
+
+        completed = ensure_planner_question_sections(report, questions, report_context, sources, {}, "")
+
+        self.assertEqual(missing_sub_question_coverage(completed, questions), [])
+        self.assertIn("torch.nn.MultiheadAttention", completed)
+        self.assertIn("Vision Transformer", completed)
+        self.assertIn("[2]", completed)
+        self.assertIn("[3]", completed)
 
     def test_rewrite_missing_sub_question_queries_keeps_queries_focused(self):
         queries = rewrite_missing_sub_question_queries(
