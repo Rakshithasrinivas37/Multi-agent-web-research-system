@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import hashlib
+import json
 from typing import Any, Sequence
 
 from src.agents.change_detection_agent import objective_key
@@ -32,6 +33,7 @@ from src.tools.text_utils import clean_text
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
 DEFAULT_GAP_QUERY_MODEL = "llama-3.1-8b-instant"
+DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL = "qwen/qwen3.6-27b"
 DEFAULT_MAX_CONTEXT_CHARS = 18000
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_REPORT_MAX_TOKENS = 1400
@@ -50,6 +52,7 @@ DEFAULT_GAP_RETRIEVAL_TOP_K = 12
 DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
 DEFAULT_PRECISION_QUERY_LIMIT = 8
+DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
 DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 30
 DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 3
 DEFAULT_SYNTHESIS_MAX_CHUNKS = 18
@@ -116,6 +119,16 @@ def rag_generation_model(model: str | None = None) -> str:
     )
 
 
+def sub_question_query_rewrite_model(model: str | None = None) -> str:
+    """Model used only for rewriting planner sub-questions into retrieval queries."""
+
+    return (
+        clean_text(os.environ.get("RAG_SUBQUESTION_QUERY_MODEL"))
+        or DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL
+        or rag_generation_model(model)
+    )
+
+
 def synthesize_report_from_research_plan(
     research_plan: dict[str, Any],
     chroma_path: str = DEFAULT_CHROMA_PATH,
@@ -168,17 +181,19 @@ def synthesize_report_from_research_plan(
         collection_name=collection_name,
     )
     allowed_history_keys = objective_scope["history_keys"]
-    rewritten_query = rewrite_query_from_planner_queries(
-        objective=objective,
-        queries=queries,
+    llm_query_result = llm_sub_question_retrieval_query_result(
+        research_plan=research_plan,
         model=model,
-    ) if rewrite_query else ""
-    if print_rewritten_query and rewritten_query:
-        print("Rewritten retrieval query:")
-        print(rewritten_query)
+    ) if rewrite_query else empty_llm_query_result()
+    llm_sub_question_queries = llm_query_result["queries"]
+    if print_rewritten_query and llm_sub_question_queries:
+        print("LLM rewritten sub-question retrieval queries:")
+        for query in llm_sub_question_queries:
+            print(f"- {query}")
+    rewritten_query = "\n".join(llm_sub_question_queries)
     precision_queries = precision_retrieval_queries(research_plan, objective=objective)
     retrieval_queries = dedupe_preserve_order(
-        ([rewritten_query] if rewritten_query else queries) + precision_queries
+        llm_sub_question_queries + queries + precision_queries
     )
     retrieved_context = multi_query_hybrid_retrieve(
         queries=retrieval_queries,
@@ -283,6 +298,10 @@ def synthesize_report_from_research_plan(
     payload["queries"] = queries
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
+    payload["llm_sub_question_retrieval_queries"] = llm_sub_question_queries
+    payload["llm_sub_question_query_model"] = llm_query_result["model"]
+    payload["llm_sub_question_query_error"] = llm_query_result["error"]
+    payload["llm_sub_question_query_raw_response"] = llm_query_result["raw_response"]
     payload["precision_retrieval_queries"] = precision_queries
     payload["gap_retrieval_queries"] = gap_queries
     payload["gap_query_model"] = gap_query_plan["model"]
@@ -367,8 +386,13 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     for sub_question in research_plan.get("sub_questions", []):
         query = clean_text(sub_question)
         if query:
-            details = matching_task_details(query, tasks)
-            sub_question_queries.append(clean_text(f"{query} {details}"))
+            sub_question_queries.extend(
+                sub_question_retrieval_queries(
+                    query,
+                    objective=objective,
+                    task_details=matching_task_details(query, tasks),
+                )
+            )
 
     if sub_question_queries:
         if objective:
@@ -395,6 +419,159 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     if objective:
         queries.append(objective)
     return dedupe_preserve_order(queries)
+
+
+def sub_question_retrieval_queries(
+    question: str,
+    objective: str = "",
+    task_details: str = "",
+    max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
+) -> list[str]:
+    """Rewrite one planner sub-question into broad retrieval intents."""
+
+    question = clean_text(question)
+    objective = clean_text(objective)
+    task_details = clean_text(task_details)
+    if not question:
+        return []
+
+    anchor = clean_text(f"{objective} {question}")
+    key_terms = " ".join(query_keywords(question, limit=10))
+    variants = [
+        clean_text(f"{question} {task_details}"),
+        clean_text(f"{objective} {key_terms} overview background concepts methods evidence"),
+        clean_text(f"{anchor} source-backed details examples definitions equations metrics implementation limitations {task_details}"),
+    ]
+    return dedupe_preserve_order(variant[:700] for variant in variants)[: max(1, max_variants)]
+
+
+def llm_sub_question_retrieval_query_result(
+    research_plan: dict[str, Any],
+    model: str | None = None,
+    max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
+) -> dict[str, Any]:
+    """Use the generation model to rewrite planner sub-questions into RAG queries."""
+
+    objective = clean_text(research_plan.get("objective"))
+    questions = planner_sub_questions(research_plan)
+    selected_model = sub_question_query_rewrite_model(model)
+    if not questions:
+        return empty_llm_query_result(model=selected_model)
+    if not os.environ.get("GROQ_API_KEY"):
+        return empty_llm_query_result(model=selected_model, error="GROQ_API_KEY is not set")
+
+    try:
+        from groq import Groq
+    except ImportError as error:
+        return empty_llm_query_result(model=selected_model, error=str(error))
+
+    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
+    prompt = f"""Research objective:
+{objective}
+
+Planner sub-questions and optional task details:
+{format_sub_question_rewrite_items(questions, tasks)}
+
+Rewrite each planner sub-question into 2-3 broad RAG retrieval queries.
+Requirements:
+- Preserve named entities, URLs, model names, datasets, metrics, APIs, equations, and important technical terms.
+- Make each query broad enough for semantic search but still useful for BM25 keyword matching.
+- Include evidence intent words when useful, such as definition, equation, benchmark, implementation, limitation, comparison, or example.
+- Do not answer the question and do not add citations.
+- Return JSON only in this shape:
+{{"items":[{{"sub_question":"...","queries":["query 1","query 2"]}}]}}"""
+
+    try:
+        response = create_chat_completion_with_retries(
+            Groq(),
+            model=selected_model,
+            temperature=0,
+            max_tokens=900,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You rewrite research planner sub-questions into high-recall RAG retrieval queries. Return JSON only.",
+                },
+                {"role": "user", "content": prompt[:6000]},
+            ],
+        )
+    except Exception as error:  # pragma: no cover - exercised through integration runs.
+        return empty_llm_query_result(model=selected_model, error=str(error))
+
+    raw_response = clean_text(response.choices[0].message.content)
+    queries = parse_llm_retrieval_queries(raw_response)
+    max_queries = max(1, len(questions) * max(1, max_variants))
+    return {
+        "queries": dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
+        "model": clean_text(getattr(response, "model", "")) or selected_model,
+        "error": "",
+        "raw_response": raw_response[:1000],
+    }
+
+
+def empty_llm_query_result(model: str = "", error: str = "") -> dict[str, Any]:
+    return {"queries": [], "model": clean_text(model), "error": clean_text(error), "raw_response": ""}
+
+
+def format_sub_question_rewrite_items(questions: Sequence[str], tasks: Sequence[dict[str, Any]]) -> str:
+    lines = []
+    for index, question in enumerate(questions, start=1):
+        details = matching_task_details(question, tasks)
+        detail_text = f"\n   task_details: {details}" if details else ""
+        lines.append(f"{index}. {question}{detail_text}")
+    return "\n".join(lines)
+
+
+def parse_llm_retrieval_queries(raw_response: str) -> list[str]:
+    text = clean_markdown_fence(raw_response)
+    try:
+        parsed = json.loads(json_payload(text))
+    except (TypeError, ValueError):
+        return fallback_line_queries(text)
+    return extract_query_strings(parsed)
+
+
+def json_payload(text: str) -> str:
+    text = clean_text(text)
+    if text.startswith("{") or text.startswith("["):
+        return text
+    match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
+    return match.group(1) if match else text
+
+
+def clean_markdown_fence(text: str) -> str:
+    return re.sub(r"^```(?:json)?|```$", "", str(text or "").strip(), flags=re.IGNORECASE).strip()
+
+
+def extract_query_strings(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        queries = []
+        for key, item in value.items():
+            key_name = key.lower()
+            if key_name in {"sub_question", "question"}:
+                continue
+            if key_name in {"query", "text"} and isinstance(item, str):
+                queries.append(item)
+            else:
+                queries.extend(extract_query_strings(item))
+        return dedupe_preserve_order(queries)
+    if isinstance(value, list):
+        queries = []
+        for item in value:
+            queries.extend(extract_query_strings(item))
+        return dedupe_preserve_order(queries)
+    if isinstance(value, str):
+        return fallback_line_queries(value)
+    return []
+
+
+def fallback_line_queries(text: str) -> list[str]:
+    lines = []
+    for line in str(text or "").splitlines():
+        line = re.sub(r"^\s*[-*\d.)]+\s*", "", line).strip().strip('"')
+        if clean_text(line):
+            lines.append(line)
+    return dedupe_preserve_order(lines)
 
 
 def precision_retrieval_queries(
@@ -465,6 +642,16 @@ def query_tokens(text: str) -> set[str]:
         for token in re.findall(r"[A-Za-z0-9_+#.-]+", clean_text(text))
         if len(token) > 2 and token.lower() not in stopwords
     }
+
+
+def query_keywords(text: str, limit: int = 10) -> list[str]:
+    keywords = []
+    for token in re.findall(r"[A-Za-z0-9_+#.-]+", clean_text(text)):
+        lowered = token.lower().strip(".")
+        if len(lowered) <= 2 or lowered in OBJECTIVE_STOPWORDS:
+            continue
+        keywords.append(token.strip(".,;:()[]{}"))
+    return dedupe_preserve_order(keywords)[: max(1, limit)]
 
 
 def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
