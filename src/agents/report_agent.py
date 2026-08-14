@@ -415,11 +415,17 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
         return ["report is empty"]
     if not any(is_references_heading(line) for line in text.splitlines()):
         issues.append("report must include a References section")
+    if has_placeholder_source_marker(text):
+        issues.append("report contains placeholder or non-source citation markers")
     source_indexes = source_index_set(sources or [])
     invalid = unavailable_citation_markers(report, source_indexes)
     if invalid:
         issues.append(f"report uses unavailable citations: {format_citation_indexes(invalid)}")
     return issues
+
+
+def has_placeholder_source_marker(text: str) -> bool:
+    return bool(re.search(r"\[\s*(?:[—-]|uncited|citation needed|source needed)[^\]]*\]", text, flags=re.IGNORECASE))
 
 
 def rewrite_missing_sub_question_queries(objective: str, questions: Sequence[str]) -> list[str]:

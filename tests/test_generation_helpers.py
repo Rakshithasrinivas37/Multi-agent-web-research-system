@@ -131,6 +131,16 @@ class GenerationHelperTests(unittest.TestCase):
 
         self.assertEqual(queries, ["attention definition equation", "attention examples"])
 
+    def test_parse_llm_retrieval_queries_recovers_json_like_query_arrays(self):
+        raw = (
+            '{"items":[{"sub_question":"What is attention?",'
+            '"queries":["attention definition equation","attention benchmark evidence",]}]}'
+        )
+
+        queries = parse_llm_retrieval_queries(raw)
+
+        self.assertEqual(queries, ["attention definition equation", "attention benchmark evidence"])
+
     def test_valid_retrieval_queries_filters_placeholders(self):
         plan = {"objective": "Attention mechanism", "sub_questions": ["What is attention?"]}
 
