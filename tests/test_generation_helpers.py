@@ -7,13 +7,16 @@ from src.rag.generation import (
     audit_synthesis_citations,
     browser_signal_results,
     high_signal_browser_snippets,
+    is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
     parse_llm_retrieval_queries,
     precision_retrieval_queries,
     print_synthesis_chunks,
     planner_tasks_to_rag_queries,
     report_supporting_chunks,
+    select_synthesis_context,
     sub_question_retrieval_queries,
+    valid_retrieval_queries,
 )
 from src.rag.retrieval import RetrievalResult
 
@@ -128,6 +131,18 @@ class GenerationHelperTests(unittest.TestCase):
 
         self.assertEqual(queries, ["attention definition equation", "attention examples"])
 
+    def test_valid_retrieval_queries_filters_placeholders(self):
+        plan = {"objective": "Attention mechanism", "sub_questions": ["What is attention?"]}
+
+        queries = valid_retrieval_queries(["query 1", "query 2", "attention mechanism definition equation"], plan)
+
+        self.assertEqual(queries, ["attention mechanism definition equation"])
+
+    def test_is_valid_retrieval_query_rejects_generic_outputs(self):
+        self.assertFalse(is_valid_retrieval_query("query 1", {"attention"}))
+        self.assertFalse(is_valid_retrieval_query("example query", {"attention"}))
+        self.assertTrue(is_valid_retrieval_query("attention mechanism definition equation", {"attention"}))
+
     @patch.dict("os.environ", {}, clear=True)
     def test_llm_sub_question_retrieval_query_result_defaults_to_qwen(self):
         result = llm_sub_question_retrieval_query_result(
@@ -141,7 +156,7 @@ class GenerationHelperTests(unittest.TestCase):
     @patch("src.rag.generation.create_chat_completion_with_retries")
     def test_llm_sub_question_retrieval_query_result_uses_query_model(self, completion):
         class Message:
-            content = '{"items":[{"sub_question":"What is X?","queries":["x overview","x evidence details"]}]}'
+            content = '{"items":[{"sub_question":"What is X?","queries":["x research overview","x research evidence details"]}]}'
 
         class Choice:
             message = Message()
@@ -156,10 +171,32 @@ class GenerationHelperTests(unittest.TestCase):
             {"objective": "X research", "sub_questions": ["What is X?"]},
         )
 
-        self.assertEqual(result["queries"], ["x overview", "x evidence details"])
+        self.assertEqual(result["queries"], ["x research overview", "x research evidence details"])
         self.assertEqual(result["model"], "llama-test")
         self.assertEqual(result["error"], "")
         self.assertEqual(completion.call_args.kwargs["model"], "llama-test")
+
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)
+    @patch("src.rag.generation.create_chat_completion_with_retries")
+    def test_llm_sub_question_retrieval_query_result_rejects_placeholder_queries(self, completion):
+        class Message:
+            content = '{"items":[{"sub_question":"What is X?","queries":["query 1","query 2"]}]}'
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "llama-test"
+
+        completion.return_value = Response()
+
+        result = llm_sub_question_retrieval_query_result(
+            {"objective": "X research", "sub_questions": ["What is X?"]},
+        )
+
+        self.assertEqual(result["queries"], [])
+        self.assertEqual(result["error"], "LLM query rewrite returned no usable queries")
 
     def test_browser_signal_results_promotes_formula_evidence(self):
         browser_results = [

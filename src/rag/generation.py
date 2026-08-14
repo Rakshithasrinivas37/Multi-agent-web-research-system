@@ -478,6 +478,7 @@ Requirements:
 - Make each query broad enough for semantic search but still useful for BM25 keyword matching.
 - Include evidence intent words when useful, such as definition, equation, benchmark, implementation, limitation, comparison, or example.
 - Do not answer the question and do not add citations.
+- Never output placeholder text such as "query 1", "query 2", "retrieval query", or "example query".
 - Return JSON only in this shape:
 {{"items":[{{"sub_question":"...","queries":["query 1","query 2"]}}]}}"""
 
@@ -499,8 +500,15 @@ Requirements:
         return empty_llm_query_result(model=selected_model, error=str(error))
 
     raw_response = clean_text(response.choices[0].message.content)
-    queries = parse_llm_retrieval_queries(raw_response)
+    queries = valid_retrieval_queries(parse_llm_retrieval_queries(raw_response), research_plan)
     max_queries = max(1, len(questions) * max(1, max_variants))
+    if not queries:
+        return {
+            "queries": [],
+            "model": clean_text(getattr(response, "model", "")) or selected_model,
+            "error": "LLM query rewrite returned no usable queries",
+            "raw_response": raw_response[:1000],
+        }
     return {
         "queries": dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
         "model": clean_text(getattr(response, "model", "")) or selected_model,
@@ -572,6 +580,36 @@ def fallback_line_queries(text: str) -> list[str]:
         if clean_text(line):
             lines.append(line)
     return dedupe_preserve_order(lines)
+
+
+def valid_retrieval_queries(queries: Sequence[str], research_plan: dict[str, Any]) -> list[str]:
+    objective_terms = query_tokens(clean_text(research_plan.get("objective")))
+    question_terms = set()
+    for question in planner_sub_questions(research_plan):
+        question_terms.update(query_tokens(question))
+    allowed_terms = objective_terms | question_terms
+    return [
+        query
+        for query in dedupe_preserve_order(queries)
+        if is_valid_retrieval_query(query, allowed_terms)
+    ]
+
+
+def is_valid_retrieval_query(query: str, allowed_terms: set[str]) -> bool:
+    text = clean_text(query)
+    lowered = text.lower()
+    if not text:
+        return False
+    if re.fullmatch(r"(?:query|retrieval query|search query|example query)\s*\d*", lowered):
+        return False
+    if re.fullmatch(r"(?:query|retrieval|search|example)(?:\s+\d+)?", lowered):
+        return False
+    if len(re.findall(r"\S+", text)) < 3:
+        return False
+    query_terms = query_tokens(text)
+    if allowed_terms and not (query_terms & allowed_terms):
+        return False
+    return True
 
 
 def precision_retrieval_queries(

@@ -14,8 +14,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
-DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
 DEFAULT_BACKEND_URL = "http://127.0.0.1:8000"
 
 
