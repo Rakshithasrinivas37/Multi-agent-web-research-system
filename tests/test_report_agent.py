@@ -10,6 +10,7 @@ from src.agents.report_agent import (
     format_evidence_coverage_brief,
     format_memory_signal_evidence,
     format_planner_evidence_packet,
+    format_supporting_evidence,
     missing_evidence_constraints,
     report_context_gap_items,
     report_context_gap_queries,
@@ -740,6 +741,43 @@ Attention weights source information and combines values in a context-aware way.
         self.assertIn("## 2. Attention in Vision Transformers", outline)
         self.assertNotIn("## 1. What is", outline)
         self.assertIn("Coverage target: What is the official PyTorch API", outline)
+
+    def test_format_supporting_evidence_selects_chunks_per_planner_topic(self):
+        context = {
+            "supporting_chunks": [
+                {
+                    "source_index": 1,
+                    "title": "General attention",
+                    "url": "https://example.com/general",
+                    "content": "Attention computes weights over values. " * 80,
+                }
+            ],
+            "retrieved_chunks": [
+                {
+                    "source_index": 2,
+                    "title": "PyTorch MultiheadAttention",
+                    "url": "https://docs.pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html",
+                    "content": "torch.nn.MultiheadAttention is the official PyTorch API for multi-head attention.",
+                },
+                {
+                    "source_index": 3,
+                    "title": "Vision Transformer",
+                    "url": "https://arxiv.org/pdf/2010.11929",
+                    "content": "Vision Transformer applies self-attention to image patches for image classification.",
+                },
+            ],
+        }
+
+        evidence = format_supporting_evidence(
+            context,
+            planner_questions=[
+                "What is the official PyTorch API for multi-head attention and how is it used?",
+                "How are attention mechanisms applied in Vision Transformers (ViT) for image data?",
+            ],
+        )
+
+        self.assertIn("torch.nn.MultiheadAttention", evidence)
+        self.assertIn("Vision Transformer", evidence)
 
     def test_rewrite_missing_sub_question_queries_keeps_queries_focused(self):
         queries = rewrite_missing_sub_question_queries(
