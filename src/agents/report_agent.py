@@ -82,7 +82,7 @@ class ReportAgent:
         report = normalize_final_report(report, sources)
         coverage = report_sub_question_coverage_check(report, planner_questions)
         schema_issues = report_schema_issues(report, planner_questions)
-        report_issues = report_quality_issues(report, sources)
+        report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}")
         review = report_self_critique(report_issues, coverage, schema_issues)
 
         return {
@@ -322,7 +322,7 @@ def dedupe_sources(sources: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> str:
-    text = remove_unavailable_citation_markers(clean_markdown(report), source_index_set(sources))
+    text = normalize_markdown_headings(remove_unavailable_citation_markers(clean_markdown(report), source_index_set(sources)))
     body = strip_references(text)
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
 
@@ -408,7 +408,11 @@ def report_self_critique(report_issues: Sequence[str], coverage_check: dict[str,
     return {"source": "deterministic", "unresolved_issues": unresolved, "coverage_missing": coverage_check.get("missing", []), "schema_issues": list(schema_issues)}
 
 
-def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None = None) -> list[str]:
+def report_quality_issues(
+    report: str,
+    sources: Sequence[dict[str, Any]] | None = None,
+    evidence_text: str = "",
+) -> list[str]:
     issues = []
     text = clean_markdown(report)
     if not text:
@@ -419,7 +423,36 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
     invalid = unavailable_citation_markers(report, source_indexes)
     if invalid:
         issues.append(f"report uses unavailable citations: {format_citation_indexes(invalid)}")
+    unsupported_metrics = unsupported_benchmark_metrics(text, evidence_text)
+    if unsupported_metrics:
+        issues.append(f"report includes benchmark metrics not present in evidence: {', '.join(unsupported_metrics[:5])}")
     return issues
+
+
+def normalize_markdown_headings(markdown: str) -> str:
+    lines = []
+    for line in clean_markdown(markdown).splitlines():
+        lines.append(re.sub(r"^(\s{0,3}#{1,6}\s+)#{1,6}\s+", r"\1", line))
+    return "\n".join(lines)
+
+
+def unsupported_benchmark_metrics(report: str, evidence_text: str) -> list[str]:
+    evidence = strip_markdown(evidence_text).lower()
+    if not evidence:
+        return []
+    unsupported = []
+    for line in clean_markdown(report).splitlines():
+        if line.lstrip().startswith("#") or is_references_heading(line):
+            continue
+        text = strip_markdown(line)
+        lowered = text.lower()
+        if not re.search(r"\b(benchmark|bleu|glue|imagenet|accuracy|top[- ]?[15]|f1|auc|rouge)\b|%", lowered):
+            continue
+        for number in re.findall(r"(?<![-\[])\b\d+(?:\.\d+)?\s*%?", text):
+            value = clean_text(number).lower()
+            if value and value not in evidence and value not in unsupported:
+                unsupported.append(value)
+    return unsupported
 
 
 def rewrite_missing_sub_question_queries(objective: str, questions: Sequence[str]) -> list[str]:

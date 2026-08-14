@@ -9,6 +9,7 @@ from src.agents.report_agent import (
     missing_evidence_constraints,
     missing_sub_question_coverage,
     normalize_final_report,
+    normalize_markdown_headings,
     remove_unavailable_citation_markers,
     report_context_gap_items,
     report_context_gap_queries,
@@ -19,6 +20,7 @@ from src.agents.report_agent import (
     report_sub_question_coverage_check,
     rewrite_missing_sub_question_queries,
     slugify_filename,
+    unsupported_benchmark_metrics,
 )
 
 
@@ -50,6 +52,26 @@ Supported [1]. Unsupported [9].
         )
 
         self.assertIn("report uses unavailable citations: [2]", issues)
+
+    def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
+        markdown = "### ## 1. Definition\nText."
+
+        self.assertEqual(normalize_markdown_headings(markdown), "### 1. Definition\nText.")
+
+    def test_report_quality_flags_benchmark_metrics_missing_from_evidence(self):
+        issues = report_quality_issues(
+            "## Benchmarks\nViT reaches 77% top-1 accuracy [1].\n\n## References\n[1] https://example.com",
+            [{"index": 1, "url": "https://example.com"}],
+            evidence_text="Vision Transformer image classification evidence without exact scores.",
+        )
+
+        self.assertIn("report includes benchmark metrics not present in evidence: 77%", issues)
+
+    def test_unsupported_benchmark_metrics_allows_evidence_numbers(self):
+        report = "BLEU-4 improves from 0.386 to 0.482 [1]."
+        evidence = "The evidence says BLEU-4 improves from 0.386 to 0.482."
+
+        self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
 
     def test_report_quality_accepts_references_after_markdown_cleanup(self):
         issues = report_quality_issues(
