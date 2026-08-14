@@ -4,6 +4,7 @@ from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     ensure_planner_question_sections,
     format_source_priority_guidance,
+    format_report_section_outline,
     hard_report_issues,
     markdown_completion_issues,
     format_evidence_coverage_brief,
@@ -717,10 +718,28 @@ Attention weights source information and combines values in a context-aware way.
         completed = ensure_planner_question_sections(report, questions, report_context, sources, {}, "")
 
         self.assertEqual(missing_sub_question_coverage(completed, questions), [])
+        self.assertIn("## 2. PyTorch Multi-Head Attention API and Usage", completed)
+        self.assertIn("## 3. Attention in Vision Transformers", completed)
+        self.assertNotIn("## 2. What is the official PyTorch API", completed)
+        self.assertLess(completed.index("## 1."), completed.index("## 2."))
+        self.assertLess(completed.index("## 2."), completed.index("## 3."))
         self.assertIn("torch.nn.MultiheadAttention", completed)
         self.assertIn("Vision Transformer", completed)
         self.assertIn("[2]", completed)
         self.assertIn("[3]", completed)
+
+    def test_format_report_section_outline_uses_topic_headings(self):
+        outline = format_report_section_outline(
+            [
+                "What is the official PyTorch API for multi-head attention and how is it used?",
+                "How are attention mechanisms applied in Vision Transformers (ViT) for image data?",
+            ]
+        )
+
+        self.assertIn("## 1. PyTorch Multi-Head Attention API and Usage", outline)
+        self.assertIn("## 2. Attention in Vision Transformers", outline)
+        self.assertNotIn("## 1. What is", outline)
+        self.assertIn("Coverage target: What is the official PyTorch API", outline)
 
     def test_rewrite_missing_sub_question_queries_keeps_queries_focused(self):
         queries = rewrite_missing_sub_question_queries(
