@@ -7,9 +7,13 @@ from src.rag.generation import (
     audit_synthesis_citations,
     browser_signal_results,
     high_signal_browser_snippets,
+    llm_sub_question_retrieval_query_result,
+    parse_llm_retrieval_queries,
     precision_retrieval_queries,
     print_synthesis_chunks,
+    planner_tasks_to_rag_queries,
     report_supporting_chunks,
+    sub_question_retrieval_queries,
 )
 from src.rag.retrieval import RetrievalResult
 
@@ -87,6 +91,75 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertIn("exact equation formula", joined)
         self.assertIn("benchmark table results", joined)
         self.assertIn("official documentation api signature", joined)
+
+    def test_sub_question_retrieval_queries_expand_each_question_generically(self):
+        queries = sub_question_retrieval_queries(
+            "How is a model deployed and monitored in production?",
+            objective="MLOps system",
+            task_details="Find lifecycle evidence.",
+        )
+
+        self.assertEqual(len(queries), 3)
+        self.assertIn("Find lifecycle evidence", queries[0])
+        self.assertIn("overview background concepts methods evidence", queries[1])
+        self.assertIn("source-backed details examples definitions", queries[2])
+
+    def test_planner_tasks_to_rag_queries_splits_sub_questions_into_variants(self):
+        plan = {
+            "objective": "Model deployment",
+            "sub_questions": [
+                "How is a model deployed?",
+                "What monitoring metrics are used?",
+            ],
+        }
+
+        queries = planner_tasks_to_rag_queries(plan)
+
+        self.assertGreaterEqual(len(queries), 5)
+        self.assertTrue(any("source-backed details" in query for query in queries))
+        self.assertIn("Model deployment", queries[-1])
+
+    def test_parse_llm_retrieval_queries_reads_json_queries_only(self):
+        raw = """```json
+{"items":[{"sub_question":"What is attention?","queries":["attention definition equation","attention examples"]}]}
+```"""
+
+        queries = parse_llm_retrieval_queries(raw)
+
+        self.assertEqual(queries, ["attention definition equation", "attention examples"])
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_llm_sub_question_retrieval_query_result_defaults_to_qwen(self):
+        result = llm_sub_question_retrieval_query_result(
+            {"objective": "X research", "sub_questions": ["What is X?"]},
+        )
+
+        self.assertEqual(result["model"], "qwen/qwen3.6-27b")
+        self.assertEqual(result["error"], "GROQ_API_KEY is not set")
+
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)
+    @patch("src.rag.generation.create_chat_completion_with_retries")
+    def test_llm_sub_question_retrieval_query_result_uses_query_model(self, completion):
+        class Message:
+            content = '{"items":[{"sub_question":"What is X?","queries":["x overview","x evidence details"]}]}'
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "llama-test"
+
+        completion.return_value = Response()
+
+        result = llm_sub_question_retrieval_query_result(
+            {"objective": "X research", "sub_questions": ["What is X?"]},
+        )
+
+        self.assertEqual(result["queries"], ["x overview", "x evidence details"])
+        self.assertEqual(result["model"], "llama-test")
+        self.assertEqual(result["error"], "")
+        self.assertEqual(completion.call_args.kwargs["model"], "llama-test")
 
     def test_browser_signal_results_promotes_formula_evidence(self):
         browser_results = [
