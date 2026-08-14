@@ -3,6 +3,7 @@ import unittest
 from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     clean_markdown,
+    dedupe_sources,
     format_report_section_outline,
     format_supporting_evidence,
     missing_evidence_constraints,
@@ -49,6 +50,25 @@ Supported [1]. Unsupported [9].
         )
 
         self.assertIn("report uses unavailable citations: [2]", issues)
+
+    def test_report_quality_accepts_references_after_markdown_cleanup(self):
+        issues = report_quality_issues(
+            "### Executive Summary\nClaim [1].\n\n## References\n[1] https://example.com",
+            [{"index": 1, "url": "https://example.com"}],
+        )
+
+        self.assertNotIn("report must include a References section", issues)
+
+    def test_dedupe_sources_preserves_existing_source_indexes(self):
+        sources = dedupe_sources(
+            [
+                {"index": 3, "url": "https://paper.example"},
+                {"url": "https://new.example"},
+                {"index": 14, "url": "https://blog.example"},
+            ]
+        )
+
+        self.assertEqual([source["index"] for source in sources], [3, 1, 14])
 
     def test_format_report_section_outline_uses_topic_headings(self):
         outline = format_report_section_outline(
@@ -123,6 +143,39 @@ No cited source markers were used.
 
         self.assertIn("missing schema section: cross-cutting analysis/synthesis", issues)
         self.assertIn("missing planner topic section: Benchmark Demonstrate GLUE And WMT Performance", issues)
+
+    def test_report_schema_accepts_nested_markdown_headings(self):
+        report = """# Topic
+
+### 1. Executive Summary
+Summary.
+
+### 2. Introduction and Context
+Context.
+
+### 3. Benchmark Demonstrate GLUE And WMT Performance
+Benchmarks.
+
+```python
+# This is not a heading
+```
+
+### 4. Cross-cutting Analysis and Synthesis
+Synthesis.
+
+### 5. Limitations and Open Questions
+Limits.
+
+### 6. Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_schema_issues(report, ["What benchmark results demonstrate GLUE and WMT performance?"])
+
+        self.assertEqual(issues, [])
 
     def test_report_self_critique_combines_diagnostics(self):
         critique = report_self_critique(
