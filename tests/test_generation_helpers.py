@@ -9,6 +9,7 @@ from src.rag.generation import (
     precision_retrieval_queries,
     print_synthesis_chunks,
     report_supporting_chunks,
+    select_synthesis_context,
 )
 from src.rag.retrieval import RetrievalResult
 
@@ -131,6 +132,79 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertIn("primary/paper", output)
         self.assertIn("https://arxiv.org/pdf/1706.03762", output)
         self.assertIn("rerank=1.000", output)
+
+    def test_select_synthesis_context_balances_planner_questions(self):
+        results = [
+            RetrievalResult(
+                id=f"general-{index}",
+                document="Attention computes weighted context vectors in neural networks. " * 4,
+                metadata={"title": "General attention", "url": "https://example.com/general"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+            for index in range(8)
+        ]
+        results.extend(
+            [
+                RetrievalResult(
+                    id="pytorch",
+                    document="torch.nn.MultiheadAttention is the official PyTorch API for multi-head attention. " * 3,
+                    metadata={"title": "PyTorch MultiheadAttention", "url": "https://docs.pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html"},
+                    score=0.8,
+                    semantic_score=0.8,
+                    bm25_score=0.0,
+                ),
+                RetrievalResult(
+                    id="vit",
+                    document="Vision Transformer applies self-attention to image patches for image classification. " * 3,
+                    metadata={"title": "Vision Transformer", "url": "https://arxiv.org/pdf/2010.11929"},
+                    score=0.7,
+                    semantic_score=0.7,
+                    bm25_score=0.0,
+                ),
+            ]
+        )
+
+        selected = select_synthesis_context(
+            results,
+            [
+                "What is the official PyTorch API for multi-head attention and how is it used?",
+                "How are attention mechanisms applied in Vision Transformers for image data?",
+            ],
+            max_chunks=4,
+            per_question=1,
+        )
+        selected_ids = {result.id for result in selected}
+
+        self.assertIn("pytorch", selected_ids)
+        self.assertIn("vit", selected_ids)
+        self.assertLessEqual(len(selected), 4)
+
+    def test_select_synthesis_context_filters_weak_chunks(self):
+        selected = select_synthesis_context(
+            [
+                RetrievalResult(
+                    id="empty",
+                    document="",
+                    metadata={"title": "Empty", "url": "https://example.com/empty"},
+                    score=1.0,
+                    semantic_score=1.0,
+                    bm25_score=0.0,
+                ),
+                RetrievalResult(
+                    id="useful",
+                    document="Performer approximates softmax attention with random feature maps for efficient attention. " * 3,
+                    metadata={"title": "Performer", "url": "https://arxiv.org/pdf/2009.14794"},
+                    score=0.8,
+                    semantic_score=0.8,
+                    bm25_score=0.0,
+                ),
+            ],
+            ["What are efficient attention methods such as Performer?"],
+        )
+
+        self.assertEqual([result.id for result in selected], ["useful"])
 
 
 if __name__ == "__main__":
