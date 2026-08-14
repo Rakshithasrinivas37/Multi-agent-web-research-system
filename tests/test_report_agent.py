@@ -207,6 +207,43 @@ Done.
 
         self.assertEqual(issues, [])
 
+    def test_report_schema_accepts_concise_topic_heading_for_long_question(self):
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+### Benchmark Evidence of Performance Impact
+Benchmarks.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_schema_issues(
+            report,
+            ["What benchmark results demonstrate the performance impact of attention mechanisms on tasks such as machine translation and GLUE?"],
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_clean_markdown_strips_open_thinking_block(self):
+        text = "Useful.\n<think>hidden reasoning that never closes"
+
+        self.assertEqual(clean_markdown(text), "Useful.")
+
     def test_report_self_critique_combines_diagnostics(self):
         critique = report_self_critique(
             ["report issue"],
