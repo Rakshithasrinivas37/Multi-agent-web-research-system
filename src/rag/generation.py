@@ -54,6 +54,8 @@ DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
 DEFAULT_PRECISION_QUERY_LIMIT = 8
 DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
 DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 30
+DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 3
+DEFAULT_SYNTHESIS_MAX_CHUNKS = 18
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
@@ -231,13 +233,15 @@ def synthesize_report_from_research_plan(
     if browser_signal_context:
         retrieved_context = merge_retrieved_context(browser_signal_context, retrieved_context)
 
-    print_synthesis_chunks(retrieved_context, label="initial")
     synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
+    planner_questions = planner_sub_questions(research_plan)
+    synthesis_context = select_synthesis_context(retrieved_context, planner_questions)
+    print_synthesis_chunks(synthesis_context, label="initial")
     payload = synthesize_context_for_report(
         objective=objective,
-        retrieved_context=retrieved_context,
+        retrieved_context=synthesis_context,
         synthesis_instruction=synthesis_instruction,
-        planner_questions=planner_sub_questions(research_plan),
+        planner_questions=planner_questions,
         model=model,
         max_context_chars=max_context_chars,
         max_tokens=max_tokens,
@@ -280,12 +284,13 @@ def synthesize_report_from_research_plan(
         if gap_new_chunk_count:
             retrieved_context = retry_context
             gap_retry_count = 1
-            print_synthesis_chunks(retrieved_context, label="gap-refresh")
+            synthesis_context = select_synthesis_context(retrieved_context, planner_questions)
+            print_synthesis_chunks(synthesis_context, label="gap-refresh")
             payload = synthesize_context_for_report(
                 objective=objective,
-                retrieved_context=retrieved_context,
+                retrieved_context=synthesis_context,
                 synthesis_instruction=synthesis_instruction,
-                planner_questions=planner_sub_questions(research_plan),
+                planner_questions=planner_questions,
                 model=model,
                 max_context_chars=max_context_chars,
                 max_tokens=max_tokens,
@@ -315,6 +320,7 @@ def synthesize_report_from_research_plan(
     payload["source_coverage_count"] = len(source_coverage_results)
     payload["browser_signal_count"] = len(browser_signal_context)
     payload["retrieved_count"] = len(retrieved_context)
+    payload["synthesis_context_count"] = len(synthesis_context)
     payload["citation_policy"] = (
         "Use only the numbered source indexes in sources. Prefer primary papers, "
         "official documentation, academic sources, and authoritative surveys for "
@@ -1604,6 +1610,101 @@ def build_generation_context(
         used_chars += len(block)
 
     return "\n\n".join(blocks), sources
+
+
+def select_synthesis_context(
+    retrieved_context: Sequence[RetrievalResult],
+    planner_questions: Sequence[str] | None = None,
+    max_chunks: int = DEFAULT_SYNTHESIS_MAX_CHUNKS,
+    per_question: int = DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
+) -> list[RetrievalResult]:
+    """Return a compact, topic-balanced context for the synthesis LLM."""
+
+    candidates = meaningful_retrieval_results(retrieved_context)
+    questions = [clean_text(question) for question in planner_questions or [] if clean_text(question)]
+    if not questions:
+        return source_balanced_results(candidates)[:max(1, max_chunks)]
+
+    selected = []
+    seen = set()
+    for question in questions:
+        for result in rank_results_for_question(question, candidates)[:max(1, per_question)]:
+            key = retrieval_result_key(result)
+            if key in seen:
+                continue
+            selected.append(result)
+            seen.add(key)
+            if len(selected) >= max_chunks:
+                return selected
+
+    for result in source_balanced_results(candidates):
+        key = retrieval_result_key(result)
+        if key in seen:
+            continue
+        selected.append(result)
+        seen.add(key)
+        if len(selected) >= max_chunks:
+            break
+    return selected
+
+
+def meaningful_retrieval_results(retrieved_context: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    results = []
+    seen = set()
+    for result in retrieved_context:
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        chunk = retrieved_chunk_preview(result.document, metadata, max_chars=MIN_EVIDENCE_CHARS * 4)
+        if not is_meaningful_evidence(chunk):
+            continue
+        key = retrieval_result_key(result, preview=chunk)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(result)
+    return results
+
+
+def rank_results_for_question(question: str, candidates: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    question_terms = query_tokens(question)
+    ranked = []
+    for position, result in enumerate(candidates):
+        text = retrieval_result_text(result)
+        terms = query_tokens(text)
+        overlap = len(question_terms & terms)
+        score = overlap * 3 + retrieval_result_priority(result)
+        if overlap or score > 0:
+            ranked.append((score, -position, result))
+    return [result for _, _, result in sorted(ranked, reverse=True)]
+
+
+def retrieval_result_text(result: RetrievalResult) -> str:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return clean_text(
+        " ".join(
+            [
+                clean_text(metadata.get("title")),
+                clean_text(primary_source_url(metadata)),
+                clean_text(metadata.get("query_contexts")),
+                retrieved_chunk_preview(result.document, metadata, max_chars=DEFAULT_CONTEXT_BLOCK_CHARS),
+            ]
+        )
+    )
+
+
+def retrieval_result_priority(result: RetrievalResult) -> int:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    priority = 2 if is_primary_source(metadata) else 0
+    if result.score is not None and result.score > 0:
+        priority += 1
+    return priority
+
+
+def retrieval_result_key(result: RetrievalResult, preview: str = "") -> str:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    stable_id = clean_text(metadata.get("parent_id")) or clean_text(result.id)
+    url = primary_source_url(metadata)
+    content = clean_text(preview or result.document)[:240].lower()
+    return clean_text(f"{stable_id}:{url}:{content}") or clean_text(result.id)
 
 
 def build_source_priority_guidance(sources: Sequence[dict[str, Any]]) -> str:
