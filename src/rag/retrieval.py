@@ -1086,7 +1086,7 @@ def load_sentence_transformer_cross_encoder(cross_encoder_cls: Any, model_name: 
     last_error: Exception | None = None
     for label, load_device, model_kwargs in attempts:
         try:
-            client = cross_encoder_cls(model_name, device=load_device, model_kwargs=model_kwargs)
+            client = cross_encoder_cls(model_name, device=load_device, automodel_args=model_kwargs)
             if label != attempts[0][0]:
                 print(f"[rag] rerank CrossEncoder loaded with fallback strategy: {label}")
             return client
