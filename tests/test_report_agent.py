@@ -89,6 +89,12 @@ Supported [1]. Unsupported [9].
 
         self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
 
+    def test_unsupported_benchmark_metrics_ignores_model_name_numbers(self):
+        report = "The benchmark compares a model-family-152 baseline with another architecture [1]."
+        evidence = "Benchmark evidence compares baseline architectures without exact scores."
+
+        self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
+
     def test_report_quality_accepts_references_after_markdown_cleanup(self):
         issues = report_quality_issues(
             "### Executive Summary\nClaim [1].\n\n## References\n[1] https://example.com",
@@ -154,6 +160,7 @@ Supported [1]. Unsupported [9].
         self.assertIn("Synthesis coverage by planner question", prompt)
         self.assertIn("q001: missing", prompt)
         self.assertIn("write a short evidence-gap subsection instead of inventing an answer", prompt)
+        self.assertIn("do not include formulas, API names, benchmark values, examples, or detailed explanations", prompt)
 
     def test_format_question_coverage_lists_status_and_sources(self):
         coverage = format_question_coverage([

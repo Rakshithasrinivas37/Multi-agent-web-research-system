@@ -1040,7 +1040,7 @@ class SentenceTransformerCrossEncoderAdapter(BaseCrossEncoder):
                 "sentence-transformers and langchain-core are required for reranking. "
                 "Install them with `pip install -r requirements.txt`."
             ) from error
-        self.client = CrossEncoder(model_name, device=device)
+        self.client = CrossEncoder(model_name, device=device, model_kwargs={"low_cpu_mem_usage": False})
 
     def score(self, text_pairs: list[tuple[str, str]]) -> list[float]:
         scores = self.client.predict(text_pairs, show_progress_bar=False)
