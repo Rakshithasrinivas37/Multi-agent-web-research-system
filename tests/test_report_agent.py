@@ -22,6 +22,7 @@ from src.agents.report_agent import (
     report_sub_question_coverage_check,
     rewrite_missing_sub_question_queries,
     slugify_filename,
+    synthesis_coverage_gap_questions,
     unsupported_benchmark_metrics,
 )
 
@@ -221,6 +222,15 @@ Supported [1]. Unsupported [9].
         self.assertEqual(check["covered_count"], 1)
         self.assertEqual(check["missing"], [questions[1]])
 
+    def test_report_coverage_includes_synthesis_gap_statuses(self):
+        questions = ["What benchmark results demonstrate GLUE and WMT performance?"]
+        report = "This report mentions GLUE, WMT, and benchmark performance."
+
+        check = report_sub_question_coverage_check(report, questions, synthesis_gap_questions=questions)
+
+        self.assertEqual(check["covered_count"], 0)
+        self.assertEqual(check["missing"], questions)
+
     def test_missing_sub_question_coverage_accepts_technical_equation_answer(self):
         report = """
 ## Scaled Dot-Product Attention
@@ -349,6 +359,17 @@ Done.
 
         self.assertEqual(gaps, plan["sub_questions"])
         self.assertIn("GLUE", queries[0])
+
+    def test_report_context_gap_items_uses_structured_synthesis_coverage(self):
+        question = "What benchmark results demonstrate GLUE performance?"
+        context = {
+            "synthesis": "The topic is mentioned.",
+            "coverage_by_question": [{"question": question, "status": "partial", "source_indexes": [1]}],
+        }
+        plan = {"objective": "Attention mechanism", "sub_questions": [question]}
+
+        self.assertEqual(synthesis_coverage_gap_questions(context, plan["sub_questions"]), [question])
+        self.assertEqual(report_context_gap_items(context, plan), [question])
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(

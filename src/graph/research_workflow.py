@@ -516,8 +516,56 @@ def merge_report_context(original: dict[str, Any], refreshed: dict[str, Any]) ->
         "synthesis": synthesis,
         "sources": sources,
         "supporting_chunks": chunks,
+        "coverage_by_question": merge_coverage_by_question(
+            original.get("coverage_by_question", []),
+            refreshed.get("coverage_by_question", []),
+            citation_map,
+        ),
         "diagnostics": diagnostics,
     }
+
+
+def merge_coverage_by_question(
+    original_items: Sequence[dict[str, Any]],
+    refreshed_items: Sequence[dict[str, Any]],
+    citation_map: dict[int, int],
+) -> list[dict[str, Any]]:
+    refreshed_by_question = {
+        coverage_question_key(item): reindex_coverage_item(item, citation_map)
+        for item in refreshed_items or []
+        if isinstance(item, dict) and coverage_question_key(item)
+    }
+    merged = []
+    seen = set()
+    for item in original_items or []:
+        if not isinstance(item, dict):
+            continue
+        key = coverage_question_key(item)
+        merged.append(refreshed_by_question.get(key, dict(item)))
+        if key:
+            seen.add(key)
+    for key, item in refreshed_by_question.items():
+        if key not in seen:
+            merged.append(item)
+    return merged
+
+
+def coverage_question_key(item: dict[str, Any]) -> str:
+    value = clean_text(item.get("question"))
+    return re.sub(r"[^a-zA-Z0-9]+", " ", value).strip().lower()
+
+
+def reindex_coverage_item(item: dict[str, Any], citation_map: dict[int, int]) -> dict[str, Any]:
+    copied = dict(item)
+    indexes = []
+    for value in copied.get("source_indexes", []) or []:
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            continue
+        indexes.append(citation_map.get(index, index))
+    copied["source_indexes"] = indexes
+    return copied
 
 
 def append_reindexed_sources(
