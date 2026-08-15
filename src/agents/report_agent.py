@@ -369,13 +369,16 @@ def report_sub_question_coverage_check(report: str, planner_questions: Sequence[
 
 
 def missing_sub_question_coverage(report: str, planner_questions: Sequence[str]) -> list[str]:
-    report_terms = detail_terms(report)
+    report_terms = set(technical_question_terms(report))
     missing = []
     for question in planner_questions:
-        terms = [term for term in detail_terms(question) if term not in STOPWORDS]
-        important = named_terms(question) or terms[:4]
+        terms = [term for term in technical_question_terms(question) if term not in STOPWORDS]
+        named = named_terms(question)
+        important = named or terms[:4]
         required = 1 if len(important) <= 2 else 2
-        if sum(1 for term in important if term in report_terms) < required:
+        named_matches = sum(1 for term in named if term in report_terms)
+        term_matches = sum(1 for term in terms[:6] if term in report_terms)
+        if named_matches < required and term_matches < required:
             missing.append(question)
     return missing
 
@@ -603,7 +606,17 @@ def headings_match(expected: str, actual: str) -> bool:
 
 
 def detail_terms(text: Any) -> set[str]:
-    return {token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9_+.-]{2,}", strip_markdown(text)) if token.lower() not in STOPWORDS}
+    return {token.lower().replace("‑", "-").replace("–", "-") for token in re.findall(r"[A-Za-z][A-Za-z0-9_+.-]{2,}", strip_markdown(text)) if token.lower() not in STOPWORDS}
+
+
+def technical_question_terms(text: Any) -> list[str]:
+    value = strip_markdown(text).replace("‑", "-").replace("–", "-")
+    terms = re.findall(r"[A-Za-z][A-Za-z0-9_+.-]{2,}", value)
+    phrases = []
+    for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9_+.-]*(?:-[A-Za-z0-9_+.-]+)+\b", value):
+        phrase = match.group(0).lower()
+        phrases.extend([phrase, phrase.replace("-", "")])
+    return dedupe_text([*(term.lower() for term in terms), *phrases])
 
 
 def named_terms(text: Any) -> list[str]:
