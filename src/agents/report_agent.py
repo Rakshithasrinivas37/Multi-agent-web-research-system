@@ -172,6 +172,8 @@ Grounding requirement (strict — read this first):
 Coverage requirement (mandatory):
 - Every planner sub-question above must map to exactly one section under heading 3, using the suggested topic heading or a clearer equivalent.
 - Each of those sections must explicitly answer its sub-question using only the retrieved context — not just mention the topic. If the evidence only partially answers a sub-question, answer what is supported and name the missing piece in that section AND in Limitations/Open Questions.
+- For any sub-question asking for a definition, formulation, equation, components, complexity, API signature, or benchmark metric, include a clearly labeled "Core equation", "Core formula", "API", or "Metric evidence" line when that detail appears in the evidence. Do not hide the main formula in prose.
+- When multiple equivalent equations appear in the evidence, show the most general/source-backed equation first, then explain its components.
 - Do not merge two sub-questions into one section unless they are genuinely the same question asked two ways — if you do this, say so explicitly.
 - Do not add sections that don't map to a sub-question, except the fixed schema sections above.
 
@@ -459,9 +461,15 @@ def unsupported_benchmark_metrics(report: str, evidence_text: str) -> list[str]:
             continue
         for number in re.findall(r"(?<![-\[])\b\d+(?:\.\d+)?\s*%?", text):
             value = clean_text(number).lower()
+            if is_publication_year_metric(value):
+                continue
             if value and value not in evidence and value not in unsupported:
                 unsupported.append(value)
     return unsupported
+
+
+def is_publication_year_metric(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:19|20)\d{2}", value))
 
 
 def rewrite_missing_sub_question_queries(objective: str, questions: Sequence[str]) -> list[str]:
