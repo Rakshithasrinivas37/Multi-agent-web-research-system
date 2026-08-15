@@ -82,7 +82,7 @@ class ReportAgent:
         report, model = generate_single_report(Groq(), self.model, prompt)
         report = normalize_final_report(report, sources)
         synthesis_gaps = synthesis_coverage_gap_questions(report_context, planner_questions)
-        coverage = report_sub_question_coverage_check(report, planner_questions, synthesis_gaps)
+        coverage = report_sub_question_coverage_check(report, planner_questions)
         schema_issues = report_schema_issues(report, planner_questions)
         report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}")
         review = report_self_critique(report_issues, coverage, schema_issues)
@@ -102,9 +102,9 @@ class ReportAgent:
                 "report_issues": report_issues,
                 "report_schema_issues": schema_issues,
                 "report_missing_sub_questions": coverage["missing"],
-                "report_synthesis_gap_questions": synthesis_gaps,
+                "report_evidence_gap_questions": synthesis_gaps,
                 "report_coverage_check": coverage,
-                "report_retry_queries": rewrite_missing_sub_question_queries(objective, coverage["missing"]),
+                "report_retry_queries": rewrite_missing_sub_question_queries(objective, dedupe_text([*coverage["missing"], *synthesis_gaps])),
                 "report_review_trace": [review],
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
                 "report_estimated_token_cap": report_generation_token_cap(),
@@ -387,10 +387,9 @@ def strip_references(report: str) -> str:
 def report_sub_question_coverage_check(
     report: str,
     planner_questions: Sequence[str],
-    synthesis_gap_questions: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     questions = [clean_text(q) for q in planner_questions if clean_text(q)]
-    missing = dedupe_text([*missing_sub_question_coverage(report, questions), *(synthesis_gap_questions or [])])
+    missing = missing_sub_question_coverage(report, questions)
     missing_keys = {normalize_heading(q) for q in missing}
     return {
         "total": len(questions),
