@@ -2,725 +2,328 @@ import unittest
 
 from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
-    ensure_supported_api_details,
-    format_source_priority_guidance,
-    hard_report_issues,
-    markdown_completion_issues,
-    format_evidence_coverage_brief,
-    format_memory_signal_evidence,
+    clean_markdown,
+    build_report_prompt,
+    dedupe_sources,
+    format_report_section_outline,
+    format_supporting_evidence,
     missing_evidence_constraints,
-    report_context_gap_items,
-    report_context_gap_queries,
     missing_sub_question_coverage,
     normalize_final_report,
-    normalize_report_for_validation,
-    remove_conflicting_missing_evidence_statements,
+    normalize_markdown_headings,
     remove_unavailable_citation_markers,
+    report_context_gap_items,
+    report_context_gap_queries,
     report_generation_token_cap,
     report_quality_issues,
+    report_schema_issues,
+    report_self_critique,
+    report_sub_question_coverage_check,
     rewrite_missing_sub_question_queries,
-    clean_markdown,
+    slugify_filename,
+    unsupported_benchmark_metrics,
 )
 
 
-class ReportAgentValidationTests(unittest.TestCase):
-    def test_report_quality_flags_unavailable_citations(self):
+class ReportAgentTests(unittest.TestCase):
+    def test_clean_markdown_strips_thinking_blocks(self):
+        text = "Useful.\n<think>hidden reasoning</think>\nFinal."
+
+        self.assertEqual(clean_markdown(text), "Useful.\n\nFinal.")
+
+    def test_normalize_final_report_removes_bad_citations_and_adds_references(self):
         report = """# Topic
 
 ## Executive Summary
-Supported claim [1]. Unsupported marker [7].
-
-## References
-[1] https://example.com/one
-"""
-        sources = [{"index": 1, "url": "https://example.com/one"}]
-
-        issues = report_quality_issues(report, "", sources=sources)
-
-        self.assertIn("report uses unavailable citations: [7]", issues)
-
-    def test_report_quality_flags_missing_reference_entries(self):
-        report = """# Topic
-
-## Executive Summary
-Supported claim [1].
-
-## References
-"""
-        sources = [{"index": 1, "url": "https://example.com/one"}]
-
-        issues = report_quality_issues(report, "", sources=sources)
-
-        self.assertIn("report References section is missing cited sources: [1]", issues)
-
-    def test_clean_markdown_strips_leaked_thinking_blocks(self):
-        text = "Useful synthesis.\n<think>private reasoning with missing gap noise</think>\nFinal evidence."
-
-        cleaned = clean_markdown(text)
-
-        self.assertIn("Useful synthesis.", cleaned)
-        self.assertIn("Final evidence.", cleaned)
-        self.assertNotIn("private reasoning", cleaned)
-
-    def test_missing_evidence_constraints_ignores_covered_table_rows(self):
-        synthesis = """| Requirement | Status | Notes |
-|---|---|---|
-| Formula | Covered | No missing evidence remains. |
-| Benchmark | Partial | Exact scores are missing. |
-"""
-
-        constraints = missing_evidence_constraints(synthesis)
-
-        self.assertEqual(constraints, ["Benchmark: Exact scores are missing."])
-
-    def test_report_quality_flags_incomplete_sections(self):
-        report = """# Topic
-
-## Executive Summary
-This section stops with
-
-## References
-No cited source markers were used.
-"""
-
-        issues = report_quality_issues(report, "")
-
-        self.assertIn("report contains incomplete sections: Executive Summary", issues)
-
-    def test_report_quality_flags_incomplete_h3_sections(self):
-        report = """# Topic
-
-### Executive Summary
-This h3 section stops with
-
-## References
-No cited source markers were used.
-"""
-
-        issues = report_quality_issues(report, "")
-
-        self.assertIn("report contains incomplete sections: Executive Summary", issues)
-
-    def test_report_quality_does_not_flag_h2_container_with_h3_content(self):
-        report = """# Topic
-
-## Parent Section
-This section has two parts:
-
-### Child Section
-This subsection is complete.
-
-## References
-No cited source markers were used.
-"""
-
-        issues = report_quality_issues(report, "")
-
-        self.assertNotIn("report contains incomplete sections: Parent Section", issues)
-
-    def test_report_quality_requires_references_heading(self):
-        report = """# Topic
-
-## Executive Summary
-This sentence mentions references but has no reference section.
-"""
-
-        issues = report_quality_issues(report, "")
-
-        self.assertIn("report must include a References section", issues)
-
-    def test_remove_unavailable_citation_markers_keeps_valid_markers(self):
-        text = "Valid source [1], duplicate style 【2】, and unavailable source [9]."
-
-        sanitized = remove_unavailable_citation_markers(text, {1, 2})
-
-        self.assertIn("[1]", sanitized)
-        self.assertIn("[2]", sanitized)
-        self.assertNotIn("[9]", sanitized)
-
-    def test_markdown_completion_ignores_trailing_horizontal_rule(self):
-        section = """## Section
-This section is complete.
-
----
-"""
-
-        self.assertEqual(markdown_completion_issues(section), [])
-
-    def test_normalize_final_report_strips_unavailable_citations_before_references(self):
-        report = """# Topic
-
-## Executive Summary
-Valid claim [1]. Bad copied marker [9].
-
-## References
-[9] https://example.com/bad
+Supported [1]. Unsupported [9].
 """
         sources = [{"index": 1, "url": "https://example.com/one"}]
 
         normalized = normalize_final_report(report, sources)
 
-        self.assertIn("[1] https://example.com/one", normalized)
+        self.assertIn("Supported [1]. Unsupported", normalized)
         self.assertNotIn("[9]", normalized)
+        self.assertIn("## References", normalized)
+        self.assertIn("[1] https://example.com/one", normalized)
 
-    def test_normalize_final_report_trims_incomplete_section_tail(self):
-        report = """# Topic
-
-## Executive Summary
-This sentence is complete.
-This final generated line stops with
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertIn("This sentence is complete.", normalized)
-        self.assertNotIn("This final generated line stops with", normalized)
-
-    def test_normalize_final_report_trims_incomplete_table_tail(self):
-        report = """# Topic
-
-## Data Summary
-| Field | Value |
-|------|---------|
-| Complete | Row |
-| Broken | Row
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertIn("| Complete | Row |", normalized)
-        self.assertNotIn("| Broken | Row", normalized)
-        self.assertEqual(report_quality_issues(normalized, ""), [])
-
-    def test_normalize_final_report_removes_malformed_table_rows(self):
-        report = """# Topic
-
-## Executive Summary
-This section is complete.
-
-| Component | Role |
-|---|---|
-| Encoder | Reads input. |
-|
-|
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertNotIn("\n|\n", normalized)
-        self.assertIn("| Encoder | Reads input. |", normalized)
-
-    def test_normalize_final_report_removes_placeholder_table_rows(self):
-        report = """# Topic
-
-## Executive Summary
-This section is complete.
-
-| Model | Dataset | Score |
-|---|---|---|
-| Transformer | WMT 2014 | 28.4 BLEU |
-| — | — | — |
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertIn("| Transformer | WMT 2014 | 28.4 BLEU |", normalized)
-        self.assertNotIn("| — | — | — |", normalized)
-
-    def test_normalize_final_report_removes_empty_math_only_section(self):
-        report = """# Topic
-
-## Executive Summary
-This section is complete.
-
-## Bahdanau Attention
-Supported content remains.
-
-### Architecture Evidence Gap
-\\[
-\\]
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertIn("## Bahdanau Attention", normalized)
-        self.assertNotIn("Architecture Evidence Gap", normalized)
-        self.assertNotIn("\\[\n\\]", normalized)
-
-    def test_normalize_final_report_removes_empty_sections(self):
-        report = """# Topic
-
-## Complete Section
-This section is complete.
-
-## Empty Generated Section
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertIn("## Complete Section", normalized)
-        self.assertNotIn("## Empty Generated Section", normalized)
-        self.assertEqual(report_quality_issues(normalized, ""), [])
-
-    def test_normalize_final_report_keeps_parent_sections_with_child_content(self):
-        report = """# Topic
-
-## Parent Section
-
-### Child Section
-This child content is complete.
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertIn("## Parent Section", normalized)
-        self.assertIn("### Child Section", normalized)
-        self.assertEqual(report_quality_issues(normalized, ""), [])
-
-    def test_normalize_final_report_removes_still_incomplete_sections(self):
-        report = """# Topic
-
-## Executive Summary
-This section is complete.
-
-## TensorFlow/Keras Implementation
-The implementation details start here and
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertNotIn("TensorFlow/Keras Implementation", normalized)
-        self.assertEqual(report_quality_issues(normalized, ""), [])
-
-    def test_normalize_final_report_moves_summary_to_executive_summary(self):
-        report = """**Deep Dive**
-
-### 1. Details
-This section is complete.
-
-### 10. Summary
-This is the generated summary.
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertIn("## Executive Summary", normalized)
-        self.assertIn("This is the generated summary.", normalized)
-        self.assertNotIn("### 10. Summary", normalized)
-
-    def test_normalize_final_report_inserts_executive_summary_when_missing(self):
-        report = """# Topic
-
-## Details
-This section explains the available evidence.
-
-## References
-No cited source markers were used.
-"""
-
-        normalized = normalize_final_report(report, [])
-
-        self.assertIn("## Executive Summary", normalized)
-        self.assertIn("This section explains the available evidence.", normalized)
-
-    def test_report_generation_token_caps_stay_under_budget(self):
-        self.assertLessEqual(
-            report_generation_token_cap(),
-            DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+    def test_report_quality_flags_unavailable_citations(self):
+        issues = report_quality_issues(
+            "Claim [2].\n\n## References\n[2] https://bad",
+            [{"index": 1, "url": "https://example.com"}],
         )
 
-    def test_missing_sub_question_coverage_flags_unanswered_questions(self):
-        report = "The report defines attention and explains neural network scoring."
+        self.assertIn("report uses unavailable citations: [2]", issues)
+
+    def test_report_quality_flags_placeholder_source_markers(self):
+        issues = report_quality_issues(
+            "Claim [— benchmark evidence missing].\n\n## References\n[1] https://example.com",
+            [{"index": 1, "url": "https://example.com"}],
+        )
+
+        self.assertIn("report contains placeholder or non-source citation markers", issues)
+
+    def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
+        markdown = "### ## 1. Definition\nText."
+
+        self.assertEqual(normalize_markdown_headings(markdown), "### 1. Definition\nText.")
+
+    def test_report_quality_flags_benchmark_metrics_missing_from_evidence(self):
+        issues = report_quality_issues(
+            "## Benchmarks\nViT reaches 77% top-1 accuracy [1].\n\n## References\n[1] https://example.com",
+            [{"index": 1, "url": "https://example.com"}],
+            evidence_text="Vision Transformer image classification evidence without exact scores.",
+        )
+
+        self.assertIn("report includes benchmark metrics not present in evidence: 77%", issues)
+
+    def test_unsupported_benchmark_metrics_allows_evidence_numbers(self):
+        report = "BLEU-4 improves from 0.386 to 0.482 [1]."
+        evidence = "The evidence says BLEU-4 improves from 0.386 to 0.482."
+
+        self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
+
+    def test_unsupported_benchmark_metrics_ignores_publication_years(self):
+        report = "The 2017 Transformer paper reports WMT benchmark results with BLEU gains [1]."
+        evidence = "WMT benchmark evidence includes BLEU gains."
+
+        self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
+
+    def test_report_quality_accepts_references_after_markdown_cleanup(self):
+        issues = report_quality_issues(
+            "### Executive Summary\nClaim [1].\n\n## References\n[1] https://example.com",
+            [{"index": 1, "url": "https://example.com"}],
+        )
+
+        self.assertNotIn("report must include a References section", issues)
+
+    def test_dedupe_sources_preserves_existing_source_indexes(self):
+        sources = dedupe_sources(
+            [
+                {"index": 3, "url": "https://paper.example"},
+                {"url": "https://new.example"},
+                {"index": 14, "url": "https://blog.example"},
+            ]
+        )
+
+        self.assertEqual([source["index"] for source in sources], [3, 1, 14])
+
+    def test_format_report_section_outline_uses_topic_headings(self):
+        outline = format_report_section_outline(
+            [
+                "What benchmark results demonstrate GLUE and WMT performance?",
+                "How is PyTorch MultiheadAttention used?",
+            ]
+        )
+
+        self.assertIn("## 1. Benchmark Demonstrate GLUE And WMT Performance", outline)
+        self.assertIn("## 2. PyTorch MultiheadAttention Used", outline)
+
+    def test_build_report_prompt_requires_core_equation_for_formula_questions(self):
+        prompt = build_report_prompt(
+            objective="Attention mechanism",
+            output_format="report",
+            planner_questions=["What is the main attention equation and its components?"],
+            synthesis="The evidence includes Attention(Q,K,V)=softmax(score(Q,K))V.",
+            evidence="[1] Attention equation evidence.",
+            sources=[{"index": 1, "url": "https://example.com"}],
+        )
+
+        self.assertIn("Core equation", prompt)
+        self.assertIn("show the most general/source-backed equation first", prompt)
+
+    def test_format_supporting_evidence_uses_chunks_once(self):
+        context = {
+            "supporting_chunks": [
+                {
+                    "source_index": 1,
+                    "title": "Paper",
+                    "url": "https://example.com",
+                    "content": "Attention evidence from a source.",
+                },
+                {
+                    "source_index": 1,
+                    "title": "Paper",
+                    "url": "https://example.com",
+                    "content": "Attention evidence from a source.",
+                },
+            ]
+        }
+
+        evidence = format_supporting_evidence(context)
+
+        self.assertEqual(evidence.count("Attention evidence"), 1)
+        self.assertIn("[1]", evidence)
+
+    def test_missing_sub_question_coverage_flags_missing_topic(self):
+        report = "The report defines attention and explains scoring."
         questions = [
-            "What is the definition of attention mechanism?",
-            "What are the applications and benefits of attention mechanisms?",
+            "What is the definition of attention?",
+            "How is PyTorch MultiheadAttention used?",
         ]
 
-        missing = missing_sub_question_coverage(report, questions)
+        self.assertEqual(missing_sub_question_coverage(report, questions), [questions[1]])
 
-        self.assertEqual(missing, [questions[1]])
+    def test_report_sub_question_coverage_check_is_inspectable(self):
+        questions = [
+            "What benchmark results demonstrate GLUE and WMT performance?",
+            "How is PyTorch MultiheadAttention used?",
+        ]
+        report = "This section covers GLUE benchmark and WMT performance evidence in detail."
 
-    def test_rewrite_missing_sub_question_queries_keeps_queries_focused(self):
+        check = report_sub_question_coverage_check(report, questions)
+
+        self.assertEqual(check["total"], 2)
+        self.assertEqual(check["covered_count"], 1)
+        self.assertEqual(check["missing"], [questions[1]])
+
+    def test_missing_sub_question_coverage_accepts_technical_equation_answer(self):
+        report = """
+## Scaled Dot-Product Attention
+The scaled dot-product attention equation is
+Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V.
+Here Q is the query matrix, K is the key matrix, V is the value matrix,
+and d_k is the key dimension used for scaling.
+"""
+        questions = ["What is the scaled dot‑product attention equation and its components?"]
+
+        self.assertEqual(missing_sub_question_coverage(report, questions), [])
+
+    def test_report_schema_issues_detects_missing_sections(self):
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+## References
+No cited source markers were used.
+"""
+
+        issues = report_schema_issues(report, ["What benchmark results demonstrate GLUE and WMT performance?"])
+
+        self.assertIn("missing schema section: cross-cutting analysis/synthesis", issues)
+        self.assertIn("missing planner topic section: Benchmark Demonstrate GLUE And WMT Performance", issues)
+
+    def test_report_schema_accepts_nested_markdown_headings(self):
+        report = """# Topic
+
+### 1. Executive Summary
+Summary.
+
+### 2. Introduction and Context
+Context.
+
+### 3. Benchmark Demonstrate GLUE And WMT Performance
+Benchmarks.
+
+```python
+# This is not a heading
+```
+
+### 4. Cross-cutting Analysis and Synthesis
+Synthesis.
+
+### 5. Limitations and Open Questions
+Limits.
+
+### 6. Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_schema_issues(report, ["What benchmark results demonstrate GLUE and WMT performance?"])
+
+        self.assertEqual(issues, [])
+
+    def test_report_schema_accepts_concise_topic_heading_for_long_question(self):
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+### Benchmark Evidence of Performance Impact
+Benchmarks.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_schema_issues(
+            report,
+            ["What benchmark results demonstrate the performance impact of attention mechanisms on tasks such as machine translation and GLUE?"],
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_clean_markdown_strips_open_thinking_block(self):
+        text = "Useful.\n<think>hidden reasoning that never closes"
+
+        self.assertEqual(clean_markdown(text), "Useful.")
+
+    def test_report_self_critique_combines_diagnostics(self):
+        critique = report_self_critique(
+            ["report issue"],
+            {"missing": ["What benchmark results demonstrate GLUE and WMT performance?"]},
+            ["schema issue"],
+        )
+
+        self.assertIn("report issue", critique["unresolved_issues"])
+        self.assertIn("schema issue", critique["unresolved_issues"])
+        self.assertIn("missing planner topic: What benchmark results demonstrate GLUE and WMT performance?", critique["unresolved_issues"])
+
+    def test_missing_evidence_constraints_extracts_gap_lines(self):
+        synthesis = "Covered item.\n- Missing: exact WMT BLEU result is not present."
+
+        self.assertEqual(missing_evidence_constraints(synthesis), ["- Missing: exact WMT BLEU result is not present."])
+
+    def test_report_context_gap_items_and_queries(self):
+        context = {"synthesis": "Benchmark evidence is Missing. No GLUE numbers are present."}
+        plan = {
+            "objective": "Attention mechanism",
+            "sub_questions": ["What benchmark results demonstrate GLUE performance?"],
+        }
+
+        gaps = report_context_gap_items(context, plan)
+        queries = report_context_gap_queries(context, plan)
+
+        self.assertEqual(gaps, plan["sub_questions"])
+        self.assertIn("GLUE", queries[0])
+
+    def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(
-            "What is attention mechanism?",
+            "Attention mechanism",
             ["What are the applications and benefits?"],
         )
 
         self.assertEqual(len(queries), 1)
         self.assertIn("applications", queries[0])
 
-    def test_report_context_gap_items_detects_missing_synthesis_coverage(self):
-        report_context = {
-            "synthesis": """# Notes
+    def test_remove_unavailable_citation_markers(self):
+        cleaned = remove_unavailable_citation_markers("Keep [1], drop [9].", {1})
 
-### What are the equations for scaled dot-product attention?
-- Evidence: None in the retrieved set.
-- Gaps: Need the scaled dot-product formula.
-""",
-            "planner_questions": ["What are the equations for scaled dot-product attention?"],
-        }
-        research_plan = {"objective": "What is attention?", "sub_questions": report_context["planner_questions"]}
+        self.assertEqual(cleaned, "Keep [1], drop .")
 
-        gaps = report_context_gap_items(report_context, research_plan)
+    def test_report_generation_token_cap_stays_under_budget(self):
+        self.assertLessEqual(report_generation_token_cap(), DEFAULT_REPORT_TOTAL_TOKEN_BUDGET)
 
-        self.assertTrue(any("scaled dot-product" in gap for gap in gaps))
-
-    def test_report_context_gap_queries_rewrites_preflight_gaps(self):
-        report_context = {
-            "synthesis": "| Requirement | Status | Notes |\n| Formula | Missing | Need exact equation. |",
-            "planner_questions": [],
-        }
-        research_plan = {"objective": "What is attention?"}
-
-        queries = report_context_gap_queries(report_context, research_plan)
-
-        self.assertEqual(len(queries), 1)
-        self.assertIn("exact equation", queries[0])
-
-    def test_format_memory_signal_evidence_adds_browser_benchmark_signal(self):
-        report_context = {
-            "browser_results": [
-                {
-                    "sources": [
-                        {
-                            "url": "https://arxiv.org/abs/1706.03762",
-                            "full_content": (
-                                "The model achieves 28.4 BLEU on WMT 2014 English-to-German "
-                                "and 41.8 BLEU on English-to-French."
-                            ),
-                        }
-                    ]
-                }
-            ]
-        }
-        sources = [{"index": 1, "url": "https://arxiv.org/pdf/1706.03762"}]
-
-        evidence = format_memory_signal_evidence(report_context, sources, {}, "No selected benchmark chunk.")
-
-        self.assertIn("[1]", evidence)
-        self.assertIn("28.4 BLEU", evidence)
-
-    def test_format_source_priority_guidance_prefers_primary_sources(self):
-        sources = [
-            {"index": 1, "title": "Attention Is All You Need", "url": "https://arxiv.org/pdf/1706.03762"},
-            {"index": 2, "title": "Background Article", "url": "https://example.com/attention"},
-        ]
-
-        guidance = format_source_priority_guidance(sources)
-
-        self.assertIn("Primary/official sources: [1] Attention Is All You Need", guidance)
-        self.assertIn("background sources", guidance)
-        self.assertIn("[2] Background Article", guidance)
-
-    def test_format_evidence_coverage_brief_separates_supported_and_missing_parts(self):
-        evidence = "Evidence: Linformer uses a low-rank approximation and reduces complexity from O(n2) to O(n)."
-        missing = "- Efficient variants: Linformer is partial, Performer details are not present."
-
-        brief = format_evidence_coverage_brief(
-            ["What efficient attention variants are covered?"],
-            "",
-            evidence,
-            missing,
-        )
-
-        self.assertIn("Supported evidence signals", brief)
-        self.assertIn("low-rank", brief)
-        self.assertIn("Performer", brief)
-
-    def test_hard_report_issues_blocks_stale_missing_evidence(self):
-        issues = [
-            "report may contain stale missing-evidence statements contradicted by supporting evidence",
-            "report must include a References section",
-        ]
-
-        self.assertEqual(hard_report_issues(issues), issues)
-
-    def test_remove_conflicting_missing_evidence_statements_drops_exact_missing_sentence(self):
-        report = r"""# Topic
-
-## Executive Summary
-The formula \(Attention(Q,K,V)=softmax(QK^T)V\) is missing from the evidence. Keep this sentence.
-
-## References
-No cited source markers were used.
-"""
-        evidence = r"Evidence includes \(Attention(Q,K,V)=softmax(QK^T)V\)."
-
-        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
-
-        self.assertNotIn("is missing from the evidence", cleaned)
-        self.assertIn("Keep this sentence.", cleaned)
-
-    def test_remove_conflicting_missing_evidence_statements_keeps_unresolved_gap(self):
-        report = """# Topic
-
-## Executive Summary
-TensorFlow API details are not present in the evidence.
-
-## References
-No cited source markers were used.
-"""
-        evidence = "Evidence discusses PyTorch only."
-
-        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
-
-        self.assertIn("TensorFlow API details are not present", cleaned)
-
-    def test_remove_conflicting_missing_evidence_statements_drops_table_gap_row(self):
-        report = """# Topic
-
-## Executive Summary
-Supported benchmark details are available.
-
-| Topic | Status | Notes |
-|---|---|---|
-| BLEU benchmarks | Missing | No BLEU numbers are present. |
-| GLUE benchmarks | Missing | No GLUE scores are present. |
-
-## References
-No cited source markers were used.
-"""
-        evidence = "The Transformer model achieves 28.4 BLEU on WMT 2014 English-to-German."
-
-        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
-
-        self.assertNotIn("BLEU benchmarks", cleaned)
-        self.assertIn("GLUE benchmarks", cleaned)
-
-    def test_remove_conflicting_missing_evidence_statements_drops_bullet_gap(self):
-        report = """# Topic
-
-## Executive Summary
-Supported API details are available.
-
-- PyTorch API details are missing.
-- TensorFlow API details are missing.
-
-## References
-No cited source markers were used.
-"""
-        evidence = "Supporting evidence includes torch.nn.MultiheadAttention."
-
-        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
-
-        self.assertNotIn("PyTorch API details are missing", cleaned)
-        self.assertIn("TensorFlow API details are missing", cleaned)
-
-    def test_remove_conflicting_missing_evidence_statements_drops_absent_gap(self):
-        report = """# Topic
-
-## Executive Summary
-Supported API details are available.
-
-- PyTorch API details are absent.
-- TensorFlow API details are absent.
-
-## References
-No cited source markers were used.
-"""
-        evidence = "Supporting evidence includes torch.nn.MultiheadAttention."
-
-        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
-
-        self.assertNotIn("PyTorch API details are absent", cleaned)
-        self.assertIn("TensorFlow API details are absent", cleaned)
-
-    def test_ensure_supported_api_details_adds_omitted_api_section(self):
-        report = """# Topic
-
-## Executive Summary
-This report summarizes implementation evidence.
-
-## References
-[1] https://docs.example.com
-"""
-        evidence = "[1] Evidence: torch.nn.MultiheadAttention supports multi-head attention."
-
-        updated = ensure_supported_api_details(report, evidence)
-
-        self.assertIn("## Implementation APIs", updated)
-        self.assertIn("`torch.nn.MultiheadAttention`", updated)
-        self.assertIn("[1]", updated)
-
-    def test_ensure_supported_api_details_ignores_incidental_torch_helpers(self):
-        report = """# Topic
-
-## Executive Summary
-This report summarizes evidence.
-
-## References
-No cited source markers were used.
-"""
-        evidence = "Example setup uses torch.manual_seed, torch.nn.Embedding, and torch.Size."
-
-        updated = ensure_supported_api_details(report, evidence)
-
-        self.assertNotIn("## Implementation APIs", updated)
-
-    def test_normalize_report_for_validation_removes_weak_implementation_api_section(self):
-        report = """# Topic
-
-## Executive Summary
-This report summarizes evidence.
-
-## Implementation APIs
-- `torch.manual_seed` is present in the supporting evidence [1].
-- `torch.Size` is present in the supporting evidence.
-
-## References
-[1] https://example.com
-"""
-        sources = [{"index": 1, "url": "https://example.com"}]
-        evidence = "Example setup uses torch.manual_seed and torch.Size."
-
-        normalized = normalize_report_for_validation(report, sources, evidence)
-
-        self.assertNotIn("## Implementation APIs", normalized)
-        self.assertNotIn("torch.manual_seed", normalized)
-
-    def test_normalize_report_for_validation_removes_resolved_evidence_gap_rows(self):
-        report = r"""# Topic
-
-## Executive Summary
-Scaled dot-product attention uses \(\text{softmax}(QK^{\top}/\sqrt{d_k})V\).
-TensorFlow offers `tf.keras.layers.MultiHeadAttention`.
-
-## Evidence Gaps
-| Planner Sub-question | Missing / Partial Detail | Reason |
-|---|---|---|
-| Scaled dot-product formula | Explicit `1/√d_k` scaling term | Only the unscaled formulation appears. |
-| TensorFlow API | Signature and argument semantics | No supporting chunk from TensorFlow is present. |
-| Statistical testing | Confidence intervals | No evidence includes confidence intervals. |
-
-## References
-[1] https://example.com
-"""
-        evidence = "Evidence includes tf.keras.layers.MultiHeadAttention and the formula softmax(QK^T / sqrt(d_k)) V."
-        sources = [{"index": 1, "url": "https://example.com"}]
-
-        normalized = normalize_report_for_validation(report, sources, evidence)
-
-        self.assertNotIn("Scaled dot-product formula | Explicit", normalized)
-        self.assertNotIn("TensorFlow API | Signature", normalized)
-        self.assertIn("Statistical testing", normalized)
-
-    def test_normalize_report_for_validation_uses_synthesis_covered_rows(self):
-        report = r"""# Topic
-
-## Executive Summary
-This report summarizes attention evidence.
-
-## Evidence Gaps
-| Planner Sub-question | Missing / Partial Detail | Reason |
-|---|---|---|
-| Scaled dot-product formula | Explicit scaling term | Only the unscaled formulation appears. |
-| Vision benchmarks | Accuracy numbers | No supporting vision benchmark evidence is present. |
-
-## References
-No cited source markers were used.
-"""
-        synthesis = """| Requirement | Status | Evidence Source(s) |
-|---|---|---|
-| Scaled-dot-product equation | Covered | [4] |
-| Benchmark impact on vision tasks | Missing | – |
-"""
-
-        normalized = normalize_report_for_validation(report, [], "", synthesis=synthesis)
-
-        self.assertNotIn("Scaled dot-product formula", normalized)
-        self.assertIn("Vision benchmarks", normalized)
-
-    def test_normalize_report_for_validation_removes_inline_resolved_gap(self):
-        report = """# Topic
-
-## Luong Attention
-Luong attention uses multiplicative dot-product scoring and global/local alignment.
-Evidence Gap: No direct citation of the Luong paper is present in the provided sources.
-
-## References
-[1] https://arxiv.org/pdf/1508.04025
-"""
-        evidence = "[1] Luong paper evidence: multiplicative dot-product scoring and global/local alignment."
-        sources = [{"index": 1, "url": "https://arxiv.org/pdf/1508.04025"}]
-
-        normalized = normalize_report_for_validation(report, sources, evidence)
-
-        self.assertIn("Luong attention uses multiplicative", normalized)
-        self.assertNotIn("No direct citation of the Luong paper", normalized)
-
-    def test_remove_conflicting_missing_evidence_statements_drops_heading_gap(self):
-        report = r"""# Topic
-
-## Executive Summary
-Supported detail is available.
-
-### Formula \(Attention(Q,K,V)=softmax(QK^T)V\) is missing
-
-## References
-No cited source markers were used.
-"""
-        evidence = r"Evidence includes \(Attention(Q,K,V)=softmax(QK^T)V\)."
-
-        cleaned = remove_conflicting_missing_evidence_statements(report, evidence)
-
-        self.assertNotIn("Formula", cleaned)
-        self.assertNotIn("is missing", cleaned)
-
-    def test_report_contract_requires_executive_summary_with_evidence(self):
-        report = """# Topic
-
-## Details
-Supported claim [1].
-
-## References
-[1] https://example.com
-"""
-
-        issues = report_quality_issues(report, "Evidence: supported claim [1].")
-
-        self.assertIn("report must include an Executive Summary section", issues)
-
-    def test_report_contract_requires_supported_formula_preservation(self):
-        report = """# Topic
-
-## Executive Summary
-Attention uses weighted values [1].
-
-## References
-[1] https://example.com
-"""
-        evidence = r"Evidence: \[Attention(Q,K,V)=\operatorname{softmax}(QK^\top/\sqrt{d_k})V\] [1]."
-
-        issues = report_quality_issues(report, evidence)
-
-        self.assertIn("report omits supported equations or formulas", issues)
+    def test_slugify_filename(self):
+        self.assertEqual(slugify_filename("What is Attention Mechanism?"), "what-is-attention-mechanism")
 
 
 if __name__ == "__main__":

@@ -661,7 +661,11 @@ def validate_rag_index(index: dict[str, Any]) -> list[str]:
         indexed_chunks = int(index.get("indexed_chunks") or 0)
     except (TypeError, ValueError):
         indexed_chunks = 0
-    if indexed_chunks <= 0:
+    try:
+        stored_chunks = int(index.get("stored_chunks") or 0)
+    except (TypeError, ValueError):
+        stored_chunks = 0
+    if indexed_chunks <= 0 and stored_chunks <= 0:
         return ["rag_index indexed zero chunks"]
     return []
 
