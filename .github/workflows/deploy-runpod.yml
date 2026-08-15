@@ -3,8 +3,9 @@ name: Deploy to RunPod
 on:
   push:
     branches:
-      - main
+    - main
   workflow_dispatch:
+
 
 env:
   RUNPOD_HOST: ${{ vars.RUNPOD_HOST }}
@@ -20,261 +21,224 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+    - name: Check out repository
+      uses: actions/checkout@v4
 
-      - name: Validate RunPod connection variables
-        run: |
-          if [ -z "$RUNPOD_HOST" ]; then
-            echo "RUNPOD_HOST repository variable is required."
-            exit 1
-          fi
-          if [ -z "$RUNPOD_PORT" ]; then
-            echo "RUNPOD_PORT repository variable is required."
-            exit 1
-          fi
-          echo "Deploy target: $RUNPOD_USER@$RUNPOD_HOST:$RUNPOD_PORT"
+    - name: Validate RunPod connection variables
+      run: |
+        if [ -z "$RUNPOD_HOST" ]; then
+          echo "RUNPOD_HOST repository variable is required."
+          exit 1
+        fi
+        if [ -z "$RUNPOD_PORT" ]; then
+          echo "RUNPOD_PORT repository variable is required."
+          exit 1
+        fi
+        echo "Deploy target: $RUNPOD_USER@$RUNPOD_HOST:$RUNPOD_PORT"
 
-      - name: Configure SSH
-        run: |
-          mkdir -p ~/.ssh
-          printf '%s\n' "${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}" > ~/.ssh/runpod_key
-          chmod 600 ~/.ssh/runpod_key
-          ssh-keyscan -p "$RUNPOD_PORT" "$RUNPOD_HOST" >> ~/.ssh/known_hosts
+    - name: Configure SSH
+      run: |
+        mkdir -p ~/.ssh
+        printf '%s\n' "${{ secrets.RUNPOD_SSH_PRIVATE_KEY }}" > ~/.ssh/runpod_key
+        chmod 600 ~/.ssh/runpod_key
+        ssh-keyscan -p "$RUNPOD_PORT" "$RUNPOD_HOST" >> ~/.ssh/known_hosts
 
-      - name: Build deployment archive
-        run: |
-          tar \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='.pycache' \
-            --exclude='.pycache/**' \
-            --exclude='__pycache__' \
-            --exclude='__pycache__/**' \
-            --exclude='*.pyc' \
-            --exclude='data/chroma' \
-            --exclude='data/*.db' \
-            --exclude='data/shared_memory.json' \
-            --exclude='data/browser_results.json' \
-            --exclude='data/research_plan.json' \
-            -czf /tmp/multi-agent-web-research-system.tar.gz .
+    - name: Build deployment archive
+      run: |
+        tar \
+          --exclude='.git' \
+          --exclude='.github' \
+          --exclude='.pycache' \
+          --exclude='.pycache/**' \
+          --exclude='__pycache__' \
+          --exclude='__pycache__/**' \
+          --exclude='*.pyc' \
+          --exclude='data/chroma' \
+          --exclude='data/*.db' \
+          --exclude='data/shared_memory.json' \
+          --exclude='data/browser_results.json' \
+          --exclude='data/research_plan.json' \
+          -czf /tmp/multi-agent-web-research-system.tar.gz .
 
-      - name: Upload archive
-        run: |
-          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
-          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "mkdir -p '$DEPLOY_DIR'"
-          scp $SSH_OPTS -P "$RUNPOD_PORT" /tmp/multi-agent-web-research-system.tar.gz "$RUNPOD_USER@$RUNPOD_HOST:/tmp/multi-agent-web-research-system.tar.gz"
+    - name: Upload archive
+      run: |
+        SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+        ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "mkdir -p '$DEPLOY_DIR'"
+        scp $SSH_OPTS -P "$RUNPOD_PORT" /tmp/multi-agent-web-research-system.tar.gz "$RUNPOD_USER@$RUNPOD_HOST:/tmp/multi-agent-web-research-system.tar.gz"
 
-      - name: Write remote environment file
-        run: |
-          cat > /tmp/runpod.env <<EOF
-          GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
-          TAVILY_API_KEY=${{ secrets.TAVILY_API_KEY }}
-          FIRECRAWL_API_KEY=${{ secrets.FIRECRAWL_API_KEY }}
-          TAVILY_MCP_TRANSPORT=http
-          TAVILY_MCP_URL=https://mcp.tavily.com/mcp/?tavilyApiKey=\${TAVILY_API_KEY}
-          TAVILY_MCP_TIMEOUT_SECONDS=90
-          RAG_EMBEDDING_MODEL=${{ secrets.RAG_EMBEDDING_MODEL }}
-          # Force sentence-transformers embeddings onto the GPU during RunPod deployments.
-          RAG_EMBEDDING_DEVICE=${{ secrets.RAG_EMBEDDING_DEVICE || 'cuda' }}
-          EOF
-          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
-          scp $SSH_OPTS -P "$RUNPOD_PORT" /tmp/runpod.env "$RUNPOD_USER@$RUNPOD_HOST:$DEPLOY_DIR/.env"
+    - name: Write remote environment file
+      run: |
+        cat > /tmp/runpod.env <<EOF
+        GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
+        TAVILY_API_KEY=${{ secrets.TAVILY_API_KEY }}
+        FIRECRAWL_API_KEY=${{ secrets.FIRECRAWL_API_KEY }}
+        TAVILY_MCP_TRANSPORT=http
+        TAVILY_MCP_URL=https://mcp.tavily.com/mcp/?tavilyApiKey=\${TAVILY_API_KEY}
+        TAVILY_MCP_TIMEOUT_SECONDS=90
+        RAG_EMBEDDING_MODEL=${{ secrets.RAG_EMBEDDING_MODEL }}
+        # Force sentence-transformers embeddings onto the GPU during RunPod deployments.
+        RAG_EMBEDDING_DEVICE=${{ secrets.RAG_EMBEDDING_DEVICE || 'cuda' }}
+        EOF
+        SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+        scp $SSH_OPTS -P "$RUNPOD_PORT" /tmp/runpod.env "$RUNPOD_USER@$RUNPOD_HOST:$DEPLOY_DIR/.env"
 
-      - name: Extract source on RunPod
-        timeout-minutes: 5
-        run: |
-          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
-          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
-          set -euo pipefail
+    - name: Extract source on RunPod
+      timeout-minutes: 5
+      run: |
+        SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+        ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
+        set -euo pipefail
 
-          cd "$DEPLOY_DIR"
-          tar --no-same-owner --no-same-permissions -xzf /tmp/multi-agent-web-research-system.tar.gz -C "$DEPLOY_DIR"
-          REMOTE
+        cd "$DEPLOY_DIR"
+        tar --no-same-owner --no-same-permissions -xzf /tmp/multi-agent-web-research-system.tar.gz -C "$DEPLOY_DIR"
+        REMOTE
 
-      - name: Install Node.js and npm on RunPod
-        timeout-minutes: 10
-        run: |
-          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
-          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "bash -s" <<'REMOTE'
-          set -euo pipefail
-          log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+    - name: Install Node.js and npm on RunPod
+      timeout-minutes: 10
+      run: |
+        SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+        ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "bash -s" <<'REMOTE'
+        set -euo pipefail
+        log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
-          NODE_MAJOR=""
-          if command -v node >/dev/null 2>&1; then
-            NODE_MAJOR="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
-          fi
+        NODE_MAJOR=""
+        if command -v node >/dev/null 2>&1; then
+          NODE_MAJOR="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
+        fi
 
-          if [ "${NODE_MAJOR:-0}" -ge 22 ] && command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
-            log "Node.js 22+, npm, and npx are already installed"
+        if [ "${NODE_MAJOR:-0}" -ge 22 ] && command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
+          log "Node.js 22+, npm, and npx are already installed"
+        else
+          log "Installing Node.js 22 for MCP tools"
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
+          mkdir -p /etc/apt/keyrings
+          rm -f /etc/apt/keyrings/nodesource.gpg
+          curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+            | gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+            > /etc/apt/sources.list.d/nodesource.list
+          DEBIAN_FRONTEND=noninteractive apt-get remove -y nodejs npm libnode-dev libnode72 || true
+          DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+        fi
+
+        log "Node.js version: $(node --version)"
+        log "npm version: $(npm --version)"
+        log "npx version: $(npx --version)"
+        REMOTE
+
+    - name: Install Python dependencies on RunPod
+      timeout-minutes: 30
+      run: |
+        SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+        ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' TORCH_INDEX_URL='$RUNPOD_TORCH_INDEX_URL' bash -s" <<'REMOTE'
+        set -euo pipefail
+        log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+        cd "$DEPLOY_DIR"
+        VENV_PATH="/tmp/multi-agent-web-research-system-venv"
+
+        if [ ! -x "$VENV_PATH/bin/python" ]; then
+          log "Creating fresh venv (no system-site-packages, fully self-contained)"
+          rm -rf "$VENV_PATH"
+          python3 -m venv "$VENV_PATH"
+        fi
+        if [ ! -L .venv ] || [ "$(readlink .venv)" != "$VENV_PATH" ]; then
+          rm -rf .venv
+          ln -s "$VENV_PATH" .venv
+        fi
+
+        . .venv/bin/activate
+        python -m pip install --upgrade pip
+
+        # Detect the system torch build so the venv can match it exactly.
+        SYSTEM_TORCH_VERSION="$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'none')"
+        SYSTEM_CUDA_AVAILABLE="$(python3 -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo 'False')"
+        log "System torch version: $SYSTEM_TORCH_VERSION, CUDA available: $SYSTEM_CUDA_AVAILABLE"
+
+        TORCH_STATE="torch=$SYSTEM_TORCH_VERSION;cuda=$SYSTEM_CUDA_AVAILABLE;index=$TORCH_INDEX_URL"
+        TORCH_STATE_HASH="$(printf '%s' "$TORCH_STATE" | sha256sum | awk '{print $1}')"
+        TORCH_STATE_HASH_FILE=".venv/.torch_state.sha256"
+
+        if [ -f "$TORCH_STATE_HASH_FILE" ] && [ "$(cat "$TORCH_STATE_HASH_FILE")" = "$TORCH_STATE_HASH" ]; then
+          log "System torch build unchanged since last deploy; skipping torch install"
+        else
+          if [ "$SYSTEM_TORCH_VERSION" != "none" ] && [ "$SYSTEM_CUDA_AVAILABLE" = "True" ]; then
+            TORCH_PIN="${SYSTEM_TORCH_VERSION%%+*}"
+            log "System torch changed or venv not yet pinned; installing torch==$TORCH_PIN to match system build"
+            python -m pip install --index-url "$TORCH_INDEX_URL" "torch==$TORCH_PIN"
           else
-            log "Installing Node.js 22 for MCP tools"
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
-            mkdir -p /etc/apt/keyrings
-            rm -f /etc/apt/keyrings/nodesource.gpg
-            curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-              | gpg --batch --yes --dearmor -o /etc/apt/keyrings/nodesource.gpg
-            echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
-              > /etc/apt/sources.list.d/nodesource.list
-            DEBIAN_FRONTEND=noninteractive apt-get remove -y nodejs npm libnode-dev libnode72 || true
-            DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+            log "No system CUDA torch detected; installing default torch from $TORCH_INDEX_URL"
+            python -m pip install --index-url "$TORCH_INDEX_URL" torch
           fi
+          printf '%s\n' "$TORCH_STATE_HASH" > "$TORCH_STATE_HASH_FILE"
+          log "Recorded torch state hash $TORCH_STATE_HASH"
+        fi
 
-          log "Node.js version: $(node --version)"
-          log "npm version: $(npm --version)"
-          log "npx version: $(npx --version)"
-          REMOTE
+        python -c 'import torch; print("torch", torch.__version__, "cuda available", torch.cuda.is_available())'
 
-      - name: Install Python dependencies on RunPod
-        timeout-minutes: 30
-        run: |
-          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
-          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' TORCH_INDEX_URL='$RUNPOD_TORCH_INDEX_URL' bash -s" <<'REMOTE'
-          set -euo pipefail
-          log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+        # Existing requirements.txt hash-based install stays below, now resolving
+        # against the already-pinned, correct torch version.
+        REQUIREMENTS_HASH="$(sha256sum requirements.txt | awk '{print $1}')"
+        REQUIREMENTS_HASH_FILE=".venv/.requirements.sha256"
+        if [ -f "$REQUIREMENTS_HASH_FILE" ] && [ "$(cat "$REQUIREMENTS_HASH_FILE")" = "$REQUIREMENTS_HASH" ]; then
+          log "requirements.txt unchanged; skipping pip install"
+        else
+          log "requirements.txt changed or not recorded; installing dependencies"
+          timeout 25m python -m pip install --progress-bar off -r requirements.txt
+          printf '%s\n' "$REQUIREMENTS_HASH" > "$REQUIREMENTS_HASH_FILE"
+          log "Recorded requirements hash $REQUIREMENTS_HASH"
+        fi
+        REMOTE
 
-          cd "$DEPLOY_DIR"
-          log "Starting dependency installation in $DEPLOY_DIR"
-          log "System Python: $(python3 --version)"
-          log "Disk usage before install"
-          df -h .
-          VENV_PATH="/tmp/multi-agent-web-research-system-venv"
-          log "Using fast local venv path: $VENV_PATH"
+    - name: Install Playwright Chromium on RunPod
+      timeout-minutes: 15
+      run: |
+        SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+        ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
+        set -euo pipefail
+        log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
-          # RunPod images often already include CUDA PyTorch. Recreate the venv with system packages
-          # so we can reuse that GPU build instead of downloading multi-GB torch wheels each deploy.
-          # The venv lives in /tmp because /workspace is network-mounted and slow for many package files.
-          if [ ! -x "$VENV_PATH/bin/python" ] || ! "$VENV_PATH/bin/python" - <<'PY'
-          import torch
-          raise SystemExit(0 if torch.cuda.is_available() else 1)
-          PY
-          then
-            log "Creating venv with system site packages so existing CUDA PyTorch can be reused"
-            rm -rf "$VENV_PATH"
-            python3 -m venv --system-site-packages "$VENV_PATH"
-          else
-            log "Reusing existing venv"
-          fi
-          if [ ! -L .venv ] || [ "$(readlink .venv)" != "$VENV_PATH" ]; then
-            log "Pointing project .venv symlink to fast local venv"
-            rm -rf .venv
-            ln -s "$VENV_PATH" .venv
-          fi
+        cd "$DEPLOY_DIR"
+        . .venv/bin/activate
+        log "Installing Playwright Chromium"
+        timeout 10m python -m playwright install chromium
+        log "Installing Playwright Linux dependencies"
+        DEBIAN_FRONTEND=noninteractive timeout 10m python -m playwright install-deps chromium || true
+        log "Playwright cache size"
+        du -sh ~/.cache/ms-playwright 2>/dev/null || true
+        log "Playwright installation completed"
+        REMOTE
 
-          . .venv/bin/activate
-          log "Venv Python: $(python --version)"
-          log "Venv path: $(python -c 'import sys; print(sys.executable)')"
-          log "Upgrading pip"
-          python -m pip install --upgrade pip
+    - name: Smoke test imports on RunPod
+      timeout-minutes: 5
+      run: |
+        SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
+        ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
+        set -euo pipefail
+        log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 
-          # Fallback for minimal images that do not ship with GPU PyTorch.
-          if python - <<'PY'
-          import torch
-          raise SystemExit(0 if torch.cuda.is_available() else 1)
-          PY
-          then
-            log "CUDA PyTorch is already available"
-            python -c 'import torch; print("torch", torch.__version__); print("cuda available", torch.cuda.is_available()); print("cuda device", torch.cuda.get_device_name(0))'
-          else
-            log "CUDA PyTorch not available in venv; installing torch from $TORCH_INDEX_URL"
-            python -m pip install --upgrade --force-reinstall --index-url "$TORCH_INDEX_URL" torch
-          fi
-          REQUIREMENTS_HASH="$(sha256sum requirements.txt | awk '{print $1}')"
-          REQUIREMENTS_HASH_FILE=".venv/.requirements.sha256"
-          if [ -f "$REQUIREMENTS_HASH_FILE" ] && [ "$(cat "$REQUIREMENTS_HASH_FILE")" = "$REQUIREMENTS_HASH" ]; then
-            log "requirements.txt unchanged; skipping pip install"
-          else
-            log "requirements.txt changed or not recorded; installing dependencies"
-            timeout 25m python -m pip install --progress-bar off -r requirements.txt &
-            INSTALL_PID=$!
-            while kill -0 "$INSTALL_PID" 2>/dev/null; do
-              sleep 60
-              if kill -0 "$INSTALL_PID" 2>/dev/null; then
-                log "pip install is still running"
-                ps -o pid,ppid,stat,etime,pcpu,pmem,cmd -p "$INSTALL_PID" || true
-                ps aux | grep -E "pip|python -m pip|torch|gcc|g\\+\\+|cmake|ninja|cargo|rustc" | grep -v grep || true
-                du -sh ~/.cache/pip .venv 2>/dev/null || true
-                ss -tpn 2>/dev/null | grep -E "python|pip" || true
-              fi
-            done
-            wait "$INSTALL_PID"
-            printf '%s\n' "$REQUIREMENTS_HASH" > "$REQUIREMENTS_HASH_FILE"
-            log "Recorded requirements hash $REQUIREMENTS_HASH"
-          fi
+        cd "$DEPLOY_DIR"
+        . .venv/bin/activate
+        set -a
+        . .env
+        set +a
+        log "Running deploy smoke test"
+        python -B - <<'PY'
+        import torch
+        from src.graph.research_workflow import run_research_graph
+        from src.rag.indexing import index_research_results, select_embedding_device
+        from src.rag.retrieval import hybrid_retrieve
 
-          log "Checking dependency compatibility"
-          python -B - <<'PY'
-          import numpy
-          import torch
-          import transformers
+        # Deployment should fail loudly when the GPU is not visible to PyTorch.
+        if not torch.cuda.is_available():
+            raise SystemExit("CUDA is not available to PyTorch in the deploy venv")
 
-          if int(numpy.__version__.split(".", 1)[0]) >= 2:
-              raise SystemExit(f"numpy must be <2 for compiled ML dependencies, found {numpy.__version__}")
-          if tuple(int(part) for part in transformers.__version__.split(".")[:1]) >= (5,):
-              raise SystemExit(f"transformers must be <5 for torch compatibility, found {transformers.__version__}")
-
-          print("dependency compatibility ok")
-          print("numpy", numpy.__version__)
-          print("torch", torch.__version__)
-          print("transformers", transformers.__version__)
-          PY
-          log "Top-level package versions"
-          python -m pip show numpy torch transformers sentence-transformers langgraph chromadb | sed -n '1,180p'
-          log "Disk usage after install"
-          df -h .
-          du -sh .venv ~/.cache/pip 2>/dev/null || true
-          log "Dependency installation completed"
-          REMOTE
-
-      - name: Install Playwright Chromium on RunPod
-        timeout-minutes: 15
-        run: |
-          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
-          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
-          set -euo pipefail
-          log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
-
-          cd "$DEPLOY_DIR"
-          . .venv/bin/activate
-          log "Installing Playwright Chromium"
-          timeout 10m python -m playwright install chromium
-          log "Installing Playwright Linux dependencies"
-          DEBIAN_FRONTEND=noninteractive timeout 10m python -m playwright install-deps chromium || true
-          log "Playwright cache size"
-          du -sh ~/.cache/ms-playwright 2>/dev/null || true
-          log "Playwright installation completed"
-          REMOTE
-
-      - name: Smoke test imports on RunPod
-        timeout-minutes: 5
-        run: |
-          SSH_OPTS="-i $HOME/.ssh/runpod_key -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o ConnectTimeout=30"
-          ssh $SSH_OPTS -p "$RUNPOD_PORT" "$RUNPOD_USER@$RUNPOD_HOST" "DEPLOY_DIR='$DEPLOY_DIR' bash -s" <<'REMOTE'
-          set -euo pipefail
-          log() { printf '\n[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
-
-          cd "$DEPLOY_DIR"
-          . .venv/bin/activate
-          set -a
-          . .env
-          set +a
-          log "Running deploy smoke test"
-          python -B - <<'PY'
-          import torch
-          from src.graph.research_workflow import run_research_graph
-          from src.rag.indexing import index_research_results, select_embedding_device
-          from src.rag.retrieval import hybrid_retrieve
-
-          # Deployment should fail loudly when the GPU is not visible to PyTorch.
-          if not torch.cuda.is_available():
-              raise SystemExit("CUDA is not available to PyTorch in the deploy venv")
-
-          print("torch cuda ok", torch.__version__, torch.cuda.get_device_name(0))
-          print("rag embedding device", select_embedding_device())
-          print("deploy import ok")
-          PY
-          log "Deploy smoke test completed"
-          REMOTE
+        print("torch cuda ok", torch.__version__, torch.cuda.get_device_name(0))
+        print("rag embedding device", select_embedding_device())
+        print("deploy import ok")
+        PY
+        log "Deploy smoke test completed"
+        REMOTE
