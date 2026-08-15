@@ -44,6 +44,7 @@ DEFAULT_SOURCE_URL_K = 1
 DEFAULT_FEATURE_WEIGHT = 0.15
 DEFAULT_FORMULA_NEIGHBOR_WINDOW = 1
 DEFAULT_MULTI_QUERY_MAX_WORKERS = 4
+FAILED_RERANKERS: set[str] = set()
 TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
 FORMULA_CONTEXT_PATTERN = re.compile(
     r"(?i)\b("
@@ -976,6 +977,11 @@ def rerank_results(
     if not candidates:
         return []
 
+    cache_key = reranker_failure_key(model_name, device)
+    if rerank_failure_cache_enabled() and cache_key in FAILED_RERANKERS:
+        print(f"[rag] rerank skipped after previous failure for {cache_key}; using hybrid retrieval order")
+        return candidates + remainder
+
     try:
         reranker = langchain_cross_encoder_reranker(
             model_name=model_name,
@@ -987,6 +993,8 @@ def rerank_results(
             query=query,
         )
     except Exception as error:
+        if rerank_failure_cache_enabled():
+            FAILED_RERANKERS.add(cache_key)
         print_rerank_error(error)
         clear_embedding_model_memory()
         return candidates + remainder
@@ -1015,6 +1023,18 @@ def rerank_results(
     reranked = sorted(reranked, key=lambda item: item.score, reverse=True)
     clear_embedding_model_memory()
     return reranked + remainder
+
+
+def reranker_failure_key(model_name: str, device: str = "") -> str:
+    return f"{clean_text(model_name) or DEFAULT_RERANKER_MODEL}@{clean_text(device) or 'auto'}"
+
+
+def rerank_failure_cache_enabled() -> bool:
+    return clean_text(os.environ.get("RAG_RERANK_DISABLE_AFTER_FAILURE", "true")).lower() not in {"0", "false", "no", "off"}
+
+
+def clear_reranker_failure_cache() -> None:
+    FAILED_RERANKERS.clear()
 
 
 def langchain_cross_encoder_reranker(model_name: str, device: str, top_n: int) -> Any:
@@ -1051,11 +1071,43 @@ class SentenceTransformerCrossEncoderAdapter(BaseCrossEncoder):
                 "sentence-transformers and langchain-core are required for reranking. "
                 "Install them with `pip install -r requirements.txt`."
             ) from error
-        self.client = CrossEncoder(model_name, device=device, model_kwargs={"low_cpu_mem_usage": False})
+        self.client = load_sentence_transformer_cross_encoder(CrossEncoder, model_name, device)
 
     def score(self, text_pairs: list[tuple[str, str]]) -> list[float]:
         scores = self.client.predict(text_pairs, show_progress_bar=False)
         return [to_float(score, 0.0) for score in list(scores)]
+
+
+def load_sentence_transformer_cross_encoder(cross_encoder_cls: Any, model_name: str, device: str) -> Any:
+    """Load a CrossEncoder with GPU/CPU fallbacks before disabling rerank."""
+
+    attempts = cross_encoder_load_attempts(device)
+    errors = []
+    last_error: Exception | None = None
+    for label, load_device, model_kwargs in attempts:
+        try:
+            client = cross_encoder_cls(model_name, device=load_device, model_kwargs=model_kwargs)
+            if label != attempts[0][0]:
+                print(f"[rag] rerank CrossEncoder loaded with fallback strategy: {label}")
+            return client
+        except Exception as error:
+            last_error = error
+            errors.append(f"{label}: {type(error).__name__}: {error}")
+            clear_embedding_model_memory()
+    message = "CrossEncoder load failed for all strategies: " + "; ".join(errors)
+    raise RuntimeError(message) from last_error
+
+
+def cross_encoder_load_attempts(device: str) -> list[tuple[str, str | None, dict[str, Any]]]:
+    selected = clean_text(device) or "cpu"
+    attempts: list[tuple[str, str | None, dict[str, Any]]] = []
+    if selected.startswith("cuda"):
+        target = "cuda:0" if selected == "cuda" else selected
+        attempts.append((f"device_map:{target}", None, {"device_map": {"": target}, "low_cpu_mem_usage": True}))
+    attempts.append((f"device:{selected}", selected, {"low_cpu_mem_usage": False}))
+    if selected != "cpu":
+        attempts.append(("device:cpu", "cpu", {"low_cpu_mem_usage": False}))
+    return attempts
 
 
 def retrieval_results_to_langchain_documents(results: Sequence[RetrievalResult]) -> list[Any]:

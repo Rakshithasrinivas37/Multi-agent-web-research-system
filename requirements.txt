@@ -18,6 +18,7 @@ rank-bm25
 sentence-transformers
 streamlit
 tavily-python
-torch>=2.2,<3
+# Torch is installed separately in deploy/local setup so it can match the
+# target CPU/CUDA platform. sentence-transformers will use that existing build.
 transformers<5
 uvicorn[standard]
