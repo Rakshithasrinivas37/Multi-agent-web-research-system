@@ -156,6 +156,18 @@ Supported [1]. Unsupported [9].
         self.assertEqual(check["covered_count"], 1)
         self.assertEqual(check["missing"], [questions[1]])
 
+    def test_missing_sub_question_coverage_accepts_technical_equation_answer(self):
+        report = """
+## Scaled Dot-Product Attention
+The scaled dot-product attention equation is
+Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V.
+Here Q is the query matrix, K is the key matrix, V is the value matrix,
+and d_k is the key dimension used for scaling.
+"""
+        questions = ["What is the scaled dot‑product attention equation and its components?"]
+
+        self.assertEqual(missing_sub_question_coverage(report, questions), [])
+
     def test_report_schema_issues_detects_missing_sections(self):
         report = """# Topic
 
