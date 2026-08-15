@@ -1,11 +1,15 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 
 from langgraph.graph import END
 
 from src.graph.research_workflow import (
     DEFAULT_REPORT_GAP_SYNTHESIS_MODEL,
+    format_exception_details,
     next_node_or_end,
+    print_retry_response_error,
     report_gap_synthesis_model,
     validate_rag_index,
 )
@@ -21,6 +25,24 @@ class ResearchWorkflowRoutingTests(unittest.TestCase):
         route = next_node_or_end("browser")
 
         self.assertEqual(route({"errors": ["planner failed"]}), END)
+
+    def test_format_exception_details_includes_traceback(self):
+        try:
+            raise RuntimeError("full error")
+        except RuntimeError as error:
+            details = format_exception_details(error)
+
+        self.assertIn("Traceback", details)
+        self.assertIn("RuntimeError: full error", details)
+
+    def test_print_retry_response_error_preserves_multiline_error(self):
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            print_retry_response_error("synthesis", 1, ["line one\nline two"])
+
+        output = buffer.getvalue()
+        self.assertIn("[synthesis] retrying after response error", output)
+        self.assertIn("line one\nline two", output)
 
     @patch.dict("os.environ", {}, clear=True)
     def test_report_gap_synthesis_model_defaults_to_qwen(self):
