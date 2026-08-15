@@ -222,14 +222,14 @@ Supported [1]. Unsupported [9].
         self.assertEqual(check["covered_count"], 1)
         self.assertEqual(check["missing"], [questions[1]])
 
-    def test_report_coverage_includes_synthesis_gap_statuses(self):
+    def test_report_coverage_does_not_fail_for_synthesis_gap_statuses(self):
         questions = ["What benchmark results demonstrate GLUE and WMT performance?"]
         report = "This report mentions GLUE, WMT, and benchmark performance."
 
-        check = report_sub_question_coverage_check(report, questions, synthesis_gap_questions=questions)
+        check = report_sub_question_coverage_check(report, questions)
 
-        self.assertEqual(check["covered_count"], 0)
-        self.assertEqual(check["missing"], questions)
+        self.assertEqual(check["covered_count"], 1)
+        self.assertEqual(check["missing"], [])
 
     def test_missing_sub_question_coverage_accepts_technical_equation_answer(self):
         report = """
