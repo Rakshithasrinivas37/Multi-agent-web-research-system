@@ -17,6 +17,13 @@ class SynthesisAgentTests(unittest.TestCase):
         self.assertEqual(payload["synthesis"], "notes")
         self.assertEqual(synthesize.call_args.kwargs["browser_results"], browser_results)
 
+    def test_write_to_memory_strips_thinking_blocks(self):
+        with patch("src.agents.synthesis_agent.SharedMemory") as memory_cls:
+            SynthesisAgent().write_to_memory({"synthesis": "Useful.\n<think>hidden</think>\nFinal."})
+
+        written = memory_cls.return_value.write_agent_output.call_args.args[1]["report_context"]["synthesis"]
+        self.assertEqual(written, "Useful.\n\nFinal.")
+
 
 if __name__ == "__main__":
     unittest.main()

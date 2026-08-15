@@ -5,6 +5,7 @@ from inspect import iscoroutinefunction
 import os
 import re
 from time import perf_counter
+import traceback
 from typing import Any, Sequence, TypedDict
 
 from langgraph.graph import END, StateGraph
@@ -97,7 +98,7 @@ def add_agent_timing(agent_name: str, state: ResearchState, elapsed: float) -> R
     print(f"[{agent_name}] {status} in {elapsed:.2f}s")
     if errors:
         for error in errors:
-            print(f"[{agent_name}] error: {clean_text(error)}")
+            print(f"[{agent_name}] error:\n{format_error_text(error)}")
     timing = {"agent": agent_name, "status": status, "elapsed_seconds": round(elapsed, 2)}
     emit_progress(
         "agent_completed",
@@ -128,7 +129,7 @@ def planner_node(state: ResearchState) -> ResearchState:
             plan_dict = plan.to_dict()
             errors = validate_research_plan(plan_dict, objective)
         except Exception as error:
-            errors = [clean_text(error)]
+            errors = [format_exception_details(error)]
         if not errors:
             break
         if attempt < DEFAULT_AGENT_RESPONSE_ATTEMPTS:
@@ -282,7 +283,7 @@ def synthesis_node(state: ResearchState) -> ResearchState:
             synthesis = synthesis_agent.synthesize(plan, browser_results=state.get("browser_results", []))
             synthesis_errors = validate_synthesis_payload(synthesis, plan)
         except Exception as error:
-            synthesis_errors = [clean_text(error)]
+            synthesis_errors = [format_exception_details(error)]
         if not synthesis_errors:
             break
         if attempt < DEFAULT_AGENT_RESPONSE_ATTEMPTS:
@@ -370,7 +371,7 @@ def report_node(state: ResearchState) -> ResearchState:
                 report = report_agent.generate(report_context, output_format=output_format)
             report_errors = report_missing_question_errors(report)
         except Exception as error:
-            report_errors = [clean_text(error)]
+            report_errors = [format_exception_details(error)]
         else:
             report_errors = report_errors or validate_report_payload(report, research_plan)
             if not report_errors:
@@ -515,8 +516,56 @@ def merge_report_context(original: dict[str, Any], refreshed: dict[str, Any]) ->
         "synthesis": synthesis,
         "sources": sources,
         "supporting_chunks": chunks,
+        "coverage_by_question": merge_coverage_by_question(
+            original.get("coverage_by_question", []),
+            refreshed.get("coverage_by_question", []),
+            citation_map,
+        ),
         "diagnostics": diagnostics,
     }
+
+
+def merge_coverage_by_question(
+    original_items: Sequence[dict[str, Any]],
+    refreshed_items: Sequence[dict[str, Any]],
+    citation_map: dict[int, int],
+) -> list[dict[str, Any]]:
+    refreshed_by_question = {
+        coverage_question_key(item): reindex_coverage_item(item, citation_map)
+        for item in refreshed_items or []
+        if isinstance(item, dict) and coverage_question_key(item)
+    }
+    merged = []
+    seen = set()
+    for item in original_items or []:
+        if not isinstance(item, dict):
+            continue
+        key = coverage_question_key(item)
+        merged.append(refreshed_by_question.get(key, dict(item)))
+        if key:
+            seen.add(key)
+    for key, item in refreshed_by_question.items():
+        if key not in seen:
+            merged.append(item)
+    return merged
+
+
+def coverage_question_key(item: dict[str, Any]) -> str:
+    value = clean_text(item.get("question"))
+    return re.sub(r"[^a-zA-Z0-9]+", " ", value).strip().lower()
+
+
+def reindex_coverage_item(item: dict[str, Any], citation_map: dict[int, int]) -> dict[str, Any]:
+    copied = dict(item)
+    indexes = []
+    for value in copied.get("source_indexes", []) or []:
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            continue
+        indexes.append(citation_map.get(index, index))
+    copied["source_indexes"] = indexes
+    return copied
 
 
 def append_reindexed_sources(
@@ -579,8 +628,17 @@ def reindex_supporting_chunks(chunks: Sequence[dict[str, Any]], citation_map: di
 
 
 def print_retry_response_error(agent_name: str, attempt: int, errors: Sequence[str]) -> None:
-    error_text = "; ".join(clean_text(error) for error in errors if clean_text(error))
-    print(f"[{agent_name}] retrying after response error ({attempt}/{DEFAULT_AGENT_RESPONSE_ATTEMPTS}): {error_text}")
+    error_text = "\n---\n".join(format_error_text(error) for error in errors if format_error_text(error))
+    print(f"[{agent_name}] retrying after response error ({attempt}/{DEFAULT_AGENT_RESPONSE_ATTEMPTS}):\n{error_text}")
+
+
+def format_exception_details(error: Exception) -> str:
+    details = "".join(traceback.format_exception(type(error), error, error.__traceback__)).strip()
+    return details or f"{type(error).__name__}: {error}"
+
+
+def format_error_text(error: Any) -> str:
+    return str(error or "").strip()
 
 
 def index_rag_after_change_detection(

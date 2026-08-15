@@ -337,6 +337,12 @@ def synthesize_report_from_research_plan(
         max_chars=retrieved_chunk_chars,
         cited_source_indexes=citation_audit.get("valid_referenced_source_indexes", []),
     )
+    payload["sub_question_specs"] = planner_sub_question_specs(research_plan)
+    payload["coverage_by_question"] = build_coverage_by_question(
+        payload.get("synthesis"),
+        payload["sub_question_specs"],
+        payload.get("sources", []),
+    )
     payload["diagnostics"] = synthesis_diagnostics(payload, retrieved_context)
     if include_retrieved_chunks:
         payload["retrieved_chunks"] = compact_retrieved_chunks(
@@ -706,6 +712,117 @@ def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
         for question in research_plan.get("sub_questions", [])
         if clean_text(question)
     )
+
+
+def planner_sub_question_specs(research_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return stable per-question coverage specs from planner output."""
+
+    raw_specs = research_plan.get("sub_question_specs")
+    specs = []
+    if isinstance(raw_specs, list):
+        for index, item in enumerate(raw_specs, start=1):
+            if not isinstance(item, dict):
+                continue
+            question = clean_text(item.get("question"))
+            if not question:
+                continue
+            specs.append(
+                {
+                    "question_id": clean_text(item.get("question_id")) or f"q{index:03d}",
+                    "question": question,
+                    "required_evidence": clean_string_list(item.get("required_evidence")) or infer_question_evidence_types(question),
+                }
+            )
+
+    if specs:
+        return specs
+    return [
+        {
+            "question_id": f"q{index:03d}",
+            "question": question,
+            "required_evidence": infer_question_evidence_types(question),
+        }
+        for index, question in enumerate(planner_sub_questions(research_plan), start=1)
+    ]
+
+
+def build_coverage_by_question(
+    synthesis: Any,
+    sub_question_specs: Sequence[dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Summarize synthesis coverage for each planner sub-question."""
+
+    synthesis_text = normalize_citation_markers(synthesis)
+    source_index_set = source_indexes(sources)
+    coverage = []
+    for spec in sub_question_specs:
+        question = clean_text(spec.get("question")) if isinstance(spec, dict) else ""
+        section = synthesis_section_for_question(synthesis_text, question)
+        cited = [index for index in citation_markers(section) if index in source_index_set]
+        status = infer_synthesis_coverage_status(section)
+        coverage.append(
+            {
+                "question_id": clean_text(spec.get("question_id")) if isinstance(spec, dict) else "",
+                "question": question,
+                "required_evidence": clean_string_list(spec.get("required_evidence")) if isinstance(spec, dict) else [],
+                "status": status,
+                "source_indexes": cited,
+                "has_citations": bool(cited),
+            }
+        )
+    return coverage
+
+
+def synthesis_section_for_question(synthesis: str, question: str) -> str:
+    if not question:
+        return ""
+    question_text = clean_text(question)
+    location = synthesis.lower().find(question_text.lower())
+    if location < 0:
+        tokens = query_tokens(question_text)
+        return "\n".join(
+            line for line in synthesis.splitlines()
+            if len(tokens & query_tokens(line)) >= max(2, min(4, len(tokens)))
+        )
+    next_heading = re.search(r"\n\s*(?:#{1,6}\s+|\d+\.\s+|[-*]\s+)?(?:What|How|Why|Which|When|Where)\b", synthesis[location + len(question_text):], flags=re.IGNORECASE)
+    end = location + len(question_text) + next_heading.start() if next_heading else min(len(synthesis), location + 1800)
+    return synthesis[location:end]
+
+
+def infer_synthesis_coverage_status(text: str) -> str:
+    lowered = clean_text(text).lower()
+    if not lowered:
+        return "missing"
+    if re.search(r"\bmissing evidence\b|\bnot present\b|\bno explicit\b|\bunavailable\b", lowered):
+        return "missing"
+    if re.search(r"\bpartial(?:ly)?\b|\blimited\b|\bweak\b", lowered):
+        return "partial"
+    if re.search(r"\bcovered\b|\bstrong\b|\bsupported\b", lowered) or citation_markers(text):
+        return "covered"
+    return "partial"
+
+
+def infer_question_evidence_types(question: str) -> list[str]:
+    lowered = clean_text(question).lower()
+    checks = [
+        ("definition", r"\b(what is|definition|define|purpose|overview)\b"),
+        ("equation", r"\b(equation|formula|formulation|mathematical|components?)\b"),
+        ("comparison", r"\b(compare|comparison|versus| vs |differ|differences?)\b"),
+        ("benchmark", r"\b(benchmark|score|performance|metric|accuracy|bleu|glue|imagenet|result)\b"),
+        ("api", r"\b(api|pytorch|tensorflow|keras|implementation|code|signature|usage)\b"),
+        ("complexity", r"\b(complexity|memory|time|efficient|linear|quadratic|scalability)\b"),
+        ("applications", r"\b(application|use case|vision|nlp|computer vision)\b"),
+        ("limitations", r"\b(limitation|challenge|drawback|open question)\b"),
+    ]
+    evidence = [name for name, pattern in checks if re.search(pattern, lowered)]
+    return evidence or ["evidence"]
+
+
+def clean_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [clean_text(item) for item in value if clean_text(item)]
 
 
 def planner_context_query(research_plan: dict[str, Any], fallback_queries: Sequence[str]) -> str:

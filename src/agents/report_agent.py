@@ -52,7 +52,7 @@ class ReportAgent:
             raise RuntimeError("groq package is not installed. Install it with `pip install -r requirements.txt`.") from error
 
         objective = clean_text(report_context.get("objective"))
-        synthesis = normalize_citation_markers(report_context.get("synthesis"))
+        synthesis = clean_markdown(normalize_citation_markers(report_context.get("synthesis")))
         if not objective:
             raise ValueError("report_context.objective is required")
         if not synthesis:
@@ -69,6 +69,7 @@ class ReportAgent:
             evidence=evidence,
             sources=sources,
             citation_policy=clean_text(report_context.get("citation_policy")),
+            coverage_by_question=report_context.get("coverage_by_question", []),
         )
 
         emit_progress(
@@ -80,9 +81,10 @@ class ReportAgent:
         )
         report, model = generate_single_report(Groq(), self.model, prompt)
         report = normalize_final_report(report, sources)
-        coverage = report_sub_question_coverage_check(report, planner_questions)
+        synthesis_gaps = synthesis_coverage_gap_questions(report_context, planner_questions)
+        coverage = report_sub_question_coverage_check(report, planner_questions, synthesis_gaps)
         schema_issues = report_schema_issues(report, planner_questions)
-        report_issues = report_quality_issues(report, sources)
+        report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}")
         review = report_self_critique(report_issues, coverage, schema_issues)
 
         return {
@@ -100,6 +102,7 @@ class ReportAgent:
                 "report_issues": report_issues,
                 "report_schema_issues": schema_issues,
                 "report_missing_sub_questions": coverage["missing"],
+                "report_synthesis_gap_questions": synthesis_gaps,
                 "report_coverage_check": coverage,
                 "report_retry_queries": rewrite_missing_sub_question_queries(objective, coverage["missing"]),
                 "report_review_trace": [review],
@@ -126,6 +129,7 @@ def build_report_prompt(
     evidence: str,
     sources: Sequence[dict[str, Any]],
     citation_policy: str = "",
+    coverage_by_question: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     return f"""Research objective:
 {objective}
@@ -151,6 +155,9 @@ Planner sub-questions to cover:
 Suggested topic headings:
 {format_report_section_outline(planner_questions)}
 
+Synthesis coverage by planner question:
+{format_question_coverage(coverage_by_question or [])}
+
 Available sources:
 {format_sources(sources)}
 
@@ -171,7 +178,12 @@ Grounding requirement (strict — read this first):
 
 Coverage requirement (mandatory):
 - Every planner sub-question above must map to exactly one section under heading 3, using the suggested topic heading or a clearer equivalent.
+- Treat "Synthesis coverage by planner question" as the coverage contract. If a question is marked missing, write a short evidence-gap subsection instead of inventing an answer. If it is partial, clearly separate supported findings from missing details.
+- For missing coverage items, do not include formulas, API names, benchmark values, examples, or detailed explanations for that topic. Write only what evidence is missing and why the report cannot answer it from the supplied context.
+- For each topic section, prefer the source indexes listed in its coverage item. Do not use citations outside that item unless the supporting evidence directly backs the claim.
 - Each of those sections must explicitly answer its sub-question using only the retrieved context — not just mention the topic. If the evidence only partially answers a sub-question, answer what is supported and name the missing piece in that section AND in Limitations/Open Questions.
+- For any sub-question asking for a definition, formulation, equation, components, complexity, API signature, or benchmark metric, include a clearly labeled "Core equation", "Core formula", "API", or "Metric evidence" line when that detail appears in the evidence. Do not hide the main formula in prose.
+- When multiple equivalent equations appear in the evidence, show the most general/source-backed equation first, then explain its components.
 - Do not merge two sub-questions into one section unless they are genuinely the same question asked two ways — if you do this, say so explicitly.
 - Do not add sections that don't map to a sub-question, except the fixed schema sections above.
 
@@ -225,6 +237,23 @@ def format_report_section_outline(questions: Sequence[str]) -> str:
     if not items:
         return "- Use clear sections that answer the objective."
     return "\n".join(f"## {i}. {planner_question_heading(q)}\nCoverage target: {q}" for i, q in enumerate(items, 1))
+
+
+def format_question_coverage(coverage_by_question: Sequence[dict[str, Any]]) -> str:
+    lines = []
+    for item in coverage_by_question or []:
+        if not isinstance(item, dict):
+            continue
+        question = clean_text(item.get("question"))
+        if not question:
+            continue
+        question_id = clean_text(item.get("question_id")) or "question"
+        status = clean_text(item.get("status")) or "unknown"
+        evidence = ", ".join(clean_text(value) for value in item.get("required_evidence", []) if clean_text(value))
+        source_indexes = [str(value) for value in item.get("source_indexes", []) if isinstance(value, int)]
+        sources = ", ".join(f"[{index}]" for index in source_indexes) or "no cited sources"
+        lines.append(f"- {question_id}: {status}; evidence={evidence or 'evidence'}; sources={sources}; question={question}")
+    return "\n".join(lines) or "- No structured coverage map was provided; use planner questions and synthesis notes."
 
 
 def planner_question_heading(question: str) -> str:
@@ -322,7 +351,7 @@ def dedupe_sources(sources: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def normalize_final_report(report: str, sources: Sequence[dict[str, Any]]) -> str:
-    text = remove_unavailable_citation_markers(clean_markdown(report), source_index_set(sources))
+    text = normalize_markdown_headings(remove_unavailable_citation_markers(clean_markdown(report), source_index_set(sources)))
     body = strip_references(text)
     return clean_markdown(f"{body}\n\n{references_section(body, sources)}")
 
@@ -355,27 +384,58 @@ def strip_references(report: str) -> str:
     return clean_markdown("\n".join(lines))
 
 
-def report_sub_question_coverage_check(report: str, planner_questions: Sequence[str]) -> dict[str, Any]:
+def report_sub_question_coverage_check(
+    report: str,
+    planner_questions: Sequence[str],
+    synthesis_gap_questions: Sequence[str] | None = None,
+) -> dict[str, Any]:
     questions = [clean_text(q) for q in planner_questions if clean_text(q)]
-    missing = missing_sub_question_coverage(report, questions)
-    missing_set = set(missing)
+    missing = dedupe_text([*missing_sub_question_coverage(report, questions), *(synthesis_gap_questions or [])])
+    missing_keys = {normalize_heading(q) for q in missing}
     return {
         "total": len(questions),
-        "covered_count": len(questions) - len(missing),
+        "covered_count": sum(1 for q in questions if normalize_heading(q) not in missing_keys),
         "missing_count": len(missing),
         "missing": missing,
-        "items": [{"question": q, "heading": planner_question_heading(q), "status": "missing" if q in missing_set else "covered"} for q in questions],
+        "items": [{"question": q, "heading": planner_question_heading(q), "status": "missing" if normalize_heading(q) in missing_keys else "covered"} for q in questions],
     }
 
 
+def synthesis_coverage_gap_questions(
+    report_context: dict[str, Any],
+    planner_questions: Sequence[str] | None = None,
+) -> list[str]:
+    """Return planner questions synthesis marked as missing, partial, or weak."""
+
+    if not isinstance(report_context, dict):
+        return []
+    canonical = {normalize_heading(q): q for q in planner_questions or [] if clean_text(q)}
+    gaps = []
+    for item in report_context.get("coverage_by_question", []) or []:
+        if not isinstance(item, dict) or not synthesis_coverage_status_is_gap(item.get("status")):
+            continue
+        question = clean_text(item.get("question"))
+        if question:
+            gaps.append(canonical.get(normalize_heading(question), question))
+    return dedupe_text(gaps)
+
+
+def synthesis_coverage_status_is_gap(status: Any) -> bool:
+    lowered = clean_text(status).lower()
+    return bool(lowered and any(term in lowered for term in ("missing", "partial", "weak", "insufficient", "unsupported", "failed", "error")))
+
+
 def missing_sub_question_coverage(report: str, planner_questions: Sequence[str]) -> list[str]:
-    report_terms = detail_terms(report)
+    report_terms = set(technical_question_terms(report))
     missing = []
     for question in planner_questions:
-        terms = [term for term in detail_terms(question) if term not in STOPWORDS]
-        important = named_terms(question) or terms[:4]
+        terms = [term for term in technical_question_terms(question) if term not in STOPWORDS]
+        named = named_terms(question)
+        important = named or terms[:4]
         required = 1 if len(important) <= 2 else 2
-        if sum(1 for term in important if term in report_terms) < required:
+        named_matches = sum(1 for term in named if term in report_terms)
+        term_matches = sum(1 for term in terms[:6] if term in report_terms)
+        if named_matches < required and term_matches < required:
             missing.append(question)
     return missing
 
@@ -408,7 +468,11 @@ def report_self_critique(report_issues: Sequence[str], coverage_check: dict[str,
     return {"source": "deterministic", "unresolved_issues": unresolved, "coverage_missing": coverage_check.get("missing", []), "schema_issues": list(schema_issues)}
 
 
-def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None = None) -> list[str]:
+def report_quality_issues(
+    report: str,
+    sources: Sequence[dict[str, Any]] | None = None,
+    evidence_text: str = "",
+) -> list[str]:
     issues = []
     text = clean_markdown(report)
     if not text:
@@ -421,11 +485,53 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
     invalid = unavailable_citation_markers(report, source_indexes)
     if invalid:
         issues.append(f"report uses unavailable citations: {format_citation_indexes(invalid)}")
+    unsupported_metrics = unsupported_benchmark_metrics(text, evidence_text)
+    if unsupported_metrics:
+        issues.append(f"report includes benchmark metrics not present in evidence: {', '.join(unsupported_metrics[:5])}")
     return issues
+
+
+def normalize_markdown_headings(markdown: str) -> str:
+    lines = []
+    for line in clean_markdown(markdown).splitlines():
+        lines.append(re.sub(r"^(\s{0,3}#{1,6}\s+)#{1,6}\s+", r"\1", line))
+    return "\n".join(lines)
 
 
 def has_placeholder_source_marker(text: str) -> bool:
     return bool(re.search(r"\[\s*(?:[—-]|uncited|citation needed|source needed)[^\]]*\]", text, flags=re.IGNORECASE))
+
+
+def unsupported_benchmark_metrics(report: str, evidence_text: str) -> list[str]:
+    evidence = strip_markdown(evidence_text).lower()
+    if not evidence:
+        return []
+    unsupported = []
+    for line in clean_markdown(report).splitlines():
+        if line.lstrip().startswith("#") or is_references_heading(line):
+            continue
+        text = strip_markdown(line)
+        lowered = text.lower()
+        if not re.search(r"\b(benchmark|bleu|glue|imagenet|accuracy|top[- ]?[15]|f1|auc|rouge)\b|%", lowered):
+            continue
+        for match in re.finditer(r"(?<![-\[])\b\d+(?:\.\d+)?\s*%?", text):
+            value = clean_text(match.group(0)).lower()
+            if is_non_metric_number(text, match):
+                continue
+            if value and value not in evidence and value not in unsupported:
+                unsupported.append(value)
+    return unsupported
+
+
+def is_non_metric_number(text: str, match: re.Match[str]) -> bool:
+    value = clean_text(match.group(0)).lower()
+    if re.fullmatch(r"(?:19|20)\d{2}", value):
+        return True
+    if value.endswith("%"):
+        return False
+    before = text[max(0, match.start() - 2):match.start()]
+    after = text[match.end():match.end() + 2]
+    return bool(re.search(r"[-._/]$", before) or re.search(r"^[-._/]", after))
 
 
 def rewrite_missing_sub_question_queries(objective: str, questions: Sequence[str]) -> list[str]:
@@ -439,7 +545,8 @@ def rewrite_missing_sub_question_queries(objective: str, questions: Sequence[str
 def report_context_gap_items(report_context: dict[str, Any], research_plan: dict[str, Any]) -> list[str]:
     synthesis = clean_text(report_context.get("synthesis")) if isinstance(report_context, dict) else ""
     questions = [clean_text(q) for q in research_plan.get("sub_questions", []) if clean_text(q)] if isinstance(research_plan, dict) else []
-    missing = missing_sub_question_coverage(synthesis, questions)
+    missing = synthesis_coverage_gap_questions(report_context, questions)
+    missing.extend(q for q in missing_sub_question_coverage(synthesis, questions) if q not in missing)
     gap_text = "\n".join(missing_evidence_constraints(synthesis)).lower()
     for question in questions:
         if question not in missing and any(term in gap_text for term in detail_terms(question)):
@@ -563,12 +670,24 @@ def headings_match(expected: str, actual: str) -> bool:
     actual_terms = detail_terms(actual)
     if not expected_terms:
         return False
-    required = min(4, max(2, len(expected_terms) // 2))
+    if len(expected_terms & actual_terms) >= min(3, len(expected_terms)):
+        return True
+    required = min(3, max(2, len(expected_terms) // 3))
     return len(expected_terms & actual_terms) >= required
 
 
 def detail_terms(text: Any) -> set[str]:
-    return {token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9_+.-]{2,}", strip_markdown(text)) if token.lower() not in STOPWORDS}
+    return {token.lower().replace("‑", "-").replace("–", "-") for token in re.findall(r"[A-Za-z][A-Za-z0-9_+.-]{2,}", strip_markdown(text)) if token.lower() not in STOPWORDS}
+
+
+def technical_question_terms(text: Any) -> list[str]:
+    value = strip_markdown(text).replace("‑", "-").replace("–", "-")
+    terms = re.findall(r"[A-Za-z][A-Za-z0-9_+.-]{2,}", value)
+    phrases = []
+    for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9_+.-]*(?:-[A-Za-z0-9_+.-]+)+\b", value):
+        phrase = match.group(0).lower()
+        phrases.extend([phrase, phrase.replace("-", "")])
+    return dedupe_text([*(term.lower() for term in terms), *phrases])
 
 
 def named_terms(text: Any) -> list[str]:

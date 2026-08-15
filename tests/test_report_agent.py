@@ -3,12 +3,15 @@ import unittest
 from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     clean_markdown,
+    build_report_prompt,
     dedupe_sources,
+    format_question_coverage,
     format_report_section_outline,
     format_supporting_evidence,
     missing_evidence_constraints,
     missing_sub_question_coverage,
     normalize_final_report,
+    normalize_markdown_headings,
     remove_unavailable_citation_markers,
     report_context_gap_items,
     report_context_gap_queries,
@@ -19,6 +22,8 @@ from src.agents.report_agent import (
     report_sub_question_coverage_check,
     rewrite_missing_sub_question_queries,
     slugify_filename,
+    synthesis_coverage_gap_questions,
+    unsupported_benchmark_metrics,
 )
 
 
@@ -59,6 +64,38 @@ Supported [1]. Unsupported [9].
 
         self.assertIn("report contains placeholder or non-source citation markers", issues)
 
+    def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
+        markdown = "### ## 1. Definition\nText."
+
+        self.assertEqual(normalize_markdown_headings(markdown), "### 1. Definition\nText.")
+
+    def test_report_quality_flags_benchmark_metrics_missing_from_evidence(self):
+        issues = report_quality_issues(
+            "## Benchmarks\nViT reaches 77% top-1 accuracy [1].\n\n## References\n[1] https://example.com",
+            [{"index": 1, "url": "https://example.com"}],
+            evidence_text="Vision Transformer image classification evidence without exact scores.",
+        )
+
+        self.assertIn("report includes benchmark metrics not present in evidence: 77%", issues)
+
+    def test_unsupported_benchmark_metrics_allows_evidence_numbers(self):
+        report = "BLEU-4 improves from 0.386 to 0.482 [1]."
+        evidence = "The evidence says BLEU-4 improves from 0.386 to 0.482."
+
+        self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
+
+    def test_unsupported_benchmark_metrics_ignores_publication_years(self):
+        report = "The 2017 Transformer paper reports WMT benchmark results with BLEU gains [1]."
+        evidence = "WMT benchmark evidence includes BLEU gains."
+
+        self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
+
+    def test_unsupported_benchmark_metrics_ignores_model_name_numbers(self):
+        report = "The benchmark compares a model-family-152 baseline with another architecture [1]."
+        evidence = "Benchmark evidence compares baseline architectures without exact scores."
+
+        self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
+
     def test_report_quality_accepts_references_after_markdown_cleanup(self):
         issues = report_quality_issues(
             "### Executive Summary\nClaim [1].\n\n## References\n[1] https://example.com",
@@ -88,6 +125,57 @@ Supported [1]. Unsupported [9].
 
         self.assertIn("## 1. Benchmark Demonstrate GLUE And WMT Performance", outline)
         self.assertIn("## 2. PyTorch MultiheadAttention Used", outline)
+
+    def test_build_report_prompt_requires_core_equation_for_formula_questions(self):
+        prompt = build_report_prompt(
+            objective="Attention mechanism",
+            output_format="report",
+            planner_questions=["What is the main attention equation and its components?"],
+            synthesis="The evidence includes Attention(Q,K,V)=softmax(score(Q,K))V.",
+            evidence="[1] Attention equation evidence.",
+            sources=[{"index": 1, "url": "https://example.com"}],
+        )
+
+        self.assertIn("Core equation", prompt)
+        self.assertIn("show the most general/source-backed equation first", prompt)
+
+    def test_build_report_prompt_includes_structured_coverage_contract(self):
+        prompt = build_report_prompt(
+            objective="Attention mechanism",
+            output_format="report",
+            planner_questions=["What benchmark results show performance?"],
+            synthesis="Benchmark notes are incomplete.",
+            evidence="[1] General benchmark source.",
+            sources=[{"index": 1, "url": "https://example.com"}],
+            coverage_by_question=[
+                {
+                    "question_id": "q001",
+                    "question": "What benchmark results show performance?",
+                    "required_evidence": ["benchmark"],
+                    "status": "missing",
+                    "source_indexes": [],
+                }
+            ],
+        )
+
+        self.assertIn("Synthesis coverage by planner question", prompt)
+        self.assertIn("q001: missing", prompt)
+        self.assertIn("write a short evidence-gap subsection instead of inventing an answer", prompt)
+        self.assertIn("do not include formulas, API names, benchmark values, examples, or detailed explanations", prompt)
+
+    def test_format_question_coverage_lists_status_and_sources(self):
+        coverage = format_question_coverage([
+            {
+                "question_id": "q002",
+                "question": "How is the API used?",
+                "required_evidence": ["api"],
+                "status": "covered",
+                "source_indexes": [1, 3],
+            }
+        ])
+
+        self.assertIn("q002: covered", coverage)
+        self.assertIn("sources=[1], [3]", coverage)
 
     def test_format_supporting_evidence_uses_chunks_once(self):
         context = {
@@ -133,6 +221,27 @@ Supported [1]. Unsupported [9].
         self.assertEqual(check["total"], 2)
         self.assertEqual(check["covered_count"], 1)
         self.assertEqual(check["missing"], [questions[1]])
+
+    def test_report_coverage_includes_synthesis_gap_statuses(self):
+        questions = ["What benchmark results demonstrate GLUE and WMT performance?"]
+        report = "This report mentions GLUE, WMT, and benchmark performance."
+
+        check = report_sub_question_coverage_check(report, questions, synthesis_gap_questions=questions)
+
+        self.assertEqual(check["covered_count"], 0)
+        self.assertEqual(check["missing"], questions)
+
+    def test_missing_sub_question_coverage_accepts_technical_equation_answer(self):
+        report = """
+## Scaled Dot-Product Attention
+The scaled dot-product attention equation is
+Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V.
+Here Q is the query matrix, K is the key matrix, V is the value matrix,
+and d_k is the key dimension used for scaling.
+"""
+        questions = ["What is the scaled dot‑product attention equation and its components?"]
+
+        self.assertEqual(missing_sub_question_coverage(report, questions), [])
 
     def test_report_schema_issues_detects_missing_sections(self):
         report = """# Topic
@@ -185,6 +294,43 @@ Done.
 
         self.assertEqual(issues, [])
 
+    def test_report_schema_accepts_concise_topic_heading_for_long_question(self):
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+### Benchmark Evidence of Performance Impact
+Benchmarks.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_schema_issues(
+            report,
+            ["What benchmark results demonstrate the performance impact of attention mechanisms on tasks such as machine translation and GLUE?"],
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_clean_markdown_strips_open_thinking_block(self):
+        text = "Useful.\n<think>hidden reasoning that never closes"
+
+        self.assertEqual(clean_markdown(text), "Useful.")
+
     def test_report_self_critique_combines_diagnostics(self):
         critique = report_self_critique(
             ["report issue"],
@@ -213,6 +359,17 @@ Done.
 
         self.assertEqual(gaps, plan["sub_questions"])
         self.assertIn("GLUE", queries[0])
+
+    def test_report_context_gap_items_uses_structured_synthesis_coverage(self):
+        question = "What benchmark results demonstrate GLUE performance?"
+        context = {
+            "synthesis": "The topic is mentioned.",
+            "coverage_by_question": [{"question": question, "status": "partial", "source_indexes": [1]}],
+        }
+        plan = {"objective": "Attention mechanism", "sub_questions": [question]}
+
+        self.assertEqual(synthesis_coverage_gap_questions(context, plan["sub_questions"]), [question])
+        self.assertEqual(report_context_gap_items(context, plan), [question])
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(
