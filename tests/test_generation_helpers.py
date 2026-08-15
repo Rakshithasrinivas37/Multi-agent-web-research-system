@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 from src.rag.generation import (
     audit_synthesis_citations,
+    build_coverage_by_question,
     browser_signal_results,
+    planner_sub_question_specs,
     precision_retrieval_queries,
     print_synthesis_chunks,
     report_supporting_chunks,
@@ -87,6 +89,50 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertIn("exact equation formula", joined)
         self.assertIn("benchmark table results", joined)
         self.assertIn("official documentation api signature", joined)
+
+    def test_planner_sub_question_specs_uses_structured_specs_when_available(self):
+        plan = {
+            "sub_questions": ["What is the core equation?"],
+            "sub_question_specs": [
+                {
+                    "question_id": "q001",
+                    "question": "What is the core equation?",
+                    "required_evidence": ["equation"],
+                }
+            ],
+        }
+
+        specs = planner_sub_question_specs(plan)
+
+        self.assertEqual(specs[0]["question_id"], "q001")
+        self.assertEqual(specs[0]["required_evidence"], ["equation"])
+
+    def test_planner_sub_question_specs_falls_back_to_plain_questions(self):
+        specs = planner_sub_question_specs({"sub_questions": ["What benchmark results show performance?"]})
+
+        self.assertEqual(specs[0]["question_id"], "q001")
+        self.assertIn("benchmark", specs[0]["required_evidence"])
+
+    def test_build_coverage_by_question_maps_status_and_citations(self):
+        specs = [
+            {"question_id": "q001", "question": "What is the core equation?", "required_evidence": ["equation"]},
+            {"question_id": "q002", "question": "What benchmark results show performance?", "required_evidence": ["benchmark"]},
+        ]
+        synthesis = """
+What is the core equation?
+Covered with equation evidence [1].
+
+What benchmark results show performance?
+Missing Evidence: exact benchmark values are not present.
+"""
+
+        coverage = build_coverage_by_question(synthesis, specs, [{"index": 1}])
+
+        self.assertEqual(coverage[0]["status"], "covered")
+        self.assertEqual(coverage[0]["source_indexes"], [1])
+        self.assertTrue(coverage[0]["has_citations"])
+        self.assertEqual(coverage[1]["status"], "missing")
+        self.assertFalse(coverage[1]["has_citations"])
 
     def test_browser_signal_results_promotes_formula_evidence(self):
         browser_results = [
