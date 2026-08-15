@@ -5,6 +5,7 @@ from src.agents.report_agent import (
     clean_markdown,
     build_report_prompt,
     dedupe_sources,
+    format_question_coverage,
     format_report_section_outline,
     format_supporting_evidence,
     missing_evidence_constraints,
@@ -130,6 +131,43 @@ Supported [1]. Unsupported [9].
 
         self.assertIn("Core equation", prompt)
         self.assertIn("show the most general/source-backed equation first", prompt)
+
+    def test_build_report_prompt_includes_structured_coverage_contract(self):
+        prompt = build_report_prompt(
+            objective="Attention mechanism",
+            output_format="report",
+            planner_questions=["What benchmark results show performance?"],
+            synthesis="Benchmark notes are incomplete.",
+            evidence="[1] General benchmark source.",
+            sources=[{"index": 1, "url": "https://example.com"}],
+            coverage_by_question=[
+                {
+                    "question_id": "q001",
+                    "question": "What benchmark results show performance?",
+                    "required_evidence": ["benchmark"],
+                    "status": "missing",
+                    "source_indexes": [],
+                }
+            ],
+        )
+
+        self.assertIn("Synthesis coverage by planner question", prompt)
+        self.assertIn("q001: missing", prompt)
+        self.assertIn("write a short evidence-gap subsection instead of inventing an answer", prompt)
+
+    def test_format_question_coverage_lists_status_and_sources(self):
+        coverage = format_question_coverage([
+            {
+                "question_id": "q002",
+                "question": "How is the API used?",
+                "required_evidence": ["api"],
+                "status": "covered",
+                "source_indexes": [1, 3],
+            }
+        ])
+
+        self.assertIn("q002: covered", coverage)
+        self.assertIn("sources=[1], [3]", coverage)
 
     def test_format_supporting_evidence_uses_chunks_once(self):
         context = {
