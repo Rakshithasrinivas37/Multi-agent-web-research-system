@@ -6,6 +6,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import os
 import re
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
@@ -975,15 +976,20 @@ def rerank_results(
     if not candidates:
         return []
 
-    reranker = langchain_cross_encoder_reranker(
-        model_name=model_name,
-        device=device,
-        top_n=len(candidates),
-    )
-    reranked_documents = reranker.compress_documents(
-        documents=retrieval_results_to_langchain_documents(candidates),
-        query=query,
-    )
+    try:
+        reranker = langchain_cross_encoder_reranker(
+            model_name=model_name,
+            device=device,
+            top_n=len(candidates),
+        )
+        reranked_documents = reranker.compress_documents(
+            documents=retrieval_results_to_langchain_documents(candidates),
+            query=query,
+        )
+    except Exception as error:
+        print_rerank_error(error)
+        clear_embedding_model_memory()
+        return candidates + remainder
     normalized_scores = rank_scores([document_id(document) for document in reranked_documents])
     rerank_weight = min(1.0, max(0.0, rerank_weight))
 
@@ -1027,6 +1033,11 @@ def langchain_cross_encoder_reranker(model_name: str, device: str, top_n: int) -
         device=selected_device,
     )
     return CrossEncoderReranker(model=cross_encoder, top_n=max(1, top_n))
+
+
+def print_rerank_error(error: Exception) -> None:
+    details = "".join(traceback.format_exception(type(error), error, error.__traceback__)).strip()
+    print(f"[rag] rerank failed; using hybrid retrieval order:\n{details or error}")
 
 
 class SentenceTransformerCrossEncoderAdapter(BaseCrossEncoder):

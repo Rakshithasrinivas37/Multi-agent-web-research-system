@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 
 from src.rag import retrieval
@@ -74,6 +76,34 @@ class RetrievalParallelTests(unittest.TestCase):
         self.assertEqual({result.id for result in results}, {"id-alpha", "id-beta"})
         self.assertEqual([rerank for _, rerank in hybrid_calls], [False, False])
         self.assertEqual(rerank_mock.call_count, 1)
+
+    def test_rerank_results_falls_back_when_reranker_fails(self):
+        results = [
+            RetrievalResult(
+                id="a",
+                document="Alpha evidence",
+                metadata={"url": "https://example.com/a"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="b",
+                document="Beta evidence",
+                metadata={"url": "https://example.com/b"},
+                score=0.8,
+                semantic_score=0.8,
+                bm25_score=0.0,
+            ),
+        ]
+        buffer = StringIO()
+
+        with patch("src.rag.retrieval.langchain_cross_encoder_reranker", side_effect=NotImplementedError("Cannot copy out of meta tensor; no data!")):
+            with redirect_stdout(buffer):
+                reranked = retrieval.rerank_results("query", results, top_n=2)
+
+        self.assertEqual([result.id for result in reranked], ["a", "b"])
+        self.assertIn("Cannot copy out of meta tensor; no data!", buffer.getvalue())
 
 
 if __name__ == "__main__":
