@@ -81,7 +81,8 @@ class ReportAgent:
         )
         report, model = generate_single_report(Groq(), self.model, prompt)
         report = normalize_final_report(report, sources)
-        coverage = report_sub_question_coverage_check(report, planner_questions)
+        synthesis_gaps = synthesis_coverage_gap_questions(report_context, planner_questions)
+        coverage = report_sub_question_coverage_check(report, planner_questions, synthesis_gaps)
         schema_issues = report_schema_issues(report, planner_questions)
         report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}")
         review = report_self_critique(report_issues, coverage, schema_issues)
@@ -101,6 +102,7 @@ class ReportAgent:
                 "report_issues": report_issues,
                 "report_schema_issues": schema_issues,
                 "report_missing_sub_questions": coverage["missing"],
+                "report_synthesis_gap_questions": synthesis_gaps,
                 "report_coverage_check": coverage,
                 "report_retry_queries": rewrite_missing_sub_question_queries(objective, coverage["missing"]),
                 "report_review_trace": [review],
@@ -382,17 +384,45 @@ def strip_references(report: str) -> str:
     return clean_markdown("\n".join(lines))
 
 
-def report_sub_question_coverage_check(report: str, planner_questions: Sequence[str]) -> dict[str, Any]:
+def report_sub_question_coverage_check(
+    report: str,
+    planner_questions: Sequence[str],
+    synthesis_gap_questions: Sequence[str] | None = None,
+) -> dict[str, Any]:
     questions = [clean_text(q) for q in planner_questions if clean_text(q)]
-    missing = missing_sub_question_coverage(report, questions)
-    missing_set = set(missing)
+    missing = dedupe_text([*missing_sub_question_coverage(report, questions), *(synthesis_gap_questions or [])])
+    missing_keys = {normalize_heading(q) for q in missing}
     return {
         "total": len(questions),
-        "covered_count": len(questions) - len(missing),
+        "covered_count": sum(1 for q in questions if normalize_heading(q) not in missing_keys),
         "missing_count": len(missing),
         "missing": missing,
-        "items": [{"question": q, "heading": planner_question_heading(q), "status": "missing" if q in missing_set else "covered"} for q in questions],
+        "items": [{"question": q, "heading": planner_question_heading(q), "status": "missing" if normalize_heading(q) in missing_keys else "covered"} for q in questions],
     }
+
+
+def synthesis_coverage_gap_questions(
+    report_context: dict[str, Any],
+    planner_questions: Sequence[str] | None = None,
+) -> list[str]:
+    """Return planner questions synthesis marked as missing, partial, or weak."""
+
+    if not isinstance(report_context, dict):
+        return []
+    canonical = {normalize_heading(q): q for q in planner_questions or [] if clean_text(q)}
+    gaps = []
+    for item in report_context.get("coverage_by_question", []) or []:
+        if not isinstance(item, dict) or not synthesis_coverage_status_is_gap(item.get("status")):
+            continue
+        question = clean_text(item.get("question"))
+        if question:
+            gaps.append(canonical.get(normalize_heading(question), question))
+    return dedupe_text(gaps)
+
+
+def synthesis_coverage_status_is_gap(status: Any) -> bool:
+    lowered = clean_text(status).lower()
+    return bool(lowered and any(term in lowered for term in ("missing", "partial", "weak", "insufficient", "unsupported", "failed", "error")))
 
 
 def missing_sub_question_coverage(report: str, planner_questions: Sequence[str]) -> list[str]:
@@ -515,7 +545,8 @@ def rewrite_missing_sub_question_queries(objective: str, questions: Sequence[str
 def report_context_gap_items(report_context: dict[str, Any], research_plan: dict[str, Any]) -> list[str]:
     synthesis = clean_text(report_context.get("synthesis")) if isinstance(report_context, dict) else ""
     questions = [clean_text(q) for q in research_plan.get("sub_questions", []) if clean_text(q)] if isinstance(research_plan, dict) else []
-    missing = missing_sub_question_coverage(synthesis, questions)
+    missing = synthesis_coverage_gap_questions(report_context, questions)
+    missing.extend(q for q in missing_sub_question_coverage(synthesis, questions) if q not in missing)
     gap_text = "\n".join(missing_evidence_constraints(synthesis)).lower()
     for question in questions:
         if question not in missing and any(term in gap_text for term in detail_terms(question)):
