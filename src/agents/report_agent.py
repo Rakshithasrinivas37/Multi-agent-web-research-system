@@ -69,6 +69,7 @@ class ReportAgent:
             evidence=evidence,
             sources=sources,
             citation_policy=clean_text(report_context.get("citation_policy")),
+            coverage_by_question=report_context.get("coverage_by_question", []),
         )
 
         emit_progress(
@@ -126,6 +127,7 @@ def build_report_prompt(
     evidence: str,
     sources: Sequence[dict[str, Any]],
     citation_policy: str = "",
+    coverage_by_question: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     return f"""Research objective:
 {objective}
@@ -151,6 +153,9 @@ Planner sub-questions to cover:
 Suggested topic headings:
 {format_report_section_outline(planner_questions)}
 
+Synthesis coverage by planner question:
+{format_question_coverage(coverage_by_question or [])}
+
 Available sources:
 {format_sources(sources)}
 
@@ -171,6 +176,8 @@ Grounding requirement (strict — read this first):
 
 Coverage requirement (mandatory):
 - Every planner sub-question above must map to exactly one section under heading 3, using the suggested topic heading or a clearer equivalent.
+- Treat "Synthesis coverage by planner question" as the coverage contract. If a question is marked missing, write a short evidence-gap subsection instead of inventing an answer. If it is partial, clearly separate supported findings from missing details.
+- For each topic section, prefer the source indexes listed in its coverage item. Do not use citations outside that item unless the supporting evidence directly backs the claim.
 - Each of those sections must explicitly answer its sub-question using only the retrieved context — not just mention the topic. If the evidence only partially answers a sub-question, answer what is supported and name the missing piece in that section AND in Limitations/Open Questions.
 - For any sub-question asking for a definition, formulation, equation, components, complexity, API signature, or benchmark metric, include a clearly labeled "Core equation", "Core formula", "API", or "Metric evidence" line when that detail appears in the evidence. Do not hide the main formula in prose.
 - When multiple equivalent equations appear in the evidence, show the most general/source-backed equation first, then explain its components.
@@ -227,6 +234,23 @@ def format_report_section_outline(questions: Sequence[str]) -> str:
     if not items:
         return "- Use clear sections that answer the objective."
     return "\n".join(f"## {i}. {planner_question_heading(q)}\nCoverage target: {q}" for i, q in enumerate(items, 1))
+
+
+def format_question_coverage(coverage_by_question: Sequence[dict[str, Any]]) -> str:
+    lines = []
+    for item in coverage_by_question or []:
+        if not isinstance(item, dict):
+            continue
+        question = clean_text(item.get("question"))
+        if not question:
+            continue
+        question_id = clean_text(item.get("question_id")) or "question"
+        status = clean_text(item.get("status")) or "unknown"
+        evidence = ", ".join(clean_text(value) for value in item.get("required_evidence", []) if clean_text(value))
+        source_indexes = [str(value) for value in item.get("source_indexes", []) if isinstance(value, int)]
+        sources = ", ".join(f"[{index}]" for index in source_indexes) or "no cited sources"
+        lines.append(f"- {question_id}: {status}; evidence={evidence or 'evidence'}; sources={sources}; question={question}")
+    return "\n".join(lines) or "- No structured coverage map was provided; use planner questions and synthesis notes."
 
 
 def planner_question_heading(question: str) -> str:
