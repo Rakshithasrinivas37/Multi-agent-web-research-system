@@ -5,11 +5,9 @@ from unittest.mock import patch
 
 from src.rag.generation import (
     audit_synthesis_citations,
+    build_coverage_by_question,
     browser_signal_results,
-    high_signal_browser_snippets,
-    is_valid_retrieval_query,
-    llm_sub_question_retrieval_query_result,
-    parse_llm_retrieval_queries,
+    planner_sub_question_specs,
     precision_retrieval_queries,
     print_synthesis_chunks,
     planner_tasks_to_rag_queries,
@@ -95,119 +93,49 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertIn("benchmark table results", joined)
         self.assertIn("official documentation api signature", joined)
 
-    def test_sub_question_retrieval_queries_expand_each_question_generically(self):
-        queries = sub_question_retrieval_queries(
-            "How is a model deployed and monitored in production?",
-            objective="MLOps system",
-            task_details="Find lifecycle evidence.",
-        )
-
-        self.assertEqual(len(queries), 3)
-        self.assertIn("Find lifecycle evidence", queries[0])
-        self.assertIn("overview background concepts methods evidence", queries[1])
-        self.assertIn("source-backed details examples definitions", queries[2])
-
-    def test_planner_tasks_to_rag_queries_splits_sub_questions_into_variants(self):
+    def test_planner_sub_question_specs_uses_structured_specs_when_available(self):
         plan = {
-            "objective": "Model deployment",
-            "sub_questions": [
-                "How is a model deployed?",
-                "What monitoring metrics are used?",
+            "sub_questions": ["What is the core equation?"],
+            "sub_question_specs": [
+                {
+                    "question_id": "q001",
+                    "question": "What is the core equation?",
+                    "required_evidence": ["equation"],
+                }
             ],
         }
 
-        queries = planner_tasks_to_rag_queries(plan)
+        specs = planner_sub_question_specs(plan)
 
-        self.assertGreaterEqual(len(queries), 5)
-        self.assertTrue(any("source-backed details" in query for query in queries))
-        self.assertIn("Model deployment", queries[-1])
+        self.assertEqual(specs[0]["question_id"], "q001")
+        self.assertEqual(specs[0]["required_evidence"], ["equation"])
 
-    def test_parse_llm_retrieval_queries_reads_json_queries_only(self):
-        raw = """```json
-{"items":[{"sub_question":"What is attention?","queries":["attention definition equation","attention examples"]}]}
-```"""
+    def test_planner_sub_question_specs_falls_back_to_plain_questions(self):
+        specs = planner_sub_question_specs({"sub_questions": ["What benchmark results show performance?"]})
 
-        queries = parse_llm_retrieval_queries(raw)
+        self.assertEqual(specs[0]["question_id"], "q001")
+        self.assertIn("benchmark", specs[0]["required_evidence"])
 
-        self.assertEqual(queries, ["attention definition equation", "attention examples"])
+    def test_build_coverage_by_question_maps_status_and_citations(self):
+        specs = [
+            {"question_id": "q001", "question": "What is the core equation?", "required_evidence": ["equation"]},
+            {"question_id": "q002", "question": "What benchmark results show performance?", "required_evidence": ["benchmark"]},
+        ]
+        synthesis = """
+What is the core equation?
+Covered with equation evidence [1].
 
-    def test_parse_llm_retrieval_queries_recovers_json_like_query_arrays(self):
-        raw = (
-            '{"items":[{"sub_question":"What is attention?",'
-            '"queries":["attention definition equation","attention benchmark evidence",]}]}'
-        )
+What benchmark results show performance?
+Missing Evidence: exact benchmark values are not present.
+"""
 
-        queries = parse_llm_retrieval_queries(raw)
+        coverage = build_coverage_by_question(synthesis, specs, [{"index": 1}])
 
-        self.assertEqual(queries, ["attention definition equation", "attention benchmark evidence"])
-
-    def test_valid_retrieval_queries_filters_placeholders(self):
-        plan = {"objective": "Attention mechanism", "sub_questions": ["What is attention?"]}
-
-        queries = valid_retrieval_queries(["query 1", "query 2", "attention mechanism definition equation"], plan)
-
-        self.assertEqual(queries, ["attention mechanism definition equation"])
-
-    def test_is_valid_retrieval_query_rejects_generic_outputs(self):
-        self.assertFalse(is_valid_retrieval_query("query 1", {"attention"}))
-        self.assertFalse(is_valid_retrieval_query("example query", {"attention"}))
-        self.assertTrue(is_valid_retrieval_query("attention mechanism definition equation", {"attention"}))
-        self.assertTrue(is_valid_retrieval_query("official implementation signature batched projections", {"attention"}))
-
-    @patch.dict("os.environ", {}, clear=True)
-    def test_llm_sub_question_retrieval_query_result_defaults_to_qwen(self):
-        result = llm_sub_question_retrieval_query_result(
-            {"objective": "X research", "sub_questions": ["What is X?"]},
-        )
-
-        self.assertEqual(result["model"], "qwen/qwen3.6-27b")
-        self.assertEqual(result["error"], "GROQ_API_KEY is not set")
-
-    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)
-    @patch("src.rag.generation.create_chat_completion_with_retries")
-    def test_llm_sub_question_retrieval_query_result_uses_query_model(self, completion):
-        class Message:
-            content = '{"items":[{"sub_question":"What is X?","queries":["x research overview","x research evidence details"]}]}'
-
-        class Choice:
-            message = Message()
-
-        class Response:
-            choices = [Choice()]
-            model = "llama-test"
-
-        completion.return_value = Response()
-
-        result = llm_sub_question_retrieval_query_result(
-            {"objective": "X research", "sub_questions": ["What is X?"]},
-        )
-
-        self.assertEqual(result["queries"], ["x research overview", "x research evidence details"])
-        self.assertEqual(result["model"], "llama-test")
-        self.assertEqual(result["error"], "")
-        self.assertEqual(completion.call_args.kwargs["model"], "llama-test")
-
-    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)
-    @patch("src.rag.generation.create_chat_completion_with_retries")
-    def test_llm_sub_question_retrieval_query_result_rejects_placeholder_queries(self, completion):
-        class Message:
-            content = '{"items":[{"sub_question":"What is X?","queries":["query 1","query 2"]}]}'
-
-        class Choice:
-            message = Message()
-
-        class Response:
-            choices = [Choice()]
-            model = "llama-test"
-
-        completion.return_value = Response()
-
-        result = llm_sub_question_retrieval_query_result(
-            {"objective": "X research", "sub_questions": ["What is X?"]},
-        )
-
-        self.assertEqual(result["queries"], [])
-        self.assertEqual(result["error"], "LLM query rewrite returned no usable queries")
+        self.assertEqual(coverage[0]["status"], "covered")
+        self.assertEqual(coverage[0]["source_indexes"], [1])
+        self.assertTrue(coverage[0]["has_citations"])
+        self.assertEqual(coverage[1]["status"], "missing")
+        self.assertFalse(coverage[1]["has_citations"])
 
     def test_browser_signal_results_promotes_formula_evidence(self):
         browser_results = [

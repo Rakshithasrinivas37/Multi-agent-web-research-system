@@ -1,4 +1,6 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 
 from src.rag import retrieval
@@ -6,6 +8,9 @@ from src.rag.retrieval import RetrievalResult
 
 
 class RetrievalParallelTests(unittest.TestCase):
+    def setUp(self):
+        retrieval.clear_reranker_failure_cache()
+
     def test_retrieval_max_workers_bounds_query_count(self):
         with patch.dict("os.environ", {"RAG_RETRIEVAL_MAX_WORKERS": "8"}, clear=False):
             self.assertEqual(retrieval.retrieval_max_workers(3), 3)
@@ -74,6 +79,72 @@ class RetrievalParallelTests(unittest.TestCase):
         self.assertEqual({result.id for result in results}, {"id-alpha", "id-beta"})
         self.assertEqual([rerank for _, rerank in hybrid_calls], [False, False])
         self.assertEqual(rerank_mock.call_count, 1)
+
+    def test_rerank_results_falls_back_when_reranker_fails(self):
+        results = [
+            RetrievalResult(
+                id="a",
+                document="Alpha evidence",
+                metadata={"url": "https://example.com/a"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="b",
+                document="Beta evidence",
+                metadata={"url": "https://example.com/b"},
+                score=0.8,
+                semantic_score=0.8,
+                bm25_score=0.0,
+            ),
+        ]
+        buffer = StringIO()
+
+        with patch("src.rag.retrieval.langchain_cross_encoder_reranker", side_effect=NotImplementedError("Cannot copy out of meta tensor; no data!")):
+            with redirect_stdout(buffer):
+                reranked = retrieval.rerank_results("query", results, top_n=2)
+
+        self.assertEqual([result.id for result in reranked], ["a", "b"])
+        self.assertIn("Cannot copy out of meta tensor; no data!", buffer.getvalue())
+
+    def test_rerank_results_skips_after_previous_reranker_failure(self):
+        results = [
+            RetrievalResult(
+                id="a",
+                document="Alpha evidence",
+                metadata={"url": "https://example.com/a"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            )
+        ]
+
+        with patch("src.rag.retrieval.langchain_cross_encoder_reranker", side_effect=RuntimeError("broken")) as reranker_mock:
+            with redirect_stdout(StringIO()):
+                retrieval.rerank_results("query", results, top_n=1)
+                retrieval.rerank_results("query", results, top_n=1)
+
+        self.assertEqual(reranker_mock.call_count, 1)
+
+    def test_cross_encoder_loader_retries_until_cpu_fallback(self):
+        calls = []
+        client = object()
+
+        def fake_cross_encoder(model_name, **kwargs):
+            calls.append(kwargs)
+            if len(calls) < 3:
+                raise NotImplementedError("Cannot copy out of meta tensor; no data!")
+            return client
+
+        with redirect_stdout(StringIO()):
+            loaded = retrieval.load_sentence_transformer_cross_encoder(fake_cross_encoder, "reranker", "cuda")
+
+        self.assertIs(loaded, client)
+        self.assertEqual(calls[0]["device"], None)
+        self.assertEqual(calls[0]["model_kwargs"]["device_map"], {"": "cuda:0"})
+        self.assertEqual(calls[1]["device"], "cuda")
+        self.assertEqual(calls[2]["device"], "cpu")
 
 
 if __name__ == "__main__":

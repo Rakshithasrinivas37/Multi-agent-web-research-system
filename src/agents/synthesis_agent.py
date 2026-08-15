@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 from src.memory.shared_memory import SharedMemory
@@ -172,8 +173,17 @@ class SynthesisAgent:
     ) -> None:
         """Persist synthesis output for the report agent."""
 
+        if isinstance(synthesis_payload.get("synthesis"), str):
+            synthesis_payload = dict(synthesis_payload)
+            synthesis_payload["synthesis"] = strip_thinking_blocks(synthesis_payload["synthesis"])
+
         memory = SharedMemory(memory_path)
         memory.write_agent_output("synthesis", {"report_context": synthesis_payload})
+
+
+def strip_thinking_blocks(text: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
 
 
 def env_text(name: str, current: str, default: str) -> str:
