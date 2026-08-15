@@ -3,6 +3,7 @@ import unittest
 from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     clean_markdown,
+    build_report_prompt,
     dedupe_sources,
     format_report_section_outline,
     format_supporting_evidence,
@@ -81,6 +82,12 @@ Supported [1]. Unsupported [9].
 
         self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
 
+    def test_unsupported_benchmark_metrics_ignores_publication_years(self):
+        report = "The 2017 Transformer paper reports WMT benchmark results with BLEU gains [1]."
+        evidence = "WMT benchmark evidence includes BLEU gains."
+
+        self.assertEqual(unsupported_benchmark_metrics(report, evidence), [])
+
     def test_report_quality_accepts_references_after_markdown_cleanup(self):
         issues = report_quality_issues(
             "### Executive Summary\nClaim [1].\n\n## References\n[1] https://example.com",
@@ -110,6 +117,19 @@ Supported [1]. Unsupported [9].
 
         self.assertIn("## 1. Benchmark Demonstrate GLUE And WMT Performance", outline)
         self.assertIn("## 2. PyTorch MultiheadAttention Used", outline)
+
+    def test_build_report_prompt_requires_core_equation_for_formula_questions(self):
+        prompt = build_report_prompt(
+            objective="Attention mechanism",
+            output_format="report",
+            planner_questions=["What is the main attention equation and its components?"],
+            synthesis="The evidence includes Attention(Q,K,V)=softmax(score(Q,K))V.",
+            evidence="[1] Attention equation evidence.",
+            sources=[{"index": 1, "url": "https://example.com"}],
+        )
+
+        self.assertIn("Core equation", prompt)
+        self.assertIn("show the most general/source-backed equation first", prompt)
 
     def test_format_supporting_evidence_uses_chunks_once(self):
         context = {
