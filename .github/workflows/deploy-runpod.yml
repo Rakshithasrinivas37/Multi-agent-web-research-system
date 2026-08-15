@@ -139,6 +139,13 @@ jobs:
 
         cd "$DEPLOY_DIR"
         VENV_PATH="/tmp/multi-agent-web-research-system-venv"
+        SYSTEM_PYTHON="/usr/bin/python3"
+
+        # Detect the system torch build BEFORE activating the venv, using an
+        # explicit path so venv activation can never shadow this check.
+        SYSTEM_TORCH_VERSION="$("$SYSTEM_PYTHON" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'none')"
+        SYSTEM_CUDA_AVAILABLE="$("$SYSTEM_PYTHON" -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo 'False')"
+        log "System torch version: $SYSTEM_TORCH_VERSION, CUDA available: $SYSTEM_CUDA_AVAILABLE"
 
         if [ ! -x "$VENV_PATH/bin/python" ]; then
           log "Creating fresh venv (no system-site-packages, fully self-contained)"
@@ -152,11 +159,6 @@ jobs:
 
         . .venv/bin/activate
         python -m pip install --upgrade pip
-
-        # Detect the system torch build so the venv can match it exactly.
-        SYSTEM_TORCH_VERSION="$(python3 -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'none')"
-        SYSTEM_CUDA_AVAILABLE="$(python3 -c 'import torch; print(torch.cuda.is_available())' 2>/dev/null || echo 'False')"
-        log "System torch version: $SYSTEM_TORCH_VERSION, CUDA available: $SYSTEM_CUDA_AVAILABLE"
 
         TORCH_STATE="torch=$SYSTEM_TORCH_VERSION;cuda=$SYSTEM_CUDA_AVAILABLE;index=$TORCH_INDEX_URL"
         TORCH_STATE_HASH="$(printf '%s' "$TORCH_STATE" | sha256sum | awk '{print $1}')"
@@ -179,8 +181,6 @@ jobs:
 
         python -c 'import torch; print("torch", torch.__version__, "cuda available", torch.cuda.is_available())'
 
-        # Existing requirements.txt hash-based install stays below, now resolving
-        # against the already-pinned, correct torch version.
         REQUIREMENTS_HASH="$(sha256sum requirements.txt | awk '{print $1}')"
         REQUIREMENTS_HASH_FILE=".venv/.requirements.sha256"
         if [ -f "$REQUIREMENTS_HASH_FILE" ] && [ "$(cat "$REQUIREMENTS_HASH_FILE")" = "$REQUIREMENTS_HASH" ]; then
