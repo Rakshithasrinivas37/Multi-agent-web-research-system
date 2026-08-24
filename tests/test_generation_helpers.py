@@ -7,6 +7,7 @@ from src.rag.generation import (
     audit_synthesis_citations,
     build_coverage_by_question,
     browser_signal_results,
+    coverage_gap_items,
     high_signal_browser_snippets,
     is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
@@ -141,6 +142,37 @@ Missing Evidence: exact benchmark values are not present.
         self.assertTrue(coverage[0]["has_citations"])
         self.assertEqual(coverage[1]["status"], "missing")
         self.assertFalse(coverage[1]["has_citations"])
+        self.assertTrue(coverage[1]["missing_reason"])
+
+    def test_build_coverage_by_question_uses_retrieved_context_sidecar(self):
+        specs = [
+            {"question_id": "q001", "question": "What is the implementation API?", "required_evidence": ["api"]},
+            {"question_id": "q002", "question": "What benchmark result is reported?", "required_evidence": ["benchmark"]},
+        ]
+        sources = [{"index": 1, "id": "api-chunk"}]
+        context = [
+            RetrievalResult(
+                id="api-chunk",
+                document="The implementation API exposes an official function with parameters and usage examples.",
+                metadata={"title": "API docs", "url": "https://docs.example.com/api"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+
+        coverage = build_coverage_by_question(
+            "The synthesis explains the topic naturally with source support [1].",
+            specs,
+            sources,
+            retrieved_context=context,
+        )
+
+        self.assertEqual(coverage[0]["status"], "covered")
+        self.assertEqual(coverage[0]["source_indexes"], [1])
+        self.assertEqual(coverage[0]["evidence_count"], 1)
+        self.assertEqual(coverage[1]["status"], "missing")
+        self.assertIn("benchmark", coverage_gap_items(coverage)[0].lower())
 
     def test_parse_llm_retrieval_queries_reads_json_queries_only(self):
         raw = """```json
