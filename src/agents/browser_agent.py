@@ -14,6 +14,7 @@ from src.tools.text_utils import clean_content, clean_list, clean_text
 
 MIN_TASK_OVERLAP = 0.06
 MIN_TRUSTED_DIRECT_CONTENT_LENGTH = 1000
+MAX_NOISE_RATIO = 0.65
 SOURCE_STOPWORDS = {
     "and",
     "are",
@@ -32,6 +33,38 @@ SOURCE_STOPWORDS = {
     "which",
     "with",
 }
+LOW_VALUE_HOST_PARTS = (
+    "academia.edu",
+    "coursehero",
+    "facebook.com",
+    "medium.com",
+    "pinterest.",
+    "quora.com",
+    "reddit.com",
+    "researchgate.net",
+    "scribd.com",
+    "slideshare.net",
+    "studocu",
+    "twitter.com",
+    "x.com",
+)
+NOISE_LINE_TERMS = (
+    "accept cookies",
+    "advertisement",
+    "all rights reserved",
+    "cookie policy",
+    "follow us",
+    "log in",
+    "newsletter",
+    "privacy policy",
+    "related articles",
+    "share this",
+    "sign in",
+    "sign up",
+    "skip to",
+    "subscribe",
+    "terms of use",
+)
 
 
 class BrowserAgent:
@@ -242,7 +275,7 @@ class BrowserAgent:
         }
 
     async def extract(self, task: dict[str, Any], url: str, title: str, content: str) -> dict[str, Any]:
-        return fallback_extraction(content, task)
+        return fallback_extraction(clean_source_content(content), task)
 
     def source_result(
         self,
@@ -283,14 +316,17 @@ class BrowserAgent:
         extraction: dict[str, Any],
         task: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        full_text = clean_content(page.get("content", ""))
+        raw_text = clean_content(page.get("content", ""))
+        full_text = clean_source_content(raw_text)
         payload = {
             "url": page["url"],
             "title": page["title"],
             "source_type": source_type,
             "extraction_method": method,
             "source_quality": "unchecked",
+            "source_authority": source_authority_level(page["url"], source_type, task or {}),
             "content_length": len(full_text),
+            "content_noise_score": content_noise_score(raw_text),
             "content_preview": full_text[:2000],
             "full_content": full_text,
             "errors": list(page.get("errors", [])),
@@ -306,7 +342,7 @@ class BrowserAgent:
             payload["source_quality"] = "blocked"
             payload["source_quality_note"] = bot_block_note()
         else:
-            payload["source_quality"] = "useful" if source_is_useful(payload, task or {}) else "weak"
+            payload["source_quality"] = source_quality_label(payload, task or {})
             payload["source_quality_note"] = source_quality_note(payload, task or {})
         return payload
 
@@ -331,7 +367,7 @@ def fallback_extraction(content: str, task: Optional[dict[str, Any]] = None) -> 
         return {
             "extraction_status": "fallback",
             "relevance": "high" if facts else ("medium" if text else "low"),
-            "extracted_facts": facts or extract_important_sentences(text),
+            "extracted_facts": facts or extract_important_sentences(text, task=task),
             "evidence": facts[:8],
             "important_sections": sections or extract_important_sections(text),
             "notes": "Fallback pricing extraction used.",
@@ -340,7 +376,7 @@ def fallback_extraction(content: str, task: Optional[dict[str, Any]] = None) -> 
     return {
         "extraction_status": "fallback",
         "relevance": "medium" if text else "low",
-        "extracted_facts": extract_important_sentences(text),
+        "extracted_facts": extract_important_sentences(text, task=task),
         "evidence": [],
         "important_sections": extract_important_sections(text),
         "notes": "Deterministic browser extraction used.",
@@ -520,44 +556,42 @@ def useful_pricing_snippet(snippet: str) -> bool:
     return True
 
 
-def extract_important_sentences(text: str, limit: int = 12) -> list[str]:
+def extract_important_sentences(text: str, limit: int = 12, task: Optional[dict[str, Any]] = None) -> list[str]:
     if not text:
         return []
 
-    keywords = (
-        "architecture",
-        "attention",
-        "benchmark",
-        "comparison",
-        "component",
-        "context",
-        "dependency",
-        "gate",
-        "limitation",
-        "memory",
-        "model",
-        "performance",
-        "price",
-        "pricing",
-        "tokens",
-        "input",
-        "output",
-        "cached",
-        "cache",
-        "batch",
-        "free tier",
-        "rate limit",
-        "recurrent",
-        "sequence",
-        "state",
-        "training",
-        "transformer",
-        "use case",
-    )
+    keywords = important_sentence_keywords(task or {})
     sentences = [sentence.strip() for sentence in text.replace("\n", " ").split(".") if sentence.strip()]
     important = [sentence for sentence in sentences if any(keyword in sentence.lower() for keyword in keywords)]
     chosen = important[:limit] if important else sentences[:limit]
     return [sentence[:500] for sentence in chosen]
+
+
+def important_sentence_keywords(task: dict[str, Any]) -> tuple[str, ...]:
+    generic = {
+        "api",
+        "application",
+        "architecture",
+        "benchmark",
+        "comparison",
+        "component",
+        "definition",
+        "equation",
+        "evidence",
+        "example",
+        "implementation",
+        "limitation",
+        "metric",
+        "performance",
+        "result",
+        "source",
+    }
+    task_terms = {
+        term
+        for term in relevance_terms(task_relevance_text(task))
+        if len(term) > 3 and term not in SOURCE_STOPWORDS
+    }
+    return tuple(sorted(generic | set(list(task_terms)[:20])))
 
 
 def extract_important_sections(text: str, limit: int = 10) -> list[str]:
@@ -646,6 +680,8 @@ def source_is_useful(payload: dict[str, Any], task: dict[str, Any]) -> bool:
         return False
     if blocked_or_empty_source(payload):
         return False
+    if payload.get("content_noise_score", 0) > MAX_NOISE_RATIO and payload.get("content_length", 0) < 1200:
+        return False
     if is_bad_dictionary_source(payload, task) or is_not_found_source(payload):
         return False
     if is_pricing_task(task):
@@ -657,6 +693,15 @@ def source_is_useful(payload: dict[str, Any], task: dict[str, Any]) -> bool:
     if not source_matches_task(payload, task):
         return False
     return bool(payload.get("extracted_facts") or payload.get("important_sections") or payload.get("content_length", 0) >= 800)
+
+
+def source_quality_label(payload: dict[str, Any], task: dict[str, Any]) -> str:
+    if not source_is_useful(payload, task):
+        return "weak"
+    authority = clean_text(payload.get("source_authority"))
+    if authority in {"primary", "official", "authoritative"}:
+        return f"useful_{authority}"
+    return "useful_secondary"
 
 
 def source_quality_note(payload: dict[str, Any], task: dict[str, Any]) -> str:
@@ -673,6 +718,8 @@ def source_quality_note(payload: dict[str, Any], task: dict[str, Any]) -> str:
         return bot_block_note()
     if blocked_or_empty_source(payload):
         return "source content is empty, blocked, or too short"
+    if payload.get("content_noise_score", 0) > MAX_NOISE_RATIO and payload.get("content_length", 0) < 1200:
+        return "source content is mostly boilerplate or navigation noise"
     if is_bad_dictionary_source(payload, task):
         return "dictionary result is not relevant to this research task"
     if is_not_found_source(payload):
@@ -686,6 +733,57 @@ def source_quality_note(payload: dict[str, Any], task: dict[str, Any]) -> str:
     if not source_matches_task(payload, task):
         return "source content has low overlap with the task"
     return "source passed basic quality checks"
+
+
+def clean_source_content(content: str) -> str:
+    lines = []
+    seen: dict[str, int] = {}
+    for line in clean_content(content).splitlines():
+        line = clean_text(line)
+        if not line or is_noise_line(line):
+            continue
+        key = line.lower()
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1 and len(line) < 160:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def is_noise_line(line: str) -> bool:
+    lower = line.lower()
+    if len(line) <= 2:
+        return True
+    if len(line) < 120 and any(term in lower for term in NOISE_LINE_TERMS):
+        return True
+    if len(line.split()) <= 4 and any(term in lower for term in ("menu", "home", "login", "share", "cookie")):
+        return True
+    return False
+
+
+def content_noise_score(content: str) -> float:
+    lines = [clean_text(line) for line in clean_content(content).splitlines() if clean_text(line)]
+    if not lines:
+        return 1.0
+    noisy = sum(1 for line in lines if is_noise_line(line))
+    return noisy / len(lines)
+
+
+def source_authority_level(url: str, source_type: str = "", task: Optional[dict[str, Any]] = None) -> str:
+    parsed = urlparse(clean_text(url))
+    host = parsed.netloc.lower().removeprefix("www.")
+    path = parsed.path.lower()
+    source_type = clean_text(source_type).lower()
+
+    if host == "arxiv.org" or host.endswith("doi.org") or source_type in {"arxiv", "academic", "paper"}:
+        return "primary"
+    if source_type in {"docs", "pricing", "careers"} or host.startswith("docs.") or "/docs" in path or "/api_docs" in path:
+        return "official"
+    if host.endswith(".gov") or host.endswith(".edu") or source_type in {"pdf", "benchmarks"}:
+        return "authoritative"
+    if task and source_matches_target({"url": url, "title": "", "content_preview": host, "full_content": ""}, task):
+        return "topic_match"
+    return "secondary"
 
 
 def is_trusted_direct_source(payload: dict[str, Any], task: dict[str, Any]) -> bool:
@@ -714,7 +812,7 @@ def is_authoritative_source_url(url: str) -> bool:
         or host.endswith("doi.org")
         or host.startswith("docs.")
         or "docs." in host
-        or host in {"pytorch.org", "tensorflow.org"}
+        or "/api_docs" in path
         or path.endswith(".pdf")
     )
 
@@ -875,9 +973,24 @@ def search_result_score(task: dict[str, Any], url: str) -> int:
     score = 0
     target_name = clean_text(task.get("target_name")).lower()
     parsed = urlparse(url)
-    text = f"{parsed.netloc.lower()} {parsed.path.lower()}"
+    host = parsed.netloc.lower()
+    path = parsed.path.lower()
+    text = f"{host} {path}"
     if target_name and target_name != "general research" and target_name in text:
         score += 40
+    if is_authoritative_source_url(url):
+        score += 35
+    if source_authority_level(url, clean_text(task.get("source_type")), task) in {"primary", "official"}:
+        score += 20
+    if any(part in host for part in LOW_VALUE_HOST_PARTS):
+        score -= 60
+    if any(word in text for word in ("forum", "login", "signin", "signup", "tag/", "category/")):
+        score -= 15
+    task_text = task_relevance_text(task).lower()
+    if any(word in task_text for word in ("api", "documentation", "implementation", "code", "usage")):
+        score += sum(15 for word in ("docs", "api_docs", "reference", "developer") if word in text)
+    if any(word in task_text for word in ("equation", "formula", "paper", "benchmark", "metric", "dataset")):
+        score += sum(15 for word in ("arxiv", "doi", "paper", "proceedings", "benchmark", "dataset") if word in text)
     if is_pricing_task(task):
         score += sum(20 for word in ("pricing", "price", "docs", "console", "platform") if word in text)
         score -= sum(80 for word in ("community", "forum", "wikipedia", "aipricing", "reddit", "medium.com") if word in text)
