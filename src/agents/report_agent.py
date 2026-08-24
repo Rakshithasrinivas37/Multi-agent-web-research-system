@@ -59,17 +59,20 @@ class ReportAgent:
             raise ValueError("report_context.synthesis is required")
 
         planner_questions = [clean_text(q) for q in report_context.get("planner_questions", []) if clean_text(q)]
+        evidence_packs = report_context.get("evidence_packs", [])
+        coverage_questions = dedupe_text([*planner_questions, *evidence_pack_questions(evidence_packs)])
         sources = dedupe_sources(sources_with_browser_results(report_context.get("sources", []), report_context.get("browser_results", [])))
         evidence = format_supporting_evidence(report_context)
         prompt = build_report_prompt(
             objective=objective,
             output_format=output_format,
-            planner_questions=planner_questions,
+            planner_questions=coverage_questions,
             synthesis=synthesis,
             evidence=evidence,
             sources=sources,
             citation_policy=clean_text(report_context.get("citation_policy")),
             coverage_by_question=report_context.get("coverage_by_question", []),
+            evidence_packs=evidence_packs,
         )
 
         emit_progress(
@@ -81,9 +84,9 @@ class ReportAgent:
         )
         report, model = generate_single_report(Groq(), self.model, prompt)
         report = normalize_final_report(report, sources)
-        synthesis_gaps = synthesis_coverage_gap_questions(report_context, planner_questions)
-        coverage = report_sub_question_coverage_check(report, planner_questions)
-        schema_issues = report_schema_issues(report, planner_questions)
+        synthesis_gaps = synthesis_coverage_gap_questions(report_context, coverage_questions)
+        coverage = report_sub_question_coverage_check(report, coverage_questions)
+        schema_issues = report_schema_issues(report, coverage_questions)
         report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}")
         review = report_self_critique(report_issues, coverage, schema_issues)
 
@@ -95,6 +98,7 @@ class ReportAgent:
             "model": model,
             "diagnostics": {
                 "source_count": len(sources),
+                "evidence_pack_count": len(evidence_packs) if isinstance(evidence_packs, list) else 0,
                 "supporting_chunk_count": len(report_context.get("supporting_chunks", []) or []),
                 "retrieved_chunk_count": len(report_context.get("retrieved_chunks", []) or []),
                 "report_length": len(report),
@@ -130,6 +134,7 @@ def build_report_prompt(
     sources: Sequence[dict[str, Any]],
     citation_policy: str = "",
     coverage_by_question: Sequence[dict[str, Any]] | None = None,
+    evidence_packs: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     return f"""Research objective:
 {objective}
@@ -158,6 +163,9 @@ Suggested topic headings:
 Synthesis coverage by planner question:
 {format_question_coverage(coverage_by_question or [])}
 
+Per-question evidence packs:
+{format_evidence_packs(evidence_packs or [])}
+
 Available sources:
 {format_sources(sources)}
 
@@ -179,6 +187,7 @@ Grounding requirement (strict — read this first):
 Coverage requirement (mandatory):
 - Every planner sub-question above must map to exactly one section under heading 3, using the suggested topic heading or a clearer equivalent.
 - Treat "Synthesis coverage by planner question" as the coverage contract. If a question is marked missing, write a short evidence-gap subsection instead of inventing an answer. If it is partial, clearly separate supported findings from missing details.
+- Treat "Per-question evidence packs" as the strongest topic-by-topic evidence map. Covered packs must be explained in the matching section, partial packs must include caveats, and missing packs must be handled only as evidence gaps.
 - For missing coverage items, do not include formulas, API names, benchmark values, examples, or detailed explanations for that topic. Write only what evidence is missing and why the report cannot answer it from the supplied context.
 - For each topic section, prefer the source indexes listed in its coverage item. Do not use citations outside that item unless the supporting evidence directly backs the claim.
 - Each of those sections must explicitly answer its sub-question using only the retrieved context — not just mention the topic. If the evidence only partially answers a sub-question, answer what is supported and name the missing piece in that section AND in Limitations/Open Questions.
@@ -254,6 +263,38 @@ def format_question_coverage(coverage_by_question: Sequence[dict[str, Any]]) -> 
         sources = ", ".join(f"[{index}]" for index in source_indexes) or "no cited sources"
         lines.append(f"- {question_id}: {status}; evidence={evidence or 'evidence'}; sources={sources}; question={question}")
     return "\n".join(lines) or "- No structured coverage map was provided; use planner questions and synthesis notes."
+
+
+def evidence_pack_questions(evidence_packs: Sequence[Any]) -> list[str]:
+    return dedupe_text(
+        clean_text(pack.get("question"))
+        for pack in evidence_packs or []
+        if isinstance(pack, dict) and clean_text(pack.get("question"))
+    )
+
+
+def format_evidence_packs(evidence_packs: Sequence[dict[str, Any]]) -> str:
+    lines = []
+    for pack in evidence_packs or []:
+        if not isinstance(pack, dict):
+            continue
+        question = clean_text(pack.get("question"))
+        if not question:
+            continue
+        coverage = clean_text(pack.get("coverage")) or "unknown"
+        lines.append(f"- {coverage}: {question}")
+        chunks = pack.get("chunks", [])
+        chunks = chunks if isinstance(chunks, list) else []
+        for chunk in chunks[:4]:
+            if not isinstance(chunk, dict):
+                continue
+            source_index = chunk.get("source_index")
+            marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
+            title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Evidence chunk"
+            content = clean_text(chunk.get("content"))[:360]
+            if content:
+                lines.append(f"  - {marker} {title}: {content}")
+    return "\n".join(lines) or "- No per-question evidence packs were provided."
 
 
 def planner_question_heading(question: str) -> str:
