@@ -1085,6 +1085,12 @@ def search_candidates_with_tavily(query: str, max_results: int) -> list[dict[str
             metadata={"query": query, "max_results": max_results},
         )
         results = search_with_tavily(query, max_results=max_results)
+        print(f"[planner_agent] Tavily returned {len(results)} result(s) for {query!r}")
+        for index, item in enumerate(results, start=1):
+            print(
+                "[planner_agent] Tavily result "
+                f"{index}: {clean_text(item.get('title')) or 'Untitled'} | {clean_text(item.get('url'))}"
+            )
     except Exception as error:
         print(f"[planner_agent] Tavily search failed for {query!r}: {error}")
         return []
