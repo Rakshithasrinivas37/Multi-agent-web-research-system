@@ -61,7 +61,7 @@ class ReportAgent:
         planner_questions = [clean_text(q) for q in report_context.get("planner_questions", []) if clean_text(q)]
         evidence_packs = report_context.get("evidence_packs", [])
         coverage_questions = dedupe_text([*planner_questions, *evidence_pack_questions(evidence_packs)])
-        sources = dedupe_sources(sources_with_browser_results(report_context.get("sources", []), report_context.get("browser_results", [])))
+        sources = sources_with_browser_results(report_context.get("sources", []), report_context.get("browser_results", []))
         evidence = format_supporting_evidence(report_context)
         prompt = build_report_prompt(
             objective=objective,
@@ -353,8 +353,23 @@ def format_sources(sources: Sequence[dict[str, Any]]) -> str:
 
 
 def sources_with_browser_results(sources: Sequence[Any], browser_results: Sequence[Any]) -> list[dict[str, Any]]:
-    merged = [dict(source) for source in sources or [] if isinstance(source, dict)]
-    existing = {normalize_url(source.get("url")) for source in merged}
+    merged = []
+    existing = set()
+    used_indexes = set()
+    for source in sources or []:
+        if not isinstance(source, dict):
+            continue
+        item = dict(source)
+        index = item.get("index")
+        if not isinstance(index, int):
+            continue
+        merged.append(item)
+        used_indexes.add(index)
+        url = normalize_url(item.get("url"))
+        if url:
+            existing.add(url)
+
+    next_index = max(used_indexes, default=0) + 1
     for result in browser_results or []:
         if not isinstance(result, dict):
             continue
@@ -364,7 +379,11 @@ def sources_with_browser_results(sources: Sequence[Any], browser_results: Sequen
             url = normalize_url(source.get("url"))
             if url and url not in existing:
                 existing.add(url)
-                merged.append({"title": source.get("title"), "url": source.get("url")})
+                while next_index in used_indexes:
+                    next_index += 1
+                used_indexes.add(next_index)
+                merged.append({"index": next_index, "title": source.get("title"), "url": source.get("url")})
+                next_index += 1
     return merged
 
 
