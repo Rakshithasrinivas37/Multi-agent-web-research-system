@@ -23,15 +23,24 @@ MCP_REQUEST_IDS = count(1)
 
 
 def search_with_tavily(query: str, max_results: int = 3) -> list[dict[str, Any]]:
+    query = clean_text(query)
+    print(
+        "[tavily_search] search requested "
+        f"backend={'mcp' if tavily_mcp_enabled() else 'sdk'} max_results={max_results} query={query!r}"
+    )
     if tavily_mcp_enabled():
         try:
-            return search_with_tavily_mcp(query, max_results=max_results)
+            results = search_with_tavily_mcp(query, max_results=max_results)
+            log_tavily_results("MCP", query, results)
+            return results
         except Exception as error:
             if tavily_mcp_required():
                 raise RuntimeError(f"Tavily MCP search failed: {error}") from error
             print(f"[tavily_search] Tavily MCP failed; using SDK fallback: {error}")
 
-    return search_with_tavily_sdk(query, max_results=max_results)
+    results = search_with_tavily_sdk(query, max_results=max_results)
+    log_tavily_results("SDK", query, results)
+    return results
 
 
 def search_with_tavily_sdk(query: str, max_results: int = 3) -> list[dict[str, Any]]:
@@ -46,7 +55,15 @@ def search_with_tavily_sdk(query: str, max_results: int = 3) -> list[dict[str, A
         max_results=max_results,
         search_depth="basic",
     )
-    return response.get("results", [])
+    results = response.get("results", [])
+    print(
+        "[tavily_search] SDK response "
+        f"keys={sorted(response.keys()) if isinstance(response, dict) else type(response).__name__} "
+        f"result_count={len(results) if isinstance(results, list) else 0}"
+    )
+    if not results:
+        print("[tavily_search] SDK returned no results; check query, API quota/key, and Tavily service response.")
+    return results if isinstance(results, list) else []
 
 
 def search_with_tavily_mcp(query: str, max_results: int = 3) -> list[dict[str, Any]]:
@@ -65,6 +82,7 @@ def search_with_tavily_mcp(query: str, max_results: int = 3) -> list[dict[str, A
         },
         timeout=float(os.environ.get("TAVILY_MCP_TIMEOUT_SECONDS") or DEFAULT_TAVILY_MCP_TIMEOUT_SECONDS),
     )
+    log_mcp_result_shape(result)
     return normalize_tavily_mcp_results(result)
 
 
@@ -295,7 +313,8 @@ def normalize_tavily_mcp_results(result: dict[str, Any]) -> list[dict[str, Any]]
     if result.get("isError"):
         raise RuntimeError(extract_mcp_text(result) or "Tavily MCP returned an error")
 
-    payload = result.get("structuredContent") or parse_json_text(extract_mcp_text(result))
+    text_payload = extract_mcp_text(result)
+    payload = result.get("structuredContent") or parse_json_text(text_payload)
     if isinstance(payload, dict):
         items = payload.get("results") or payload.get("data") or []
     elif isinstance(payload, list):
@@ -304,11 +323,15 @@ def normalize_tavily_mcp_results(result: dict[str, Any]) -> list[dict[str, Any]]
         items = []
 
     normalized = []
+    skipped_non_dict = 0
+    skipped_missing_url = 0
     for item in items:
         if not isinstance(item, dict):
+            skipped_non_dict += 1
             continue
         url = clean_text(item.get("url"))
         if not url:
+            skipped_missing_url += 1
             continue
         normalized.append(
             {
@@ -319,7 +342,73 @@ def normalize_tavily_mcp_results(result: dict[str, Any]) -> list[dict[str, Any]]
                 "raw_content": clean_text(item.get("raw_content")),
             }
         )
+    print(
+        "[tavily_search] MCP normalized "
+        f"payload={payload_summary(payload)} item_count={len(items)} normalized_count={len(normalized)} "
+        f"skipped_non_dict={skipped_non_dict} skipped_missing_url={skipped_missing_url}"
+    )
+    if not normalized:
+        reason = mcp_empty_result_reason(payload, items, skipped_non_dict, skipped_missing_url, text_payload)
+        print(f"[tavily_search] MCP returned no usable results: {reason}")
     return normalized
+
+
+def log_tavily_results(source: str, query: str, results: list[dict[str, Any]]) -> None:
+    print(f"[tavily_search] {source} final result_count={len(results)} for query={clean_text(query)!r}")
+    if not results:
+        print(f"[tavily_search] {source} produced no results for planner/browser to consume.")
+        return
+    for index, item in enumerate(results, start=1):
+        print(
+            "[tavily_search] "
+            f"{source} result {index}: {clean_text(item.get('title')) or 'Untitled'} | {clean_text(item.get('url'))}"
+        )
+
+
+def log_mcp_result_shape(result: dict[str, Any]) -> None:
+    structured = result.get("structuredContent") if isinstance(result, dict) else None
+    content = result.get("content") if isinstance(result, dict) else None
+    content_types = [
+        clean_text(item.get("type"))
+        for item in (content or [])
+        if isinstance(item, dict) and clean_text(item.get("type"))
+    ]
+    print(
+        "[tavily_search] MCP raw response "
+        f"keys={sorted(result.keys()) if isinstance(result, dict) else type(result).__name__} "
+        f"structured={payload_summary(structured)} content_items={len(content or [])} content_types={content_types[:5]}"
+    )
+
+
+def payload_summary(payload: Any) -> str:
+    if isinstance(payload, dict):
+        return f"dict(keys={sorted(payload.keys())[:8]})"
+    if isinstance(payload, list):
+        return f"list(len={len(payload)})"
+    if payload is None:
+        return "none"
+    return type(payload).__name__
+
+
+def mcp_empty_result_reason(
+    payload: Any,
+    items: Any,
+    skipped_non_dict: int,
+    skipped_missing_url: int,
+    text_payload: str,
+) -> str:
+    if not payload:
+        preview = clean_text(text_payload)[:500]
+        return f"no structuredContent and text payload was not parsed as JSON; text_preview={preview!r}"
+    if isinstance(payload, dict) and not (payload.get("results") or payload.get("data")):
+        return f"payload dict has no results/data array; keys={sorted(payload.keys())[:8]}"
+    if isinstance(items, list) and not items:
+        return "payload had an empty results/data list"
+    if skipped_missing_url:
+        return "items were present but missing url fields"
+    if skipped_non_dict:
+        return "items were present but were not JSON objects"
+    return "unknown MCP response shape"
 
 
 def extract_mcp_text(result: dict[str, Any]) -> str:
