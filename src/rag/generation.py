@@ -107,49 +107,6 @@ OBJECTIVE_STOPWORDS = {
     "what",
     "with",
 }
-COVERAGE_GENERIC_TERMS = OBJECTIVE_STOPWORDS | {
-    "addressing",
-    "compared",
-    "deep",
-    "evidence",
-    "core",
-    "key",
-    "known",
-    "learning",
-    "main",
-    "major",
-    "mechanism",
-    "mechanisms",
-    "primary",
-    "recent",
-    "reported",
-    "research",
-    "standard",
-}
-COVERAGE_EVIDENCE_TERMS = {
-    "accuracy",
-    "api",
-    "application",
-    "applications",
-    "benchmark",
-    "benchmarks",
-    "challenge",
-    "challenges",
-    "complexity",
-    "definition",
-    "equation",
-    "formula",
-    "implementation",
-    "limitation",
-    "limitations",
-    "metric",
-    "metrics",
-    "performance",
-    "result",
-    "results",
-    "score",
-    "scores",
-}
 
 
 def rag_generation_model(model: str | None = None) -> str:
@@ -269,6 +226,7 @@ def synthesize_report_from_research_plan(
         rerank_weight=rerank_weight,
     )
     planned_source_urls = planner_source_urls(research_plan)
+    question_source_urls = planner_question_source_urls(research_plan)
     source_coverage_results = []
     if include_planned_source_urls and planned_source_urls:
         source_coverage_results = source_url_coverage_retrieve(
@@ -288,27 +246,24 @@ def synthesize_report_from_research_plan(
 
     synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
     planner_questions = planner_sub_questions(research_plan)
-    synthesis_context = select_synthesis_context(retrieved_context, planner_questions)
+    synthesis_context = select_synthesis_context(
+        retrieved_context,
+        planner_questions,
+        question_source_urls=question_source_urls,
+    )
     print_synthesis_chunks(synthesis_context, label="initial")
     payload = synthesize_context_for_report(
         objective=objective,
         retrieved_context=synthesis_context,
         synthesis_instruction=synthesis_instruction,
         planner_questions=planner_questions,
+        question_source_urls=question_source_urls,
         model=model,
         max_context_chars=max_context_chars,
         max_tokens=max_tokens,
     )
-    sub_question_specs = planner_sub_question_specs(research_plan)
-    initial_coverage = build_coverage_by_question(
-        payload.get("synthesis"),
-        sub_question_specs,
-        payload.get("sources", []),
-        retrieved_context=synthesis_context,
-    )
-    gap_seed = "\n".join(coverage_gap_items(initial_coverage)) or payload.get("synthesis")
     gap_query_plan = synthesis_gap_retrieval_plan(
-        gap_seed,
+        payload.get("synthesis"),
         objective=objective,
         synthesis_instruction=synthesis_instruction,
         sources=payload.get("sources", []),
@@ -345,13 +300,18 @@ def synthesize_report_from_research_plan(
         if gap_new_chunk_count:
             retrieved_context = retry_context
             gap_retry_count = 1
-            synthesis_context = select_synthesis_context(retrieved_context, planner_questions)
+            synthesis_context = select_synthesis_context(
+                retrieved_context,
+                planner_questions,
+                question_source_urls=question_source_urls,
+            )
             print_synthesis_chunks(synthesis_context, label="gap-refresh")
             payload = synthesize_context_for_report(
                 objective=objective,
                 retrieved_context=synthesis_context,
                 synthesis_instruction=synthesis_instruction,
                 planner_questions=planner_questions,
+                question_source_urls=question_source_urls,
                 model=model,
                 max_context_chars=max_context_chars,
                 max_tokens=max_tokens,
@@ -378,6 +338,7 @@ def synthesize_report_from_research_plan(
     payload["allowed_history_keys"] = allowed_history_keys
     payload["objective_scope"] = objective_scope
     payload["planned_source_urls"] = planned_source_urls
+    payload["question_source_urls"] = question_source_urls
     payload["source_coverage_count"] = len(source_coverage_results)
     payload["browser_signal_count"] = len(browser_signal_context)
     payload["retrieved_count"] = len(retrieved_context)
@@ -391,24 +352,19 @@ def synthesize_report_from_research_plan(
     )
     citation_audit = audit_synthesis_citations(payload.get("synthesis"), payload.get("sources", []))
     payload["citation_audit"] = citation_audit
-    payload["sub_question_specs"] = sub_question_specs
-    payload["coverage_by_question"] = build_coverage_by_question(
-        payload.get("synthesis"),
-        payload["sub_question_specs"],
-        payload.get("sources", []),
-        retrieved_context=synthesis_context,
-    )
     payload["supporting_chunks"] = report_supporting_chunks(
         retrieved_context,
         payload.get("sources", []),
         max_chunks=supporting_chunk_count,
         max_chars=retrieved_chunk_chars,
-        cited_source_indexes=dedupe_ints(
-            [
-                *citation_audit.get("valid_referenced_source_indexes", []),
-                *coverage_source_indexes(payload["coverage_by_question"]),
-            ]
-        ),
+        cited_source_indexes=citation_audit.get("valid_referenced_source_indexes", []),
+    )
+    payload["sub_question_specs"] = planner_sub_question_specs(research_plan)
+    payload["coverage_by_question"] = build_coverage_by_question(
+        payload.get("synthesis"),
+        payload["sub_question_specs"],
+        payload.get("sources", []),
+        evidence_packs=payload.get("evidence_packs", []),
     )
     payload["diagnostics"] = synthesis_diagnostics(payload, retrieved_context)
     if include_retrieved_chunks:
@@ -810,14 +766,6 @@ def query_tokens(text: str) -> set[str]:
     }
 
 
-def coverage_question_tokens(text: str) -> set[str]:
-    return {
-        token.strip(".").lower()
-        for token in query_tokens(text)
-        if token.strip(".").lower() not in COVERAGE_GENERIC_TERMS
-    }
-
-
 def query_keywords(text: str, limit: int = 10) -> list[str]:
     keywords = []
     for token in re.findall(r"[A-Za-z0-9_+#.-]+", clean_text(text)):
@@ -874,156 +822,36 @@ def build_coverage_by_question(
     synthesis: Any,
     sub_question_specs: Sequence[dict[str, Any]],
     sources: Sequence[dict[str, Any]],
-    retrieved_context: Sequence[RetrievalResult] | None = None,
+    evidence_packs: Sequence[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Summarize synthesis coverage for each planner sub-question."""
 
     synthesis_text = normalize_citation_markers(synthesis)
     source_index_set = source_indexes(sources)
+    packs_by_question = evidence_packs_by_question(evidence_packs or [])
     coverage = []
     for spec in sub_question_specs:
         question = clean_text(spec.get("question")) if isinstance(spec, dict) else ""
         section = synthesis_section_for_question(synthesis_text, question)
         cited = [index for index in citation_markers(section) if index in source_index_set]
-        required = clean_string_list(spec.get("required_evidence")) if isinstance(spec, dict) else []
-        context_matches = coverage_matches_for_question(
-            question,
-            retrieved_context or [],
-            sources,
-            required_evidence=required,
-        )
-        context_source_indexes = [item["source_index"] for item in context_matches if item.get("source_index") in source_index_set]
-        source_indexes_for_question = dedupe_ints([*cited, *context_source_indexes])
-        context_status = infer_context_coverage_status(context_matches)
-        status = merge_coverage_status(infer_synthesis_coverage_status(section), context_status)
-        if required_evidence_needs_signal(required) and context_status != "covered":
-            status = context_status if context_status == "partial" or not cited else "partial"
+        status = infer_synthesis_coverage_status(section)
+        pack = packs_by_question.get(question_key(question), {})
+        pack_indexes = pack_source_indexes(pack)
+        if pack_indexes and (not clean_text(section) or not cited):
+            cited = pack_indexes
+            status = clean_text(pack.get("coverage")) or status
         coverage.append(
             {
                 "question_id": clean_text(spec.get("question_id")) if isinstance(spec, dict) else "",
                 "question": question,
-                "required_evidence": required,
+                "required_evidence": clean_string_list(spec.get("required_evidence")) if isinstance(spec, dict) else [],
                 "status": status,
-                "source_indexes": source_indexes_for_question,
+                "source_indexes": cited,
                 "has_citations": bool(cited),
-                "evidence_count": len(context_matches),
-                "missing_reason": coverage_missing_reason(status, context_matches, section),
+                "evidence_count": len(pack.get("chunks", [])) if isinstance(pack, dict) else 0,
             }
         )
     return coverage
-
-
-def coverage_matches_for_question(
-    question: str,
-    retrieved_context: Sequence[RetrievalResult],
-    sources: Sequence[dict[str, Any]],
-    required_evidence: Sequence[str] | None = None,
-    limit: int = 4,
-) -> list[dict[str, Any]]:
-    question_terms = coverage_question_tokens(question)
-    if not question_terms:
-        return []
-
-    source_index_by_id = citation_index_by_chunk_id(sources)
-    source_index_by_url = citation_index_by_source_url(sources)
-    matches = []
-    for result in retrieved_context:
-        metadata = result.metadata if isinstance(result.metadata, dict) else {}
-        text = retrieval_result_text(result)
-        result_terms = coverage_question_tokens(text)
-        if not result_terms:
-            continue
-        overlap_terms = sorted(question_terms & result_terms)
-        overlap_ratio = len(overlap_terms) / max(1, min(len(question_terms), len(result_terms)))
-        evidence_score = evidence_type_score(required_evidence or infer_question_evidence_types(question), text, metadata)
-        if not evidence_score and required_evidence_needs_signal(required_evidence or infer_question_evidence_types(question)):
-            continue
-        topic_terms = [term for term in question_terms if term not in COVERAGE_EVIDENCE_TERMS]
-        topic_overlap_terms = [term for term in overlap_terms if term in topic_terms]
-        if required_evidence_needs_signal(required_evidence or infer_question_evidence_types(question)) and topic_terms and not topic_overlap_terms:
-            continue
-        if len(overlap_terms) < 2 and overlap_ratio < 0.25:
-            continue
-        source_index = source_index_by_id.get(result.id) or source_index_by_url.get(source_url_key(primary_source_url(metadata)))
-        matches.append(
-            {
-                "source_index": source_index,
-                "overlap_ratio": round(overlap_ratio, 3),
-                "matched_terms": overlap_terms[:10],
-                "evidence_score": evidence_score,
-                "is_primary_source": is_primary_source(metadata),
-            }
-        )
-
-    return sorted(
-        matches,
-        key=lambda item: (
-            1 if item.get("source_index") is not None else 0,
-            1 if item.get("is_primary_source") else 0,
-            item.get("evidence_score", 0),
-            item.get("overlap_ratio", 0.0),
-        ),
-        reverse=True,
-    )[: max(1, limit)]
-
-
-def infer_context_coverage_status(matches: Sequence[dict[str, Any]]) -> str:
-    if not matches:
-        return "missing"
-    cited_matches = [item for item in matches if item.get("source_index") is not None]
-    strong_matches = [item for item in cited_matches if float(item.get("overlap_ratio") or 0.0) >= 0.30]
-    if strong_matches or len(cited_matches) >= 2:
-        return "covered"
-    return "partial"
-
-
-def merge_coverage_status(synthesis_status: str, context_status: str) -> str:
-    rank = {"missing": 0, "partial": 1, "covered": 2}
-    return synthesis_status if rank.get(synthesis_status, 0) >= rank.get(context_status, 0) else context_status
-
-
-def coverage_missing_reason(status: str, matches: Sequence[dict[str, Any]], section: str) -> str:
-    if status == "covered":
-        return ""
-    if not matches and not clean_text(section):
-        return "No retrieved context or synthesis prose matched this planner sub-question."
-    if matches and not any(item.get("source_index") is not None for item in matches):
-        return "Retrieved context matched the topic, but it was not included as a citable synthesis source."
-    if status == "partial":
-        return "Only partial retrieved or cited support was found for this planner sub-question."
-    return "The synthesis marked this item as missing or unsupported."
-
-
-def coverage_gap_items(coverage: Sequence[dict[str, Any]]) -> list[str]:
-    gaps = []
-    for item in coverage:
-        if not isinstance(item, dict) or item.get("status") == "covered":
-            continue
-        question = clean_text(item.get("question"))
-        required = " ".join(clean_string_list(item.get("required_evidence")))
-        reason = clean_text(item.get("missing_reason"))
-        if question:
-            gaps.append(clean_text(f"{question}. Required evidence: {required}. {reason}"))
-    return dedupe_preserve_order(gaps)
-
-
-def coverage_source_indexes(coverage: Sequence[dict[str, Any]]) -> list[int]:
-    values: list[int] = []
-    for item in coverage:
-        if isinstance(item, dict):
-            values.extend(index for index in item.get("source_indexes", []) if isinstance(index, int))
-    return dedupe_ints(values)
-
-
-def dedupe_ints(values: Sequence[Any]) -> list[int]:
-    result = []
-    seen = set()
-    for value in values:
-        if not isinstance(value, int) or value in seen:
-            continue
-        seen.add(value)
-        result.append(value)
-    return result
 
 
 def synthesis_section_for_question(synthesis: str, question: str) -> str:
@@ -1055,6 +883,32 @@ def infer_synthesis_coverage_status(text: str) -> str:
     return "partial"
 
 
+def evidence_packs_by_question(evidence_packs: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    packs = {}
+    for pack in evidence_packs or []:
+        if not isinstance(pack, dict):
+            continue
+        key = question_key(pack.get("question"))
+        if key:
+            packs[key] = pack
+    return packs
+
+
+def pack_source_indexes(pack: dict[str, Any]) -> list[int]:
+    indexes = []
+    for chunk in pack.get("chunks", []) if isinstance(pack, dict) else []:
+        if not isinstance(chunk, dict):
+            continue
+        index = chunk.get("source_index")
+        if isinstance(index, int) and index not in indexes:
+            indexes.append(index)
+    return indexes
+
+
+def question_key(question: Any) -> str:
+    return clean_text(question).lower()
+
+
 def infer_question_evidence_types(question: str) -> list[str]:
     lowered = clean_text(question).lower()
     checks = [
@@ -1069,40 +923,6 @@ def infer_question_evidence_types(question: str) -> list[str]:
     ]
     evidence = [name for name, pattern in checks if re.search(pattern, lowered)]
     return evidence or ["evidence"]
-
-
-def required_evidence_needs_signal(required_evidence: Sequence[str]) -> bool:
-    strict_types = {"api", "benchmark", "complexity", "equation", "limitations"}
-    return any(clean_text(item).lower() in strict_types for item in required_evidence)
-
-
-def evidence_type_score(required_evidence: Sequence[str], text: str, metadata: dict[str, Any]) -> int:
-    body = " ".join([clean_text(text), clean_text(metadata.get("title"))]).lower()
-    url = primary_source_url(metadata).lower()
-    haystack = f"{body} {url}"
-    score = 0
-    for item in required_evidence:
-        evidence_type = clean_text(item).lower()
-        if evidence_type == "equation" and BROWSER_FORMULA_SIGNAL_PATTERN.search(haystack):
-            score += 3
-        elif evidence_type == "benchmark" and (
-            BROWSER_METRIC_SIGNAL_PATTERN.search(haystack)
-            or re.search(r"\b(benchmark|score|metric|accuracy|bleu|glue|imagenet|result)\b", haystack)
-        ):
-            score += 3
-        elif evidence_type == "api" and (
-            BROWSER_API_SIGNAL_PATTERN.search(body)
-            or re.search(r"\b(api|parameter|signature|class|function|method|docs?|pytorch|tensorflow|keras)\b", haystack)
-            or any(part in url for part in ("/docs", "docs.", "pytorch.org", "tensorflow.org"))
-        ):
-            score += 3
-        elif evidence_type == "complexity" and re.search(r"\b(complexity|quadratic|linear|runtime|memory|o\(|o\(n|time)\b", haystack):
-            score += 3
-        elif evidence_type == "limitations" and re.search(r"\b(limitations?|challenges?|drawbacks?|bottleneck|scalability|quadratic|memory)\b", haystack):
-            score += 3
-        elif evidence_type in {"definition", "comparison", "applications", "examples", "evidence"}:
-            score += 1
-    return score
 
 
 def clean_string_list(value: Any) -> list[str]:
@@ -1315,6 +1135,37 @@ def planner_source_urls(research_plan: dict[str, Any]) -> list[str]:
     return dedupe_source_urls(urls)
 
 
+def planner_question_source_urls(research_plan: dict[str, Any]) -> dict[str, list[str]]:
+    """Map planner sub-questions to the task URLs assigned to them."""
+
+    specs = planner_sub_question_specs(research_plan)
+    question_by_id = {
+        clean_text(spec.get("question_id")).lower(): clean_text(spec.get("question"))
+        for spec in specs
+        if clean_text(spec.get("question_id")) and clean_text(spec.get("question"))
+    }
+    question_by_text = {question_key(spec.get("question")): clean_text(spec.get("question")) for spec in specs}
+    mapped: dict[str, list[str]] = {clean_text(spec.get("question")): [] for spec in specs if clean_text(spec.get("question"))}
+
+    for task in research_plan.get("tasks", []) or []:
+        if not isinstance(task, dict):
+            continue
+        url = first_url(task.get("url"))
+        context = clean_text(task.get("query_context"))
+        question = question_by_id.get(context.lower()) or question_by_text.get(question_key(context))
+        if not url or not question:
+            continue
+        mapped.setdefault(question, []).append(url)
+
+    return {question: dedupe_source_urls(urls) for question, urls in mapped.items() if urls}
+
+
+def first_url(value: Any) -> str:
+    text = clean_text(value)
+    match = URL_PATTERN.search(text)
+    return normalize_source_url(match.group(0).rstrip(".,;:")) if match else ""
+
+
 def nested_values(value: Any) -> list[Any]:
     if isinstance(value, dict):
         values = []
@@ -1524,6 +1375,7 @@ def synthesize_context_for_report(
     retrieved_context: Sequence[RetrievalResult],
     synthesis_instruction: str = "",
     planner_questions: Sequence[str] | None = None,
+    question_source_urls: dict[str, list[str]] | None = None,
     model: str | None = None,
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
     max_tokens: int = DEFAULT_REPORT_MAX_TOKENS,
@@ -1557,7 +1409,12 @@ def synthesize_context_for_report(
         context_budget = max(8000, int(max_context_chars * (0.70 ** attempt)))
         token_budget = max(700, int(max_tokens * (0.80 ** attempt)))
         context_text, sources = build_generation_context(retrieved_context, max_context_chars=context_budget)
-        evidence_packs = build_sub_question_evidence_packs(planner_questions or [], retrieved_context, sources)
+        evidence_packs = build_sub_question_evidence_packs(
+            planner_questions or [],
+            retrieved_context,
+            sources,
+            question_source_urls=question_source_urls,
+        )
         source_priority_guidance = build_source_priority_guidance(sources)
         prompt = f"""Research objective:
 {objective}
@@ -1580,24 +1437,28 @@ Per-question evidence packs:
 Retrieved context from multiple sources:
 {context_text}
 
-Create natural report-agent-ready synthesis notes using only the retrieved context.
-Do not write the final report. Prepare rich prose that another agent can turn into a detailed report.
+Create a detailed report-agent-ready evidence package using only the retrieved context.
+Do not write the final report. Prepare rich notes that another agent can turn into a technical report.
 
 Return Markdown with these sections:
-1. Synthesis Overview
-   Write concise paragraphs that explain the main findings and the shape of the evidence.
-2. Topic Coverage Narrative
-   Cover every planner sub-question in natural prose, but do not repeat every question as a heading.
-   Do not create evidence bullets under each planner question.
-   Mention equations, formulas, API details, benchmark values, comparisons, limitations, and examples only when they are present in the retrieved context.
-3. Cross-Source Synthesis
-   Connect repeated ideas across sources and explain how primary, official, and secondary sources complement each other.
-4. Details To Preserve
-   Preserve exact definitions, equations, model components, implementation details, benchmark values, dates, names, and source-specific facts only when present in the retrieved context.
-5. Conflicts Or Gaps
-   In short prose, identify missing evidence, weak citations, source conflicts, or claims that need caution.
-6. Recommended Report Flow
-   Suggest the report structure in prose and mention which source markers support major sections.
+1. Instruction Coverage Checklist
+   - For each instruction requirement, mark Covered, Partial, or Missing Evidence.
+   - Cite source markers for Covered/Partial items and name the exact missing facts for Missing Evidence items.
+2. Coverage Map
+   - For each planner sub-question, state whether the retrieved context has strong, partial, or missing evidence.
+3. Section Notes By Planner Question
+   - Repeat each planner sub-question as a subsection.
+   - Include the direct answer, important evidence, equations/formulas/API details when available, and gaps.
+   - Keep enough detail for a report agent to write a full section without needing to infer missing facts.
+4. Cross-Source Synthesis
+   - Connect repeated ideas across sources and identify how the sources complement each other.
+5. Technical Details To Preserve
+   - Preserve exact equations, definitions, model components, implementation details, and benchmark values only when present in the retrieved context.
+6. Conflicts Or Gaps
+   - List missing evidence, weak citations, source conflicts, or claims that need caution.
+7. Recommended Report Structure
+   - Suggest report sections and which source markers support each section.
+   - Include every Covered/Partial instruction requirement and explicit gap notes for Missing Evidence requirements.
 
 Use only plain ASCII numbered source markers that appear in the retrieved context, exactly like [1], [2], [3].
 Every evidence-backed claim must include at least one source marker.
@@ -1609,7 +1470,7 @@ Do not compress important technical details into vague summaries.
 Do not use Markdown tables.
 Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inline.
 If a requested equation, number, API detail, or definition is not explicitly present in the retrieved context, mark it as missing evidence and tell the report agent not to add it.
-Before finishing, check the planner sub-questions against the Recommended Report Flow so requested items are not silently dropped.
+Before finishing, check the Instruction Coverage Checklist against the Recommended Report Structure so requested items are not silently dropped.
 Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
 
         try:
@@ -2029,7 +1890,6 @@ def build_generation_context(
     """
     blocks = []
     sources = []
-    source_index_by_url: dict[str, int] = {}
     used_chars = 0
     max_context_chars = max(1000, max_context_chars)
     ordered_results = source_balanced_results(retrieved_context)
@@ -2038,33 +1898,11 @@ def build_generation_context(
     for retrieval_rank, result in enumerate(ordered_results, start=1):
         metadata = result.metadata if isinstance(result.metadata, dict) else {}
         url = primary_source_url(metadata)
-        url_key = source_url_key(url) or clean_text(result.id)
-        citation_index = source_index_by_url.get(url_key)
-        title = clean_text(metadata.get("title")) or url or f"Source {citation_index or len(sources) + 1}"
+        citation_index = len(blocks) + 1
+        title = clean_text(metadata.get("title")) or url or f"Source {citation_index}"
         chunk = retrieved_chunk_preview(result.document, metadata, max_chars=block_char_limit)
         if not is_meaningful_evidence(chunk):
             continue
-        if citation_index is None:
-            citation_index = len(sources) + 1
-            source_index_by_url[url_key] = citation_index
-            sources.append(
-                {
-                    "index": citation_index,
-                    "retrieval_rank": retrieval_rank,
-                    "id": result.id,
-                    "ids": [result.id],
-                    "url": url,
-                    "title": title,
-                    "score": result.score,
-                }
-            )
-        else:
-            source = sources[citation_index - 1]
-            ids = source.setdefault("ids", [])
-            if result.id not in ids:
-                ids.append(result.id)
-            if result.score is not None and (source.get("score") is None or result.score > source.get("score")):
-                source["score"] = result.score
 
         block = f"[{citation_index}] {title}\nURL: {url}\n{chunk}"
         if used_chars + len(block) > max_context_chars:
@@ -2074,6 +1912,16 @@ def build_generation_context(
             block = block[:remaining].rstrip()
 
         blocks.append(block)
+        sources.append(
+            {
+                "index": citation_index,
+                "retrieval_rank": retrieval_rank,
+                "id": result.id,
+                "url": url,
+                "title": title,
+                "score": result.score,
+            }
+        )
         used_chars += len(block)
 
     return "\n\n".join(blocks), sources
@@ -2082,6 +1930,7 @@ def build_generation_context(
 def select_synthesis_context(
     retrieved_context: Sequence[RetrievalResult],
     planner_questions: Sequence[str] | None = None,
+    question_source_urls: dict[str, list[str]] | None = None,
     max_chunks: int = DEFAULT_SYNTHESIS_MAX_CHUNKS,
     per_question: int = DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
 ) -> list[RetrievalResult]:
@@ -2094,17 +1943,33 @@ def select_synthesis_context(
 
     selected = []
     seen = set()
+    selected_by_question: dict[str, int] = {}
+
+    def add_for_question(question: str, result: RetrievalResult) -> bool:
+        key = retrieval_result_key(result)
+        if key in seen or len(selected) >= max_chunks:
+            return False
+        selected.append(result)
+        seen.add(key)
+        selected_by_question[question_key(question)] = selected_by_question.get(question_key(question), 0) + 1
+        return True
+
     for question in questions:
-        for result in rank_results_for_question(question, candidates)[:max(1, per_question)]:
-            key = retrieval_result_key(result)
-            if key in seen:
-                continue
-            selected.append(result)
-            seen.add(key)
+        for result in question_ranked_results(question, candidates, question_source_urls)[:1]:
+            add_for_question(question, result)
+            break
+
+    for question in questions:
+        for result in question_ranked_results(question, candidates, question_source_urls):
+            if selected_by_question.get(question_key(question), 0) >= max(1, per_question):
+                break
+            add_for_question(question, result)
             if len(selected) >= max_chunks:
                 return selected
 
     for result in source_balanced_results(candidates):
+        if len(selected) >= max_chunks:
+            break
         key = retrieval_result_key(result)
         if key in seen:
             continue
@@ -2113,6 +1978,48 @@ def select_synthesis_context(
         if len(selected) >= max_chunks:
             break
     return selected
+
+
+def question_ranked_results(
+    question: str,
+    candidates: Sequence[RetrievalResult],
+    question_source_urls: dict[str, list[str]] | None = None,
+) -> list[RetrievalResult]:
+    preferred = source_matched_results(candidates, question_source_urls_for(question, question_source_urls))
+    ranked = rank_results_for_question(question, preferred) + rank_results_for_question(question, candidates)
+    return unique_retrieval_results(ranked)
+
+
+def source_matched_results(results: Sequence[RetrievalResult], urls: Sequence[str]) -> list[RetrievalResult]:
+    if not urls:
+        return []
+    return [result for result in results if result_matches_source_urls(result, urls)]
+
+
+def result_matches_source_urls(result: RetrievalResult, urls: Sequence[str]) -> bool:
+    target_urls = set(dedupe_source_urls(urls))
+    if not target_urls:
+        return False
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return bool(target_urls & set(dedupe_source_urls(result_source_urls_from_metadata(metadata))))
+
+
+def question_source_urls_for(question: str, question_source_urls: dict[str, list[str]] | None) -> list[str]:
+    if not question_source_urls:
+        return []
+    return question_source_urls.get(question) or question_source_urls.get(question_key(question), [])
+
+
+def unique_retrieval_results(results: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    unique = []
+    seen = set()
+    for result in results:
+        key = retrieval_result_key(result)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(result)
+    return unique
 
 
 def meaningful_retrieval_results(retrieved_context: Sequence[RetrievalResult]) -> list[RetrievalResult]:
@@ -2238,7 +2145,6 @@ def compact_retrieved_chunks(
     """Serialize selected retrieved chunks for a downstream report agent."""
 
     source_index_by_id = citation_index_by_chunk_id(sources or [])
-    source_index_by_url = citation_index_by_source_url(sources or [])
     chunks = []
     for rank, result in enumerate(retrieved_context, start=1):
         metadata = result.metadata if isinstance(result.metadata, dict) else {}
@@ -2249,7 +2155,7 @@ def compact_retrieved_chunks(
             continue
         chunks.append(
             {
-                "source_index": source_index_by_id.get(result.id) or source_index_by_url.get(source_url_key(url)),
+                "source_index": source_index_by_id.get(result.id),
                 "retrieval_rank": rank,
                 "id": result.id,
                 "url": url,
@@ -2268,6 +2174,7 @@ def build_sub_question_evidence_packs(
     planner_questions: Sequence[str],
     retrieved_context: Sequence[RetrievalResult],
     sources: Sequence[dict[str, Any]],
+    question_source_urls: dict[str, list[str]] | None = None,
     max_chunks_per_question: int = 4,
 ) -> list[dict[str, Any]]:
     """Group source-numbered chunks under each planner sub-question."""
@@ -2284,17 +2191,39 @@ def build_sub_question_evidence_packs(
         for chunk in chunks:
             text = " ".join([clean_text(chunk.get("title")), clean_text(chunk.get("content"))])
             overlap = len(question_terms & query_tokens(text))
-            if overlap:
-                scored.append((overlap, float(chunk.get("score") or 0.0), chunk))
-        selected = [chunk for _, _, chunk in sorted(scored, key=lambda item: (-item[0], -item[1]))[:max_chunks_per_question]]
+            preferred = chunk_matches_source_urls(chunk, question_source_urls_for(question, question_source_urls))
+            if overlap or preferred:
+                scored.append(
+                    (
+                        1 if preferred else 0,
+                        1 if chunk.get("is_primary_source") else 0,
+                        overlap,
+                        float(chunk.get("score") or 0.0),
+                        chunk,
+                    )
+                )
+        selected = [
+            chunk
+            for *_score, chunk in sorted(scored, key=lambda item: (-item[0], -item[1], -item[2], -item[3]))
+            [:max_chunks_per_question]
+        ]
         packs.append(
             {
                 "question": question,
                 "coverage": "covered" if len(selected) >= 2 else ("partial" if selected else "missing"),
+                "planned_source_urls": question_source_urls_for(question, question_source_urls),
                 "chunks": selected,
             }
         )
     return packs
+
+
+def chunk_matches_source_urls(chunk: dict[str, Any], urls: Sequence[str]) -> bool:
+    target_urls = set(dedupe_source_urls(urls))
+    if not target_urls:
+        return False
+    chunk_urls = dedupe_source_urls([clean_text(chunk.get("url"))])
+    return bool(target_urls & set(chunk_urls))
 
 
 def format_evidence_packs_for_prompt(evidence_packs: Sequence[dict[str, Any]]) -> str:
@@ -2393,30 +2322,12 @@ def citation_index_by_chunk_id(sources: Sequence[dict[str, Any]]) -> dict[str, i
     for source in sources:
         if not isinstance(source, dict):
             continue
+        chunk_id = clean_text(source.get("id"))
         index = source.get("index")
-        if not isinstance(index, int):
+        if not chunk_id or not isinstance(index, int):
             continue
-        chunk_ids = [source.get("id"), *(source.get("ids") or [])]
-        for chunk_id in chunk_ids:
-            chunk_id = clean_text(chunk_id)
-            if chunk_id:
-                indexes[chunk_id] = index
+        indexes[chunk_id] = index
     return indexes
-
-
-def citation_index_by_source_url(sources: Sequence[dict[str, Any]]) -> dict[str, int]:
-    indexes = {}
-    for source in sources:
-        if not isinstance(source, dict) or not isinstance(source.get("index"), int):
-            continue
-        key = source_url_key(clean_text(source.get("url")))
-        if key:
-            indexes[key] = source["index"]
-    return indexes
-
-
-def source_url_key(url: str) -> str:
-    return normalize_source_url(url) or clean_text(url).lower()
 
 
 def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[RetrievalResult]) -> dict[str, Any]:
