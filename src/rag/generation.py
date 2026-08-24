@@ -352,19 +352,24 @@ def synthesize_report_from_research_plan(
     )
     citation_audit = audit_synthesis_citations(payload.get("synthesis"), payload.get("sources", []))
     payload["citation_audit"] = citation_audit
-    payload["supporting_chunks"] = report_supporting_chunks(
-        retrieved_context,
-        payload.get("sources", []),
-        max_chunks=supporting_chunk_count,
-        max_chars=retrieved_chunk_chars,
-        cited_source_indexes=citation_audit.get("valid_referenced_source_indexes", []),
-    )
     payload["sub_question_specs"] = planner_sub_question_specs(research_plan)
     payload["coverage_by_question"] = build_coverage_by_question(
         payload.get("synthesis"),
         payload["sub_question_specs"],
         payload.get("sources", []),
         evidence_packs=payload.get("evidence_packs", []),
+    )
+    payload["supporting_chunks"] = report_supporting_chunks(
+        retrieved_context,
+        payload.get("sources", []),
+        max_chunks=supporting_chunk_count,
+        max_chars=retrieved_chunk_chars,
+        cited_source_indexes=dedupe_ints(
+            [
+                *citation_audit.get("valid_referenced_source_indexes", []),
+                *coverage_source_indexes(payload["coverage_by_question"]),
+            ]
+        ),
     )
     payload["diagnostics"] = synthesis_diagnostics(payload, retrieved_context)
     if include_retrieved_chunks:
@@ -903,6 +908,31 @@ def pack_source_indexes(pack: dict[str, Any]) -> list[int]:
         if isinstance(index, int) and index not in indexes:
             indexes.append(index)
     return indexes
+
+
+def coverage_source_indexes(coverage: Sequence[dict[str, Any]]) -> list[int]:
+    values = []
+    for item in coverage or []:
+        if isinstance(item, dict):
+            values.extend(item.get("source_indexes", []))
+    return dedupe_ints(values)
+
+
+def dedupe_ints(values: Sequence[Any]) -> list[int]:
+    deduped = []
+    seen = set()
+    for value in values or []:
+        if isinstance(value, bool):
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number in seen:
+            continue
+        seen.add(number)
+        deduped.append(number)
+    return deduped
 
 
 def question_key(question: Any) -> str:
