@@ -7,7 +7,10 @@ from src.rag.generation import (
     audit_synthesis_citations,
     build_sub_question_evidence_packs,
     build_coverage_by_question,
+    build_generation_context,
     browser_signal_results,
+    compact_retrieved_chunks,
+    coverage_gap_items,
     high_signal_browser_snippets,
     is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
@@ -214,13 +217,112 @@ What benchmark results show performance?
 Missing Evidence: exact benchmark values are not present.
 """
 
-        coverage = build_coverage_by_question(synthesis, specs, [{"index": 1}])
+        context = [
+            RetrievalResult(
+                id="equation",
+                document="The core equation is y = softmax(QK^T / sqrt(d_k)) V with enough surrounding evidence text.",
+                metadata={"title": "Equation source", "url": "https://arxiv.org/abs/1234.5678"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+
+        coverage = build_coverage_by_question(synthesis, specs, [{"index": 1, "id": "equation"}], retrieved_context=context)
 
         self.assertEqual(coverage[0]["status"], "covered")
         self.assertEqual(coverage[0]["source_indexes"], [1])
         self.assertTrue(coverage[0]["has_citations"])
         self.assertEqual(coverage[1]["status"], "missing")
         self.assertFalse(coverage[1]["has_citations"])
+        self.assertTrue(coverage[1]["missing_reason"])
+
+    def test_build_coverage_by_question_uses_retrieved_context_sidecar(self):
+        specs = [
+            {"question_id": "q001", "question": "What is the implementation API?", "required_evidence": ["api"]},
+            {"question_id": "q002", "question": "What benchmark result is reported?", "required_evidence": ["benchmark"]},
+        ]
+        sources = [{"index": 1, "id": "api-chunk"}]
+        context = [
+            RetrievalResult(
+                id="api-chunk",
+                document="The implementation API exposes an official function with parameters and usage examples.",
+                metadata={"title": "API docs", "url": "https://docs.example.com/api"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+
+        coverage = build_coverage_by_question(
+            "The synthesis explains the topic naturally with source support [1].",
+            specs,
+            sources,
+            retrieved_context=context,
+        )
+
+        self.assertEqual(coverage[0]["status"], "covered")
+        self.assertEqual(coverage[0]["source_indexes"], [1])
+        self.assertEqual(coverage[0]["evidence_count"], 1)
+        self.assertEqual(coverage[1]["status"], "missing")
+        self.assertIn("benchmark", coverage_gap_items(coverage)[0].lower())
+
+    def test_build_coverage_requires_topic_match_for_strict_evidence(self):
+        specs = [
+            {
+                "question_id": "q001",
+                "question": "What are the known limitations of attention mechanisms?",
+                "required_evidence": ["limitations"],
+            }
+        ]
+        context = [
+            RetrievalResult(
+                id="generic-limitations",
+                document="Limitations in research are constraints that affect what can be concluded from a study. " * 3,
+                metadata={"title": "Limitations in Research", "url": "https://example.com/limitations"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+
+        coverage = build_coverage_by_question(
+            "Known limitations of attention mechanisms are discussed [1].",
+            specs,
+            [{"index": 1, "id": "generic-limitations"}],
+            retrieved_context=context,
+        )
+
+        self.assertEqual(coverage[0]["status"], "partial")
+        self.assertEqual(coverage[0]["evidence_count"], 0)
+
+    def test_build_generation_context_dedupes_sources_by_url(self):
+        results = [
+            RetrievalResult(
+                id="chunk-a",
+                document="First source chunk with enough evidence about the topic. " * 4,
+                metadata={"title": "Shared Source", "url": "https://example.com/source"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="chunk-b",
+                document="Second source chunk with more evidence from the same source URL. " * 4,
+                metadata={"title": "Shared Source", "url": "https://example.com/source"},
+                score=0.8,
+                semantic_score=0.8,
+                bm25_score=0.0,
+            ),
+        ]
+
+        context, sources = build_generation_context(results)
+        chunks = compact_retrieved_chunks(results, sources)
+
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["ids"], ["chunk-a", "chunk-b"])
+        self.assertEqual(context.count("[1] Shared Source"), 2)
+        self.assertEqual({chunk["source_index"] for chunk in chunks}, {1})
 
     def test_build_coverage_by_question_uses_evidence_pack_when_synthesis_section_is_generic(self):
         specs = [{"question_id": "q001", "question": "What is the official API?", "required_evidence": ["api"]}]

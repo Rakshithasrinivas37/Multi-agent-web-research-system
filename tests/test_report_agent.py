@@ -5,6 +5,8 @@ from src.agents.report_agent import (
     clean_markdown,
     build_report_prompt,
     dedupe_sources,
+    evidence_pack_questions,
+    format_evidence_packs,
     format_question_coverage,
     format_report_section_outline,
     format_supporting_evidence,
@@ -21,6 +23,7 @@ from src.agents.report_agent import (
     report_self_critique,
     report_sub_question_coverage_check,
     rewrite_missing_sub_question_queries,
+    sources_with_browser_results,
     slugify_filename,
     synthesis_coverage_gap_questions,
     unsupported_benchmark_metrics,
@@ -115,6 +118,26 @@ Supported [1]. Unsupported [9].
 
         self.assertEqual([source["index"] for source in sources], [3, 1, 14])
 
+    def test_sources_with_browser_results_preserves_synthesis_indexes(self):
+        sources = [
+            {"index": 1, "url": "https://paper.example"},
+            {"index": 7, "url": "https://paper.example"},
+        ]
+        browser_results = [
+            {
+                "sources": [
+                    {"title": "Paper duplicate", "url": "https://paper.example"},
+                    {"title": "Docs", "url": "https://docs.example.com/api"},
+                ]
+            }
+        ]
+
+        merged = sources_with_browser_results(sources, browser_results)
+
+        self.assertEqual([source["index"] for source in merged], [1, 7, 8])
+        self.assertEqual(merged[1]["url"], "https://paper.example")
+        self.assertEqual(merged[2]["url"], "https://docs.example.com/api")
+
     def test_format_report_section_outline_uses_topic_headings(self):
         outline = format_report_section_outline(
             [
@@ -163,6 +186,27 @@ Supported [1]. Unsupported [9].
         self.assertIn("write a short evidence-gap subsection instead of inventing an answer", prompt)
         self.assertIn("do not include formulas, API names, benchmark values, examples, or detailed explanations", prompt)
 
+    def test_build_report_prompt_includes_evidence_packs(self):
+        prompt = build_report_prompt(
+            objective="Research topic",
+            output_format="report",
+            planner_questions=["How is the API used?"],
+            synthesis="API usage is covered.",
+            evidence="[1] API evidence.",
+            sources=[{"index": 1, "url": "https://docs.example.com/api"}],
+            evidence_packs=[
+                {
+                    "question": "How is the API used?",
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "title": "API docs", "content": "The API usage is documented."}],
+                }
+            ],
+        )
+
+        self.assertIn("Per-question evidence packs", prompt)
+        self.assertIn("covered: How is the API used?", prompt)
+        self.assertIn("Covered packs must be explained", prompt)
+
     def test_format_question_coverage_lists_status_and_sources(self):
         coverage = format_question_coverage([
             {
@@ -176,6 +220,21 @@ Supported [1]. Unsupported [9].
 
         self.assertIn("q002: covered", coverage)
         self.assertIn("sources=[1], [3]", coverage)
+
+    def test_format_evidence_packs_lists_chunks_and_questions(self):
+        packs = [
+            {
+                "question": "What benchmark result is reported?",
+                "coverage": "partial",
+                "chunks": [{"source_index": 2, "title": "Benchmark", "content": "Metric evidence appears here."}],
+            }
+        ]
+
+        formatted = format_evidence_packs(packs)
+
+        self.assertIn("partial: What benchmark result is reported?", formatted)
+        self.assertIn("[2] Benchmark", formatted)
+        self.assertEqual(evidence_pack_questions(packs), ["What benchmark result is reported?"])
 
     def test_format_supporting_evidence_uses_chunks_once(self):
         context = {

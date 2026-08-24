@@ -3,8 +3,11 @@ import unittest
 from src.agents.planner_agent import (
     ResearchPlan,
     ResearchTask,
+    apply_authoritative_search_hints,
     build_sub_question_specs,
     clean_sub_questions,
+    is_disallowed_source_url,
+    validate_plan,
 )
 
 
@@ -22,11 +25,11 @@ class PlannerAgentTests(unittest.TestCase):
 
     def test_clean_sub_questions_accepts_legacy_strings_and_structured_items(self):
         questions = clean_sub_questions([
-            "What is attention?",
+            "What is the concept?",
             {"question": "How does it perform?", "required_evidence": ["benchmark"]},
         ])
 
-        self.assertEqual(questions, ["What is attention?", "How does it perform?"])
+        self.assertEqual(questions, ["What is the concept?", "How does it perform?"])
 
     def test_research_plan_to_dict_preserves_plain_questions_and_specs(self):
         questions = ["What is the API usage?"]
@@ -54,6 +57,73 @@ class PlannerAgentTests(unittest.TestCase):
         self.assertEqual(data["sub_questions"], questions)
         self.assertEqual(data["sub_question_specs"][0]["question_id"], "q001")
         self.assertIn("api", data["sub_question_specs"][0]["required_evidence"])
+
+    def test_authoritative_search_hints_add_primary_source_terms(self):
+        tasks = [
+            ResearchTask(
+                task_id="task_001",
+                query_context="What is the core equation and computational complexity?",
+                url="SEARCH:core equation computational complexity",
+                source_type="search",
+                priority=1,
+                extraction_goal="Extract equation, components, and complexity.",
+            )
+        ]
+
+        result = apply_authoritative_search_hints(tasks, "technical_deep_dive")
+
+        self.assertIn("original", result[0].url)
+        self.assertIn("paper", result[0].url)
+        self.assertIn("arxiv", result[0].url)
+        self.assertIn("doi", result[0].url)
+
+    def test_authoritative_search_hints_add_official_docs_terms(self):
+        tasks = [
+            ResearchTask(
+                task_id="task_001",
+                query_context="Find framework API usage.",
+                url="SEARCH:framework API usage",
+                source_type="search",
+                priority=1,
+                extraction_goal="Extract official API signatures and code usage.",
+            )
+        ]
+
+        result = apply_authoritative_search_hints(tasks, "technical_deep_dive")
+
+        url = result[0].url.lower()
+
+        self.assertIn("official", url)
+        self.assertIn("docs", url)
+        self.assertIn("api", url)
+
+    def test_video_and_social_sources_are_disallowed(self):
+        self.assertTrue(is_disallowed_source_url("https://www.youtube.com/watch?v=test"))
+        self.assertTrue(is_disallowed_source_url("https://youtu.be/test"))
+        self.assertFalse(is_disallowed_source_url("https://arxiv.org/abs/1706.03762"))
+
+    def test_validate_plan_rejects_disallowed_source_urls(self):
+        tasks = [
+            ResearchTask(
+                task_id="task_001",
+                query_context="Find primary evidence",
+                url="https://www.youtube.com/watch?v=test",
+                source_type="webpage",
+                priority=1,
+                extraction_goal="Extract evidence.",
+            ),
+            ResearchTask(
+                task_id="task_002",
+                query_context="Find official docs",
+                url="SEARCH:official docs",
+                source_type="search",
+                priority=2,
+                extraction_goal="Extract evidence.",
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "disallowed source URL"):
+            validate_plan(tasks, "knowledge_research", [], ["What is the evidence?"])
 
 
 if __name__ == "__main__":
