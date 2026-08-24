@@ -15,11 +15,11 @@ python-dotenv
 numpy<2
 ragas
 rank-bm25
-sentence-transformers==3.3.1
+sentence-transformers>=2.7.0
 streamlit
 tavily-python
 # Torch is installed separately in deploy/local setup so it can match the
 # target CPU/CUDA platform. sentence-transformers will use that existing build.
 accelerate==1.1.1
-transformers==4.46.3
+transformers>=4.51.0,<5.0.0
 uvicorn[standard]
