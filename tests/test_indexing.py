@@ -7,6 +7,7 @@ from src.rag.indexing import (
     parent_content_for_id,
     parent_context_chunks,
     parent_rows_from_documents,
+    source_records,
     split_document,
     structure_aware_chunks,
     strip_parent_content_metadata,
@@ -189,6 +190,33 @@ ImageNet top-1 accuracy improves by 1.00%.
         self.assertGreater(metadata_signal_score("equation formula softmax", metadata), 0)
         self.assertGreater(metadata_signal_score("PyTorch API usage", metadata), 0)
         self.assertGreater(metadata_signal_score("ImageNet benchmark accuracy", metadata), 0)
+
+    def test_source_records_preserve_browser_authority_metadata(self):
+        browser_results = [
+            {
+                "task_id": "task_001",
+                "query_context": "Find evidence for topic A.",
+                "task_url": "SEARCH:topic A evidence",
+                "sources": [
+                    {
+                        "url": "https://example.edu/source",
+                        "title": "Authoritative Source",
+                        "source_type": "webpage",
+                        "source_quality": "useful_authoritative",
+                        "source_authority": "authoritative",
+                        "content_noise_score": 0.1,
+                        "full_content": "Detailed evidence for topic A. " * 20,
+                    }
+                ],
+            }
+        ]
+
+        records = list(source_records(browser_results))
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].source_quality, "useful_authoritative")
+        self.assertEqual(records[0].source_authority, "authoritative")
+        self.assertEqual(records[0].content_noise_score, 0.1)
 
 
 if __name__ == "__main__":

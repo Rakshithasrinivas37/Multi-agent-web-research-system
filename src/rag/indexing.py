@@ -30,7 +30,7 @@ DEFAULT_PARENT_STORE_NAME = "parent_chunks.sqlite3"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
-DEFAULT_METADATA_SCHEMA_VERSION = 7
+DEFAULT_METADATA_SCHEMA_VERSION = 8
 TOKEN_PATTERN = re.compile(r"\S+")
 SECTION_HEADING_PATTERN = re.compile(
     r"(?i)^\s*(?:#{1,6}\s+|\d+(?:\.\d+)*[.)]\s+)?"
@@ -66,6 +66,8 @@ class SourceRecord:
     query_contexts: str
     source_type: str
     source_quality: str
+    source_authority: str
+    content_noise_score: float
     content_hash: str
     content: str
 
@@ -326,6 +328,8 @@ def build_langchain_document(record: SourceRecord, objective: str, history_key: 
                 "query_contexts": record.query_contexts,
                 "source_type": record.source_type,
                 "source_quality": record.source_quality,
+                "source_authority": record.source_authority,
+                "content_noise_score": record.content_noise_score,
                 "content_hash": record.content_hash,
                 "metadata_schema_version": DEFAULT_METADATA_SCHEMA_VERSION,
                 "change_status": change_status,
@@ -793,6 +797,8 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
                     "query_contexts": [],
                     "source_type": clean_text(source.get("source_type")),
                     "source_quality": clean_text(source.get("source_quality")),
+                    "source_authority": clean_text(source.get("source_authority")),
+                    "content_noise_score": to_float(source.get("content_noise_score"), 0.0),
                     "content": content,
                 },
             )
@@ -803,11 +809,15 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
             if query_context and query_context not in record["query_contexts"]:
                 record["query_contexts"].append(query_context)
 
+            if source_quality_rank(source.get("source_quality")) > source_quality_rank(record["source_quality"]):
+                record["source_quality"] = clean_text(source.get("source_quality"))
+            if source_authority_rank(source.get("source_authority")) > source_authority_rank(record["source_authority"]):
+                record["source_authority"] = clean_text(source.get("source_authority"))
             if len(content) > len(record["content"]):
                 record["content"] = content
                 record["title"] = clean_text(source.get("title")) or record["title"]
                 record["source_type"] = clean_text(source.get("source_type")) or record["source_type"]
-                record["source_quality"] = clean_text(source.get("source_quality")) or record["source_quality"]
+                record["content_noise_score"] = to_float(source.get("content_noise_score"), record["content_noise_score"])
 
     for record in grouped.values():
         content = record["content"]
@@ -819,6 +829,8 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
             query_contexts=" | ".join(record["query_contexts"]),
             source_type=record["source_type"],
             source_quality=record["source_quality"],
+            source_authority=record["source_authority"],
+            content_noise_score=record["content_noise_score"],
             content_hash=hash_text(content),
             content=content,
         )
@@ -838,6 +850,27 @@ def chunk_document(record: SourceRecord, chunk: str) -> str:
 def chunk_id(history_key: str, url: str, chunk_index: int) -> str:
     digest = hashlib.sha256(f"{history_key}:{url}:{chunk_index}".encode("utf-8")).hexdigest()
     return f"chunk-{digest}"
+
+
+def source_quality_rank(value: Any) -> int:
+    text = clean_text(value).lower()
+    if "primary" in text:
+        return 5
+    if "official" in text:
+        return 4
+    if "authoritative" in text:
+        return 3
+    if "useful" in text:
+        return 2
+    if "weak" in text:
+        return 1
+    return 0
+
+
+def source_authority_rank(value: Any) -> int:
+    text = clean_text(value).lower()
+    ranks = {"primary": 5, "official": 4, "authoritative": 3, "topic_match": 2, "secondary": 1}
+    return ranks.get(text, 0)
 
 
 def summary_urls(items: Any) -> set[str]:
@@ -929,6 +962,13 @@ def clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 def to_int(value: Any, default: int) -> int:
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
