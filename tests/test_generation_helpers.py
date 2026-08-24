@@ -13,6 +13,7 @@ from src.rag.generation import (
     llm_sub_question_retrieval_query_result,
     parse_gap_query_lines,
     parse_llm_retrieval_queries,
+    planner_question_source_urls,
     planner_sub_question_specs,
     precision_retrieval_queries,
     print_synthesis_chunks,
@@ -108,6 +109,51 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertEqual(packs[0]["chunks"][0]["source_index"], 1)
         self.assertEqual(packs[1]["chunks"][0]["source_index"], 2)
 
+    def test_build_sub_question_evidence_packs_prefers_planned_source_url(self):
+        results = [
+            RetrievalResult(
+                id="secondary",
+                document="API API API general tutorial text with enough content for meaningful evidence. " * 3,
+                metadata={"title": "Tutorial", "url": "https://example.com/tutorial"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="official",
+                document="Official reference documents constructor arguments and usage examples. " * 3,
+                metadata={"title": "Official docs", "url": "https://docs.example.com/api"},
+                score=0.2,
+                semantic_score=0.2,
+                bm25_score=0.0,
+            ),
+        ]
+        sources = [
+            {"index": 1, "id": "secondary", "url": "https://example.com/tutorial"},
+            {"index": 2, "id": "official", "url": "https://docs.example.com/api"},
+        ]
+
+        packs = build_sub_question_evidence_packs(
+            ["What is the API usage?"],
+            results,
+            sources,
+            question_source_urls={"What is the API usage?": ["https://docs.example.com/api"]},
+            max_chunks_per_question=1,
+        )
+
+        self.assertEqual(packs[0]["chunks"][0]["source_index"], 2)
+
+    def test_planner_question_source_urls_maps_task_context_ids(self):
+        plan = {
+            "sub_questions": ["What is the core equation?"],
+            "sub_question_specs": [{"question_id": "q001", "question": "What is the core equation?"}],
+            "tasks": [{"query_context": "q001", "url": "https://arxiv.org/abs/1234.56789"}],
+        }
+
+        mapping = planner_question_source_urls(plan)
+
+        self.assertEqual(mapping["What is the core equation?"], ["https://arxiv.org/pdf/1234.56789"])
+
     def test_precision_retrieval_queries_adds_exact_evidence_terms(self):
         plan = {
             "objective": "Attention mechanism",
@@ -175,6 +221,22 @@ Missing Evidence: exact benchmark values are not present.
         self.assertTrue(coverage[0]["has_citations"])
         self.assertEqual(coverage[1]["status"], "missing")
         self.assertFalse(coverage[1]["has_citations"])
+
+    def test_build_coverage_by_question_uses_evidence_pack_when_synthesis_section_is_generic(self):
+        specs = [{"question_id": "q001", "question": "What is the official API?", "required_evidence": ["api"]}]
+        packs = [
+            {
+                "question": "What is the official API?",
+                "coverage": "covered",
+                "chunks": [{"source_index": 2, "content": "Official API usage"}],
+            }
+        ]
+
+        coverage = build_coverage_by_question("API details are available in official docs.", specs, [{"index": 2}], evidence_packs=packs)
+
+        self.assertEqual(coverage[0]["status"], "covered")
+        self.assertEqual(coverage[0]["source_indexes"], [2])
+        self.assertEqual(coverage[0]["evidence_count"], 1)
 
     def test_parse_llm_retrieval_queries_reads_json_queries_only(self):
         raw = """```json
@@ -401,6 +463,36 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("pytorch", selected_ids)
         self.assertIn("vit", selected_ids)
         self.assertLessEqual(len(selected), 4)
+
+    def test_select_synthesis_context_prefers_question_planned_sources(self):
+        results = [
+            RetrievalResult(
+                id="secondary",
+                document="API API API tutorial overview with enough content for meaningful evidence. " * 4,
+                metadata={"title": "Tutorial", "url": "https://example.com/tutorial"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="official",
+                document="Official reference covers parameters and usage examples. " * 4,
+                metadata={"title": "Official docs", "url": "https://docs.example.com/api"},
+                score=0.2,
+                semantic_score=0.2,
+                bm25_score=0.0,
+            ),
+        ]
+
+        selected = select_synthesis_context(
+            results,
+            ["What is the API usage?"],
+            question_source_urls={"What is the API usage?": ["https://docs.example.com/api"]},
+            max_chunks=1,
+            per_question=1,
+        )
+
+        self.assertEqual([result.id for result in selected], ["official"])
 
     def test_select_synthesis_context_filters_weak_chunks(self):
         selected = select_synthesis_context(
