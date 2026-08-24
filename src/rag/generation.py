@@ -1420,6 +1420,7 @@ def synthesize_context_for_report(
             "objective": objective,
             "synthesis": "No retrieved context was available for report synthesis.",
             "sources": [],
+            "evidence_packs": [],
         }
     if not os.environ.get("GROQ_API_KEY"):
         raise RuntimeError("GROQ_API_KEY is not set")
@@ -1439,6 +1440,7 @@ def synthesize_context_for_report(
         context_budget = max(8000, int(max_context_chars * (0.70 ** attempt)))
         token_budget = max(700, int(max_tokens * (0.80 ** attempt)))
         context_text, sources = build_generation_context(retrieved_context, max_context_chars=context_budget)
+        evidence_packs = build_sub_question_evidence_packs(planner_questions or [], retrieved_context, sources)
         source_priority_guidance = build_source_priority_guidance(sources)
         prompt = f"""Research objective:
 {objective}
@@ -1454,6 +1456,9 @@ Planner sub-questions to cover:
 
 Source priority guidance:
 {source_priority_guidance}
+
+Per-question evidence packs:
+{format_evidence_packs_for_prompt(evidence_packs)}
 
 Retrieved context from multiple sources:
 {context_text}
@@ -1524,6 +1529,7 @@ Do not invent source names, authors, dates, titles, papers, benchmark numbers, e
             "planner_questions": list(planner_questions or []),
             "synthesis": synthesis,
             "sources": sources,
+            "evidence_packs": evidence_packs,
             "model": response.model,
             "synthesis_attempts": attempt + 1,
             "synthesis_context_chars": context_budget,
@@ -2125,6 +2131,55 @@ def compact_retrieved_chunks(
             }
         )
     return chunks
+
+
+def build_sub_question_evidence_packs(
+    planner_questions: Sequence[str],
+    retrieved_context: Sequence[RetrievalResult],
+    sources: Sequence[dict[str, Any]],
+    max_chunks_per_question: int = 4,
+) -> list[dict[str, Any]]:
+    """Group source-numbered chunks under each planner sub-question."""
+
+    chunks = [
+        chunk
+        for chunk in compact_retrieved_chunks(retrieved_context, sources=sources, max_chars=500)
+        if chunk.get("source_index") is not None
+    ]
+    packs = []
+    for question in dedupe_preserve_order(planner_questions):
+        question_terms = query_tokens(question)
+        scored = []
+        for chunk in chunks:
+            text = " ".join([clean_text(chunk.get("title")), clean_text(chunk.get("content"))])
+            overlap = len(question_terms & query_tokens(text))
+            if overlap:
+                scored.append((overlap, float(chunk.get("score") or 0.0), chunk))
+        selected = [chunk for _, _, chunk in sorted(scored, key=lambda item: (-item[0], -item[1]))[:max_chunks_per_question]]
+        packs.append(
+            {
+                "question": question,
+                "coverage": "covered" if len(selected) >= 2 else ("partial" if selected else "missing"),
+                "chunks": selected,
+            }
+        )
+    return packs
+
+
+def format_evidence_packs_for_prompt(evidence_packs: Sequence[dict[str, Any]]) -> str:
+    if not evidence_packs:
+        return "- No per-question evidence packs were built."
+    lines = []
+    for pack in evidence_packs:
+        question = clean_text(pack.get("question")) if isinstance(pack, dict) else ""
+        coverage = clean_text(pack.get("coverage")) if isinstance(pack, dict) else "missing"
+        lines.append(f"- {question} ({coverage})")
+        for chunk in (pack.get("chunks", []) if isinstance(pack, dict) else [])[:4]:
+            marker = f"[{chunk.get('source_index')}]"
+            title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Retrieved chunk"
+            content = clean_text(chunk.get("content"))[:260]
+            lines.append(f"  - {marker} {title}: {content}")
+    return "\n".join(lines)
 
 
 def report_supporting_chunks(

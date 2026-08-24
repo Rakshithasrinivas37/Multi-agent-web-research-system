@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from src.rag.generation import (
     audit_synthesis_citations,
+    build_sub_question_evidence_packs,
     build_coverage_by_question,
     browser_signal_results,
     coverage_gap_items,
@@ -74,6 +75,39 @@ class GenerationHelperTests(unittest.TestCase):
         chunks = report_supporting_chunks(results, sources, max_chunks=1, cited_source_indexes=[1])
 
         self.assertEqual(chunks[0]["source_index"], 1)
+
+    def test_build_sub_question_evidence_packs_groups_matching_chunks(self):
+        results = [
+            RetrievalResult(
+                id="api",
+                document="Official API reference explains implementation parameters and usage examples. " * 3,
+                metadata={"title": "API docs", "url": "https://docs.example.com/api"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="benchmark",
+                document="Benchmark results report accuracy, latency, and evaluation metrics. " * 3,
+                metadata={"title": "Benchmark report", "url": "https://example.com/benchmarks"},
+                score=0.8,
+                semantic_score=0.8,
+                bm25_score=0.0,
+            ),
+        ]
+        sources = [
+            {"index": 1, "id": "api", "title": "API docs", "url": "https://docs.example.com/api"},
+            {"index": 2, "id": "benchmark", "title": "Benchmark report", "url": "https://example.com/benchmarks"},
+        ]
+
+        packs = build_sub_question_evidence_packs(
+            ["What is the implementation API?", "What benchmark result is reported?"],
+            results,
+            sources,
+        )
+
+        self.assertEqual(packs[0]["chunks"][0]["source_index"], 1)
+        self.assertEqual(packs[1]["chunks"][0]["source_index"], 2)
 
     def test_precision_retrieval_queries_adds_exact_evidence_terms(self):
         plan = {
