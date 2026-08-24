@@ -32,7 +32,7 @@ from src.tools.text_utils import clean_text
 
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
-DEFAULT_GAP_QUERY_MODEL = "llama-3.1-8b-instant"
+DEFAULT_GAP_QUERY_MODEL = "qwen/qwen3.6-27b"
 DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL = "qwen/qwen3.6-27b"
 DEFAULT_MAX_CONTEXT_CHARS = 18000
 DEFAULT_MAX_TOKENS = 900
@@ -125,6 +125,16 @@ def sub_question_query_rewrite_model(model: str | None = None) -> str:
     return (
         clean_text(os.environ.get("RAG_SUBQUESTION_QUERY_MODEL"))
         or DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL
+        or rag_generation_model(model)
+    )
+
+
+def gap_query_model(model: str | None = None) -> str:
+    """Model used for rewriting synthesis evidence gaps into retrieval queries."""
+
+    return (
+        clean_text(os.environ.get("RAG_GAP_QUERY_MODEL"))
+        or DEFAULT_GAP_QUERY_MODEL
         or rag_generation_model(model)
     )
 
@@ -486,7 +496,7 @@ Requirements:
 - Do not answer the question and do not add citations.
 - Never output placeholder text such as "query 1", "query 2", "retrieval query", or "example query".
 - Return JSON only in this shape:
-{{"items":[{{"sub_question":"...","queries":["query 1","query 2"]}}]}}"""
+{{"items":[{{"sub_question":"...","queries":["topic definition evidence","topic equation formula source"]}}]}}"""
 
     try:
         response = create_chat_completion_with_retries(
@@ -505,21 +515,22 @@ Requirements:
     except Exception as error:  # pragma: no cover - exercised through integration runs.
         return empty_llm_query_result(model=selected_model, error=str(error))
 
-    raw_response = clean_text(response.choices[0].message.content)
+    raw_response = str(response.choices[0].message.content or "")
     queries = valid_retrieval_queries(parse_llm_retrieval_queries(raw_response), research_plan)
+    raw_response_text = clean_text(raw_response)
     max_queries = max(1, len(questions) * max(1, max_variants))
     if not queries:
         return {
             "queries": [],
             "model": clean_text(getattr(response, "model", "")) or selected_model,
             "error": "LLM query rewrite returned no usable queries",
-            "raw_response": raw_response[:1000],
+            "raw_response": raw_response_text[:1000],
         }
     return {
         "queries": dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
         "model": clean_text(getattr(response, "model", "")) or selected_model,
         "error": "",
-        "raw_response": raw_response[:1000],
+        "raw_response": raw_response_text[:1000],
     }
 
 
@@ -537,12 +548,30 @@ def format_sub_question_rewrite_items(questions: Sequence[str], tasks: Sequence[
 
 
 def parse_llm_retrieval_queries(raw_response: str) -> list[str]:
-    text = clean_markdown_fence(raw_response)
+    text = clean_query_generation_response(raw_response)
+    if generated_query_output_is_noise(text):
+        return []
     try:
         parsed = json.loads(json_payload(text))
     except (TypeError, ValueError):
         return fallback_json_like_queries(text) or fallback_line_queries(text)
     return extract_query_strings(parsed)
+
+
+def clean_query_generation_response(text: Any) -> str:
+    return strip_thinking_blocks(clean_markdown_fence(str(text or "")))
+
+
+def strip_thinking_blocks(text: Any) -> str:
+    value = str(text or "")
+    value = re.sub(r"(?is)<think>.*?</think>", " ", value)
+    open_think = re.search(r"(?is)<think>", value)
+    if open_think:
+        prefix = value[: open_think.start()]
+        tail = value[open_think.end() :]
+        payload = re.search(r"(\{.*\}|\[.*\])", tail, flags=re.DOTALL)
+        value = f"{prefix}\n{payload.group(1)}" if payload else prefix
+    return value.strip()
 
 
 def json_payload(text: str) -> str:
@@ -612,16 +641,46 @@ def valid_retrieval_queries(queries: Sequence[str], research_plan: dict[str, Any
 
 def is_valid_retrieval_query(query: str, allowed_terms: set[str]) -> bool:
     text = clean_text(query)
+    if not is_valid_generated_query(text, max_chars=420):
+        return False
+    if len(re.findall(r"\S+", text)) < 3:
+        return False
+    return True
+
+
+def is_valid_generated_query(query: str, max_chars: int = 600) -> bool:
+    text = clean_text(query)
     lowered = text.lower()
-    if not text:
+    if not text or len(text) > max_chars:
+        return False
+    if generated_query_output_is_noise(text):
         return False
     if re.fullmatch(r"(?:query|retrieval query|search query|example query)\s*\d*", lowered):
         return False
     if re.fullmatch(r"(?:query|retrieval|search|example)(?:\s+\d+)?", lowered):
         return False
-    if len(re.findall(r"\S+", text)) < 3:
+    if re.search(r"\b(?:query|retrieval query|search query|example query)\s*\d+\b", lowered):
         return False
     return True
+
+
+def generated_query_output_is_noise(text: Any) -> bool:
+    lowered = clean_text(text).lower()
+    if not lowered:
+        return False
+    noise_signals = (
+        "<think",
+        "</think",
+        "thinking process",
+        "analyze user input",
+        "research objective:",
+        "planner sub-questions",
+        "requirements:",
+        "output json",
+        "return json only",
+        "do not answer",
+    )
+    return any(signal in lowered for signal in noise_signals)
 
 
 def precision_retrieval_queries(
@@ -1469,6 +1528,7 @@ def synthesis_gap_retrieval_plan(
         fallback_queries=fallback_queries,
         llm_error=llm_result["error"],
         llm_raw_response=llm_result["raw_response"],
+        model=llm_result.get("model", ""),
     )
 
 
@@ -1478,6 +1538,7 @@ def gap_retrieval_plan(
     fallback_queries: Sequence[str],
     llm_error: str = "",
     llm_raw_response: str = "",
+    model: str = "",
 ) -> dict[str, Any]:
     llm_count = len(llm_queries)
     fallback_count = len(fallback_queries)
@@ -1493,7 +1554,7 @@ def gap_retrieval_plan(
         "queries": list(queries),
         "llm_queries": list(llm_queries),
         "fallback_queries": list(fallback_queries),
-        "model": DEFAULT_GAP_QUERY_MODEL,
+        "model": clean_text(model) or DEFAULT_GAP_QUERY_MODEL,
         "source": source,
         "llm_error": clean_text(llm_error),
         "llm_raw_response": clean_text(llm_raw_response)[:1000],
@@ -1547,15 +1608,16 @@ def llm_gap_retrieval_query_result(
 
     clean_gaps = dedupe_preserve_order(gaps)
     if not clean_gaps:
-        return llm_gap_query_result([], error="no_gap_items")
+        return llm_gap_query_result([], model=gap_query_model(model), error="no_gap_items")
     if not os.environ.get("GROQ_API_KEY"):
-        return llm_gap_query_result([], error="missing_groq_api_key")
+        return llm_gap_query_result([], model=gap_query_model(model), error="missing_groq_api_key")
 
     try:
         from groq import Groq
     except ImportError as error:
-        return llm_gap_query_result([], error=f"groq_import_error: {clean_text(error)}")
+        return llm_gap_query_result([], model=gap_query_model(model), error=f"groq_import_error: {clean_text(error)}")
 
+    selected_model = gap_query_model(model)
     prompt_gaps = clean_gaps[: max(1, max_queries)]
     gap_text = format_gap_items_for_query_prompt(prompt_gaps)
     source_hints = format_gap_query_source_hints(sources or [])
@@ -1589,7 +1651,7 @@ Requirements:
     try:
         response = create_chat_completion_with_retries(
             Groq(),
-            model=DEFAULT_GAP_QUERY_MODEL,
+            model=selected_model,
             temperature=0,
             max_tokens=500,
             messages=[
@@ -1602,25 +1664,27 @@ Requirements:
         )
         raw_response = clean_text(response.choices[0].message.content)
     except Exception as error:
-        return llm_gap_query_result([], error=f"groq_api_error: {type(error).__name__}: {clean_text(error)}")
+        return llm_gap_query_result([], model=selected_model, error=f"groq_api_error: {type(error).__name__}: {clean_text(error)}")
 
     if not raw_response:
-        return llm_gap_query_result([], error="empty_response")
+        return llm_gap_query_result([], model=selected_model, error="empty_response")
     queries = parse_gap_query_lines(raw_response, max_queries=max_queries)
     if len(prompt_gaps) > 1 and len(queries) <= 1:
-        return llm_gap_query_result([], error="insufficient_item_queries", raw_response=raw_response)
+        return llm_gap_query_result([], model=selected_model, error="insufficient_item_queries", raw_response=raw_response)
     if not queries:
-        return llm_gap_query_result([], error="parsed_empty_response", raw_response=raw_response)
-    return llm_gap_query_result(queries, raw_response=raw_response)
+        return llm_gap_query_result([], model=selected_model, error="parsed_empty_response", raw_response=raw_response)
+    return llm_gap_query_result(queries, model=selected_model, raw_response=raw_response)
 
 
 def llm_gap_query_result(
     queries: Sequence[str],
+    model: str = "",
     error: str = "",
     raw_response: str = "",
 ) -> dict[str, Any]:
     return {
         "queries": list(queries),
+        "model": clean_text(model),
         "error": clean_text(error),
         "raw_response": clean_text(raw_response)[:1000],
     }
@@ -1628,11 +1692,11 @@ def llm_gap_query_result(
 
 def parse_gap_query_lines(text: Any, max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES) -> list[str]:
     queries = []
-    for line in split_gap_query_response(text):
+    for line in split_gap_query_response(strip_thinking_blocks(text)):
         query = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
         query = re.sub(r"^G\d+\s*:\s*", "", query, flags=re.IGNORECASE).strip()
         query = clean_text(query.strip("\"'`"))
-        if query:
+        if is_valid_generated_query(query, max_chars=600):
             queries.append(query[:600])
     return dedupe_preserve_order(queries)[: max(1, max_queries)]
 
