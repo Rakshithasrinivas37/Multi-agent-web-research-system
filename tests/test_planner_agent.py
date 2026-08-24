@@ -6,6 +6,8 @@ from src.agents.planner_agent import (
     apply_authoritative_search_hints,
     build_sub_question_specs,
     clean_sub_questions,
+    is_disallowed_source_url,
+    validate_plan,
 )
 
 
@@ -94,6 +96,34 @@ class PlannerAgentTests(unittest.TestCase):
         self.assertIn("official", url)
         self.assertIn("docs", url)
         self.assertIn("api", url)
+
+    def test_video_and_social_sources_are_disallowed(self):
+        self.assertTrue(is_disallowed_source_url("https://www.youtube.com/watch?v=test"))
+        self.assertTrue(is_disallowed_source_url("https://youtu.be/test"))
+        self.assertFalse(is_disallowed_source_url("https://arxiv.org/abs/1706.03762"))
+
+    def test_validate_plan_rejects_disallowed_source_urls(self):
+        tasks = [
+            ResearchTask(
+                task_id="task_001",
+                query_context="Find primary evidence",
+                url="https://www.youtube.com/watch?v=test",
+                source_type="webpage",
+                priority=1,
+                extraction_goal="Extract evidence.",
+            ),
+            ResearchTask(
+                task_id="task_002",
+                query_context="Find official docs",
+                url="SEARCH:official docs",
+                source_type="search",
+                priority=2,
+                extraction_goal="Extract evidence.",
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "disallowed source URL"):
+            validate_plan(tasks, "knowledge_research", [], ["What is the evidence?"])
 
 
 if __name__ == "__main__":
