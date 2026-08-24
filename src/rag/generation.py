@@ -256,8 +256,16 @@ def synthesize_report_from_research_plan(
         max_context_chars=max_context_chars,
         max_tokens=max_tokens,
     )
-    gap_query_plan = synthesis_gap_retrieval_plan(
+    sub_question_specs = planner_sub_question_specs(research_plan)
+    initial_coverage = build_coverage_by_question(
         payload.get("synthesis"),
+        sub_question_specs,
+        payload.get("sources", []),
+        retrieved_context=synthesis_context,
+    )
+    gap_seed = "\n".join(coverage_gap_items(initial_coverage)) or payload.get("synthesis")
+    gap_query_plan = synthesis_gap_retrieval_plan(
+        gap_seed,
         objective=objective,
         synthesis_instruction=synthesis_instruction,
         sources=payload.get("sources", []),
@@ -347,11 +355,12 @@ def synthesize_report_from_research_plan(
         max_chars=retrieved_chunk_chars,
         cited_source_indexes=citation_audit.get("valid_referenced_source_indexes", []),
     )
-    payload["sub_question_specs"] = planner_sub_question_specs(research_plan)
+    payload["sub_question_specs"] = sub_question_specs
     payload["coverage_by_question"] = build_coverage_by_question(
         payload.get("synthesis"),
         payload["sub_question_specs"],
         payload.get("sources", []),
+        retrieved_context=synthesis_context,
     )
     payload["diagnostics"] = synthesis_diagnostics(payload, retrieved_context)
     if include_retrieved_chunks:
@@ -809,6 +818,7 @@ def build_coverage_by_question(
     synthesis: Any,
     sub_question_specs: Sequence[dict[str, Any]],
     sources: Sequence[dict[str, Any]],
+    retrieved_context: Sequence[RetrievalResult] | None = None,
 ) -> list[dict[str, Any]]:
     """Summarize synthesis coverage for each planner sub-question."""
 
@@ -819,18 +829,118 @@ def build_coverage_by_question(
         question = clean_text(spec.get("question")) if isinstance(spec, dict) else ""
         section = synthesis_section_for_question(synthesis_text, question)
         cited = [index for index in citation_markers(section) if index in source_index_set]
-        status = infer_synthesis_coverage_status(section)
+        context_matches = coverage_matches_for_question(question, retrieved_context or [], sources)
+        context_source_indexes = [item["source_index"] for item in context_matches if item.get("source_index") in source_index_set]
+        source_indexes_for_question = dedupe_ints([*cited, *context_source_indexes])
+        status = merge_coverage_status(
+            infer_synthesis_coverage_status(section),
+            infer_context_coverage_status(context_matches),
+        )
         coverage.append(
             {
                 "question_id": clean_text(spec.get("question_id")) if isinstance(spec, dict) else "",
                 "question": question,
                 "required_evidence": clean_string_list(spec.get("required_evidence")) if isinstance(spec, dict) else [],
                 "status": status,
-                "source_indexes": cited,
+                "source_indexes": source_indexes_for_question,
                 "has_citations": bool(cited),
+                "evidence_count": len(context_matches),
+                "missing_reason": coverage_missing_reason(status, context_matches, section),
             }
         )
     return coverage
+
+
+def coverage_matches_for_question(
+    question: str,
+    retrieved_context: Sequence[RetrievalResult],
+    sources: Sequence[dict[str, Any]],
+    limit: int = 4,
+) -> list[dict[str, Any]]:
+    question_terms = query_tokens(question)
+    if not question_terms:
+        return []
+
+    source_index_by_id = citation_index_by_chunk_id(sources)
+    matches = []
+    for result in retrieved_context:
+        text = retrieval_result_text(result)
+        result_terms = query_tokens(text)
+        if not result_terms:
+            continue
+        overlap_terms = sorted(question_terms & result_terms)
+        overlap_ratio = len(overlap_terms) / max(1, min(len(question_terms), len(result_terms)))
+        if len(overlap_terms) < 2 and overlap_ratio < 0.18:
+            continue
+        matches.append(
+            {
+                "source_index": source_index_by_id.get(result.id),
+                "overlap_ratio": round(overlap_ratio, 3),
+                "matched_terms": overlap_terms[:10],
+                "is_primary_source": is_primary_source(result.metadata if isinstance(result.metadata, dict) else {}),
+            }
+        )
+
+    return sorted(
+        matches,
+        key=lambda item: (
+            1 if item.get("source_index") is not None else 0,
+            item.get("overlap_ratio", 0.0),
+            1 if item.get("is_primary_source") else 0,
+        ),
+        reverse=True,
+    )[: max(1, limit)]
+
+
+def infer_context_coverage_status(matches: Sequence[dict[str, Any]]) -> str:
+    if not matches:
+        return "missing"
+    cited_matches = [item for item in matches if item.get("source_index") is not None]
+    strong_matches = [item for item in cited_matches if float(item.get("overlap_ratio") or 0.0) >= 0.30]
+    if strong_matches or len(cited_matches) >= 2:
+        return "covered"
+    return "partial"
+
+
+def merge_coverage_status(synthesis_status: str, context_status: str) -> str:
+    rank = {"missing": 0, "partial": 1, "covered": 2}
+    return synthesis_status if rank.get(synthesis_status, 0) >= rank.get(context_status, 0) else context_status
+
+
+def coverage_missing_reason(status: str, matches: Sequence[dict[str, Any]], section: str) -> str:
+    if status == "covered":
+        return ""
+    if not matches and not clean_text(section):
+        return "No retrieved context or synthesis prose matched this planner sub-question."
+    if matches and not any(item.get("source_index") is not None for item in matches):
+        return "Retrieved context matched the topic, but it was not included as a citable synthesis source."
+    if status == "partial":
+        return "Only partial retrieved or cited support was found for this planner sub-question."
+    return "The synthesis marked this item as missing or unsupported."
+
+
+def coverage_gap_items(coverage: Sequence[dict[str, Any]]) -> list[str]:
+    gaps = []
+    for item in coverage:
+        if not isinstance(item, dict) or item.get("status") == "covered":
+            continue
+        question = clean_text(item.get("question"))
+        required = " ".join(clean_string_list(item.get("required_evidence")))
+        reason = clean_text(item.get("missing_reason"))
+        if question:
+            gaps.append(clean_text(f"{question}. Required evidence: {required}. {reason}"))
+    return dedupe_preserve_order(gaps)
+
+
+def dedupe_ints(values: Sequence[Any]) -> list[int]:
+    result = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, int) or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def synthesis_section_for_question(synthesis: str, question: str) -> str:
@@ -1348,28 +1458,24 @@ Source priority guidance:
 Retrieved context from multiple sources:
 {context_text}
 
-Create a detailed report-agent-ready evidence package using only the retrieved context.
-Do not write the final report. Prepare rich notes that another agent can turn into a technical report.
+Create natural report-agent-ready synthesis notes using only the retrieved context.
+Do not write the final report. Prepare rich prose that another agent can turn into a detailed report.
 
 Return Markdown with these sections:
-1. Instruction Coverage Checklist
-   - For each instruction requirement, mark Covered, Partial, or Missing Evidence.
-   - Cite source markers for Covered/Partial items and name the exact missing facts for Missing Evidence items.
-2. Coverage Map
-   - For each planner sub-question, state whether the retrieved context has strong, partial, or missing evidence.
-3. Section Notes By Planner Question
-   - Repeat each planner sub-question as a subsection.
-   - Include the direct answer, important evidence, equations/formulas/API details when available, and gaps.
-   - Keep enough detail for a report agent to write a full section without needing to infer missing facts.
-4. Cross-Source Synthesis
-   - Connect repeated ideas across sources and identify how the sources complement each other.
-5. Technical Details To Preserve
-   - Preserve exact equations, definitions, model components, implementation details, and benchmark values only when present in the retrieved context.
-6. Conflicts Or Gaps
-   - List missing evidence, weak citations, source conflicts, or claims that need caution.
-7. Recommended Report Structure
-   - Suggest report sections and which source markers support each section.
-   - Include every Covered/Partial instruction requirement and explicit gap notes for Missing Evidence requirements.
+1. Synthesis Overview
+   Write concise paragraphs that explain the main findings and the shape of the evidence.
+2. Topic Coverage Narrative
+   Cover every planner sub-question in natural prose, but do not repeat every question as a heading.
+   Do not create evidence bullets under each planner question.
+   Mention equations, formulas, API details, benchmark values, comparisons, limitations, and examples only when they are present in the retrieved context.
+3. Cross-Source Synthesis
+   Connect repeated ideas across sources and explain how primary, official, and secondary sources complement each other.
+4. Details To Preserve
+   Preserve exact definitions, equations, model components, implementation details, benchmark values, dates, names, and source-specific facts only when present in the retrieved context.
+5. Conflicts Or Gaps
+   In short prose, identify missing evidence, weak citations, source conflicts, or claims that need caution.
+6. Recommended Report Flow
+   Suggest the report structure in prose and mention which source markers support major sections.
 
 Use only plain ASCII numbered source markers that appear in the retrieved context, exactly like [1], [2], [3].
 Every evidence-backed claim must include at least one source marker.
@@ -1381,7 +1487,7 @@ Do not compress important technical details into vague summaries.
 Do not use Markdown tables.
 Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inline.
 If a requested equation, number, API detail, or definition is not explicitly present in the retrieved context, mark it as missing evidence and tell the report agent not to add it.
-Before finishing, check the Instruction Coverage Checklist against the Recommended Report Structure so requested items are not silently dropped.
+Before finishing, check the planner sub-questions against the Recommended Report Flow so requested items are not silently dropped.
 Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
 
         try:
