@@ -7,6 +7,11 @@ from src.rag.generation import (
     audit_synthesis_citations,
     build_coverage_by_question,
     browser_signal_results,
+    high_signal_browser_snippets,
+    is_valid_retrieval_query,
+    llm_sub_question_retrieval_query_result,
+    parse_gap_query_lines,
+    parse_llm_retrieval_queries,
     planner_sub_question_specs,
     precision_retrieval_queries,
     print_synthesis_chunks,
@@ -136,6 +141,127 @@ Missing Evidence: exact benchmark values are not present.
         self.assertTrue(coverage[0]["has_citations"])
         self.assertEqual(coverage[1]["status"], "missing")
         self.assertFalse(coverage[1]["has_citations"])
+
+    def test_parse_llm_retrieval_queries_reads_json_queries_only(self):
+        raw = """```json
+{"items":[{"sub_question":"What is attention?","queries":["attention definition equation","attention examples"]}]}
+```"""
+
+        queries = parse_llm_retrieval_queries(raw)
+
+        self.assertEqual(queries, ["attention definition equation", "attention examples"])
+
+    def test_parse_llm_retrieval_queries_recovers_json_like_query_arrays(self):
+        raw = (
+            '{"items":[{"sub_question":"What is attention?",'
+            '"queries":["attention definition equation","attention benchmark evidence",]}]}'
+        )
+
+        queries = parse_llm_retrieval_queries(raw)
+
+        self.assertEqual(queries, ["attention definition equation", "attention benchmark evidence"])
+
+    def test_parse_llm_retrieval_queries_strips_thinking_blocks(self):
+        raw = (
+            "<think>Here is my reasoning. It should not become a query.</think>\n"
+            '{"items":[{"sub_question":"What is attention?",'
+            '"queries":["attention definition equation","attention api implementation"]}]}'
+        )
+
+        queries = parse_llm_retrieval_queries(raw)
+
+        self.assertEqual(queries, ["attention definition equation", "attention api implementation"])
+
+    def test_valid_retrieval_queries_filters_placeholders(self):
+        plan = {"objective": "Attention mechanism", "sub_questions": ["What is attention?"]}
+
+        queries = valid_retrieval_queries(["query 1", "query 2", "attention mechanism definition equation"], plan)
+
+        self.assertEqual(queries, ["attention mechanism definition equation"])
+
+    def test_valid_retrieval_queries_filters_reasoning_output(self):
+        plan = {"objective": "Attention mechanism", "sub_questions": ["What is attention?"]}
+
+        queries = valid_retrieval_queries(
+            [
+                "<think>Here's a thinking process: analyze user input and return JSON only.</think>",
+                "attention mechanism scaled dot product equation",
+            ],
+            plan,
+        )
+
+        self.assertEqual(queries, ["attention mechanism scaled dot product equation"])
+
+    def test_is_valid_retrieval_query_rejects_generic_outputs(self):
+        self.assertFalse(is_valid_retrieval_query("query 1", {"attention"}))
+        self.assertFalse(is_valid_retrieval_query("example query", {"attention"}))
+        self.assertTrue(is_valid_retrieval_query("attention mechanism definition equation", {"attention"}))
+        self.assertTrue(is_valid_retrieval_query("official implementation signature batched projections", {"attention"}))
+
+    def test_parse_gap_query_lines_rejects_reasoning_output(self):
+        raw = (
+            "<think>Analyze user input and plan query generation.</think>\n"
+            "G1: scaled dot product attention equation softmax sqrt dk"
+        )
+
+        queries = parse_gap_query_lines(raw)
+
+        self.assertEqual(queries, ["scaled dot product attention equation softmax sqrt dk"])
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_llm_sub_question_retrieval_query_result_defaults_to_qwen(self):
+        result = llm_sub_question_retrieval_query_result(
+            {"objective": "X research", "sub_questions": ["What is X?"]},
+        )
+
+        self.assertEqual(result["model"], "qwen/qwen3.6-27b")
+        self.assertEqual(result["error"], "GROQ_API_KEY is not set")
+
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)
+    @patch("src.rag.generation.create_chat_completion_with_retries")
+    def test_llm_sub_question_retrieval_query_result_uses_query_model(self, completion):
+        class Message:
+            content = '{"items":[{"sub_question":"What is X?","queries":["x research overview","x research evidence details"]}]}'
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "llama-test"
+
+        completion.return_value = Response()
+
+        result = llm_sub_question_retrieval_query_result(
+            {"objective": "X research", "sub_questions": ["What is X?"]},
+        )
+
+        self.assertEqual(result["queries"], ["x research overview", "x research evidence details"])
+        self.assertEqual(result["model"], "llama-test")
+        self.assertEqual(result["error"], "")
+        self.assertEqual(completion.call_args.kwargs["model"], "llama-test")
+
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)
+    @patch("src.rag.generation.create_chat_completion_with_retries")
+    def test_llm_sub_question_retrieval_query_result_rejects_placeholder_queries(self, completion):
+        class Message:
+            content = '{"items":[{"sub_question":"What is X?","queries":["query 1","query 2"]}]}'
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "llama-test"
+
+        completion.return_value = Response()
+
+        result = llm_sub_question_retrieval_query_result(
+            {"objective": "X research", "sub_questions": ["What is X?"]},
+        )
+
+        self.assertEqual(result["queries"], [])
+        self.assertEqual(result["error"], "LLM query rewrite returned no usable queries")
 
     def test_browser_signal_results_promotes_formula_evidence(self):
         browser_results = [
