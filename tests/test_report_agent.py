@@ -23,6 +23,7 @@ from src.agents.report_agent import (
     report_self_critique,
     report_sub_question_coverage_check,
     rewrite_missing_sub_question_queries,
+    sources_with_browser_results,
     slugify_filename,
     synthesis_coverage_gap_questions,
     unsupported_benchmark_metrics,
@@ -116,6 +117,26 @@ Supported [1]. Unsupported [9].
         )
 
         self.assertEqual([source["index"] for source in sources], [3, 1, 14])
+
+    def test_sources_with_browser_results_preserves_synthesis_indexes(self):
+        sources = [
+            {"index": 1, "url": "https://paper.example"},
+            {"index": 7, "url": "https://paper.example"},
+        ]
+        browser_results = [
+            {
+                "sources": [
+                    {"title": "Paper duplicate", "url": "https://paper.example"},
+                    {"title": "Docs", "url": "https://docs.example.com/api"},
+                ]
+            }
+        ]
+
+        merged = sources_with_browser_results(sources, browser_results)
+
+        self.assertEqual([source["index"] for source in merged], [1, 7, 8])
+        self.assertEqual(merged[1]["url"], "https://paper.example")
+        self.assertEqual(merged[2]["url"], "https://docs.example.com/api")
 
     def test_format_report_section_outline_uses_topic_headings(self):
         outline = format_report_section_outline(
