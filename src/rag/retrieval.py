@@ -799,7 +799,7 @@ def metadata_signal_score(query: str, metadata: Any) -> float:
         score += 0.03
     if metadata.get("has_formula_signal") and query_needs_formula_signal(query_text):
         score += 0.12
-    if metadata.get("has_api_signal") and re.search(r"\b(api|sdk|pytorch|tensorflow|torch\.|tf\.|keras\.)\b", query_text):
+    if metadata.get("has_api_signal") and re.search(r"\b(api|sdk|docs?|documentation|reference|implementation|code|usage|class|function)\b", query_text):
         score += 0.10
     if metadata.get("has_benchmark_signal") and re.search(r"\b(benchmark|score|accuracy|bleu|glue|imagenet|metric)\b", query_text):
         score += 0.10
@@ -1130,30 +1130,47 @@ def retrieval_results_to_langchain_documents(results: Sequence[RetrievalResult])
 
 
 def diversify_by_url(results: Sequence[RetrievalResult], top_k: int) -> list[RetrievalResult]:
-    """Prefer source diversity, then fill remaining slots by score."""
+    """Prefer source and planner-task diversity, then fill remaining slots by score."""
     top_k = max(1, top_k)
     selected = []
     selected_ids = set()
     seen_urls = set()
+    seen_contexts = set()
 
-    for result in results:
-        url = clean_text(result.metadata.get("url"))
-        if url and url in seen_urls:
-            continue
+    def choose(result: RetrievalResult) -> None:
         selected.append(result)
         selected_ids.add(result.id)
+        url = result_url_key(result)
+        context = result_context_key(result)
         if url:
             seen_urls.add(url)
-        if len(selected) >= top_k:
-            return selected
+        if context:
+            seen_contexts.add(context)
 
-    for result in results:
-        if result.id in selected_ids:
-            continue
-        selected.append(result)
-        if len(selected) >= top_k:
-            break
+    for require_new_url, require_new_context in ((True, True), (True, False), (False, True), (False, False)):
+        for result in results:
+            if result.id in selected_ids:
+                continue
+            url = result_url_key(result)
+            context = result_context_key(result)
+            if require_new_url and url and url in seen_urls:
+                continue
+            if require_new_context and context and context in seen_contexts:
+                continue
+            choose(result)
+            if len(selected) >= top_k:
+                return selected
     return selected
+
+
+def result_url_key(result: RetrievalResult) -> str:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return clean_text(metadata.get("url") or metadata.get("source_url")).lower()
+
+
+def result_context_key(result: RetrievalResult) -> str:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    return clean_text(metadata.get("task_ids") or metadata.get("query_contexts")).lower()
 
 
 def source_authority_score(metadata: Any) -> float:
@@ -1163,11 +1180,26 @@ def source_authority_score(metadata: Any) -> float:
     title = clean_text(metadata.get("title")).lower()
     source_type = clean_text(metadata.get("source_type")).lower()
     source_quality = clean_text(metadata.get("source_quality")).lower()
+    source_authority = clean_text(metadata.get("source_authority")).lower()
+    noise_score = to_float(metadata.get("content_noise_score"), 0.0)
+    weak_source = "weak" in source_quality
 
     score = 0.0
+    if "blocked" in source_quality:
+        return 0.0
+    if weak_source:
+        score = max(score, 0.10)
+    if "primary" in source_quality or source_authority == "primary":
+        score = max(score, 1.0)
+    if "official" in source_quality or source_authority == "official":
+        score = max(score, 0.90)
+    if "authoritative" in source_quality or source_authority == "authoritative":
+        score = max(score, 0.80)
     if source_type in {"arxiv", "pdf", "paper"} or "arxiv.org" in urls:
         score = max(score, 1.0)
-    if any(domain in urls for domain in ("nature.com", "ibm.com", ".edu", "docs.", "documentation")):
+    if source_type in {"docs", "pricing", "careers"}:
+        score = max(score, 0.90)
+    if any(domain in urls for domain in ("nature.com", ".gov", ".edu", "docs.", "documentation", "/api_docs")):
         score = max(score, 0.75)
     if source_type in {"webpage", "news"}:
         score = max(score, 0.45)
@@ -1177,6 +1209,10 @@ def source_authority_score(metadata: Any) -> float:
         score = max(score, 0.55 if score == 0 else score)
     if any(word in title for word in ("paper", "arxiv", "documentation", "docs")):
         score = max(score, 0.7)
+    if weak_source:
+        score = min(score, 0.20)
+    if noise_score >= 0.65:
+        score = min(score, 0.40)
     return min(1.0, max(0.0, score))
 
 

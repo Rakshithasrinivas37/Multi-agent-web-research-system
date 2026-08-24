@@ -4,7 +4,7 @@ from io import StringIO
 from unittest.mock import patch
 
 from src.rag import retrieval
-from src.rag.retrieval import RetrievalResult
+from src.rag.retrieval import RetrievalResult, diversify_by_url, source_authority_score
 
 
 class RetrievalParallelTests(unittest.TestCase):
@@ -142,9 +142,57 @@ class RetrievalParallelTests(unittest.TestCase):
 
         self.assertIs(loaded, client)
         self.assertEqual(calls[0]["device"], None)
-        self.assertEqual(calls[0]["model_kwargs"]["device_map"], {"": "cuda:0"})
+        self.assertEqual(calls[0]["automodel_args"]["device_map"], {"": "cuda:0"})
         self.assertEqual(calls[1]["device"], "cuda")
         self.assertEqual(calls[2]["device"], "cpu")
+
+    def test_source_authority_score_uses_browser_authority_metadata(self):
+        official = {
+            "url": "https://example.com/docs/api",
+            "source_quality": "useful_official",
+            "source_authority": "official",
+            "source_type": "docs",
+        }
+        weak = {
+            "url": "https://example-blog.com/post",
+            "source_quality": "weak",
+            "source_authority": "secondary",
+            "source_type": "webpage",
+        }
+
+        self.assertGreater(source_authority_score(official), source_authority_score(weak))
+
+    def test_diversify_by_url_prefers_new_task_contexts(self):
+        results = [
+            RetrievalResult(
+                id="a1",
+                document="topic a source one",
+                metadata={"url": "https://one.example/a", "query_contexts": "topic A"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="a2",
+                document="topic a source two",
+                metadata={"url": "https://two.example/a", "query_contexts": "topic A"},
+                score=0.95,
+                semantic_score=0.95,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="b1",
+                document="topic b source one",
+                metadata={"url": "https://one.example/b", "query_contexts": "topic B"},
+                score=0.90,
+                semantic_score=0.90,
+                bm25_score=0.0,
+            ),
+        ]
+
+        selected = diversify_by_url(results, top_k=2)
+
+        self.assertEqual([item.id for item in selected], ["a1", "b1"])
 
 
 if __name__ == "__main__":
