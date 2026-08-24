@@ -116,6 +116,7 @@ class BrowserAgent:
                 errors.append(f"Skipped invalid search result URL: {url}")
                 continue
 
+
             try:
                 page = await self.scrape_search_result(task, url)
             except Exception as error:
