@@ -18,11 +18,12 @@ DEFAULT_REPORT_MAX_TOKENS = 4000
 DEFAULT_REPORT_PROMPT_CHARS = 12000
 DEFAULT_REPORT_TOTAL_TOKEN_BUDGET = 10000
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
-DEFAULT_EVIDENCE_CHARS = 2800
-DEFAULT_SYNTHESIS_CHARS = 2400
-DEFAULT_EVIDENCE_PACK_CHARS = 2200
-DEFAULT_SOURCE_CHARS = 1800
-DEFAULT_CHUNK_CHARS = 650
+DEFAULT_EVIDENCE_CHARS = 3000
+DEFAULT_SYNTHESIS_CHARS = 1600
+DEFAULT_EVIDENCE_PACK_CHARS = 1000
+DEFAULT_COVERAGE_CHARS = 1200
+DEFAULT_SOURCE_CHARS = 1400
+DEFAULT_CHUNK_CHARS = 420
 
 REPORT_SYSTEM_PROMPT = (
     "You write concise, well-structured, cited reports from supplied evidence only. "
@@ -58,6 +59,8 @@ Evidence and citation rules:
 - Never state a number, date, name, or quote that does not appear in the supplied context.
 - If sources conflict, present both with citations.
 - End with ## References, listing only sources actually cited."""
+
+EVIDENCE_SNIPPET_SIGNALS = ["definition", "equation", "formula", "benchmark", "score", "result", "complexity", "api", "limitation", "challenge"]
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "be", "by", "can", "do", "does", "for", "from",
@@ -99,7 +102,9 @@ class ReportAgent:
         evidence_packs = report_context.get("evidence_packs", [])
         coverage_questions = dedupe_text([*planner_questions, *evidence_pack_questions(evidence_packs)])
         sources = sources_with_browser_results(report_context.get("sources", []), report_context.get("browser_results", []))
-        evidence = format_supporting_evidence(report_context)
+        evidence = format_supporting_evidence(report_context, sources=sources)
+        pack_text = format_evidence_packs(evidence_packs)
+        sources = evidence_backed_sources(sources, evidence, synthesis, pack_text)
         prompt = build_report_prompt(
             objective=objective,
             output_format=output_format,
@@ -124,7 +129,7 @@ class ReportAgent:
         synthesis_gaps = synthesis_coverage_gap_questions(report_context, coverage_questions)
         coverage = report_sub_question_coverage_check(report, coverage_questions)
         schema_issues = report_schema_issues(report, coverage_questions)
-        report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}")
+        report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}\n{pack_text}")
         review = report_self_critique(report_issues, coverage, schema_issues)
 
         return {
@@ -184,29 +189,31 @@ Citation policy:
 
 {REPORT_PROMPT_RULES}
 
+Write the final Markdown report from the evidence below. Explain each supported topic in clear prose before equations, tables, APIs, or technical details.
+
 Planner sub-questions to cover:
 {format_planner_questions(planner_questions)}
 
 Suggested topic headings:
 {format_report_section_outline(planner_questions)}
 
+Available sources:
+{compact_text(format_sources(sources), DEFAULT_SOURCE_CHARS)}
+
+Supporting evidence:
+{compact_text(evidence, DEFAULT_EVIDENCE_CHARS)}
+
+Synthesis notes:
+{compact_text(synthesis, DEFAULT_SYNTHESIS_CHARS)}
+
 Synthesis coverage by planner question:
-{format_question_coverage(coverage_by_question or [])}
+{compact_text(format_question_coverage(coverage_by_question or []), DEFAULT_COVERAGE_CHARS)}
 
 Evidence gaps from synthesis:
 {format_missing_evidence_constraints(synthesis)}
 
 Per-question evidence packs:
 {compact_text(format_evidence_packs(evidence_packs or []), DEFAULT_EVIDENCE_PACK_CHARS)}
-
-Available sources:
-{compact_text(format_sources(sources), DEFAULT_SOURCE_CHARS)}
-
-Synthesis notes:
-{compact_text(synthesis, DEFAULT_SYNTHESIS_CHARS)}
-
-Supporting evidence:
-{compact_text(evidence, DEFAULT_EVIDENCE_CHARS)}
 
 Write the final Markdown report. Explain each supported topic in clear prose before equations, tables, APIs, or technical details."""
     return trim_report_prompt(prompt)
@@ -241,7 +248,7 @@ def format_report_section_outline(questions: Sequence[str]) -> str:
     items = [clean_text(q) for q in questions if clean_text(q)]
     if not items:
         return "- Use clear sections that answer the objective."
-    return "\n".join(f"## {i}. {planner_question_heading(q)}\nCoverage target: {q}" for i, q in enumerate(items, 1))
+    return "\n".join(f"## {i}. {planner_question_heading(q)}" for i, q in enumerate(items, 1))
 
 
 def format_question_coverage(coverage_by_question: Sequence[dict[str, Any]]) -> str:
@@ -281,13 +288,13 @@ def format_evidence_packs(evidence_packs: Sequence[dict[str, Any]]) -> str:
         lines.append(f"- {coverage}: {question}")
         chunks = pack.get("chunks", [])
         chunks = chunks if isinstance(chunks, list) else []
-        for chunk in chunks[:4]:
+        for chunk in chunks[:1]:
             if not isinstance(chunk, dict):
                 continue
             source_index = chunk.get("source_index")
             marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
-            title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Evidence chunk"
-            content = clean_text(chunk.get("content"))[:360]
+            title = compact_text(clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Evidence chunk", 90)
+            content = sanitize_evidence_content(chunk.get("content"))[:220]
             if content:
                 lines.append(f"  - {marker} {title}: {content}")
     return "\n".join(lines) or "- No per-question evidence packs were provided."
@@ -311,29 +318,96 @@ def planner_question_heading(question: str) -> str:
     return " ".join(words)[:90].strip() or "Research Finding"
 
 
-def format_supporting_evidence(report_context: dict[str, Any], max_chars: int = DEFAULT_EVIDENCE_CHARS) -> str:
+def format_supporting_evidence(
+    report_context: dict[str, Any],
+    max_chars: int = DEFAULT_EVIDENCE_CHARS,
+    sources: Sequence[dict[str, Any]] | None = None,
+) -> str:
     chunks = list(report_context.get("supporting_chunks") or []) + list(report_context.get("retrieved_chunks") or [])
-    blocks: list[str] = []
+    blocks: list[dict[str, Any]] = []
     seen = set()
-    used = 0
-    for chunk in chunks:
-        if not isinstance(chunk, dict):
-            continue
-        source_index = chunk.get("source_index") if isinstance(chunk.get("source_index"), int) else chunk.get("index")
-        content = clean_text(chunk.get("content"))[:DEFAULT_CHUNK_CHARS]
+    source_index_by_url = {normalize_url(source.get("url")): source.get("index") for source in sources or [] if isinstance(source, dict)}
+    query_text = " ".join(clean_text(q) for q in report_context.get("planner_questions", []) if clean_text(q))
+    terms = list(detail_terms(query_text))[:20]
+
+    def add_block(source_index: Any, title: Any, url: Any, content: Any) -> None:
+        index = source_index if isinstance(source_index, int) else source_index_by_url.get(normalize_url(url))
+        content = sanitize_evidence_content(content)[:DEFAULT_CHUNK_CHARS]
         if not content:
-            continue
-        key = clean_text(f"{source_index}:{chunk.get('url')}:{content[:120]}").lower()
+            return
+        key = clean_text(f"{index}:{url}:{content[:120]}").lower()
         if key in seen:
-            continue
+            return
         seen.add(key)
-        marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
-        block = f"{marker} {clean_text(chunk.get('title')) or clean_text(chunk.get('url'))}\n{content}"
-        if used + len(block) > max_chars:
-            break
-        blocks.append(block)
-        used += len(block)
-    return "\n\n".join(blocks)
+        marker = f"[{index}]" if isinstance(index, int) else "[uncited]"
+        block = f"{marker} {clean_text(title) or clean_text(url)}\n{content}"
+        score = source_priority(url) * 20 + evidence_snippet_score(content, terms, EVIDENCE_SNIPPET_SIGNALS)
+        blocks.append({"source_index": index, "url": clean_text(url), "block": block, "score": score})
+
+    for chunk in chunks:
+        if isinstance(chunk, dict):
+            add_block(chunk.get("source_index") if isinstance(chunk.get("source_index"), int) else chunk.get("index"), chunk.get("title"), chunk.get("url"), chunk.get("content"))
+
+    for source in browser_result_sources(report_context.get("browser_results", [])):
+        url = source.get("url")
+        add_block(source_index_by_url.get(normalize_url(url)), source.get("title"), url, best_evidence_snippet(source, query_text))
+
+    return compact_evidence_blocks(blocks, max_chars)
+
+
+def browser_result_sources(browser_results: Sequence[Any]) -> list[dict[str, Any]]:
+    sources = []
+    for result in browser_results or []:
+        if not isinstance(result, dict):
+            continue
+        sources.extend(source for source in result.get("sources", []) or [] if isinstance(source, dict))
+    return sources
+
+
+def best_evidence_snippet(source: dict[str, Any], query_text: str) -> str:
+    content = clean_text(source.get("full_content") or source.get("content") or source.get("content_preview"))
+    if not content:
+        return ""
+    terms = list(detail_terms(query_text))[:20]
+    candidates = [0]
+    lowered = content.lower()
+    for term in [*terms, *EVIDENCE_SNIPPET_SIGNALS]:
+        location = lowered.find(term.lower())
+        if location >= 0:
+            candidates.append(location)
+    best = max(candidates, key=lambda pos: evidence_snippet_score(content[pos: pos + DEFAULT_CHUNK_CHARS], terms, EVIDENCE_SNIPPET_SIGNALS))
+    start = max(0, best - DEFAULT_CHUNK_CHARS // 4)
+    return clean_text(content[start: start + DEFAULT_CHUNK_CHARS])
+
+
+def evidence_snippet_score(snippet: str, terms: Sequence[str], signals: Sequence[str]) -> int:
+    lowered = snippet.lower()
+    return sum(1 for term in terms if term in lowered) + 2 * sum(1 for signal in signals if signal in lowered)
+
+
+def sanitize_evidence_content(text: Any) -> str:
+    """Remove paper-internal numeric citations so they cannot be mistaken for source markers."""
+
+    return clean_text(re.sub(r"\[\s*\d+(?:\s*,\s*\d+)*\s*\]", "", clean_text(text)))
+
+
+def compact_evidence_blocks(blocks: Sequence[dict[str, Any]], max_chars: int) -> str:
+    ordered = sorted(blocks, key=lambda item: (-int(item.get("score") or 0), len(clean_text(item.get("block")))))
+    selected, seen_sources, used = [], set(), 0
+    for pass_number in (1, 2):
+        for item in ordered:
+            source_key = item.get("source_index") or normalize_url(item.get("url"))
+            if pass_number == 1 and source_key in seen_sources:
+                continue
+            block = clean_text(item.get("block"))
+            if not block or block in selected:
+                continue
+            if used + len(block) > max_chars:
+                continue
+            selected.append(block)
+            seen_sources.add(source_key)
+            used += len(block)
+    return "\n\n".join(selected)
 
 
 def format_sources(sources: Sequence[dict[str, Any]]) -> str:
@@ -346,6 +420,23 @@ def format_sources(sources: Sequence[dict[str, Any]]) -> str:
         url = clean_text(source.get("url"))
         lines.append(f"[{index}] {title} - {url}")
     return "\n".join(lines) or "No sources provided."
+
+
+def evidence_backed_sources(sources: Sequence[dict[str, Any]], *evidence_texts: Any) -> list[dict[str, Any]]:
+    cited = set()
+    for text in evidence_texts:
+        cited.update(citation_markers(text))
+    if not cited:
+        return list(sources or [])
+    backed = [source for source in sources or [] if isinstance(source, dict) and source.get("index") in cited]
+    return backed or list(sources or [])
+
+
+def source_priority(url: Any) -> int:
+    value = clean_text(url).lower()
+    if any(signal in value for signal in ("arxiv.org", "openreview.net", "doi.org", "pytorch.org", "tensorflow.org", "docs.")) or ".edu" in value:
+        return 2
+    return 1 if value else 0
 
 
 def sources_with_browser_results(sources: Sequence[Any], browser_results: Sequence[Any]) -> list[dict[str, Any]]:
