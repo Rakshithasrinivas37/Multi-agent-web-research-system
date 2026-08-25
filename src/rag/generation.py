@@ -145,6 +145,33 @@ COVERAGE_EVIDENCE_TERMS = {
     "score",
     "scores",
 }
+QUERY_FILLER_TERMS = OBJECTIVE_STOPWORDS | {
+    "about",
+    "also",
+    "are",
+    "be",
+    "been",
+    "being",
+    "can",
+    "could",
+    "did",
+    "does",
+    "doing",
+    "eg",
+    "e.g",
+    "its",
+    "main",
+    "should",
+    "such",
+    "their",
+    "them",
+    "they",
+    "using",
+    "versus",
+    "was",
+    "were",
+    "would",
+}
 
 
 def rag_generation_model(model: str | None = None) -> str:
@@ -181,6 +208,13 @@ def clean_model_name(value: Any) -> str:
     """Normalize env-provided model names without changing valid ids."""
 
     return clean_text(value).strip("\"'“”‘’")
+
+
+def retrieve_full_collection_enabled() -> bool:
+    """Default RAG retrieval to the full Chroma collection, not one run scope."""
+
+    value = clean_text(os.environ.get("RAG_RETRIEVE_FULL_COLLECTION", "true")).lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def synthesize_report_from_research_plan(
@@ -235,6 +269,8 @@ def synthesize_report_from_research_plan(
         collection_name=collection_name,
     )
     allowed_history_keys = objective_scope["history_keys"]
+    retrieval_history_keys = [] if retrieve_full_collection_enabled() else allowed_history_keys
+    retrieval_scope = "full_collection" if not retrieval_history_keys else "objective_history_keys"
     llm_query_result = llm_sub_question_retrieval_query_result(
         research_plan=research_plan,
         model=model,
@@ -257,7 +293,7 @@ def synthesize_report_from_research_plan(
         per_query_k=per_query_k,
         semantic_k=semantic_k,
         bm25_k=bm25_k,
-        history_keys=allowed_history_keys,
+        history_keys=retrieval_history_keys,
         semantic_weight=semantic_weight,
         bm25_weight=bm25_weight,
         authority_weight=authority_weight,
@@ -278,7 +314,7 @@ def synthesize_report_from_research_plan(
             query=planner_context_query(research_plan, retrieval_queries),
             chroma_path=chroma_path,
             collection_name=collection_name,
-            history_keys=allowed_history_keys,
+            history_keys=retrieval_history_keys,
             top_k_per_url=max(source_url_k, 3),
             scan_limit=bm25_scan_limit,
         )
@@ -291,7 +327,7 @@ def synthesize_report_from_research_plan(
             retrieved_context=retrieved_context,
             chroma_path=chroma_path,
             collection_name=collection_name,
-            history_keys=allowed_history_keys,
+            history_keys=retrieval_history_keys,
             top_k_per_url=source_url_k,
             scan_limit=bm25_scan_limit,
         )
@@ -340,7 +376,7 @@ def synthesize_report_from_research_plan(
             per_query_k=DEFAULT_GAP_RETRIEVAL_PER_QUERY_K,
             semantic_k=semantic_k,
             bm25_k=max(bm25_k, DEFAULT_GAP_RETRIEVAL_TOP_K),
-            history_keys=allowed_history_keys,
+            history_keys=retrieval_history_keys,
             semantic_weight=semantic_weight,
             bm25_weight=bm25_weight,
             authority_weight=authority_weight,
@@ -393,6 +429,8 @@ def synthesize_report_from_research_plan(
     payload["gap_retry_count"] = gap_retry_count
     payload["history_key"] = current_history_key
     payload["allowed_history_keys"] = allowed_history_keys
+    payload["retrieval_history_keys"] = retrieval_history_keys
+    payload["retrieval_scope"] = retrieval_scope
     payload["objective_scope"] = objective_scope
     payload["planned_source_urls"] = planned_source_urls
     payload["question_source_urls"] = question_source_urls
@@ -528,13 +566,13 @@ def sub_question_retrieval_queries(
     if not question:
         return []
 
-    anchor = clean_text(f"{objective} {question}")
+    topic = retrieval_topic_phrase(f"{question} {task_details}", limit=14)
     key_terms = " ".join(query_keywords(f"{question} {task_details}", limit=12))
     hints = " ".join(broad_query_hints(f"{question} {task_details}"))
     variants = [
-        clean_text(f"{question} {task_details}"),
-        clean_text(f"{objective} {key_terms} overview background concepts methods evidence"),
-        clean_text(f"{anchor} {key_terms} {hints} source context examples"),
+        clean_text(f"{topic} {hints}"),
+        clean_text(f"{objective} {topic} overview background concepts methods evidence"),
+        clean_text(f"{topic} {key_terms} {hints} source context examples"),
     ]
     return dedupe_preserve_order(variant[:700] for variant in variants)[: max(1, max_variants)]
 
@@ -896,10 +934,17 @@ def query_keywords(text: str, limit: int = 10) -> list[str]:
     keywords = []
     for token in re.findall(r"[A-Za-z0-9_+#.-]+", clean_text(text)):
         lowered = token.lower().strip(".")
-        if len(lowered) <= 2 or lowered in OBJECTIVE_STOPWORDS:
+        if len(lowered) <= 2 or lowered in QUERY_FILLER_TERMS:
             continue
         keywords.append(token.strip(".,;:()[]{}"))
     return dedupe_preserve_order(keywords)[: max(1, limit)]
+
+
+def retrieval_topic_phrase(text: str, limit: int = 14) -> str:
+    normalized = clean_text(text).replace("‑", "-").replace("–", "-").replace("—", "-")
+    normalized = re.sub(r"(?i)\b(?:what|how|why|when|where|which)\s+(?:is|are|does|do|did|can|should)?\b", " ", normalized)
+    normalized = re.sub(r"(?i)\b(?:as|e\.g\.|eg)\b", " ", normalized)
+    return " ".join(query_keywords(normalized, limit=limit))
 
 
 def broad_query_hints(text: str) -> list[str]:
@@ -2741,6 +2786,7 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
     sources = payload.get("sources", [])
     supporting_chunks = payload.get("supporting_chunks", [])
     allowed_history_keys = payload.get("allowed_history_keys", [])
+    retrieval_history_keys = payload.get("retrieval_history_keys", [])
     objective_scope = payload.get("objective_scope", {})
     primary_source_count = sum(
         1 for result in retrieved_context
@@ -2769,6 +2815,8 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "gap_retrieved_count": payload.get("gap_retrieved_count", 0),
         "gap_new_chunk_count": payload.get("gap_new_chunk_count", 0),
         "gap_retry_count": payload.get("gap_retry_count", 0),
+        "retrieval_scope": payload.get("retrieval_scope", ""),
+        "retrieval_history_key_count": len(retrieval_history_keys) if isinstance(retrieval_history_keys, list) else 0,
         "allowed_history_key_count": len(allowed_history_keys) if isinstance(allowed_history_keys, list) else 0,
         "similar_previous_objective_count": max(
             0,
