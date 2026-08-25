@@ -25,6 +25,8 @@ from src.rag.generation import (
     print_synthesis_chunks,
     planner_tasks_to_rag_queries,
     report_supporting_chunks,
+    retrieve_full_collection_enabled,
+    retrieval_topic_phrase,
     select_synthesis_context,
     sub_question_retrieval_queries,
     valid_retrieval_queries,
@@ -409,7 +411,26 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("overview", joined)
         self.assertIn("benchmark", joined)
         self.assertIn("metrics", joined)
+        self.assertFalse(any(query.lower().startswith("what ") for query in queries))
         self.assertNotIn("source-backed details examples definitions equations metrics implementation limitations", joined)
+
+    def test_retrieval_topic_phrase_removes_question_filler(self):
+        phrase = retrieval_topic_phrase(
+            "What recent efficient-attention architectures (e.g., Linformer, Performer, Longformer) "
+            "propose and how do they trade off performance vs. cost?"
+        )
+
+        self.assertIn("Linformer", phrase)
+        self.assertIn("Performer", phrase)
+        self.assertIn("Longformer", phrase)
+        self.assertNotIn("What", phrase)
+        self.assertNotIn("they", phrase.lower().split())
+
+    def test_retrieve_full_collection_enabled_by_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertTrue(retrieve_full_collection_enabled())
+        with patch.dict("os.environ", {"RAG_RETRIEVE_FULL_COLLECTION": "false"}):
+            self.assertFalse(retrieve_full_collection_enabled())
 
     def test_broad_query_hints_adds_relevant_intents(self):
         hints = broad_query_hints("official API benchmark comparison with complexity limitations")
@@ -452,6 +473,8 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("computer vision", joined)
         self.assertIn("linformer", joined)
         self.assertIn("performer", joined)
+        self.assertNotIn("what are", joined)
+        self.assertNotIn("are major", joined)
         self.assertLessEqual(len(queries), 6)
 
     def test_parse_gap_query_lines_rejects_reasoning_output(self):
