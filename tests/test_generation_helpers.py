@@ -13,6 +13,7 @@ from src.rag.generation import (
     compact_retrieved_chunks,
     complete_sub_question_query_coverage,
     coverage_gap_items,
+    evidence_focused_question_query,
     fallback_gap_retrieval_queries,
     high_signal_browser_snippets,
     is_valid_retrieval_query,
@@ -27,6 +28,7 @@ from src.rag.generation import (
     report_supporting_chunks,
     retrieve_full_collection_enabled,
     retrieval_topic_phrase,
+    result_supports_question,
     select_synthesis_context,
     sub_question_retrieval_queries,
     valid_retrieval_queries,
@@ -150,6 +152,31 @@ class GenerationHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(packs[0]["chunks"][0]["source_index"], 2)
+
+    def test_evidence_pack_does_not_mark_wrong_evidence_type_covered(self):
+        results = [
+            RetrievalResult(
+                id="luong-benchmark",
+                document="Luong attention reports WMT BLEU gains and benchmark results from translation experiments. " * 3,
+                metadata={"title": "Luong paper", "url": "https://arxiv.org/pdf/1508.04025", "source_type": "arxiv"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 1, "id": "luong-benchmark", "url": "https://arxiv.org/pdf/1508.04025"}]
+
+        packs = build_sub_question_evidence_packs(
+            ["How does multiplicative attention work, including its equations?"],
+            results,
+            sources,
+            question_source_urls={
+                "How does multiplicative attention work, including its equations?": ["https://arxiv.org/pdf/1508.04025"]
+            },
+        )
+
+        self.assertEqual(packs[0]["coverage"], "partial")
+        self.assertEqual(packs[0]["chunks"][0]["source_index"], 1)
 
     def test_planner_question_source_urls_maps_task_context_ids(self):
         plan = {
@@ -431,6 +458,35 @@ Missing Evidence: exact benchmark values are not present.
             self.assertTrue(retrieve_full_collection_enabled())
         with patch.dict("os.environ", {"RAG_RETRIEVE_FULL_COLLECTION": "false"}):
             self.assertFalse(retrieve_full_collection_enabled())
+
+    def test_result_supports_question_requires_requested_evidence_type(self):
+        question = "How does multiplicative attention work, including its equations?"
+        benchmark_only = RetrievalResult(
+            id="benchmark",
+            document="Luong attention improves WMT BLEU benchmark results from translation experiments. " * 2,
+            metadata={"title": "Luong paper", "url": "https://arxiv.org/pdf/1508.04025", "source_type": "arxiv"},
+            score=1.0,
+            semantic_score=1.0,
+            bm25_score=0.0,
+        )
+        equation_chunk = RetrievalResult(
+            id="equation",
+            document="Multiplicative attention uses a score function with a dot product equation h_t^T W h_s = value.",
+            metadata={"title": "Luong paper", "url": "https://arxiv.org/pdf/1508.04025", "source_type": "arxiv"},
+            score=1.0,
+            semantic_score=1.0,
+            bm25_score=0.0,
+        )
+
+        self.assertFalse(result_supports_question(question, benchmark_only))
+        self.assertTrue(result_supports_question(question, equation_chunk))
+
+    def test_evidence_focused_question_query_adds_evidence_hints(self):
+        query = evidence_focused_question_query("How does multiplicative attention work, including its equations?")
+
+        self.assertIn("equation", query.lower())
+        self.assertIn("score function", query.lower())
+        self.assertIn("dot product", query.lower())
 
     def test_broad_query_hints_adds_relevant_intents(self):
         hints = broad_query_hints("official API benchmark comparison with complexity limitations")
