@@ -11,6 +11,7 @@ from src.rag.generation import (
     build_generation_context,
     browser_signal_results,
     compact_retrieved_chunks,
+    complete_sub_question_query_coverage,
     coverage_gap_items,
     fallback_gap_retrieval_queries,
     high_signal_browser_snippets,
@@ -431,6 +432,27 @@ Missing Evidence: exact benchmark values are not present.
         self.assertLess(len(queries[0]), 220)
         self.assertNotIn("Missing Evidence", queries[0])
         self.assertIn("benchmark", queries[0].lower())
+
+    def test_complete_sub_question_query_coverage_backfills_skipped_topics(self):
+        plan = {
+            "objective": "Attention mechanism",
+            "sub_questions": [
+                "What are major applications and benchmark results of attention mechanisms in NLP and computer vision?",
+                "What are known limitations of attention mechanisms and recent efficient attention approaches such as Linformer and Performer?",
+            ],
+        }
+
+        queries = complete_sub_question_query_coverage(
+            ["attention mechanism definition", "attention mechanism equation"],
+            plan,
+        )
+        joined = " ".join(queries).lower()
+
+        self.assertIn("nlp", joined)
+        self.assertIn("computer vision", joined)
+        self.assertIn("linformer", joined)
+        self.assertIn("performer", joined)
+        self.assertLessEqual(len(queries), 6)
 
     def test_parse_gap_query_lines_rejects_reasoning_output(self):
         raw = (
