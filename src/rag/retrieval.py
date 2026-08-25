@@ -1360,7 +1360,7 @@ def normalize_source_url(value: Any) -> str:
 def canonical_source_url(url: str) -> str:
     parsed = urlparse(url)
     path = parsed.path.rstrip("/")
-    match = re.match(r"^/(abs|pdf)/([0-9]{4}\.[0-9]{4,5})(?:v\d+)?(?:\.pdf)?$", path)
+    match = re.match(r"^/(abs|pdf|html)/([0-9]{4}\.[0-9]{4,5})(?:v\d+)?(?:\.pdf)?$", path)
     if parsed.netloc.lower() == "arxiv.org" and match:
         return f"{parsed.scheme}://arxiv.org/pdf/{match.group(2)}"
     return url
