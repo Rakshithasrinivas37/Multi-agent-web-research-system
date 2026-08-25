@@ -1,6 +1,7 @@
 import unittest
 
 from src.agents.report_agent import (
+    DEFAULT_REPORT_PROMPT_CHARS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     clean_markdown,
     build_report_prompt,
@@ -26,6 +27,7 @@ from src.agents.report_agent import (
     sources_with_browser_results,
     slugify_filename,
     synthesis_coverage_gap_questions,
+    trim_report_prompt,
     unsupported_benchmark_metrics,
 )
 
@@ -206,6 +208,35 @@ Supported [1]. Unsupported [9].
         self.assertIn("Per-question evidence packs", prompt)
         self.assertIn("covered: How is the API used?", prompt)
         self.assertIn("Covered packs must be explained", prompt)
+
+    def test_build_report_prompt_keeps_rules_inside_prompt_budget(self):
+        prompt = build_report_prompt(
+            objective="Large research topic",
+            output_format="report",
+            planner_questions=["What evidence should be covered?"],
+            synthesis="Synthesis sentence. " * 1000,
+            evidence="[1] Evidence sentence. " * 1000,
+            sources=[{"index": 1, "url": "https://example.com"}],
+            evidence_packs=[
+                {
+                    "question": "What evidence should be covered?",
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "title": "Source", "content": "Useful evidence. " * 200}],
+                }
+            ],
+        )
+
+        self.assertLessEqual(len(prompt), DEFAULT_REPORT_PROMPT_CHARS)
+        self.assertIn("Grounding requirement (strict - read this first)", prompt)
+        self.assertLess(prompt.index("Grounding requirement"), prompt.index("Per-question evidence packs"))
+
+    def test_trim_report_prompt_limits_prompt_size(self):
+        prompt = "Rules first.\n\n" + ("long evidence " * 2000)
+
+        trimmed = trim_report_prompt(prompt, max_chars=1000)
+
+        self.assertLessEqual(len(trimmed), 1000)
+        self.assertTrue(trimmed.startswith("Rules first."))
 
     def test_format_question_coverage_lists_status_and_sources(self):
         coverage = format_question_coverage([

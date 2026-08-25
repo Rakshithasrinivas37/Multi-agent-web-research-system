@@ -18,9 +18,46 @@ DEFAULT_REPORT_MAX_TOKENS = 4000
 DEFAULT_REPORT_PROMPT_CHARS = 12000
 DEFAULT_REPORT_TOTAL_TOKEN_BUDGET = 10000
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
-DEFAULT_EVIDENCE_CHARS = 5200
-DEFAULT_SYNTHESIS_CHARS = 3400
-DEFAULT_CHUNK_CHARS = 900
+DEFAULT_EVIDENCE_CHARS = 2800
+DEFAULT_SYNTHESIS_CHARS = 2400
+DEFAULT_EVIDENCE_PACK_CHARS = 2200
+DEFAULT_SOURCE_CHARS = 1800
+DEFAULT_CHUNK_CHARS = 650
+
+REPORT_SYSTEM_PROMPT = (
+    "You write concise, well-structured, cited reports from supplied evidence only. "
+    "Do not use outside knowledge. If evidence is missing, state the gap instead of answering from memory."
+)
+
+REPORT_PROMPT_RULES = """Grounding requirement (strict - read this first):
+- Use ONLY the supplied sources, evidence packs, supporting evidence, and synthesis notes.
+- Do not use any fact, figure, date, name, definition, or background knowledge from your own training.
+- If retrieved context is silent on a topic, state the gap instead of filling it from general knowledge.
+- If a sentence has no source support, delete it or make it an explicit limitation.
+
+Required report schema:
+1. Executive Summary
+2. Introduction and Context
+3. One main section per planner sub-question topic, in order
+4. Cross-cutting Analysis and Synthesis
+5. Limitations and Open Questions
+6. Conclusion
+7. References
+
+Coverage requirement (mandatory):
+- Every planner sub-question must map to exactly one topic section under heading 3.
+- Treat synthesis coverage as the coverage contract. If a question is marked missing, write a short evidence-gap subsection instead of inventing an answer.
+- Treat per-question evidence packs as the strongest topic-by-topic evidence map. Covered packs must be explained in the matching section; partial packs must include caveats.
+- For missing coverage items, do not include formulas, API names, benchmark values, examples, or detailed explanations.
+- Each topic section must directly answer its sub-question using only retrieved context.
+- For questions asking for a definition, equation, components, complexity, API, or benchmark metric, include a clearly labeled "Core equation", "Core formula", "API", or "Metric evidence" line only when that detail appears in evidence.
+- When multiple equivalent equations appear in evidence, show the most general/source-backed equation first.
+
+Evidence and citation rules:
+- Cite every factual claim inline with a real available source marker like [1].
+- Never state a number, date, name, or quote that does not appear in the supplied context.
+- If sources conflict, present both with citations.
+- End with ## References, listing only sources actually cited."""
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "be", "by", "can", "do", "does", "for", "from",
@@ -136,7 +173,7 @@ def build_report_prompt(
     coverage_by_question: Sequence[dict[str, Any]] | None = None,
     evidence_packs: Sequence[dict[str, Any]] | None = None,
 ) -> str:
-    return f"""Research objective:
+    prompt = f"""Research objective:
 {objective}
 
 Requested output format:
@@ -145,14 +182,7 @@ Requested output format:
 Citation policy:
 {citation_policy or "Use only numbered source markers from the available sources."}
 
-Required report schema (use these exact headings, in this order):
-1. Executive Summary
-2. Introduction and Context
-3. One main section per planner sub-question topic, in order
-4. Cross-cutting Analysis and Synthesis
-5. Limitations and Open Questions
-6. Conclusion
-7. References
+{REPORT_PROMPT_RULES}
 
 Planner sub-questions to cover:
 {format_planner_questions(planner_questions)}
@@ -163,70 +193,36 @@ Suggested topic headings:
 Synthesis coverage by planner question:
 {format_question_coverage(coverage_by_question or [])}
 
+Evidence gaps from synthesis:
+{format_missing_evidence_constraints(synthesis)}
+
 Per-question evidence packs:
-{format_evidence_packs(evidence_packs or [])}
+{compact_text(format_evidence_packs(evidence_packs or []), DEFAULT_EVIDENCE_PACK_CHARS)}
 
 Available sources:
-{format_sources(sources)}
-
-Supporting evidence:
-{compact_text(evidence, DEFAULT_EVIDENCE_CHARS)}
+{compact_text(format_sources(sources), DEFAULT_SOURCE_CHARS)}
 
 Synthesis notes:
 {compact_text(synthesis, DEFAULT_SYNTHESIS_CHARS)}
 
-Write the final Markdown report.
+Supporting evidence:
+{compact_text(evidence, DEFAULT_EVIDENCE_CHARS)}
 
-Grounding requirement (strict — read this first):
-- Use ONLY the information in "Available sources," "Supporting evidence," and "Synthesis notes" above. Treat this as the complete and only knowledge you have access to.
-- Do not use any fact, figure, date, name, definition, or background knowledge from your own training. Even facts you are confident are true must not be included unless they appear in the retrieved context above.
-- If the retrieved context is silent on something a sub-question asks about, do not fill the gap from general knowledge. State the gap explicitly in that section and in Limitations/Open Questions instead.
-- Do not include "outside evidence scope" explanations. A gap statement is enough when evidence is missing.
-- If you find yourself writing a sentence with no source to cite for it, delete the sentence or move it to Limitations/Open Questions as a stated gap — do not soften it into an uncited claim.
+Write the final Markdown report. Explain each supported topic in clear prose before equations, tables, APIs, or technical details."""
+    return trim_report_prompt(prompt)
 
-Coverage requirement (mandatory):
-- Every planner sub-question above must map to exactly one section under heading 3, using the suggested topic heading or a clearer equivalent.
-- Treat "Synthesis coverage by planner question" as the coverage contract. If a question is marked missing, write a short evidence-gap subsection instead of inventing an answer. If it is partial, clearly separate supported findings from missing details.
-- Treat "Per-question evidence packs" as the strongest topic-by-topic evidence map. Covered packs must be explained in the matching section, partial packs must include caveats, and missing packs must be handled only as evidence gaps.
-- For missing coverage items, do not include formulas, API names, benchmark values, examples, or detailed explanations for that topic. Write only what evidence is missing and why the report cannot answer it from the supplied context.
-- For each topic section, prefer the source indexes listed in its coverage item. Do not use citations outside that item unless the supporting evidence directly backs the claim.
-- Each of those sections must explicitly answer its sub-question using only the retrieved context — not just mention the topic. If the evidence only partially answers a sub-question, answer what is supported and name the missing piece in that section AND in Limitations/Open Questions.
-- For any sub-question asking for a definition, formulation, equation, components, complexity, API signature, or benchmark metric, include a clearly labeled "Core equation", "Core formula", "API", or "Metric evidence" line when that detail appears in the evidence. Do not hide the main formula in prose.
-- When multiple equivalent equations appear in the evidence, show the most general/source-backed equation first, then explain its components.
-- Do not merge two sub-questions into one section unless they are genuinely the same question asked two ways — if you do this, say so explicitly.
-- Do not add sections that don't map to a sub-question, except the fixed schema sections above.
-
-Evidence and citation rules:
-- Every factual claim must trace to a source in "Available sources." Cite inline using [n] immediately after the claim, not bundled at the end of a paragraph.
-- Never state a number, date, name, or quote that does not appear in the evidence or synthesis notes.
-- If two sources conflict, present both and cite both — do not silently pick one.
-- Do not cite a source for a claim it doesn't actually support.
-
-Writing rules:
-- Explain each topic in plain prose before any equations, tables, or technical detail.
-- Write for a reader who has not seen the sub-questions — sections should read as a coherent report, not as Q&A pairs.
-- Keep the Cross-cutting Analysis section genuinely cross-cutting: identify tensions, agreements, or patterns across sections rather than repeating section content.
-
-Before writing References, run this self-check silently and correct any failures before output — do not show this checklist in the final report:
-- [ ] Every claim in the report can be traced to a specific line in the retrieved context — none came from outside knowledge
-- [ ] Every planner sub-question has a matching section that directly answers it using only retrieved context
-- [ ] Every claim has an inline citation to a real, relevant source
-- [ ] No invented facts, figures, or attributions
-- [ ] Every evidence gap is named specifically (not "some information was missing" — state exactly what is missing and for which sub-question)
-- [ ] Executive Summary accurately reflects the sections below it, including any major limitations
-
-End with ## References, listing only sources actually cited in the report, numbered to match inline markers."""
 
 def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, str]:
     print(f"Generating single report with model {model}...")
+    prompt = trim_report_prompt(prompt)
     response = create_chat_completion_with_retries(
         client,
         model=model,
         temperature=0,
         max_tokens=DEFAULT_REPORT_MAX_TOKENS,
         messages=[
-            {"role": "system", "content": "You write concise, well-structured, cited technical reports from provided evidence only."},
-            {"role": "user", "content": prompt[:DEFAULT_REPORT_PROMPT_CHARS]},
+            {"role": "system", "content": REPORT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
         ],
     )
     return normalize_citation_markers(response.choices[0].message.content), clean_text(getattr(response, "model", "")) or model
@@ -771,6 +767,14 @@ def strip_markdown(text: Any) -> str:
 def compact_text(value: Any, max_chars: int) -> str:
     text = clean_markdown(value)
     return text if len(text) <= max_chars else text[:max_chars].rstrip()
+
+
+def trim_report_prompt(prompt: Any, max_chars: int = DEFAULT_REPORT_PROMPT_CHARS) -> str:
+    text = clean_markdown(prompt)
+    if len(text) <= max_chars:
+        return text
+    trimmed = text[:max_chars].rstrip()
+    return trimmed.rsplit("\n\n", 1)[0].rstrip() if "\n\n" in trimmed else trimmed
 
 
 def dedupe_text(items: Sequence[str]) -> list[str]:
