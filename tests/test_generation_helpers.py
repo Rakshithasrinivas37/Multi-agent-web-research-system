@@ -577,6 +577,9 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(completion.call_args.kwargs["model"], "llama-test")
         prompt = completion.call_args.kwargs["messages"][1]["content"]
         self.assertIn("broad, high-recall RAG retrieval queries", prompt)
+        self.assertIn("concept/context query", prompt)
+        self.assertIn("Do not output only narrow labels", prompt)
+        self.assertIn("source/section query", prompt)
         self.assertNotIn('"query 1"', prompt)
 
     @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)

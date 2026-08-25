@@ -616,11 +616,14 @@ Planner sub-questions and optional task details:
 
 Rewrite each planner sub-question into 2-3 broad, high-recall RAG retrieval queries.
 Requirements:
-- Preserve named entities, URLs, model names, datasets, metrics, APIs, equations, and important technical terms.
-- Make each query broad enough to retrieve surrounding source chunks, not just exact phrase matches.
-- Prefer short noun phrases over full questions: one concept query, one evidence/detail query, and one source/implementation/benchmark query only when useful.
-- Include evidence intent words when useful, such as definition, equation, benchmark, implementation, limitation, comparison, or example.
-- Include aliases or related terms from the planner/task details when they improve recall.
+- For each sub-question, create complementary queries: a broad concept/context query, an evidence/detail query, and a source/section query when source details exist.
+- Do not output only narrow labels like "entity + equation"; include surrounding vocabulary that may appear near the answer in papers, docs, reports, or extracted web text.
+- Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, aliases, and important technical terms from the planner/task details.
+- For equation/formula questions, include nearby evidence terms such as equation, formula, derivation, score function, alignment, matrix, variables, components, or operation names when relevant.
+- For benchmark questions, include dataset names, metrics, result table, scores, comparison, performance, and evaluation terms when relevant.
+- For API/implementation questions, include official documentation, class/function names, signature, parameters, usage, and example terms when relevant.
+- For limitation/complexity questions, include complexity, memory, runtime, scaling, tradeoffs, bottleneck, sparse, efficient, or alternatives when relevant.
+- Prefer compact noun phrases of 6-18 words over full questions.
 - Do not answer the question and do not add citations.
 - Do not include reasoning, <think> text, or explanations.
 - Never output placeholder labels or generic query names.
@@ -636,7 +639,11 @@ Requirements:
             messages=[
                 {
                     "role": "system",
-                    "content": "You rewrite research planner sub-questions into high-recall RAG retrieval queries. Return JSON only.",
+                    "content": (
+                        "You rewrite planner sub-questions into broad, complementary RAG retrieval "
+                        "queries that maximize recall across papers, docs, reports, and web extracts. "
+                        "Return JSON only."
+                    ),
                 },
                 {"role": "user", "content": prompt[:6000]},
             ],
