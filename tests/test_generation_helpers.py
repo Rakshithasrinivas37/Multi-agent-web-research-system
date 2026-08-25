@@ -5,12 +5,14 @@ from unittest.mock import patch
 
 from src.rag.generation import (
     audit_synthesis_citations,
+    broad_query_hints,
     build_sub_question_evidence_packs,
     build_coverage_by_question,
     build_generation_context,
     browser_signal_results,
     compact_retrieved_chunks,
     coverage_gap_items,
+    fallback_gap_retrieval_queries,
     high_signal_browser_snippets,
     is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
@@ -396,6 +398,40 @@ Missing Evidence: exact benchmark values are not present.
         self.assertTrue(is_valid_retrieval_query("attention mechanism definition equation", {"attention"}))
         self.assertTrue(is_valid_retrieval_query("official implementation signature batched projections", {"attention"}))
 
+    def test_sub_question_retrieval_queries_are_broad(self):
+        queries = sub_question_retrieval_queries(
+            "What benchmark results compare model performance?",
+            objective="Model architecture",
+        )
+        joined = " ".join(queries).lower()
+
+        self.assertIn("overview", joined)
+        self.assertIn("benchmark", joined)
+        self.assertIn("metrics", joined)
+        self.assertNotIn("source-backed details examples definitions equations metrics implementation limitations", joined)
+
+    def test_broad_query_hints_adds_relevant_intents(self):
+        hints = broad_query_hints("official API benchmark comparison with complexity limitations")
+
+        self.assertIn("api", hints)
+        self.assertIn("benchmark", hints)
+        self.assertIn("comparison", hints)
+        self.assertIn("complexity", hints)
+
+    def test_fallback_gap_queries_do_not_copy_long_gap_text(self):
+        queries = fallback_gap_retrieval_queries(
+            [
+                "Missing Evidence: the report lacks exact implementation details, benchmark numbers, "
+                "and full background explanation that should not be copied verbatim into retrieval queries."
+            ],
+            objective="Research topic",
+        )
+
+        self.assertEqual(len(queries), 1)
+        self.assertLess(len(queries[0]), 220)
+        self.assertNotIn("Missing Evidence", queries[0])
+        self.assertIn("benchmark", queries[0].lower())
+
     def test_parse_gap_query_lines_rejects_reasoning_output(self):
         raw = (
             "<think>Analyze user input and plan query generation.</think>\n"
@@ -438,6 +474,9 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(result["model"], "llama-test")
         self.assertEqual(result["error"], "")
         self.assertEqual(completion.call_args.kwargs["model"], "llama-test")
+        prompt = completion.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("broad, high-recall RAG retrieval queries", prompt)
+        self.assertNotIn('"query 1"', prompt)
 
     @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)
     @patch("src.rag.generation.create_chat_completion_with_retries")
