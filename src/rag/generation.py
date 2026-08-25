@@ -575,7 +575,7 @@ Requirements:
 - Include aliases or related terms from the planner/task details when they improve recall.
 - Do not answer the question and do not add citations.
 - Do not include reasoning, <think> text, or explanations.
-- Never output placeholder text such as "query 1", "query 2", "retrieval query", or "example query".
+- Never output placeholder labels or generic query names.
 - Return JSON only in this shape:
 {{"items":[{{"sub_question":"...","queries":["topic overview evidence","topic method comparison source"]}}]}}"""
 
@@ -607,6 +607,7 @@ Requirements:
             "error": "LLM query rewrite returned no usable queries",
             "raw_response": raw_response_text[:1000],
         }
+    queries = complete_sub_question_query_coverage(queries, research_plan, max_variants=max_variants)
     return {
         "queries": dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
         "model": clean_text(getattr(response, "model", "")) or selected_model,
@@ -617,6 +618,58 @@ Requirements:
 
 def empty_llm_query_result(model: str = "", error: str = "") -> dict[str, Any]:
     return {"queries": [], "model": clean_text(model), "error": clean_text(error), "raw_response": ""}
+
+
+def complete_sub_question_query_coverage(
+    queries: Sequence[str],
+    research_plan: dict[str, Any],
+    max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
+) -> list[str]:
+    questions = planner_sub_questions(research_plan)
+    if not questions:
+        return dedupe_preserve_order(queries)
+
+    objective = clean_text(research_plan.get("objective"))
+    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
+    backfill = []
+    for question in questions:
+        if query_list_covers_sub_question(question, queries):
+            continue
+        backfill.extend(
+            sub_question_retrieval_queries(
+                question,
+                objective=objective,
+                task_details=matching_task_details(question, tasks),
+                max_variants=max_variants,
+            )
+        )
+
+    max_queries = max(1, len(questions) * max(1, max_variants))
+    room_for_llm = max(0, max_queries - len(dedupe_preserve_order(backfill)))
+    return dedupe_preserve_order([*list(queries)[:room_for_llm], *backfill])[:max_queries]
+
+
+def query_list_covers_sub_question(question: str, queries: Sequence[str]) -> bool:
+    query_terms = set()
+    for query in queries:
+        query_terms.update(query_tokens(query))
+    named_terms = question_named_terms(question)
+    if named_terms and not set(named_terms).issubset(query_terms):
+        return False
+
+    ignored_terms = COVERAGE_GENERIC_TERMS | COVERAGE_EVIDENCE_TERMS | {"attention", "method", "methods", "topic", "topics"}
+    topic_terms = [term for term in query_keywords(question, limit=8) if term.lower() not in ignored_terms]
+    normalized = {term.lower().replace("‑", "-").replace("–", "-") for term in topic_terms}
+    if not normalized:
+        return bool(queries)
+    return len(normalized & query_terms) >= min(2, len(normalized))
+
+
+def question_named_terms(question: str) -> list[str]:
+    normalized = clean_text(question).replace("‑", "-").replace("–", "-").replace("—", "-")
+    terms = re.findall(r"\b[A-Z][A-Za-z0-9_.-]{2,}\b|\b[A-Z]{2,}\b", normalized)
+    terms.extend(re.findall(r"\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b", normalized))
+    return dedupe_preserve_order(term.lower() for term in terms if term.lower() not in OBJECTIVE_STOPWORDS)
 
 
 def format_sub_question_rewrite_items(questions: Sequence[str], tasks: Sequence[dict[str, Any]]) -> str:
@@ -830,10 +883,11 @@ def matching_task_details(question: str, tasks: Sequence[dict[str, Any]]) -> str
 
 
 def query_tokens(text: str) -> set[str]:
+    text = clean_text(text).replace("‑", "-").replace("–", "-").replace("—", "-")
     stopwords = {"and", "are", "for", "from", "how", "the", "what", "with"}
     return {
         token.lower()
-        for token in re.findall(r"[A-Za-z0-9_+#.-]+", clean_text(text))
+        for token in re.findall(r"[A-Za-z0-9_+#.-]+", text)
         if len(token) > 2 and token.lower() not in stopwords
     }
 
