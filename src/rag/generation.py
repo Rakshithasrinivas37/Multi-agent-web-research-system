@@ -529,11 +529,12 @@ def sub_question_retrieval_queries(
         return []
 
     anchor = clean_text(f"{objective} {question}")
-    key_terms = " ".join(query_keywords(question, limit=10))
+    key_terms = " ".join(query_keywords(f"{question} {task_details}", limit=12))
+    hints = " ".join(broad_query_hints(f"{question} {task_details}"))
     variants = [
         clean_text(f"{question} {task_details}"),
         clean_text(f"{objective} {key_terms} overview background concepts methods evidence"),
-        clean_text(f"{anchor} source-backed details examples definitions equations metrics implementation limitations {task_details}"),
+        clean_text(f"{anchor} {key_terms} {hints} source context examples"),
     ]
     return dedupe_preserve_order(variant[:700] for variant in variants)[: max(1, max_variants)]
 
@@ -565,15 +566,18 @@ def llm_sub_question_retrieval_query_result(
 Planner sub-questions and optional task details:
 {format_sub_question_rewrite_items(questions, tasks)}
 
-Rewrite each planner sub-question into 2-3 broad RAG retrieval queries.
+Rewrite each planner sub-question into 2-3 broad, high-recall RAG retrieval queries.
 Requirements:
 - Preserve named entities, URLs, model names, datasets, metrics, APIs, equations, and important technical terms.
-- Make each query broad enough for semantic search but still useful for BM25 keyword matching.
+- Make each query broad enough to retrieve surrounding source chunks, not just exact phrase matches.
+- Prefer short noun phrases over full questions: one concept query, one evidence/detail query, and one source/implementation/benchmark query only when useful.
 - Include evidence intent words when useful, such as definition, equation, benchmark, implementation, limitation, comparison, or example.
+- Include aliases or related terms from the planner/task details when they improve recall.
 - Do not answer the question and do not add citations.
+- Do not include reasoning, <think> text, or explanations.
 - Never output placeholder text such as "query 1", "query 2", "retrieval query", or "example query".
 - Return JSON only in this shape:
-{{"items":[{{"sub_question":"...","queries":["topic definition evidence","topic equation formula source"]}}]}}"""
+{{"items":[{{"sub_question":"...","queries":["topic overview evidence","topic method comparison source"]}}]}}"""
 
     try:
         response = create_chat_completion_with_retries(
@@ -842,6 +846,24 @@ def query_keywords(text: str, limit: int = 10) -> list[str]:
             continue
         keywords.append(token.strip(".,;:()[]{}"))
     return dedupe_preserve_order(keywords)[: max(1, limit)]
+
+
+def broad_query_hints(text: str) -> list[str]:
+    lowered = clean_text(text).lower()
+    hints = ["overview", "evidence"]
+    hint_rules = [
+        (r"\b(defin|concept|what is)\b", ["definition", "concept"]),
+        (r"\b(equation|formula|mathematical|formulation)\b", ["formula", "equation"]),
+        (r"\b(benchmark|metric|score|accuracy|performance|result)\b", ["benchmark", "metrics"]),
+        (r"\b(api|implementation|framework|library|function|class)\b", ["implementation", "api"]),
+        (r"\b(complexity|limitation|memory|runtime|efficient|trade[- ]?off)\b", ["complexity", "limitations"]),
+        (r"\b(compare|comparison|versus|difference|variant|type)\b", ["comparison", "variants"]),
+        (r"\b(application|use case|example)\b", ["applications", "examples"]),
+    ]
+    for pattern, words in hint_rules:
+        if re.search(pattern, lowered):
+            hints.extend(words)
+    return dedupe_preserve_order(hints)
 
 
 def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
@@ -1943,8 +1965,10 @@ def fallback_gap_retrieval_queries(
     objective = clean_text(objective)
     queries = []
     for gap in gaps:
-        detail_terms = "exact equation formula benchmark number API signature implementation evidence"
-        query = clean_text(f"{objective} {gap} {detail_terms}")
+        gap_text = re.sub(r"(?i)\b(?:missing|partial|weak)\s+evidence\s*:?", " ", clean_text(gap))
+        key_terms = " ".join(query_keywords(gap_text, limit=12))
+        hints = " ".join(broad_query_hints(gap_text))
+        query = clean_text(f"{objective} {key_terms} {hints} source evidence")
         if query:
             queries.append(query[:600])
     return dedupe_preserve_order(queries)[: max(1, max_queries)]
@@ -2007,18 +2031,17 @@ Missing or partial evidence items:
 Available source hints:
 {source_hints}
 
-Generate focused RAG retrieval queries to find the exact missing evidence in indexed chunks.
+Generate broad RAG retrieval queries to find relevant evidence in indexed chunks.
 Requirements:
 - Return one query per missing item, using the same item id format: G1: query text.
 - Generate at most {len(prompt_gaps)} queries.
-- Keep each query focused on only that missing item.
-- Include literal technical terms, equation tokens, API names, benchmark names, model names, author names, and source titles that match the item.
+- Keep each query centered on the missing item, but broad enough to retrieve surrounding source context.
+- Prefer compact noun phrases over full missing-evidence sentences.
+- Include literal technical terms, aliases, API names, benchmark names, model names, author names, and source titles that match the item.
 - Preserve the target entity from the missing item; do not move benchmarks, formulas, metrics, or limitations from one model/source to another.
-- Do not add assumed values or labels such as "quadratic", "linear", benchmark names, or model names unless they are explicitly present in the missing item.
-- For missing equations, include only symbols and variants that fit the named equation or architecture.
+- For missing equations, include the named equation/architecture and broad terms like formula, derivation, components, or notation.
 - For missing API details, include official class/function names and parameters.
 - Do not answer the research question.
-- Do not combine multiple missing items into one broad query.
 - Do not add bullets, markdown tables, quotes, or explanation."""
 
     raw_response = ""
@@ -2043,8 +2066,6 @@ Requirements:
     if not raw_response:
         return llm_gap_query_result([], model=selected_model, error="empty_response")
     queries = parse_gap_query_lines(raw_response, max_queries=max_queries)
-    if len(prompt_gaps) > 1 and len(queries) <= 1:
-        return llm_gap_query_result([], model=selected_model, error="insufficient_item_queries", raw_response=raw_response)
     if not queries:
         return llm_gap_query_result([], model=selected_model, error="parsed_empty_response", raw_response=raw_response)
     return llm_gap_query_result(queries, model=selected_model, raw_response=raw_response)
