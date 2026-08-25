@@ -172,6 +172,16 @@ QUERY_FILLER_TERMS = OBJECTIVE_STOPWORDS | {
     "were",
     "would",
 }
+EVIDENCE_QUERY_HINTS = {
+    "api": ["official documentation", "api signature", "parameters", "usage example"],
+    "applications": ["applications", "use cases", "examples"],
+    "benchmark": ["benchmark", "results table", "scores", "metrics"],
+    "comparison": ["comparison", "differences", "tradeoffs"],
+    "complexity": ["time complexity", "memory complexity", "big O", "scaling"],
+    "definition": ["definition", "overview", "purpose", "concept"],
+    "equation": ["equation", "formula", "mathematical derivation", "score function", "variables"],
+    "limitations": ["limitations", "challenges", "bottlenecks", "open questions"],
+}
 
 
 def rag_generation_model(model: str | None = None) -> str:
@@ -1267,7 +1277,7 @@ def infer_question_evidence_types(question: str) -> list[str]:
     lowered = clean_text(question).lower()
     checks = [
         ("definition", r"\b(what is|definition|define|purpose|overview)\b"),
-        ("equation", r"\b(equation|formula|formulation|mathematical|components?)\b"),
+        ("equation", r"\b(equations?|formulas?|formulations?|mathematical|components?)\b"),
         ("comparison", r"\b(compare|comparison|versus| vs |differ|differences?)\b"),
         ("benchmark", r"\b(benchmark|score|performance|metric|accuracy|bleu|glue|imagenet|result)\b"),
         ("api", r"\b(api|pytorch|tensorflow|keras|implementation|code|signature|usage)\b"),
@@ -1580,7 +1590,7 @@ def question_source_coverage_retrieve(
             continue
         results = source_url_coverage_retrieve(
             source_urls=missing_urls,
-            query=question,
+            query=evidence_focused_question_query(question),
             chroma_path=chroma_path,
             collection_name=collection_name,
             history_keys=history_keys,
@@ -1609,6 +1619,21 @@ def uncovered_source_urls_for_question(
             continue
         missing.append(url)
     return missing
+
+
+def evidence_focused_question_query(question: str) -> str:
+    """Add evidence-type hints so planned-source recovery finds the right section."""
+
+    question = clean_text(question)
+    hints = []
+    for evidence_type in infer_question_evidence_types(question):
+        hints.extend(EVIDENCE_QUERY_HINTS.get(evidence_type, []))
+    lowered = question.lower()
+    if "multiplicative" in lowered:
+        hints.extend(["dot product", "bilinear score", "general score"])
+    if "additive" in lowered:
+        hints.extend(["feedforward score", "tanh"])
+    return clean_text(f"{question} {' '.join(dedupe_preserve_order(hints))}")[:1000]
 
 
 def merge_retrieved_context(*groups: Sequence[RetrievalResult]) -> list[RetrievalResult]:
@@ -2477,12 +2502,22 @@ def rank_results_for_question(question: str, candidates: Sequence[RetrievalResul
 
 
 def result_supports_question(question: str, result: RetrievalResult) -> bool:
-    text = retrieval_result_text(result)
+    return text_supports_question(question, retrieval_result_text(result))
+
+
+def text_supports_question(question: str, text: str, required_evidence: Sequence[str] | None = None) -> bool:
+    text = clean_text(text)
     question_terms = coverage_question_tokens(question)
+    chunk_terms = coverage_question_tokens(text)
     topic_terms = {term for term in question_terms if term not in COVERAGE_EVIDENCE_TERMS}
-    if topic_terms and not (topic_terms & coverage_question_tokens(text)):
+    if topic_terms and not (topic_terms & chunk_terms):
         return False
-    return bool((question_terms & coverage_question_tokens(text)) or evidence_type_score(text, infer_question_evidence_types(question)))
+    evidence_types = clean_string_list(list(required_evidence or [])) or infer_question_evidence_types(question)
+    strict_evidence = [item for item in evidence_types if item != "evidence"]
+    evidence_score = evidence_type_score(text, strict_evidence)
+    if strict_evidence and not evidence_score:
+        return False
+    return bool((question_terms & chunk_terms) or evidence_score)
 
 
 def retrieval_result_text(result: RetrievalResult) -> str:
@@ -2628,9 +2663,11 @@ def build_sub_question_evidence_packs(
             text = " ".join([clean_text(chunk.get("title")), clean_text(chunk.get("content"))])
             overlap = len(question_terms & query_tokens(text))
             preferred = chunk_matches_source_urls(chunk, question_source_urls_for(question, question_source_urls))
-            if overlap or preferred:
+            supported = text_supports_question(question, text)
+            if overlap or preferred or supported:
                 scored.append(
                     (
+                        1 if supported else 0,
                         1 if preferred else 0,
                         1 if chunk.get("is_primary_source") else 0,
                         overlap,
@@ -2640,13 +2677,18 @@ def build_sub_question_evidence_packs(
                 )
         selected = [
             chunk
-            for *_score, chunk in sorted(scored, key=lambda item: (-item[0], -item[1], -item[2], -item[3]))
+            for *_score, chunk in sorted(scored, key=lambda item: (-item[0], -item[1], -item[2], -item[3], -item[4]))
             [:max_chunks_per_question]
         ]
+        supported_count = sum(
+            1
+            for chunk in selected
+            if text_supports_question(question, " ".join([clean_text(chunk.get("title")), clean_text(chunk.get("content"))]))
+        )
         packs.append(
             {
                 "question": question,
-                "coverage": "covered" if len(selected) >= 2 else ("partial" if selected else "missing"),
+                "coverage": "covered" if supported_count else ("partial" if selected else "missing"),
                 "planned_source_urls": question_source_urls_for(question, question_source_urls),
                 "chunks": selected,
             }
