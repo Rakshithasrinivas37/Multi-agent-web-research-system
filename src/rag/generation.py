@@ -6,6 +6,7 @@ import os
 import re
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
 from src.agents.change_detection_agent import objective_key
@@ -53,7 +54,10 @@ DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
 DEFAULT_PRECISION_QUERY_LIMIT = 8
 DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
+DEFAULT_SUBQUESTION_RETRIEVAL_MAX_WORKERS = 4
+DEFAULT_SUBQUESTION_RERANK_MAX_WORKERS = 2
 DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 48
+DEFAULT_SYNTHESIS_CANDIDATE_CHUNKS_PER_QUESTION = 20
 DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 6
 DEFAULT_SYNTHESIS_MAX_CHUNKS = 48
 MIN_EVIDENCE_CHARS = 120
@@ -268,6 +272,10 @@ def synthesize_report_from_research_plan(
         top_k,
         len(planner_questions) * DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
     )
+    candidate_chunks_per_question = max(
+        DEFAULT_SYNTHESIS_CANDIDATE_CHUNKS_PER_QUESTION,
+        DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
+    )
     queries = planner_tasks_to_rag_queries(research_plan)
     emit_progress(
         "tool_called",
@@ -327,7 +335,8 @@ def synthesize_report_from_research_plan(
         chroma_path=chroma_path,
         collection_name=collection_name,
         history_keys=retrieval_history_keys,
-        per_question=DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
+        candidate_chunks=candidate_chunks_per_question,
+        final_chunks=DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
         per_query_k=per_query_k,
         semantic_k=semantic_k,
         bm25_k=bm25_k,
@@ -336,7 +345,9 @@ def synthesize_report_from_research_plan(
         authority_weight=authority_weight,
         bm25_scan_limit=bm25_scan_limit,
         embedding_device=embedding_device,
+        rerank=rerank,
         reranker_model=reranker_model,
+        rerank_k=max(rerank_k, candidate_chunks_per_question),
         rerank_weight=rerank_weight,
     )
     if question_context_results:
@@ -448,6 +459,8 @@ def synthesize_report_from_research_plan(
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
     payload["sub_question_context_count"] = len(question_context_results)
+    payload["sub_question_candidate_chunks_per_question"] = candidate_chunks_per_question
+    payload["sub_question_final_chunks_per_question"] = DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION
     payload["llm_sub_question_retrieval_queries"] = llm_sub_question_queries
     payload["llm_sub_question_query_model"] = llm_query_result["model"]
     payload["llm_sub_question_query_error"] = llm_query_result["error"]
@@ -621,7 +634,8 @@ def retrieve_sub_question_context(
     chroma_path: str,
     collection_name: str,
     history_keys: Sequence[str] | None,
-    per_question: int,
+    candidate_chunks: int,
+    final_chunks: int,
     per_query_k: int,
     semantic_k: int,
     bm25_k: int,
@@ -630,40 +644,66 @@ def retrieve_sub_question_context(
     authority_weight: float,
     bm25_scan_limit: int,
     embedding_device: str,
+    rerank: bool,
     reranker_model: str,
+    rerank_k: int,
     rerank_weight: float,
 ) -> list[RetrievalResult]:
-    """Retrieve a small, independent evidence set for each planner sub-question."""
+    """Retrieve and rerank an independent evidence set for each planner sub-question."""
 
     results = []
     tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
-    for question in dedupe_preserve_order(questions):
+    candidate_chunks = max(1, candidate_chunks)
+    final_chunks = max(1, min(final_chunks, candidate_chunks))
+    clean_questions = dedupe_preserve_order(questions)
+
+    def retrieve_question(question: str) -> list[RetrievalResult]:
         query_set = per_question_context_queries(question, objective=objective, tasks=tasks)
         if not query_set:
-            continue
-        results = merge_retrieved_context(
-            results,
-            multi_query_hybrid_retrieve(
-                queries=query_set,
-                chroma_path=chroma_path,
-                collection_name=collection_name,
-                top_k=max(1, per_question),
-                per_query_k=max(1, per_query_k),
-                semantic_k=semantic_k,
-                bm25_k=bm25_k,
-                history_keys=history_keys,
-                semantic_weight=semantic_weight,
-                bm25_weight=bm25_weight,
-                authority_weight=authority_weight,
-                bm25_scan_limit=bm25_scan_limit,
-                embedding_device=embedding_device,
-                diversify_urls=False,
-                rerank=False,
-                reranker_model=reranker_model,
-                rerank_weight=rerank_weight,
-            ),
+            return []
+        candidates = multi_query_hybrid_retrieve(
+            queries=query_set,
+            chroma_path=chroma_path,
+            collection_name=collection_name,
+            top_k=candidate_chunks,
+            per_query_k=max(1, min(per_query_k, candidate_chunks)),
+            semantic_k=semantic_k,
+            bm25_k=bm25_k,
+            history_keys=history_keys,
+            semantic_weight=semantic_weight,
+            bm25_weight=bm25_weight,
+            authority_weight=authority_weight,
+            bm25_scan_limit=bm25_scan_limit,
+            embedding_device=embedding_device,
+            diversify_urls=False,
+            rerank=rerank,
+            reranker_model=reranker_model,
+            rerank_k=max(rerank_k, candidate_chunks),
+            rerank_weight=rerank_weight,
         )
+        return meaningful_retrieval_results(candidates)[:final_chunks]
+
+    max_workers = sub_question_retrieval_max_workers(len(clean_questions), rerank=rerank)
+    if max_workers <= 1:
+        result_groups = [retrieve_question(question) for question in clean_questions]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rag-subquestion") as executor:
+            result_groups = list(executor.map(retrieve_question, clean_questions))
+
+    for result_group in result_groups:
+        results = merge_retrieved_context(results, result_group)
     return results
+
+
+def sub_question_retrieval_max_workers(question_count: int, rerank: bool = False) -> int:
+    """Bound parallel sub-question retrieval, especially when CrossEncoder rerank is enabled."""
+
+    default_workers = DEFAULT_SUBQUESTION_RERANK_MAX_WORKERS if rerank else DEFAULT_SUBQUESTION_RETRIEVAL_MAX_WORKERS
+    try:
+        workers = int(os.environ.get("RAG_SUBQUESTION_RETRIEVAL_MAX_WORKERS", default_workers))
+    except (TypeError, ValueError):
+        workers = default_workers
+    return min(max(1, workers), max(1, question_count))
 
 
 def per_question_context_queries(question: str, objective: str = "", tasks: Sequence[dict[str, Any]] = ()) -> list[str]:

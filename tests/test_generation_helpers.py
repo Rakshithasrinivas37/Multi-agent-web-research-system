@@ -27,9 +27,11 @@ from src.rag.generation import (
     planner_tasks_to_rag_queries,
     report_supporting_chunks,
     retrieve_full_collection_enabled,
+    retrieve_sub_question_context,
     retrieval_topic_phrase,
     result_supports_question,
     select_synthesis_context,
+    sub_question_retrieval_max_workers,
     sub_question_retrieval_queries,
     valid_retrieval_queries,
 )
@@ -773,6 +775,65 @@ Missing Evidence: exact benchmark values are not present.
 
         self.assertEqual(len([item for item in selected_ids if item.startswith("alpha-")]), 6)
         self.assertEqual(len([item for item in selected_ids if item.startswith("beta-")]), 6)
+
+    def test_retrieve_sub_question_context_reranks_candidates_and_keeps_six(self):
+        calls = []
+
+        def fake_retrieve(**kwargs):
+            calls.append(kwargs)
+            topic = "beta" if "beta" in " ".join(kwargs["queries"]).lower() else "alpha"
+            return [
+                RetrievalResult(
+                    id=f"{topic}-{index}",
+                    document=f"{topic} topic source-backed details with definitions equations metrics and limitations. " * 3,
+                    metadata={"title": f"{topic} source", "url": f"https://example.com/{topic}/{index}"},
+                    score=1.0 - (index * 0.01),
+                    semantic_score=1.0,
+                    bm25_score=0.0,
+                )
+                for index in range(20)
+            ]
+
+        with patch("src.rag.generation.multi_query_hybrid_retrieve", side_effect=fake_retrieve):
+            selected = retrieve_sub_question_context(
+                research_plan={},
+                questions=["What is alpha topic?", "What is beta topic?"],
+                objective="Alpha objective",
+                chroma_path="/tmp/chroma",
+                collection_name="test",
+                history_keys=[],
+                candidate_chunks=20,
+                final_chunks=6,
+                per_query_k=25,
+                semantic_k=10,
+                bm25_k=10,
+                semantic_weight=0.3,
+                bm25_weight=0.3,
+                authority_weight=0.4,
+                bm25_scan_limit=100,
+                embedding_device="",
+                rerank=True,
+                reranker_model="cross-encoder",
+                rerank_k=20,
+                rerank_weight=0.7,
+            )
+
+        selected_ids = {result.id for result in selected}
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len([item for item in selected_ids if item.startswith("alpha-")]), 6)
+        self.assertEqual(len([item for item in selected_ids if item.startswith("beta-")]), 6)
+        self.assertTrue(all(call["top_k"] == 20 for call in calls))
+        self.assertTrue(all(call["per_query_k"] == 20 for call in calls))
+        self.assertTrue(all(call["rerank"] for call in calls))
+
+    def test_sub_question_retrieval_max_workers_is_bounded(self):
+        self.assertEqual(sub_question_retrieval_max_workers(10, rerank=False), 4)
+        self.assertEqual(sub_question_retrieval_max_workers(10, rerank=True), 2)
+
+        with patch.dict("os.environ", {"RAG_SUBQUESTION_RETRIEVAL_MAX_WORKERS": "3"}):
+            self.assertEqual(sub_question_retrieval_max_workers(10, rerank=True), 3)
+            self.assertEqual(sub_question_retrieval_max_workers(2, rerank=True), 2)
 
     def test_select_synthesis_context_prefers_question_planned_sources(self):
         results = [
