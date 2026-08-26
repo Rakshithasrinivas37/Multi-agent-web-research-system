@@ -470,7 +470,7 @@ def synthesize_report_from_research_plan(
         retrieved_context,
         payload.get("sources", []),
         max_chunks=supporting_chunk_count,
-        max_chars=retrieved_chunk_chars,
+        max_chars=None,
         cited_source_indexes=dedupe_ints(
             [
                 *citation_audit.get("valid_referenced_source_indexes", []),
@@ -483,7 +483,7 @@ def synthesize_report_from_research_plan(
         payload["retrieved_chunks"] = compact_retrieved_chunks(
             retrieved_context,
             payload.get("sources", []),
-            max_chars=retrieved_chunk_chars,
+            max_chars=None,
         )
     return payload
 
@@ -576,13 +576,14 @@ def sub_question_retrieval_queries(
     if not question:
         return []
 
-    topic = retrieval_topic_phrase(f"{question} {task_details}", limit=14)
-    key_terms = " ".join(query_keywords(f"{question} {task_details}", limit=12))
+    source_terms = source_query_terms(task_details)
+    topic = retrieval_topic_phrase(f"{question} {task_details}", limit=12)
+    key_terms = " ".join(query_keywords(question, limit=10)) or topic or objective
     hints = " ".join(broad_query_hints(f"{question} {task_details}"))
     variants = [
-        clean_text(f"{topic} {hints}"),
-        clean_text(f"{objective} {topic} overview background concepts methods evidence"),
-        clean_text(f"{topic} {key_terms} {hints} source context examples"),
+        clean_text(f"What source-backed context explains {topic} {hints}?"),
+        clean_text(f"Which evidence gives {key_terms} details, examples, equations, benchmarks, or limitations?"),
+        clean_text(f"Where do authoritative sources discuss {objective} {topic} {source_terms} source sections evidence?"),
     ]
     return dedupe_preserve_order(variant[:700] for variant in variants)[: max(1, max_variants)]
 
@@ -616,14 +617,17 @@ Planner sub-questions and optional task details:
 
 Rewrite each planner sub-question into 2-3 broad, high-recall RAG retrieval queries.
 Requirements:
-- For each sub-question, create complementary queries: a broad concept/context query, an evidence/detail query, and a source/section query when source details exist.
+- Return exactly 2 or 3 queries for every sub-question, in the same order as the planner list.
+- Write each query as a broad natural-language retrieval question, not a short keyword label.
+- For each sub-question, create complementary queries: one broad concept/context query, one evidence/detail query, and one source/section query when source details exist.
 - Do not output only narrow labels like "entity + equation"; include surrounding vocabulary that may appear near the answer in papers, docs, reports, or extracted web text.
+- Keep each query tied to one planner sub-question. Do not let benchmark, limitation, or formula queries drift into unrelated sub-question groups.
 - Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, aliases, and important technical terms from the planner/task details.
 - For equation/formula questions, include nearby evidence terms such as equation, formula, derivation, score function, alignment, matrix, variables, components, or operation names when relevant.
 - For benchmark questions, include dataset names, metrics, result table, scores, comparison, performance, and evaluation terms when relevant.
 - For API/implementation questions, include official documentation, class/function names, signature, parameters, usage, and example terms when relevant.
 - For limitation/complexity questions, include complexity, memory, runtime, scaling, tradeoffs, bottleneck, sparse, efficient, or alternatives when relevant.
-- Prefer compact noun phrases of 6-18 words over full questions.
+- Prefer 8-22 words per query.
 - Do not answer the question and do not add citations.
 - Do not include reasoning, <think> text, or explanations.
 - Never output placeholder labels or generic query names.
@@ -686,38 +690,67 @@ def complete_sub_question_query_coverage(
 
     objective = clean_text(research_plan.get("objective"))
     tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
-    backfill = []
+    clean_queries = dedupe_preserve_order(queries)
+    grouped = []
+    used = set()
+    min_variants = min(max(1, max_variants), 2)
     for question in questions:
-        if query_list_covers_sub_question(question, queries):
-            continue
-        backfill.extend(
-            sub_question_retrieval_queries(
-                question,
-                objective=objective,
-                task_details=matching_task_details(question, tasks),
-                max_variants=max_variants,
-            )
+        question_queries = [
+            query for query in clean_queries
+            if query not in used and query_matches_sub_question(question, query)
+        ][: max(1, max_variants)]
+        used.update(question_queries)
+        fallback_queries = sub_question_retrieval_queries(
+            question,
+            objective=objective,
+            task_details=matching_task_details(question, tasks),
+            max_variants=max_variants,
         )
+        target_count = max(1, max_variants) if not question_queries else min_variants
+        for query in fallback_queries:
+            if len(question_queries) >= target_count:
+                break
+            if query not in question_queries:
+                question_queries.append(query)
+        grouped.extend(question_queries[: max(1, max_variants)])
 
     max_queries = max(1, len(questions) * max(1, max_variants))
-    room_for_llm = max(0, max_queries - len(dedupe_preserve_order(backfill)))
-    return dedupe_preserve_order([*list(queries)[:room_for_llm], *backfill])[:max_queries]
+    return dedupe_preserve_order(grouped)[:max_queries]
 
 
 def query_list_covers_sub_question(question: str, queries: Sequence[str]) -> bool:
-    query_terms = set()
-    for query in queries:
-        query_terms.update(query_tokens(query))
+    return any(query_matches_sub_question(question, query) for query in queries)
+
+
+def query_matches_sub_question(question: str, query: str) -> bool:
+    query_terms = query_tokens(query)
     named_terms = question_named_terms(question)
-    if named_terms and not set(named_terms).issubset(query_terms):
+    if named_terms and not any(term_matches_query(term, query_terms, query) for term in named_terms):
         return False
 
     ignored_terms = COVERAGE_GENERIC_TERMS | COVERAGE_EVIDENCE_TERMS | {"attention", "method", "methods", "topic", "topics"}
     topic_terms = [term for term in query_keywords(question, limit=8) if term.lower() not in ignored_terms]
     normalized = {term.lower().replace("‑", "-").replace("–", "-") for term in topic_terms}
+    evidence_terms = {
+        term.lower()
+        for term in query_keywords(question, limit=12)
+        if term.lower() in COVERAGE_EVIDENCE_TERMS
+    }
     if not normalized:
-        return bool(queries)
-    return len(normalized & query_terms) >= min(2, len(normalized))
+        if evidence_terms:
+            return bool(evidence_terms & query_terms)
+        return bool(clean_text(query))
+    topic_overlap = len(normalized & query_terms)
+    if len(normalized) == 1 and evidence_terms:
+        return topic_overlap > 0 and bool(evidence_terms & query_terms)
+    return topic_overlap >= min(2, len(normalized))
+
+
+def term_matches_query(term: str, query_terms: set[str], query: str) -> bool:
+    normalized = clean_text(term).lower().replace("‑", "-").replace("–", "-")
+    compact = normalized.replace("-", "")
+    query_text = clean_text(query).lower().replace("‑", "-").replace("–", "-")
+    return normalized in query_terms or compact in {token.replace("-", "") for token in query_terms} or normalized in query_text
 
 
 def question_named_terms(question: str) -> list[str]:
@@ -962,6 +995,12 @@ def retrieval_topic_phrase(text: str, limit: int = 14) -> str:
     normalized = re.sub(r"(?i)\b(?:what|how|why|when|where|which)\s+(?:is|are|does|do|did|can|should)?\b", " ", normalized)
     normalized = re.sub(r"(?i)\b(?:as|e\.g\.|eg)\b", " ", normalized)
     return " ".join(query_keywords(normalized, limit=limit))
+
+
+def source_query_terms(text: str, limit: int = 8) -> str:
+    urls = [match.group(0).rstrip(".,;:") for match in URL_PATTERN.finditer(clean_text(text))]
+    terms = [term for term in query_keywords(text, limit=limit) if not URL_PATTERN.search(term)]
+    return clean_text(" ".join([*urls[:2], *terms[:limit]]))[:300]
 
 
 def broad_query_hints(text: str) -> list[str]:
@@ -2617,7 +2656,7 @@ def normalize_citation_markers(text: str) -> str:
 def compact_retrieved_chunks(
     retrieved_context: Sequence[RetrievalResult],
     sources: Sequence[dict[str, Any]] | None = None,
-    max_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+    max_chars: int | None = DEFAULT_CONTEXT_BLOCK_CHARS,
 ) -> list[dict[str, Any]]:
     """Serialize selected retrieved chunks for a downstream report agent."""
 
@@ -2731,7 +2770,7 @@ def report_supporting_chunks(
     retrieved_context: Sequence[RetrievalResult],
     sources: Sequence[dict[str, Any]],
     max_chunks: int = DEFAULT_REPORT_SUPPORTING_CHUNKS,
-    max_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+    max_chars: int | None = DEFAULT_CONTEXT_BLOCK_CHARS,
     cited_source_indexes: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Return citation-linked chunks that are safest for the report agent."""
@@ -2891,17 +2930,17 @@ def is_primary_source(metadata: dict[str, Any]) -> bool:
     )
 
 
-def retrieved_chunk_preview(document: str, metadata: dict[str, Any], max_chars: int) -> str:
+def retrieved_chunk_preview(document: str, metadata: dict[str, Any], max_chars: int | None) -> str:
     """Return chunk body text without dropping content after stored headers."""
 
     body = strip_stored_chunk_headers(document, metadata)
     if not body and stored_chunk_header_present(document):
         return ""
     if not body:
-        body = display_document_preview(document, max_chars=max_chars)
+        body = clean_text(document) if max_chars is None else display_document_preview(document, max_chars=max_chars)
     if not body:
         body = clean_text(document)
-    preview = body[: max(80, max_chars)].strip()
+    preview = body.strip() if max_chars is None else body[: max(80, max_chars)].strip()
     return preview if is_meaningful_evidence(preview) else ""
 
 
