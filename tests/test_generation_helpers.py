@@ -356,6 +356,24 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(context.count("[1] Shared Source"), 2)
         self.assertEqual({chunk["source_index"] for chunk in chunks}, {1})
 
+    def test_compact_retrieved_chunks_keeps_full_content_when_uncapped(self):
+        tail = "critical evidence at the end"
+        results = [
+            RetrievalResult(
+                id="chunk-long",
+                document=("Long retrieved context with useful evidence. " * 120) + tail,
+                metadata={"title": "Long Source", "url": "https://example.com/long"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 1, "url": "https://example.com/long", "ids": ["chunk-long"]}]
+
+        chunks = compact_retrieved_chunks(results, sources, max_chars=None)
+
+        self.assertIn(tail, chunks[0]["content"])
+
     def test_build_coverage_by_question_uses_evidence_pack_when_synthesis_section_is_generic(self):
         specs = [{"question_id": "q001", "question": "What is the official API?", "required_evidence": ["api"]}]
         packs = [

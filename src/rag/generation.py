@@ -470,7 +470,7 @@ def synthesize_report_from_research_plan(
         retrieved_context,
         payload.get("sources", []),
         max_chunks=supporting_chunk_count,
-        max_chars=retrieved_chunk_chars,
+        max_chars=None,
         cited_source_indexes=dedupe_ints(
             [
                 *citation_audit.get("valid_referenced_source_indexes", []),
@@ -483,7 +483,7 @@ def synthesize_report_from_research_plan(
         payload["retrieved_chunks"] = compact_retrieved_chunks(
             retrieved_context,
             payload.get("sources", []),
-            max_chars=retrieved_chunk_chars,
+            max_chars=None,
         )
     return payload
 
@@ -2656,7 +2656,7 @@ def normalize_citation_markers(text: str) -> str:
 def compact_retrieved_chunks(
     retrieved_context: Sequence[RetrievalResult],
     sources: Sequence[dict[str, Any]] | None = None,
-    max_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+    max_chars: int | None = DEFAULT_CONTEXT_BLOCK_CHARS,
 ) -> list[dict[str, Any]]:
     """Serialize selected retrieved chunks for a downstream report agent."""
 
@@ -2770,7 +2770,7 @@ def report_supporting_chunks(
     retrieved_context: Sequence[RetrievalResult],
     sources: Sequence[dict[str, Any]],
     max_chunks: int = DEFAULT_REPORT_SUPPORTING_CHUNKS,
-    max_chars: int = DEFAULT_CONTEXT_BLOCK_CHARS,
+    max_chars: int | None = DEFAULT_CONTEXT_BLOCK_CHARS,
     cited_source_indexes: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Return citation-linked chunks that are safest for the report agent."""
@@ -2930,17 +2930,17 @@ def is_primary_source(metadata: dict[str, Any]) -> bool:
     )
 
 
-def retrieved_chunk_preview(document: str, metadata: dict[str, Any], max_chars: int) -> str:
+def retrieved_chunk_preview(document: str, metadata: dict[str, Any], max_chars: int | None) -> str:
     """Return chunk body text without dropping content after stored headers."""
 
     body = strip_stored_chunk_headers(document, metadata)
     if not body and stored_chunk_header_present(document):
         return ""
     if not body:
-        body = display_document_preview(document, max_chars=max_chars)
+        body = clean_text(document) if max_chars is None else display_document_preview(document, max_chars=max_chars)
     if not body:
         body = clean_text(document)
-    preview = body[: max(80, max_chars)].strip()
+    preview = body.strip() if max_chars is None else body[: max(80, max_chars)].strip()
     return preview if is_meaningful_evidence(preview) else ""
 
 
