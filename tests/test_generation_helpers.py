@@ -438,7 +438,7 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("overview", joined)
         self.assertIn("benchmark", joined)
         self.assertIn("metrics", joined)
-        self.assertFalse(any(query.lower().startswith("what ") for query in queries))
+        self.assertTrue(any(query.lower().startswith(("what ", "which ", "where ")) for query in queries))
         self.assertNotIn("source-backed details examples definitions equations metrics implementation limitations", joined)
 
     def test_retrieval_topic_phrase_removes_question_filler(self):
@@ -529,9 +529,32 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("computer vision", joined)
         self.assertIn("linformer", joined)
         self.assertIn("performer", joined)
-        self.assertNotIn("what are", joined)
+        self.assertIn("what source-backed context", joined)
         self.assertNotIn("are major", joined)
         self.assertLessEqual(len(queries), 6)
+
+    def test_complete_sub_question_query_coverage_groups_queries_by_question(self):
+        plan = {
+            "objective": "Attention mechanism",
+            "sub_questions": [
+                "What is the Bahdanau additive attention equation?",
+                "What benchmark results demonstrate Transformer performance?",
+            ],
+        }
+
+        queries = complete_sub_question_query_coverage(
+            [
+                "What benchmark tables report Transformer BLEU scores and performance results?",
+                "Which evidence explains Bahdanau additive attention score function equation?",
+                "attention mechanism overview",
+            ],
+            plan,
+        )
+
+        self.assertGreaterEqual(len(queries), 4)
+        self.assertLessEqual(len(queries), 6)
+        self.assertIn("Bahdanau", queries[0])
+        self.assertIn("benchmark", " ".join(queries[2:]).lower())
 
     def test_parse_gap_query_lines_rejects_reasoning_output(self):
         raw = (
