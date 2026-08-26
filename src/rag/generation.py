@@ -53,9 +53,9 @@ DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
 DEFAULT_PRECISION_QUERY_LIMIT = 8
 DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
-DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 30
-DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 3
-DEFAULT_SYNTHESIS_MAX_CHUNKS = 18
+DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 48
+DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 6
+DEFAULT_SYNTHESIS_MAX_CHUNKS = 48
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
@@ -263,6 +263,11 @@ def synthesize_report_from_research_plan(
     if not objective:
         raise ValueError("research_plan.objective is required")
 
+    planner_questions = planner_sub_questions(research_plan)
+    synthesis_target_chunks = max(
+        top_k,
+        len(planner_questions) * DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
+    )
     queries = planner_tasks_to_rag_queries(research_plan)
     emit_progress(
         "tool_called",
@@ -299,7 +304,7 @@ def synthesize_report_from_research_plan(
         queries=retrieval_queries,
         chroma_path=chroma_path,
         collection_name=collection_name,
-        top_k=top_k,
+        top_k=synthesis_target_chunks,
         per_query_k=per_query_k,
         semantic_k=semantic_k,
         bm25_k=bm25_k,
@@ -315,6 +320,27 @@ def synthesize_report_from_research_plan(
         rerank_k=rerank_k,
         rerank_weight=rerank_weight,
     )
+    question_context_results = retrieve_sub_question_context(
+        research_plan=research_plan,
+        questions=planner_questions,
+        objective=objective,
+        chroma_path=chroma_path,
+        collection_name=collection_name,
+        history_keys=retrieval_history_keys,
+        per_question=DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
+        per_query_k=per_query_k,
+        semantic_k=semantic_k,
+        bm25_k=bm25_k,
+        semantic_weight=semantic_weight,
+        bm25_weight=bm25_weight,
+        authority_weight=authority_weight,
+        bm25_scan_limit=bm25_scan_limit,
+        embedding_device=embedding_device,
+        reranker_model=reranker_model,
+        rerank_weight=rerank_weight,
+    )
+    if question_context_results:
+        retrieved_context = merge_retrieved_context(question_context_results, retrieved_context)
     planned_source_urls = planner_source_urls(research_plan)
     question_source_urls = planner_question_source_urls(research_plan)
     source_coverage_results = []
@@ -348,7 +374,6 @@ def synthesize_report_from_research_plan(
         retrieved_context = merge_retrieved_context(browser_signal_context, retrieved_context)
 
     synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
-    planner_questions = planner_sub_questions(research_plan)
     synthesis_context = select_synthesis_context(
         retrieved_context,
         planner_questions,
@@ -382,7 +407,7 @@ def synthesize_report_from_research_plan(
             queries=gap_queries,
             chroma_path=chroma_path,
             collection_name=collection_name,
-            top_k=DEFAULT_GAP_RETRIEVAL_TOP_K,
+            top_k=max(DEFAULT_GAP_RETRIEVAL_TOP_K, synthesis_target_chunks),
             per_query_k=DEFAULT_GAP_RETRIEVAL_PER_QUERY_K,
             semantic_k=semantic_k,
             bm25_k=max(bm25_k, DEFAULT_GAP_RETRIEVAL_TOP_K),
@@ -422,6 +447,7 @@ def synthesize_report_from_research_plan(
     payload["queries"] = queries
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
+    payload["sub_question_context_count"] = len(question_context_results)
     payload["llm_sub_question_retrieval_queries"] = llm_sub_question_queries
     payload["llm_sub_question_query_model"] = llm_query_result["model"]
     payload["llm_sub_question_query_error"] = llm_query_result["error"]
@@ -586,6 +612,70 @@ def sub_question_retrieval_queries(
         clean_text(f"Where do authoritative sources discuss {objective} {topic} {source_terms} source sections evidence?"),
     ]
     return dedupe_preserve_order(variant[:700] for variant in variants)[: max(1, max_variants)]
+
+
+def retrieve_sub_question_context(
+    research_plan: dict[str, Any],
+    questions: Sequence[str],
+    objective: str,
+    chroma_path: str,
+    collection_name: str,
+    history_keys: Sequence[str] | None,
+    per_question: int,
+    per_query_k: int,
+    semantic_k: int,
+    bm25_k: int,
+    semantic_weight: float,
+    bm25_weight: float,
+    authority_weight: float,
+    bm25_scan_limit: int,
+    embedding_device: str,
+    reranker_model: str,
+    rerank_weight: float,
+) -> list[RetrievalResult]:
+    """Retrieve a small, independent evidence set for each planner sub-question."""
+
+    results = []
+    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
+    for question in dedupe_preserve_order(questions):
+        query_set = per_question_context_queries(question, objective=objective, tasks=tasks)
+        if not query_set:
+            continue
+        results = merge_retrieved_context(
+            results,
+            multi_query_hybrid_retrieve(
+                queries=query_set,
+                chroma_path=chroma_path,
+                collection_name=collection_name,
+                top_k=max(1, per_question),
+                per_query_k=max(1, per_query_k),
+                semantic_k=semantic_k,
+                bm25_k=bm25_k,
+                history_keys=history_keys,
+                semantic_weight=semantic_weight,
+                bm25_weight=bm25_weight,
+                authority_weight=authority_weight,
+                bm25_scan_limit=bm25_scan_limit,
+                embedding_device=embedding_device,
+                diversify_urls=False,
+                rerank=False,
+                reranker_model=reranker_model,
+                rerank_weight=rerank_weight,
+            ),
+        )
+    return results
+
+
+def per_question_context_queries(question: str, objective: str = "", tasks: Sequence[dict[str, Any]] = ()) -> list[str]:
+    """Build broad plus exact-evidence queries for one planner sub-question."""
+
+    task_details = matching_task_details(question, tasks)
+    queries = sub_question_retrieval_queries(question, objective=objective, task_details=task_details)
+    exact_queries = [
+        clean_text(f"{objective} {question} {suffix} {task_details}")[:700]
+        for suffix in precision_query_suffixes(question)
+    ]
+    return dedupe_preserve_order([*queries, *exact_queries])
 
 
 def llm_sub_question_retrieval_query_result(
@@ -2421,7 +2511,7 @@ def select_synthesis_context(
     retrieved_context: Sequence[RetrievalResult],
     planner_questions: Sequence[str] | None = None,
     question_source_urls: dict[str, list[str]] | None = None,
-    max_chunks: int = DEFAULT_SYNTHESIS_MAX_CHUNKS,
+    max_chunks: int | None = None,
     per_question: int = DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
 ) -> list[RetrievalResult]:
     """Return a compact, topic-balanced context for the synthesis LLM."""
@@ -2429,7 +2519,14 @@ def select_synthesis_context(
     candidates = meaningful_retrieval_results(retrieved_context)
     questions = [clean_text(question) for question in planner_questions or [] if clean_text(question)]
     if not questions:
-        return source_balanced_results(candidates)[:max(1, max_chunks)]
+        cap = max(1, max_chunks if max_chunks is not None else DEFAULT_SYNTHESIS_MAX_CHUNKS)
+        return source_balanced_results(candidates)[:cap]
+
+    per_question = max(1, per_question)
+    effective_max_chunks = max(
+        1,
+        max_chunks if max_chunks is not None else max(DEFAULT_SYNTHESIS_MAX_CHUNKS, len(questions) * per_question),
+    )
 
     selected = []
     seen = set()
@@ -2437,7 +2534,7 @@ def select_synthesis_context(
 
     def add_for_question(question: str, result: RetrievalResult) -> bool:
         key = retrieval_result_key(result)
-        if key in seen or len(selected) >= max_chunks:
+        if key in seen or len(selected) >= effective_max_chunks:
             return False
         selected.append(result)
         seen.add(key)
@@ -2451,21 +2548,21 @@ def select_synthesis_context(
 
     for question in questions:
         for result in question_ranked_results(question, candidates, question_source_urls):
-            if selected_by_question.get(question_key(question), 0) >= max(1, per_question):
+            if selected_by_question.get(question_key(question), 0) >= per_question:
                 break
             add_for_question(question, result)
-            if len(selected) >= max_chunks:
+            if len(selected) >= effective_max_chunks:
                 return selected
 
     for result in source_balanced_results(candidates):
-        if len(selected) >= max_chunks:
+        if len(selected) >= effective_max_chunks:
             break
         key = retrieval_result_key(result)
         if key in seen:
             continue
         selected.append(result)
         seen.add(key)
-        if len(selected) >= max_chunks:
+        if len(selected) >= effective_max_chunks:
             break
     return selected
 
@@ -2692,7 +2789,7 @@ def build_sub_question_evidence_packs(
     retrieved_context: Sequence[RetrievalResult],
     sources: Sequence[dict[str, Any]],
     question_source_urls: dict[str, list[str]] | None = None,
-    max_chunks_per_question: int = 4,
+    max_chunks_per_question: int = DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
 ) -> list[dict[str, Any]]:
     """Group source-numbered chunks under each planner sub-question."""
 
@@ -2758,10 +2855,10 @@ def format_evidence_packs_for_prompt(evidence_packs: Sequence[dict[str, Any]]) -
         question = clean_text(pack.get("question")) if isinstance(pack, dict) else ""
         coverage = clean_text(pack.get("coverage")) if isinstance(pack, dict) else "missing"
         lines.append(f"- {question} ({coverage})")
-        for chunk in (pack.get("chunks", []) if isinstance(pack, dict) else [])[:4]:
+        for chunk in (pack.get("chunks", []) if isinstance(pack, dict) else []):
             marker = f"[{chunk.get('source_index')}]"
             title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Retrieved chunk"
-            content = clean_text(chunk.get("content"))[:260]
+            content = clean_text(chunk.get("content"))
             lines.append(f"  - {marker} {title}: {content}")
     return "\n".join(lines)
 
