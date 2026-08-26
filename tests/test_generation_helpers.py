@@ -935,6 +935,56 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(groups[0]["chunk_count"], 3)
         self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], "What is alpha topic?")
 
+    def test_retrieve_sub_question_context_groups_scans_collection_when_hybrid_empty(self):
+        class FakeCollection:
+            def get(self, **kwargs):
+                return {
+                    "ids": ["weak", "formula", "primary"],
+                    "documents": [
+                        "Unrelated background with enough words to be meaningful evidence. " * 4,
+                        "Alpha topic equation formula variables and detailed source-backed explanation. " * 4,
+                        "Official alpha source explains definition equation formula and implementation. " * 4,
+                    ],
+                    "metadatas": [
+                        {"title": "Weak", "url": "https://example.com/weak"},
+                        {"title": "Formula", "url": "https://example.com/formula", "has_formula_signal": True},
+                        {"title": "Primary", "url": "https://arxiv.org/pdf/1234.5678", "source_type": "arxiv"},
+                    ],
+                }
+
+        with (
+            patch("src.rag.generation.multi_query_hybrid_retrieve", return_value=[]),
+            patch("src.rag.generation.get_collection", return_value=FakeCollection()),
+            patch("src.rag.generation.expand_parent_context_results", side_effect=lambda results, chroma_path: list(results)),
+        ):
+            groups = retrieve_sub_question_context_groups(
+                research_plan={},
+                questions=["What is alpha topic equation?"],
+                objective="Alpha objective",
+                chroma_path="/tmp/chroma",
+                collection_name="test",
+                history_keys=[],
+                candidate_chunks=8,
+                final_chunks=2,
+                per_query_k=25,
+                semantic_k=10,
+                bm25_k=10,
+                semantic_weight=0.3,
+                bm25_weight=0.3,
+                authority_weight=0.4,
+                bm25_scan_limit=100,
+                embedding_device="",
+                rerank=False,
+                reranker_model="cross-encoder",
+                rerank_k=8,
+                rerank_weight=0.7,
+            )
+
+        self.assertGreaterEqual(groups[0]["candidate_count"], 2)
+        self.assertEqual(groups[0]["chunk_count"], 2)
+        self.assertTrue(all(chunk.metadata.get("synthesis_question") for chunk in groups[0]["chunks"]))
+        self.assertEqual(groups[0]["chunks"][0].id, "primary")
+
     def test_sub_question_retrieval_max_workers_is_bounded(self):
         self.assertEqual(sub_question_retrieval_max_workers(10, rerank=False), 4)
         self.assertEqual(sub_question_retrieval_max_workers(10, rerank=True), 2)

@@ -22,6 +22,7 @@ from src.rag.retrieval import (
     DEFAULT_SEMANTIC_K,
     RetrievalResult,
     display_document_preview,
+    expand_parent_context_results,
     multi_query_hybrid_retrieve,
     normalize_source_url,
     result_source_urls_from_metadata,
@@ -712,11 +713,13 @@ def retrieve_sub_question_context_groups(
     candidate_chunks = max(1, candidate_chunks)
     final_chunks = max(1, min(final_chunks, candidate_chunks))
     clean_questions = dedupe_preserve_order(questions)
+    question_source_urls = planner_question_source_urls(research_plan)
 
     def retrieve_question(question: str) -> dict[str, Any]:
         query_set = per_question_context_queries(question, objective=objective, tasks=tasks)
         if not query_set:
             return sub_question_context_group(question, [], [], [])
+        fallback_used = False
         candidates = multi_query_hybrid_retrieve(
             queries=query_set,
             chroma_path=chroma_path,
@@ -737,9 +740,22 @@ def retrieve_sub_question_context_groups(
             rerank_k=max(rerank_k, candidate_chunks),
             rerank_weight=rerank_weight,
         )
+        if len(candidates) < final_chunks:
+            fallback_candidates = collection_scan_question_retrieve(
+                question=question,
+                queries=query_set,
+                chroma_path=chroma_path,
+                collection_name=collection_name,
+                history_keys=history_keys,
+                top_k=candidate_chunks,
+                scan_limit=bm25_scan_limit,
+                question_source_urls=question_source_urls,
+            )
+            fallback_used = bool(fallback_candidates)
+            candidates = merge_retrieved_context(candidates, fallback_candidates)
         selected = meaningful_retrieval_results(candidates) or list(candidates)
         tagged = [tag_result_for_question(result, question) for result in selected[:final_chunks]]
-        return sub_question_context_group(question, query_set, candidates, tagged)
+        return sub_question_context_group(question, query_set, candidates, tagged, fallback_used=fallback_used)
 
     max_workers = sub_question_retrieval_max_workers(len(clean_questions), rerank=rerank)
     if max_workers <= 1:
@@ -754,14 +770,137 @@ def sub_question_context_group(
     queries: Sequence[str],
     candidates: Sequence[RetrievalResult],
     chunks: Sequence[RetrievalResult],
+    fallback_used: bool = False,
 ) -> dict[str, Any]:
     return {
         "question": clean_text(question),
         "queries": list(queries),
         "candidate_count": len(candidates),
         "chunk_count": len(chunks),
+        "fallback_used": bool(fallback_used),
         "chunks": list(chunks),
     }
+
+
+def collection_scan_question_retrieve(
+    question: str,
+    queries: Sequence[str],
+    chroma_path: str,
+    collection_name: str,
+    history_keys: Sequence[str] | None,
+    top_k: int,
+    scan_limit: int,
+    question_source_urls: dict[str, list[str]] | None = None,
+) -> list[RetrievalResult]:
+    """Fallback per-question retrieval by directly scoring Chroma rows."""
+
+    try:
+        collection = get_collection(chroma_path, collection_name)
+        raw = collection.get(
+            include=["documents", "metadatas"],
+            limit=max(1, scan_limit, top_k * 25),
+        )
+    except Exception as error:
+        print(f"[synthesis] per-question collection scan failed: {error}")
+        return []
+
+    ids = raw.get("ids", []) if isinstance(raw, dict) else []
+    documents = raw.get("documents", []) if isinstance(raw, dict) else []
+    metadatas = raw.get("metadatas", []) if isinstance(raw, dict) else []
+    allowed_history_keys = set(clean_string_list(history_keys or []))
+    candidates = []
+    for index, document in enumerate(documents):
+        metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
+        if allowed_history_keys and clean_text(metadata.get("history_key")) not in allowed_history_keys:
+            continue
+        item_id = clean_text(ids[index] if index < len(ids) else "")
+        content = clean_text(document)
+        if not item_id or not content:
+            continue
+        candidates.append(
+            RetrievalResult(
+                id=item_id,
+                document=content,
+                metadata=metadata,
+                score=0.0,
+                semantic_score=0.0,
+                bm25_score=0.0,
+                authority_score=1.0 if is_primary_source(metadata) else 0.0,
+            )
+        )
+
+    ranked = rank_collection_scan_results(
+        question=question,
+        queries=queries,
+        candidates=candidates,
+        question_source_urls=question_source_urls,
+    )
+    selected = ranked[: max(1, top_k)]
+    return expand_parent_context_results(selected, chroma_path=chroma_path)
+
+
+def rank_collection_scan_results(
+    question: str,
+    queries: Sequence[str],
+    candidates: Sequence[RetrievalResult],
+    question_source_urls: dict[str, list[str]] | None = None,
+) -> list[RetrievalResult]:
+    """Rank direct collection rows for one planner question."""
+
+    query_text = clean_text(" ".join([question, *queries]))
+    query_terms = query_tokens(query_text)
+    topic_terms = {term for term in query_terms if term not in COVERAGE_GENERIC_TERMS}
+    evidence_types = infer_question_evidence_types(question)
+    source_urls = question_source_urls_for(question, question_source_urls)
+    scored = []
+    fallback = []
+
+    for position, result in enumerate(candidates):
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        chunk = retrieved_chunk_preview(result.document, metadata, max_chars=DEFAULT_CONTEXT_BLOCK_CHARS * 2)
+        if not is_meaningful_evidence(chunk):
+            continue
+        fallback.append(result)
+        text = retrieval_result_text(result)
+        text_terms = query_tokens(text)
+        overlap = len(query_terms & text_terms)
+        topic_overlap = len(topic_terms & text_terms)
+        evidence_score = evidence_type_score(text, evidence_types)
+        preferred_source = result_matches_source_urls(result, source_urls)
+        if not (overlap or topic_overlap or evidence_score or preferred_source):
+            continue
+        score = (
+            (topic_overlap * 4.0)
+            + (overlap * 1.5)
+            + (evidence_score * 3.0)
+            + (8.0 if preferred_source else 0.0)
+            + retrieval_result_priority(result)
+            + (1.0 / (position + 1))
+        )
+        scored.append((score, result))
+
+    ranked = [
+        collection_scan_scored_result(result, score)
+        for score, result in sorted(scored, key=lambda item: item[0], reverse=True)
+    ]
+    if ranked:
+        return unique_retrieval_results(ranked)
+    return source_balanced_results(fallback)
+
+
+def collection_scan_scored_result(result: RetrievalResult, score: float) -> RetrievalResult:
+    return RetrievalResult(
+        id=result.id,
+        document=result.document,
+        metadata=result.metadata,
+        score=float(score),
+        semantic_score=result.semantic_score,
+        bm25_score=result.bm25_score,
+        authority_score=result.authority_score,
+        rerank_score=result.rerank_score,
+        semantic_rank=result.semantic_rank,
+        bm25_rank=result.bm25_rank,
+    )
 
 
 def flatten_sub_question_context_groups(groups: Sequence[dict[str, Any]]) -> list[RetrievalResult]:
@@ -779,6 +918,7 @@ def sub_question_context_counts(groups: Sequence[dict[str, Any]]) -> list[dict[s
             "query_count": len(group.get("queries", [])),
             "candidate_count": int(group.get("candidate_count") or 0),
             "chunk_count": int(group.get("chunk_count") or 0),
+            "fallback_used": bool(group.get("fallback_used")),
         }
         for group in groups
         if isinstance(group, dict)
