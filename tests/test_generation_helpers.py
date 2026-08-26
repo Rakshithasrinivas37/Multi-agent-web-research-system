@@ -750,6 +750,30 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("vit", selected_ids)
         self.assertLessEqual(len(selected), 4)
 
+    def test_select_synthesis_context_keeps_six_chunks_per_question_by_default(self):
+        results = []
+        for topic in ("alpha", "beta"):
+            for index in range(6):
+                results.append(
+                    RetrievalResult(
+                        id=f"{topic}-{index}",
+                        document=f"{topic} topic source-backed details with definitions equations metrics and limitations. " * 3,
+                        metadata={"title": f"{topic} source", "url": f"https://example.com/{topic}/{index}"},
+                        score=1.0 - (index * 0.01),
+                        semantic_score=1.0,
+                        bm25_score=0.0,
+                    )
+                )
+
+        selected = select_synthesis_context(
+            results,
+            ["What is alpha topic?", "What is beta topic?"],
+        )
+        selected_ids = {result.id for result in selected}
+
+        self.assertEqual(len([item for item in selected_ids if item.startswith("alpha-")]), 6)
+        self.assertEqual(len([item for item in selected_ids if item.startswith("beta-")]), 6)
+
     def test_select_synthesis_context_prefers_question_planned_sources(self):
         results = [
             RetrievalResult(
