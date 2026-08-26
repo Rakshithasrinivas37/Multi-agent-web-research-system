@@ -18,6 +18,12 @@ DEFAULT_REPORT_MAX_TOKENS = 4000
 DEFAULT_REPORT_PROMPT_CHARS = 12000
 DEFAULT_REPORT_TOTAL_TOKEN_BUDGET = 10000
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
+DEFAULT_RETRY_EVIDENCE_CHARS = 3000
+DEFAULT_RETRY_SYNTHESIS_CHARS = 1600
+DEFAULT_RETRY_EVIDENCE_PACK_CHARS = 1000
+DEFAULT_RETRY_COVERAGE_CHARS = 1200
+DEFAULT_RETRY_SOURCE_CHARS = 1400
+DEFAULT_RETRY_PACK_CHARS = 220
 
 REPORT_SYSTEM_PROMPT = (
     "You write concise, well-structured, cited reports from supplied evidence only. "
@@ -99,16 +105,21 @@ class ReportAgent:
         evidence = format_supporting_evidence(report_context, sources=sources)
         pack_text = format_evidence_packs(evidence_packs)
         sources = evidence_backed_sources(sources, evidence, synthesis, pack_text)
-        prompt = build_report_prompt(
-            objective=objective,
-            output_format=output_format,
-            planner_questions=coverage_questions,
-            synthesis=synthesis,
-            evidence=evidence,
-            sources=sources,
-            citation_policy=clean_text(report_context.get("citation_policy")),
-            coverage_by_question=report_context.get("coverage_by_question", []),
-            evidence_packs=evidence_packs,
+        prompt_inputs = {
+            "objective": objective,
+            "output_format": output_format,
+            "planner_questions": coverage_questions,
+            "synthesis": synthesis,
+            "evidence": evidence,
+            "sources": sources,
+            "citation_policy": clean_text(report_context.get("citation_policy")),
+            "coverage_by_question": report_context.get("coverage_by_question", []),
+            "evidence_packs": evidence_packs,
+        }
+        prompt = build_report_prompt(**prompt_inputs)
+        fallback_prompt = build_report_prompt(
+            **prompt_inputs,
+            compact=True,
         )
 
         emit_progress(
@@ -118,7 +129,7 @@ class ReportAgent:
             tool="groq",
             metadata={"model": self.model},
         )
-        report, model = generate_single_report(Groq(), self.model, prompt)
+        report, model = generate_single_report(Groq(), self.model, prompt, fallback_prompt=fallback_prompt)
         report = normalize_final_report(report, sources)
         synthesis_gaps = synthesis_coverage_gap_questions(report_context, coverage_questions)
         coverage = report_sub_question_coverage_check(report, coverage_questions)
@@ -147,7 +158,9 @@ class ReportAgent:
                 "report_retry_queries": rewrite_missing_sub_question_queries(objective, dedupe_text([*coverage["missing"], *synthesis_gaps])),
                 "report_review_trace": [review],
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
-                "report_estimated_token_cap": report_generation_token_cap(),
+                "report_prompt_chars": len(prompt),
+                "report_fallback_prompt_chars": len(fallback_prompt),
+                "report_estimated_token_cap": report_generation_token_cap(len(prompt)),
             },
         }
 
@@ -171,7 +184,26 @@ def build_report_prompt(
     citation_policy: str = "",
     coverage_by_question: Sequence[dict[str, Any]] | None = None,
     evidence_packs: Sequence[dict[str, Any]] | None = None,
+    compact: bool = False,
 ) -> str:
+    source_text = format_sources(sources)
+    evidence_text = clean_markdown(evidence)
+    synthesis_text = clean_markdown(synthesis)
+    coverage_text = format_question_coverage(coverage_by_question or [])
+    pack_text = format_evidence_packs(evidence_packs or [])
+    if compact:
+        source_text = compact_text(source_text, DEFAULT_RETRY_SOURCE_CHARS)
+        evidence_text = compact_text(evidence_text, DEFAULT_RETRY_EVIDENCE_CHARS)
+        synthesis_text = compact_text(synthesis_text, DEFAULT_RETRY_SYNTHESIS_CHARS)
+        coverage_text = compact_text(coverage_text, DEFAULT_RETRY_COVERAGE_CHARS)
+        pack_text = compact_text(
+            format_evidence_packs(
+                evidence_packs or [],
+                max_chunks_per_pack=1,
+                chunk_chars=DEFAULT_RETRY_PACK_CHARS,
+            ),
+            DEFAULT_RETRY_EVIDENCE_PACK_CHARS,
+        )
     prompt = f"""Research objective:
 {objective}
 
@@ -192,40 +224,61 @@ Suggested topic headings:
 {format_report_section_outline(planner_questions)}
 
 Available sources:
-{format_sources(sources)}
+{source_text}
 
 Supporting evidence:
-{evidence}
+{evidence_text}
 
 Synthesis notes:
-{synthesis}
+{synthesis_text}
 
 Synthesis coverage by planner question:
-{format_question_coverage(coverage_by_question or [])}
+{coverage_text}
 
 Evidence gaps from synthesis:
 {format_missing_evidence_constraints(synthesis)}
 
 Per-question evidence packs:
-{format_evidence_packs(evidence_packs or [])}
+{pack_text}
 
 Write the final Markdown report. Explain each supported topic in clear prose before equations, tables, APIs, or technical details."""
-    return prompt
+    return trim_report_prompt(prompt) if compact else prompt
 
 
-def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, str]:
+def generate_single_report(client: Any, model: str, prompt: str, fallback_prompt: str | None = None) -> tuple[str, str]:
     print(f"Generating single report with model {model}...")
-    response = create_chat_completion_with_retries(
+    try:
+        response = create_report_completion(client, model, prompt, retry_attempts=1)
+    except Exception as error:
+        if not fallback_prompt or not report_prompt_too_large_error(error):
+            raise
+        print("[report] prompt too large; retrying with compact evidence context")
+        response = create_report_completion(client, model, fallback_prompt, retry_attempts=3)
+    return normalize_citation_markers(response.choices[0].message.content), clean_text(getattr(response, "model", "")) or model
+
+
+def create_report_completion(client: Any, model: str, prompt: str, retry_attempts: int) -> Any:
+    return create_chat_completion_with_retries(
         client,
         model=model,
         temperature=0,
         max_tokens=DEFAULT_REPORT_MAX_TOKENS,
+        retry_attempts=retry_attempts,
         messages=[
             {"role": "system", "content": REPORT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
     )
-    return normalize_citation_markers(response.choices[0].message.content), clean_text(getattr(response, "model", "")) or model
+
+
+def report_prompt_too_large_error(error: Exception) -> bool:
+    message = clean_text(error).lower()
+    return (
+        "context_length_exceeded" in message
+        or "please reduce the length of the messages or completion" in message
+        or "please reduce your message size" in message
+        or "request too large" in message
+    )
 
 
 def report_generation_token_cap(prompt_chars: int | None = None) -> int:
@@ -271,7 +324,11 @@ def evidence_pack_questions(evidence_packs: Sequence[Any]) -> list[str]:
     )
 
 
-def format_evidence_packs(evidence_packs: Sequence[dict[str, Any]]) -> str:
+def format_evidence_packs(
+    evidence_packs: Sequence[dict[str, Any]],
+    max_chunks_per_pack: int | None = None,
+    chunk_chars: int | None = None,
+) -> str:
     lines = []
     for pack in evidence_packs or []:
         if not isinstance(pack, dict):
@@ -283,13 +340,16 @@ def format_evidence_packs(evidence_packs: Sequence[dict[str, Any]]) -> str:
         lines.append(f"- {coverage}: {question}")
         chunks = pack.get("chunks", [])
         chunks = chunks if isinstance(chunks, list) else []
-        for chunk in chunks:
+        selected_chunks = chunks if max_chunks_per_pack is None else chunks[: max(0, max_chunks_per_pack)]
+        for chunk in selected_chunks:
             if not isinstance(chunk, dict):
                 continue
             source_index = chunk.get("source_index")
             marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
             title = compact_text(clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Evidence chunk", 90)
             content = sanitize_evidence_content(chunk.get("content"))
+            if chunk_chars is not None:
+                content = content[:chunk_chars].rstrip()
             if content:
                 lines.append(f"  - {marker} {title}: {content}")
     return "\n".join(lines) or "- No per-question evidence packs were provided."

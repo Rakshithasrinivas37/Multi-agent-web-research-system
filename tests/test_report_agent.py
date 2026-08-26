@@ -2,6 +2,7 @@ import unittest
 
 import src.agents.report_agent as report_agent_module
 from src.agents.report_agent import (
+    DEFAULT_REPORT_PROMPT_CHARS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     clean_markdown,
     build_report_prompt,
@@ -234,6 +235,27 @@ Supported [1]. Unsupported [9].
         self.assertIn("Grounding requirement (strict - read this first)", prompt)
         self.assertLess(prompt.index("Grounding requirement"), prompt.index("Per-question evidence packs"))
 
+    def test_build_report_prompt_can_compact_for_retry(self):
+        prompt = build_report_prompt(
+            objective="Large research topic",
+            output_format="report",
+            planner_questions=["What evidence should be covered?"],
+            synthesis="Synthesis sentence. " * 1000,
+            evidence="[1] Evidence sentence. " * 1000,
+            sources=[{"index": 1, "url": "https://example.com"}],
+            evidence_packs=[
+                {
+                    "question": "What evidence should be covered?",
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "title": "Source", "content": "Useful evidence. " * 200}],
+                }
+            ],
+            compact=True,
+        )
+
+        self.assertLessEqual(len(prompt), DEFAULT_REPORT_PROMPT_CHARS)
+        self.assertIn("Grounding requirement (strict - read this first)", prompt)
+
     def test_trim_report_prompt_limits_prompt_size(self):
         prompt = "Rules first.\n\n" + ("long evidence " * 2000)
 
@@ -356,6 +378,34 @@ Supported [1]. Unsupported [9].
             report_agent_module.create_chat_completion_with_retries = original
 
         self.assertIn(tail, captured["prompt"])
+
+    def test_generate_single_report_retries_with_compact_prompt_on_context_error(self):
+        calls = []
+
+        class Message:
+            content = "## Executive Summary\nDone.\n\n## References\n"
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "test-model"
+
+        def fake_completion(client, **kwargs):
+            calls.append(kwargs["messages"][1]["content"])
+            if len(calls) == 1:
+                raise RuntimeError("context_length_exceeded: Please reduce the length of the messages or completion.")
+            return Response()
+
+        original = report_agent_module.create_chat_completion_with_retries
+        report_agent_module.create_chat_completion_with_retries = fake_completion
+        try:
+            generate_single_report(object(), "test-model", "full prompt", fallback_prompt="compact prompt")
+        finally:
+            report_agent_module.create_chat_completion_with_retries = original
+
+        self.assertEqual(calls, ["full prompt", "compact prompt"])
 
     def test_missing_sub_question_coverage_flags_missing_topic(self):
         report = "The report defines attention and explains scoring."
