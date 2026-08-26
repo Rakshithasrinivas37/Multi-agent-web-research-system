@@ -26,10 +26,12 @@ from src.rag.generation import (
     print_synthesis_chunks,
     planner_tasks_to_rag_queries,
     report_supporting_chunks,
+    retrieve_sub_question_context_groups,
     retrieve_full_collection_enabled,
     retrieve_sub_question_context,
     retrieval_topic_phrase,
     result_supports_question,
+    select_question_first_synthesis_context,
     select_synthesis_context,
     sub_question_retrieval_max_workers,
     sub_question_retrieval_queries,
@@ -120,6 +122,38 @@ class GenerationHelperTests(unittest.TestCase):
 
         self.assertEqual(packs[0]["chunks"][0]["source_index"], 1)
         self.assertEqual(packs[1]["chunks"][0]["source_index"], 2)
+
+    def test_build_sub_question_evidence_packs_prefers_assigned_question_chunk(self):
+        results = [
+            RetrievalResult(
+                id="assigned",
+                document="This source-backed passage has enough context for a detailed section. " * 4,
+                metadata={
+                    "title": "Assigned source",
+                    "url": "https://example.com/assigned",
+                    "synthesis_question": "What is alpha?",
+                },
+                score=0.2,
+                semantic_score=0.2,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="overlap",
+                document="Alpha alpha alpha general text with enough evidence content for retrieval. " * 4,
+                metadata={"title": "Overlap source", "url": "https://example.com/overlap"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+        ]
+        sources = [
+            {"index": 1, "id": "assigned", "title": "Assigned source", "url": "https://example.com/assigned"},
+            {"index": 2, "id": "overlap", "title": "Overlap source", "url": "https://example.com/overlap"},
+        ]
+
+        packs = build_sub_question_evidence_packs(["What is alpha?"], results, sources, max_chunks_per_question=1)
+
+        self.assertEqual(packs[0]["chunks"][0]["id"], "assigned")
 
     def test_build_sub_question_evidence_packs_prefers_planned_source_url(self):
         results = [
@@ -776,6 +810,37 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(len([item for item in selected_ids if item.startswith("alpha-")]), 6)
         self.assertEqual(len([item for item in selected_ids if item.startswith("beta-")]), 6)
 
+    def test_select_question_first_synthesis_context_keeps_question_chunks_first(self):
+        question_chunks = [
+            RetrievalResult(
+                id="question-alpha",
+                document="Alpha planner question evidence with definitions equations and limitations. " * 4,
+                metadata={"title": "Alpha", "url": "https://example.com/alpha", "synthesis_question": "What is alpha?"},
+                score=0.4,
+                semantic_score=0.4,
+                bm25_score=0.0,
+            )
+        ]
+        fallback = [
+            RetrievalResult(
+                id="browser-signal",
+                document="Browser fallback evidence with definitions equations and limitations. " * 4,
+                metadata={"title": "Browser", "url": "https://example.com/browser"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+
+        selected = select_question_first_synthesis_context(
+            question_context_results=question_chunks,
+            fallback_context=fallback,
+            planner_questions=["What is alpha?"],
+        )
+
+        self.assertEqual(selected[0].id, "question-alpha")
+        self.assertIn("browser-signal", {result.id for result in selected})
+
     def test_retrieve_sub_question_context_reranks_candidates_and_keeps_six(self):
         calls = []
 
@@ -826,6 +891,49 @@ Missing Evidence: exact benchmark values are not present.
         self.assertTrue(all(call["top_k"] == 20 for call in calls))
         self.assertTrue(all(call["per_query_k"] == 20 for call in calls))
         self.assertTrue(all(call["rerank"] for call in calls))
+        self.assertTrue(all(result.metadata.get("synthesis_question") for result in selected))
+
+    def test_retrieve_sub_question_context_groups_exposes_counts(self):
+        def fake_retrieve(**kwargs):
+            return [
+                RetrievalResult(
+                    id=f"alpha-{index}",
+                    document="Alpha topic source-backed details with definitions equations metrics and limitations. " * 3,
+                    metadata={"title": "Alpha source", "url": f"https://example.com/alpha/{index}"},
+                    score=1.0 - (index * 0.01),
+                    semantic_score=1.0,
+                    bm25_score=0.0,
+                )
+                for index in range(8)
+            ]
+
+        with patch("src.rag.generation.multi_query_hybrid_retrieve", side_effect=fake_retrieve):
+            groups = retrieve_sub_question_context_groups(
+                research_plan={},
+                questions=["What is alpha topic?"],
+                objective="Alpha objective",
+                chroma_path="/tmp/chroma",
+                collection_name="test",
+                history_keys=[],
+                candidate_chunks=8,
+                final_chunks=3,
+                per_query_k=25,
+                semantic_k=10,
+                bm25_k=10,
+                semantic_weight=0.3,
+                bm25_weight=0.3,
+                authority_weight=0.4,
+                bm25_scan_limit=100,
+                embedding_device="",
+                rerank=False,
+                reranker_model="cross-encoder",
+                rerank_k=8,
+                rerank_weight=0.7,
+            )
+
+        self.assertEqual(groups[0]["candidate_count"], 8)
+        self.assertEqual(groups[0]["chunk_count"], 3)
+        self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], "What is alpha topic?")
 
     def test_sub_question_retrieval_max_workers_is_bounded(self):
         self.assertEqual(sub_question_retrieval_max_workers(10, rerank=False), 4)
