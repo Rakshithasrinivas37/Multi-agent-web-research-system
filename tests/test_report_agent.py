@@ -1,7 +1,7 @@
 import unittest
 
+import src.agents.report_agent as report_agent_module
 from src.agents.report_agent import (
-    DEFAULT_REPORT_PROMPT_CHARS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     clean_markdown,
     build_report_prompt,
@@ -11,6 +11,7 @@ from src.agents.report_agent import (
     format_question_coverage,
     format_report_section_outline,
     format_supporting_evidence,
+    generate_single_report,
     missing_evidence_constraints,
     missing_sub_question_coverage,
     normalize_final_report,
@@ -209,13 +210,15 @@ Supported [1]. Unsupported [9].
         self.assertIn("covered: How is the API used?", prompt)
         self.assertIn("Covered packs must be explained", prompt)
 
-    def test_build_report_prompt_keeps_rules_inside_prompt_budget(self):
+    def test_build_report_prompt_keeps_full_evidence_and_synthesis(self):
+        evidence_tail = "retrieved evidence tail should remain"
+        synthesis_tail = "synthesis tail should remain"
         prompt = build_report_prompt(
             objective="Large research topic",
             output_format="report",
             planner_questions=["What evidence should be covered?"],
-            synthesis="Synthesis sentence. " * 1000,
-            evidence="[1] Evidence sentence. " * 1000,
+            synthesis=("Synthesis sentence. " * 1000) + synthesis_tail,
+            evidence=("[1] Evidence sentence. " * 1000) + evidence_tail,
             sources=[{"index": 1, "url": "https://example.com"}],
             evidence_packs=[
                 {
@@ -226,7 +229,8 @@ Supported [1]. Unsupported [9].
             ],
         )
 
-        self.assertLessEqual(len(prompt), DEFAULT_REPORT_PROMPT_CHARS)
+        self.assertIn(evidence_tail, prompt)
+        self.assertIn(synthesis_tail, prompt)
         self.assertIn("Grounding requirement (strict - read this first)", prompt)
         self.assertLess(prompt.index("Grounding requirement"), prompt.index("Per-question evidence packs"))
 
@@ -289,6 +293,69 @@ Supported [1]. Unsupported [9].
 
         self.assertEqual(evidence.count("Attention evidence"), 1)
         self.assertIn("[1]", evidence)
+
+    def test_format_supporting_evidence_keeps_full_chunk_content(self):
+        tail = "important formula appears at the end"
+        context = {
+            "retrieved_chunks": [
+                {
+                    "source_index": 2,
+                    "title": "Long source",
+                    "url": "https://example.com/long",
+                    "content": f"{'context evidence ' * 700}{tail}",
+                }
+            ]
+        }
+
+        evidence = format_supporting_evidence(context)
+
+        self.assertIn(tail, evidence)
+
+    def test_format_evidence_packs_keeps_all_chunk_content(self):
+        first_tail = "first chunk tail"
+        second_tail = "second chunk tail"
+        formatted = format_evidence_packs(
+            [
+                {
+                    "question": "What evidence is available?",
+                    "coverage": "covered",
+                    "chunks": [
+                        {"source_index": 1, "title": "One", "content": f"{'alpha ' * 100}{first_tail}"},
+                        {"source_index": 2, "title": "Two", "content": f"{'beta ' * 100}{second_tail}"},
+                    ],
+                }
+            ]
+        )
+
+        self.assertIn(first_tail, formatted)
+        self.assertIn(second_tail, formatted)
+
+    def test_generate_single_report_sends_full_prompt(self):
+        captured = {}
+
+        class Message:
+            content = "## Executive Summary\nDone.\n\n## References\n"
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "test-model"
+
+        def fake_completion(client, **kwargs):
+            captured["prompt"] = kwargs["messages"][1]["content"]
+            return Response()
+
+        original = report_agent_module.create_chat_completion_with_retries
+        report_agent_module.create_chat_completion_with_retries = fake_completion
+        try:
+            tail = "prompt tail should remain"
+            generate_single_report(object(), "test-model", f"{'prompt content ' * 1200}{tail}")
+        finally:
+            report_agent_module.create_chat_completion_with_retries = original
+
+        self.assertIn(tail, captured["prompt"])
 
     def test_missing_sub_question_coverage_flags_missing_topic(self):
         report = "The report defines attention and explains scoring."

@@ -18,12 +18,6 @@ DEFAULT_REPORT_MAX_TOKENS = 4000
 DEFAULT_REPORT_PROMPT_CHARS = 12000
 DEFAULT_REPORT_TOTAL_TOKEN_BUDGET = 10000
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
-DEFAULT_EVIDENCE_CHARS = 3000
-DEFAULT_SYNTHESIS_CHARS = 1600
-DEFAULT_EVIDENCE_PACK_CHARS = 1000
-DEFAULT_COVERAGE_CHARS = 1200
-DEFAULT_SOURCE_CHARS = 1400
-DEFAULT_CHUNK_CHARS = 420
 
 REPORT_SYSTEM_PROMPT = (
     "You write concise, well-structured, cited reports from supplied evidence only. "
@@ -198,30 +192,29 @@ Suggested topic headings:
 {format_report_section_outline(planner_questions)}
 
 Available sources:
-{compact_text(format_sources(sources), DEFAULT_SOURCE_CHARS)}
+{format_sources(sources)}
 
 Supporting evidence:
-{compact_text(evidence, DEFAULT_EVIDENCE_CHARS)}
+{evidence}
 
 Synthesis notes:
-{compact_text(synthesis, DEFAULT_SYNTHESIS_CHARS)}
+{synthesis}
 
 Synthesis coverage by planner question:
-{compact_text(format_question_coverage(coverage_by_question or []), DEFAULT_COVERAGE_CHARS)}
+{format_question_coverage(coverage_by_question or [])}
 
 Evidence gaps from synthesis:
 {format_missing_evidence_constraints(synthesis)}
 
 Per-question evidence packs:
-{compact_text(format_evidence_packs(evidence_packs or []), DEFAULT_EVIDENCE_PACK_CHARS)}
+{format_evidence_packs(evidence_packs or [])}
 
 Write the final Markdown report. Explain each supported topic in clear prose before equations, tables, APIs, or technical details."""
-    return trim_report_prompt(prompt)
+    return prompt
 
 
 def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, str]:
     print(f"Generating single report with model {model}...")
-    prompt = trim_report_prompt(prompt)
     response = create_chat_completion_with_retries(
         client,
         model=model,
@@ -235,8 +228,10 @@ def generate_single_report(client: Any, model: str, prompt: str) -> tuple[str, s
     return normalize_citation_markers(response.choices[0].message.content), clean_text(getattr(response, "model", "")) or model
 
 
-def report_generation_token_cap() -> int:
-    return (DEFAULT_REPORT_PROMPT_CHARS + 3) // 4 + DEFAULT_REPORT_MAX_TOKENS
+def report_generation_token_cap(prompt_chars: int | None = None) -> int:
+    if prompt_chars is None:
+        return DEFAULT_REPORT_TOTAL_TOKEN_BUDGET
+    return (max(0, prompt_chars) + 3) // 4 + DEFAULT_REPORT_MAX_TOKENS
 
 
 def format_planner_questions(questions: Sequence[str]) -> str:
@@ -288,13 +283,13 @@ def format_evidence_packs(evidence_packs: Sequence[dict[str, Any]]) -> str:
         lines.append(f"- {coverage}: {question}")
         chunks = pack.get("chunks", [])
         chunks = chunks if isinstance(chunks, list) else []
-        for chunk in chunks[:1]:
+        for chunk in chunks:
             if not isinstance(chunk, dict):
                 continue
             source_index = chunk.get("source_index")
             marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
             title = compact_text(clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Evidence chunk", 90)
-            content = sanitize_evidence_content(chunk.get("content"))[:220]
+            content = sanitize_evidence_content(chunk.get("content"))
             if content:
                 lines.append(f"  - {marker} {title}: {content}")
     return "\n".join(lines) or "- No per-question evidence packs were provided."
@@ -320,7 +315,7 @@ def planner_question_heading(question: str) -> str:
 
 def format_supporting_evidence(
     report_context: dict[str, Any],
-    max_chars: int = DEFAULT_EVIDENCE_CHARS,
+    max_chars: int | None = None,
     sources: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     chunks = list(report_context.get("supporting_chunks") or []) + list(report_context.get("retrieved_chunks") or [])
@@ -332,7 +327,7 @@ def format_supporting_evidence(
 
     def add_block(source_index: Any, title: Any, url: Any, content: Any) -> None:
         index = source_index if isinstance(source_index, int) else source_index_by_url.get(normalize_url(url))
-        content = sanitize_evidence_content(content)[:DEFAULT_CHUNK_CHARS]
+        content = sanitize_evidence_content(content)
         if not content:
             return
         key = clean_text(f"{index}:{url}:{content[:120]}").lower()
@@ -368,16 +363,7 @@ def best_evidence_snippet(source: dict[str, Any], query_text: str) -> str:
     content = clean_text(source.get("full_content") or source.get("content") or source.get("content_preview"))
     if not content:
         return ""
-    terms = list(detail_terms(query_text))[:20]
-    candidates = [0]
-    lowered = content.lower()
-    for term in [*terms, *EVIDENCE_SNIPPET_SIGNALS]:
-        location = lowered.find(term.lower())
-        if location >= 0:
-            candidates.append(location)
-    best = max(candidates, key=lambda pos: evidence_snippet_score(content[pos: pos + DEFAULT_CHUNK_CHARS], terms, EVIDENCE_SNIPPET_SIGNALS))
-    start = max(0, best - DEFAULT_CHUNK_CHARS // 4)
-    return clean_text(content[start: start + DEFAULT_CHUNK_CHARS])
+    return content
 
 
 def evidence_snippet_score(snippet: str, terms: Sequence[str], signals: Sequence[str]) -> int:
@@ -391,7 +377,7 @@ def sanitize_evidence_content(text: Any) -> str:
     return clean_text(re.sub(r"\[\s*\d+(?:\s*,\s*\d+)*\s*\]", "", clean_text(text)))
 
 
-def compact_evidence_blocks(blocks: Sequence[dict[str, Any]], max_chars: int) -> str:
+def compact_evidence_blocks(blocks: Sequence[dict[str, Any]], max_chars: int | None) -> str:
     ordered = sorted(blocks, key=lambda item: (-int(item.get("score") or 0), len(clean_text(item.get("block")))))
     selected, seen_sources, used = [], set(), 0
     for pass_number in (1, 2):
@@ -402,7 +388,7 @@ def compact_evidence_blocks(blocks: Sequence[dict[str, Any]], max_chars: int) ->
             block = clean_text(item.get("block"))
             if not block or block in selected:
                 continue
-            if used + len(block) > max_chars:
+            if max_chars is not None and used + len(block) > max_chars:
                 continue
             selected.append(block)
             seen_sources.add(source_key)
