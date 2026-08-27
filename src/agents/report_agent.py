@@ -18,12 +18,15 @@ DEFAULT_REPORT_MAX_TOKENS = 4000
 DEFAULT_REPORT_PROMPT_CHARS = 12000
 DEFAULT_REPORT_TOTAL_TOKEN_BUDGET = 10000
 DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
-DEFAULT_RETRY_EVIDENCE_CHARS = 3000
+DEFAULT_RETRY_EVIDENCE_CHARS = 8000
 DEFAULT_RETRY_SYNTHESIS_CHARS = 1600
 DEFAULT_RETRY_EVIDENCE_PACK_CHARS = 1000
 DEFAULT_RETRY_COVERAGE_CHARS = 1200
 DEFAULT_RETRY_SOURCE_CHARS = 1400
 DEFAULT_RETRY_PACK_CHARS = 220
+DEFAULT_FOCUSED_EVIDENCE_CHARS = 9000
+DEFAULT_FOCUSED_CHUNKS_PER_QUESTION = 2
+DEFAULT_FOCUSED_CHUNK_CHARS = 700
 
 REPORT_SYSTEM_PROMPT = (
     "You write concise, well-structured, cited reports from supplied evidence only. "
@@ -47,7 +50,8 @@ Required report schema:
 
 Coverage requirement (mandatory):
 - Every planner sub-question must map to exactly one topic section under heading 3.
-- Treat synthesis coverage as the coverage contract. If a question is marked missing, write a short evidence-gap subsection instead of inventing an answer.
+- Treat synthesis coverage as a signal, but cited per-question evidence overrides stale gap notes.
+- If a question is marked missing and no cited evidence is supplied for it, write a short evidence-gap subsection instead of inventing an answer.
 - Treat per-question evidence packs as the strongest topic-by-topic evidence map. Covered packs must be explained in the matching section; partial packs must include caveats.
 - For missing coverage items, do not include formulas, API names, benchmark values, examples, or detailed explanations.
 - Each topic section must directly answer its sub-question using only retrieved context.
@@ -102,7 +106,9 @@ class ReportAgent:
         evidence_packs = report_context.get("evidence_packs", [])
         coverage_questions = dedupe_text([*planner_questions, *evidence_pack_questions(evidence_packs)])
         sources = sources_with_browser_results(report_context.get("sources", []), report_context.get("browser_results", []))
-        evidence = format_supporting_evidence(report_context, sources=sources)
+        evidence = format_question_focused_evidence(report_context, coverage_questions, sources=sources, evidence_packs=evidence_packs)
+        if not evidence:
+            evidence = format_supporting_evidence(report_context, sources=sources)
         pack_text = format_evidence_packs(evidence_packs)
         sources = evidence_backed_sources(sources, evidence, synthesis, pack_text)
         prompt_inputs = {
@@ -340,7 +346,9 @@ def format_evidence_packs(
         lines.append(f"- {coverage}: {question}")
         chunks = pack.get("chunks", [])
         chunks = chunks if isinstance(chunks, list) else []
-        selected_chunks = chunks if max_chunks_per_pack is None else chunks[: max(0, max_chunks_per_pack)]
+        selected_chunks = chunks
+        if max_chunks_per_pack is not None:
+            selected_chunks = rank_question_chunks(question, chunks)[: max(0, max_chunks_per_pack)]
         for chunk in selected_chunks:
             if not isinstance(chunk, dict):
                 continue
@@ -408,6 +416,118 @@ def format_supporting_evidence(
         add_block(source_index_by_url.get(normalize_url(url)), source.get("title"), url, best_evidence_snippet(source, query_text))
 
     return compact_evidence_blocks(blocks, max_chars)
+
+
+def format_question_focused_evidence(
+    report_context: dict[str, Any],
+    questions: Sequence[str],
+    sources: Sequence[dict[str, Any]] | None = None,
+    evidence_packs: Sequence[dict[str, Any]] | None = None,
+    max_chars: int = DEFAULT_FOCUSED_EVIDENCE_CHARS,
+) -> str:
+    """Build compact evidence blocks that keep support for every planner question."""
+
+    clean_questions = [clean_text(q) for q in questions if clean_text(q)]
+    if not clean_questions:
+        return ""
+    all_chunks = all_report_chunks(report_context, evidence_packs)
+    if not all_chunks:
+        return ""
+    source_index_by_url = {normalize_url(source.get("url")): source.get("index") for source in sources or [] if isinstance(source, dict)}
+    packs_by_question = {normalize_heading(pack.get("question")): pack for pack in evidence_packs or [] if isinstance(pack, dict)}
+    per_question_budget = max(650, max_chars // max(1, len(clean_questions)))
+    blocks = []
+    used = 0
+    for question in clean_questions:
+        pack = packs_by_question.get(normalize_heading(question), {})
+        planned_urls = pack.get("planned_source_urls", []) if isinstance(pack, dict) else []
+        ranked = rank_question_chunks(question, all_chunks, planned_urls=planned_urls)
+        lines = [f"Question: {question}"]
+        remaining = per_question_budget
+        for chunk in ranked[:DEFAULT_FOCUSED_CHUNKS_PER_QUESTION]:
+            content = sanitize_evidence_content(chunk.get("content"))[:DEFAULT_FOCUSED_CHUNK_CHARS].rstrip()
+            if not content:
+                continue
+            source_index = chunk.get("source_index") if isinstance(chunk.get("source_index"), int) else chunk.get("index")
+            if not isinstance(source_index, int):
+                source_index = source_index_by_url.get(normalize_url(chunk.get("url")))
+            marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
+            title = compact_text(clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Evidence chunk", 90)
+            line = f"- {marker} {title}: {content}"
+            if len(line) > remaining and len(lines) > 1:
+                continue
+            lines.append(line)
+            remaining -= len(line)
+        block = "\n".join(lines)
+        if len(lines) == 1:
+            block += "\n- No cited retrieved evidence was selected for this question."
+        if used + len(block) > max_chars and blocks:
+            break
+        blocks.append(block)
+        used += len(block)
+    return "\n\n".join(blocks)
+
+
+def all_report_chunks(report_context: dict[str, Any], evidence_packs: Sequence[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for pack in evidence_packs or []:
+        if isinstance(pack, dict):
+            chunks.extend(chunk for chunk in pack.get("chunks", []) or [] if isinstance(chunk, dict))
+    chunks.extend(chunk for chunk in report_context.get("supporting_chunks", []) or [] if isinstance(chunk, dict))
+    chunks.extend(chunk for chunk in report_context.get("retrieved_chunks", []) or [] if isinstance(chunk, dict))
+    deduped = []
+    seen = set()
+    for chunk in chunks:
+        content = sanitize_evidence_content(chunk.get("content"))
+        key = clean_text(f"{chunk.get('source_index')}:{chunk.get('url')}:{content[:160]}").lower()
+        if content and key not in seen:
+            seen.add(key)
+            item = dict(chunk)
+            item["content"] = content
+            deduped.append(item)
+    return deduped
+
+
+def rank_question_chunks(
+    question: str,
+    chunks: Sequence[dict[str, Any]],
+    planned_urls: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    target_urls = {normalize_url(url) for url in planned_urls or [] if normalize_url(url)}
+    return sorted(
+        [chunk for chunk in chunks if isinstance(chunk, dict)],
+        key=lambda chunk: -question_chunk_score(question, chunk, target_urls),
+    )
+
+
+def question_chunk_score(question: str, chunk: dict[str, Any], planned_urls: set[str] | None = None) -> int:
+    text = clean_text(" ".join([clean_text(chunk.get("title")), clean_text(chunk.get("url")), clean_text(chunk.get("content"))]))
+    terms = detail_terms(question)
+    overlap = len(terms & detail_terms(text))
+    source_url = normalize_url(chunk.get("url"))
+    assigned = normalize_heading(chunk.get("synthesis_question") or chunk.get("question")) == normalize_heading(question)
+    planned = bool(source_url and source_url in (planned_urls or set()))
+    score = overlap
+    score += 8 if assigned else 0
+    score += 6 if planned else 0
+    score += 4 if chunk.get("is_primary_source") else 0
+    score += source_priority(source_url) * 2
+    score += evidence_snippet_score(text, list(terms), evidence_signals_for_question(question))
+    return score
+
+
+def evidence_signals_for_question(question: str) -> list[str]:
+    lowered = clean_text(question).lower()
+    signals = list(EVIDENCE_SNIPPET_SIGNALS)
+    if any(term in lowered for term in ("equation", "formula", "mathematical", "component")):
+        signals.extend(["=", "softmax", "sqrt", "tanh", "exp", "sum", "∑", "alpha", "attention("])
+    if any(term in lowered for term in ("benchmark", "performance", "score", "metric", "improve")):
+        signals.extend(["benchmark", "score", "result", "improve", "accuracy", "bleu", "glue", "wmt", "%"])
+    if any(term in lowered for term in ("complexity", "scale", "cost", "sequence length")):
+        signals.extend(["complexity", "quadratic", "linear", "memory", "o(", "sequence length"])
+    if any(term in lowered for term in ("limitation", "challenge", "risk", "open question")):
+        signals.extend(["limitation", "challenge", "bottleneck", "cost", "interpretability", "locality"])
+    return dedupe_text(signals)
 
 
 def browser_result_sources(browser_results: Sequence[Any]) -> list[dict[str, Any]]:
@@ -602,14 +722,28 @@ def synthesis_coverage_gap_questions(
     if not isinstance(report_context, dict):
         return []
     canonical = {normalize_heading(q): q for q in planner_questions or [] if clean_text(q)}
+    covered_packs = {
+        normalize_heading(pack.get("question"))
+        for pack in report_context.get("evidence_packs", []) or []
+        if isinstance(pack, dict) and evidence_pack_has_cited_evidence(pack)
+    }
     gaps = []
     for item in report_context.get("coverage_by_question", []) or []:
         if not isinstance(item, dict) or not synthesis_coverage_status_is_gap(item.get("status")):
             continue
         question = clean_text(item.get("question"))
+        if normalize_heading(question) in covered_packs:
+            continue
         if question:
             gaps.append(canonical.get(normalize_heading(question), question))
     return dedupe_text(gaps)
+
+
+def evidence_pack_has_cited_evidence(pack: dict[str, Any]) -> bool:
+    coverage = clean_text(pack.get("coverage")).lower()
+    if synthesis_coverage_status_is_gap(coverage):
+        return False
+    return any(isinstance(chunk, dict) and isinstance(chunk.get("source_index"), int) and clean_text(chunk.get("content")) for chunk in pack.get("chunks", []) or [])
 
 
 def synthesis_coverage_status_is_gap(status: Any) -> bool:
