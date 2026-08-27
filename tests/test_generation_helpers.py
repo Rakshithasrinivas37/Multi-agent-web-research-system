@@ -28,6 +28,7 @@ from src.rag.generation import (
     select_synthesis_context,
 )
 from src.rag.sub_question_context import (
+    browser_question_context_retrieve,
     complete_sub_question_query_coverage,
     is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
@@ -1073,6 +1074,45 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("browser_results", groups[0]["fallback_sources"])
         self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], "How does multiplicative Luong attention work?")
         self.assertEqual(groups[0]["chunks"][0].metadata["url"], "https://arxiv.org/pdf/1508.04025")
+
+    def test_browser_question_context_prefers_exact_benchmark_from_primary_source(self):
+        browser_results = [
+            {
+                "sources": [
+                    {
+                        "url": "https://example.com/benchmark-overview",
+                        "title": "Benchmark Overview",
+                        "source_type": "webpage",
+                        "full_content": (
+                            "This overview discusses benchmark evaluation and model performance in broad terms. "
+                            "It does not provide exact metric values for the target source. "
+                        ) * 8,
+                    },
+                    {
+                        "url": "https://arxiv.org/pdf/1706.03762",
+                        "title": "Attention Is All You Need",
+                        "source_type": "pdf",
+                        "full_content": (
+                            "The Transformer uses attention mechanisms for sequence transduction. "
+                            "Experiments on two machine translation tasks show superior quality. "
+                            "The model achieves 28.4 BLEU on the WMT 2014 English-to-German task, "
+                            "improving over the existing best results by over 2 BLEU. "
+                        ) * 4,
+                    },
+                ]
+            }
+        ]
+
+        results = browser_question_context_retrieve(
+            question="What are the primary applications and benchmark results in NLP and computer vision?",
+            queries=["applications benchmark results NLP computer vision"],
+            browser_results=browser_results,
+            top_k=2,
+        )
+
+        self.assertEqual(results[0].metadata["url"], "https://arxiv.org/pdf/1706.03762")
+        self.assertIn("28.4 BLEU", results[0].document)
+        self.assertIn("WMT 2014", results[0].document)
 
     def test_sub_question_retrieval_max_workers_is_bounded(self):
         self.assertEqual(sub_question_retrieval_max_workers(10, rerank=False), 4)

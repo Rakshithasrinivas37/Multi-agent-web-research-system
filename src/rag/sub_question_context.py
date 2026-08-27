@@ -25,6 +25,15 @@ DEFAULT_SYNTHESIS_MAX_CHUNKS = 48
 DEFAULT_CONTEXT_BLOCK_CHARS = 750
 DEFAULT_HF_QUERY_MAX_INPUT_TOKENS = 4096
 DEFAULT_HF_QUERY_MAX_NEW_TOKENS = 900
+EVIDENCE_TERMS_BY_TYPE = {
+    "api": {"api", "class", "function", "method", "parameter", "argument", "signature", "usage", "example"},
+    "applications": {"application", "applications", "task", "tasks", "used for", "nlp", "vision", "computer vision", "image", "classification", "translation", "speech", "recognition"},
+    "benchmark": {"benchmark", "benchmarks", "score", "scores", "result", "results", "performance", "accuracy", "bleu", "glue", "wmt", "imagenet", "cifar", "vtab", "top-1"},
+    "complexity": {"complexity", "runtime", "memory", "quadratic", "linear", "scalability", "sequence length"},
+    "definition": {"definition", "defined as", "refers to", "means", "purpose", "overview"},
+    "equation": {"equation", "formula", "formulation", "softmax", "sqrt", "tanh", "exp", "alpha", "sum"},
+    "limitations": {"limitation", "limitations", "challenge", "challenges", "drawback", "bottleneck", "open question"},
+}
 
 
 def generation_helpers() -> Any:
@@ -229,20 +238,25 @@ def retrieve_sub_question_context_groups(
             if fallback_candidates:
                 fallback_sources.append("collection_scan")
                 candidates = helpers.merge_retrieved_context(candidates, fallback_candidates)
-        if len(candidates) < final_chunks:
-            browser_candidates = browser_question_context_retrieve(
-                question=question,
-                queries=query_set,
-                browser_results=browser_results or [],
-                top_k=candidate_chunks,
-                question_source_urls=question_source_urls,
-            )
-            if browser_candidates:
-                fallback_sources.append("browser_results")
-                candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
+        browser_candidates = browser_question_context_retrieve(
+            question=question,
+            queries=query_set,
+            browser_results=browser_results or [],
+            top_k=candidate_chunks,
+            question_source_urls=question_source_urls,
+        )
+        if browser_candidates:
+            fallback_sources.append("browser_results")
+            candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
         if not candidates:
             print(f"[synthesis] no per-question chunks found for: {question[:120]}")
-        selected = helpers.meaningful_retrieval_results(candidates) or list(candidates)
+        ranked_candidates = rank_collection_scan_results(
+            question=question,
+            queries=query_set,
+            candidates=candidates,
+            question_source_urls=question_source_urls,
+        )
+        selected = helpers.meaningful_retrieval_results(ranked_candidates) or ranked_candidates or list(candidates)
         tagged = [tag_result_for_question(result, question) for result in selected[:final_chunks]]
         return sub_question_context_group(
             question,
@@ -293,7 +307,8 @@ def browser_question_context_retrieve(
         return []
 
     query_text = clean_text(" ".join([question, *queries]))
-    query_terms = helpers.query_tokens(query_text)
+    evidence_terms = browser_evidence_query_terms(question)
+    query_terms = helpers.query_tokens(query_text) | evidence_terms
     source_urls = helpers.question_source_urls_for(question, question_source_urls)
     candidates = []
     for result_index, browser_result in enumerate(browser_results):
@@ -314,7 +329,7 @@ def browser_question_context_retrieve(
                 "source_authority": clean_text(source.get("source_authority")),
                 "query_contexts": task_context,
             }
-            for snippet_index, snippet in enumerate(browser_source_snippets(source, query_terms=query_terms)):
+            for snippet_index, snippet in enumerate(browser_source_snippets(source, query_terms=query_terms, priority_terms=evidence_terms)):
                 content = clean_text(snippet)
                 if not helpers.is_meaningful_evidence(content):
                     continue
@@ -339,13 +354,20 @@ def browser_question_context_retrieve(
     return ranked[: max(1, top_k)]
 
 
-def browser_source_snippets(source: dict[str, Any], query_terms: set[str], max_snippets: int = 8) -> list[str]:
+def browser_source_snippets(
+    source: dict[str, Any],
+    query_terms: set[str],
+    priority_terms: set[str] | None = None,
+    max_snippets: int = 8,
+) -> list[str]:
     """Return compact source snippets likely to answer a planner sub-question."""
 
     snippets = []
     for key in ("full_content", "content_preview"):
         text = clean_text(source.get(key))
         if text:
+            if priority_terms:
+                snippets.extend(text_windows_for_terms(text, query_terms=priority_terms, max_windows=5))
             snippets.extend(text_windows_for_terms(text, query_terms=query_terms))
 
     for key in ("important_sections", "extracted_facts", "evidence"):
@@ -368,6 +390,16 @@ def browser_source_snippets(source: dict[str, Any], query_terms: set[str], max_s
         if len(unique) >= max_snippets:
             break
     return unique
+
+
+def browser_evidence_query_terms(question: str) -> set[str]:
+    """Terms used to recover exact evidence from browser text before vector chunks lose it."""
+
+    helpers = generation_helpers()
+    terms = set()
+    for evidence_type in helpers.infer_question_evidence_types(question):
+        terms.update(EVIDENCE_TERMS_BY_TYPE.get(clean_text(evidence_type).lower(), set()))
+    return {term.lower() for term in terms if len(term) >= 3}
 
 
 def browser_source_item_text(item: Any) -> str:
