@@ -11,28 +11,30 @@ from src.rag.generation import (
     build_generation_context,
     browser_signal_results,
     compact_retrieved_chunks,
-    complete_sub_question_query_coverage,
     coverage_gap_items,
     evidence_focused_question_query,
     fallback_gap_retrieval_queries,
     high_signal_browser_snippets,
-    is_valid_retrieval_query,
-    llm_sub_question_retrieval_query_result,
     parse_gap_query_lines,
-    parse_llm_retrieval_queries,
     planner_question_source_urls,
     planner_sub_question_specs,
     precision_retrieval_queries,
     print_synthesis_chunks,
     planner_tasks_to_rag_queries,
     report_supporting_chunks,
-    retrieve_sub_question_context_groups,
     retrieve_full_collection_enabled,
-    retrieve_sub_question_context,
     retrieval_topic_phrase,
     result_supports_question,
-    select_question_first_synthesis_context,
     select_synthesis_context,
+)
+from src.rag.sub_question_context import (
+    complete_sub_question_query_coverage,
+    is_valid_retrieval_query,
+    llm_sub_question_retrieval_query_result,
+    parse_llm_retrieval_queries,
+    retrieve_sub_question_context_groups,
+    retrieve_sub_question_context,
+    select_question_first_synthesis_context,
     sub_question_retrieval_max_workers,
     sub_question_retrieval_queries,
     valid_retrieval_queries,
@@ -620,7 +622,7 @@ Missing Evidence: exact benchmark values are not present.
 
         self.assertEqual(queries, ["scaled dot product attention equation softmax sqrt dk"])
 
-    @patch.dict("os.environ", {}, clear=True)
+    @patch.dict("os.environ", {"RAG_QUERY_REWRITE_PROVIDER": "groq"}, clear=True)
     def test_llm_sub_question_retrieval_query_result_defaults_to_qwen(self):
         result = llm_sub_question_retrieval_query_result(
             {"objective": "X research", "sub_questions": ["What is X?"]},
@@ -629,8 +631,8 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(result["model"], "qwen/qwen3.6-27b")
         self.assertEqual(result["error"], "GROQ_API_KEY is not set")
 
-    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)
-    @patch("src.rag.generation.create_chat_completion_with_retries")
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test", "RAG_QUERY_REWRITE_PROVIDER": "groq"}, clear=False)
+    @patch("src.rag.sub_question_context.create_chat_completion_with_retries")
     def test_llm_sub_question_retrieval_query_result_uses_query_model(self, completion):
         class Message:
             content = '{"items":[{"sub_question":"What is X?","queries":["x research overview","x research evidence details"]}]}'
@@ -659,8 +661,8 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("source/section query", prompt)
         self.assertNotIn('"query 1"', prompt)
 
-    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test"}, clear=False)
-    @patch("src.rag.generation.create_chat_completion_with_retries")
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test", "RAG_QUERY_REWRITE_PROVIDER": "groq"}, clear=False)
+    @patch("src.rag.sub_question_context.create_chat_completion_with_retries")
     def test_llm_sub_question_retrieval_query_result_rejects_placeholder_queries(self, completion):
         class Message:
             content = '{"items":[{"sub_question":"What is X?","queries":["query 1","query 2"]}]}'
@@ -680,6 +682,28 @@ Missing Evidence: exact benchmark values are not present.
 
         self.assertEqual(result["queries"], [])
         self.assertEqual(result["error"], "LLM query rewrite returned no usable queries")
+
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_QUERY_REWRITE_PROVIDER": "auto"}, clear=False)
+    @patch("src.rag.sub_question_context.hf_sub_question_retrieval_query_result")
+    @patch("src.rag.sub_question_context.create_chat_completion_with_retries")
+    def test_llm_sub_question_retrieval_query_result_falls_back_to_hf(self, completion, hf_rewrite):
+        completion.side_effect = RuntimeError("Groq failed")
+        hf_rewrite.return_value = {
+            "queries": ["x research overview", "x research evidence details"],
+            "model": "hf-test",
+            "error": "",
+            "raw_response": "{}",
+            "provider": "hf",
+            "fallback_reason": "Groq failed",
+        }
+
+        result = llm_sub_question_retrieval_query_result(
+            {"objective": "X research", "sub_questions": ["What is X?"]},
+        )
+
+        self.assertEqual(result["queries"], ["x research overview", "x research evidence details"])
+        self.assertEqual(result["provider"], "hf")
+        self.assertIn("Groq failed", result["fallback_reason"])
 
     def test_browser_signal_results_promotes_formula_evidence(self):
         browser_results = [
@@ -859,7 +883,7 @@ Missing Evidence: exact benchmark values are not present.
                 for index in range(20)
             ]
 
-        with patch("src.rag.generation.multi_query_hybrid_retrieve", side_effect=fake_retrieve):
+        with patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", side_effect=fake_retrieve):
             selected = retrieve_sub_question_context(
                 research_plan={},
                 questions=["What is alpha topic?", "What is beta topic?"],
@@ -907,7 +931,7 @@ Missing Evidence: exact benchmark values are not present.
                 for index in range(8)
             ]
 
-        with patch("src.rag.generation.multi_query_hybrid_retrieve", side_effect=fake_retrieve):
+        with patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", side_effect=fake_retrieve):
             groups = retrieve_sub_question_context_groups(
                 research_plan={},
                 questions=["What is alpha topic?"],
@@ -953,9 +977,9 @@ Missing Evidence: exact benchmark values are not present.
                 }
 
         with (
-            patch("src.rag.generation.multi_query_hybrid_retrieve", return_value=[]),
-            patch("src.rag.generation.get_collection", return_value=FakeCollection()),
-            patch("src.rag.generation.expand_parent_context_results", side_effect=lambda results, chroma_path: list(results)),
+            patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", return_value=[]),
+            patch("src.rag.sub_question_context.get_collection", return_value=FakeCollection()),
+            patch("src.rag.sub_question_context.expand_parent_context_results", side_effect=lambda results, chroma_path: list(results)),
         ):
             groups = retrieve_sub_question_context_groups(
                 research_plan={},
