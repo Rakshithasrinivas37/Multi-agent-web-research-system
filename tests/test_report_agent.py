@@ -10,6 +10,7 @@ from src.agents.report_agent import (
     evidence_pack_questions,
     format_evidence_packs,
     format_question_coverage,
+    format_question_focused_evidence,
     format_report_section_outline,
     format_supporting_evidence,
     generate_single_report,
@@ -352,6 +353,41 @@ Supported [1]. Unsupported [9].
         self.assertIn(first_tail, formatted)
         self.assertIn(second_tail, formatted)
 
+    def test_format_question_focused_evidence_keeps_per_question_details(self):
+        context = {
+            "planner_questions": [
+                "What is the equation?",
+                "What benchmark result is reported?",
+            ],
+            "retrieved_chunks": [
+                {
+                    "source_index": 1,
+                    "title": "Paper",
+                    "url": "https://paper.example",
+                    "content": "General background without the requested detail.",
+                },
+                {
+                    "source_index": 2,
+                    "title": "Equation paper",
+                    "url": "https://equation.example",
+                    "content": "The core formula is score(q,k)=exp(q k) and alpha=sum weights.",
+                },
+                {
+                    "source_index": 3,
+                    "title": "Benchmark paper",
+                    "url": "https://benchmark.example",
+                    "content": "The benchmark result improves BLEU from 20.1 to 24.3.",
+                },
+            ],
+        }
+
+        evidence = format_question_focused_evidence(context, context["planner_questions"])
+
+        self.assertIn("Question: What is the equation?", evidence)
+        self.assertIn("score(q,k)=exp(q k)", evidence)
+        self.assertIn("Question: What benchmark result is reported?", evidence)
+        self.assertIn("BLEU from 20.1 to 24.3", evidence)
+
     def test_generate_single_report_sends_full_prompt(self):
         captured = {}
 
@@ -577,6 +613,21 @@ Done.
 
         self.assertEqual(synthesis_coverage_gap_questions(context, plan["sub_questions"]), [question])
         self.assertEqual(report_context_gap_items(context, plan), [question])
+
+    def test_synthesis_gap_ignores_stale_missing_when_pack_has_cited_evidence(self):
+        question = "What equation is used?"
+        context = {
+            "coverage_by_question": [{"question": question, "status": "missing", "source_indexes": []}],
+            "evidence_packs": [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "content": "The equation is present."}],
+                }
+            ],
+        }
+
+        self.assertEqual(synthesis_coverage_gap_questions(context, [question]), [])
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(
