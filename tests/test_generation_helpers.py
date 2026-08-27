@@ -494,7 +494,8 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("overview", joined)
         self.assertIn("benchmark", joined)
         self.assertIn("metrics", joined)
-        self.assertTrue(any(query.lower().startswith(("what ", "which ", "where ")) for query in queries))
+        self.assertFalse(any(query.lower().startswith(("what ", "which ", "where ", "how ")) for query in queries))
+        self.assertNotIn("source-backed context", joined)
         self.assertNotIn("source-backed details examples definitions equations metrics implementation limitations", joined)
 
     def test_retrieval_topic_phrase_removes_question_filler(self):
@@ -585,7 +586,7 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("computer vision", joined)
         self.assertIn("linformer", joined)
         self.assertIn("performer", joined)
-        self.assertIn("what source-backed context", joined)
+        self.assertNotIn("what source-backed context", joined)
         self.assertNotIn("are major", joined)
         self.assertLessEqual(len(queries), 6)
 
@@ -655,10 +656,10 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(result["error"], "")
         self.assertEqual(completion.call_args.kwargs["model"], "llama-test")
         prompt = completion.call_args.kwargs["messages"][1]["content"]
-        self.assertIn("broad, high-recall RAG retrieval queries", prompt)
-        self.assertIn("concept/context query", prompt)
-        self.assertIn("Do not output only narrow labels", prompt)
-        self.assertIn("source/section query", prompt)
+        self.assertIn("compact, high-recall RAG search queries", prompt)
+        self.assertIn("keyword-style queries", prompt)
+        self.assertIn("Do not start queries with", prompt)
+        self.assertIn("source-targeted query", prompt)
         self.assertNotIn('"query 1"', prompt)
 
     @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test", "RAG_QUERY_REWRITE_PROVIDER": "groq"}, clear=False)
@@ -1008,6 +1009,70 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(groups[0]["chunk_count"], 2)
         self.assertTrue(all(chunk.metadata.get("synthesis_question") for chunk in groups[0]["chunks"]))
         self.assertEqual(groups[0]["chunks"][0].id, "primary")
+
+    def test_retrieve_sub_question_context_groups_uses_browser_results_when_index_empty(self):
+        browser_results = [
+            {
+                "task_id": "task_001",
+                "query_context": "q001",
+                "sources": [
+                    {
+                        "url": "https://arxiv.org/pdf/1508.04025",
+                        "title": "Effective Approaches to Attention-based Neural Machine Translation",
+                        "source_type": "pdf",
+                        "source_quality": "useful_primary",
+                        "source_authority": "primary",
+                        "full_content": (
+                            "Luong multiplicative attention defines global attention and local attention. "
+                            "The general score function uses a bilinear equation between decoder state "
+                            "and encoder hidden state. This source compares multiplicative attention "
+                            "with additive attention and reports WMT translation evidence. "
+                        ) * 4,
+                    }
+                ],
+            }
+        ]
+        plan = {
+            "objective": "Attention mechanism",
+            "sub_questions": ["How does multiplicative Luong attention work?"],
+            "sub_question_specs": [{"question_id": "q001", "question": "How does multiplicative Luong attention work?"}],
+            "tasks": [{"query_context": "q001", "url": "https://arxiv.org/abs/1508.04025"}],
+        }
+
+        with (
+            patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", return_value=[]),
+            patch("src.rag.sub_question_context.source_url_coverage_retrieve", return_value=[]),
+            patch("src.rag.sub_question_context.collection_scan_question_retrieve", return_value=[]),
+        ):
+            groups = retrieve_sub_question_context_groups(
+                research_plan=plan,
+                questions=plan["sub_questions"],
+                objective="Attention mechanism",
+                chroma_path="/tmp/chroma",
+                collection_name="test",
+                history_keys=[],
+                candidate_chunks=8,
+                final_chunks=2,
+                per_query_k=25,
+                semantic_k=10,
+                bm25_k=10,
+                semantic_weight=0.3,
+                bm25_weight=0.3,
+                authority_weight=0.4,
+                bm25_scan_limit=100,
+                embedding_device="",
+                rerank=False,
+                reranker_model="cross-encoder",
+                rerank_k=8,
+                rerank_weight=0.7,
+                browser_results=browser_results,
+            )
+
+        self.assertGreaterEqual(groups[0]["candidate_count"], 1)
+        self.assertGreaterEqual(groups[0]["chunk_count"], 1)
+        self.assertIn("browser_results", groups[0]["fallback_sources"])
+        self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], "How does multiplicative Luong attention work?")
+        self.assertEqual(groups[0]["chunks"][0].metadata["url"], "https://arxiv.org/pdf/1508.04025")
 
     def test_sub_question_retrieval_max_workers_is_bounded(self):
         self.assertEqual(sub_question_retrieval_max_workers(10, rerank=False), 4)

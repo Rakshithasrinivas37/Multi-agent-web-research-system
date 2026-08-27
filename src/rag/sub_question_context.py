@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
 from src.rag.indexing import get_collection
-from src.rag.retrieval import RetrievalResult, expand_parent_context_results, multi_query_hybrid_retrieve
+from src.rag.retrieval import RetrievalResult, expand_parent_context_results, multi_query_hybrid_retrieve, source_url_coverage_retrieve
 from src.tools.groq_retry import create_chat_completion_with_retries
 from src.tools.text_utils import clean_text
 
@@ -67,7 +68,7 @@ def sub_question_retrieval_queries(
     task_details: str = "",
     max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
 ) -> list[str]:
-    """Rewrite one planner sub-question into broad retrieval intents."""
+    """Rewrite one planner sub-question into compact retrieval queries."""
 
     helpers = generation_helpers()
     question = clean_text(question)
@@ -81,11 +82,11 @@ def sub_question_retrieval_queries(
     key_terms = " ".join(helpers.query_keywords(question, limit=10)) or topic or objective
     hints = " ".join(helpers.broad_query_hints(f"{question} {task_details}"))
     variants = [
-        clean_text(f"What source-backed context explains {topic} {hints}?"),
-        clean_text(f"Which evidence gives {key_terms} details, examples, equations, benchmarks, or limitations?"),
-        clean_text(f"Where do authoritative sources discuss {objective} {topic} {source_terms} source sections evidence?"),
+        clean_text(f"{topic} {hints}"),
+        clean_text(f"{key_terms} evidence details examples equations benchmarks limitations"),
+        clean_text(f"{objective} {topic} {source_terms} primary source official docs paper"),
     ]
-    return helpers.dedupe_preserve_order(variant[:700] for variant in variants)[: max(1, max_variants)]
+    return helpers.dedupe_preserve_order(variant[:220] for variant in variants if variant)[: max(1, max_variants)]
 
 
 def retrieve_sub_question_context(
@@ -109,6 +110,7 @@ def retrieve_sub_question_context(
     reranker_model: str,
     rerank_k: int,
     rerank_weight: float,
+    browser_results: Sequence[Any] | None = None,
 ) -> list[RetrievalResult]:
     """Retrieve and rerank an independent evidence set for each planner sub-question."""
 
@@ -134,6 +136,7 @@ def retrieve_sub_question_context(
             reranker_model=reranker_model,
             rerank_k=rerank_k,
             rerank_weight=rerank_weight,
+            browser_results=browser_results,
         )
     )
 
@@ -159,6 +162,7 @@ def retrieve_sub_question_context_groups(
     reranker_model: str,
     rerank_k: int,
     rerank_weight: float,
+    browser_results: Sequence[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Retrieve an inspectable chunk group for each planner sub-question."""
 
@@ -173,7 +177,7 @@ def retrieve_sub_question_context_groups(
         query_set = per_question_context_queries(question, objective=objective, tasks=tasks)
         if not query_set:
             return sub_question_context_group(question, [], [], [])
-        fallback_used = False
+        fallback_sources = []
         candidates = multi_query_hybrid_retrieve(
             queries=query_set,
             chroma_path=chroma_path,
@@ -195,6 +199,23 @@ def retrieve_sub_question_context_groups(
             rerank_weight=rerank_weight,
         )
         if len(candidates) < final_chunks:
+            try:
+                source_candidates = source_url_coverage_retrieve(
+                    source_urls=helpers.question_source_urls_for(question, question_source_urls),
+                    query=query_set,
+                    chroma_path=chroma_path,
+                    collection_name=collection_name,
+                    history_keys=history_keys,
+                    top_k_per_url=candidate_chunks,
+                    scan_limit=bm25_scan_limit,
+                )
+            except Exception as error:
+                print(f"[synthesis] per-question source URL retrieval failed: {error}")
+                source_candidates = []
+            if source_candidates:
+                fallback_sources.append("source_url")
+                candidates = helpers.merge_retrieved_context(candidates, source_candidates)
+        if len(candidates) < final_chunks:
             fallback_candidates = collection_scan_question_retrieve(
                 question=question,
                 queries=query_set,
@@ -205,11 +226,31 @@ def retrieve_sub_question_context_groups(
                 scan_limit=bm25_scan_limit,
                 question_source_urls=question_source_urls,
             )
-            fallback_used = bool(fallback_candidates)
-            candidates = helpers.merge_retrieved_context(candidates, fallback_candidates)
+            if fallback_candidates:
+                fallback_sources.append("collection_scan")
+                candidates = helpers.merge_retrieved_context(candidates, fallback_candidates)
+        if len(candidates) < final_chunks:
+            browser_candidates = browser_question_context_retrieve(
+                question=question,
+                queries=query_set,
+                browser_results=browser_results or [],
+                top_k=candidate_chunks,
+                question_source_urls=question_source_urls,
+            )
+            if browser_candidates:
+                fallback_sources.append("browser_results")
+                candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
+        if not candidates:
+            print(f"[synthesis] no per-question chunks found for: {question[:120]}")
         selected = helpers.meaningful_retrieval_results(candidates) or list(candidates)
         tagged = [tag_result_for_question(result, question) for result in selected[:final_chunks]]
-        return sub_question_context_group(question, query_set, candidates, tagged, fallback_used=fallback_used)
+        return sub_question_context_group(
+            question,
+            query_set,
+            candidates,
+            tagged,
+            fallback_sources=fallback_sources,
+        )
 
     max_workers = sub_question_retrieval_max_workers(len(clean_questions), rerank=rerank)
     if max_workers <= 1:
@@ -224,15 +265,152 @@ def sub_question_context_group(
     candidates: Sequence[RetrievalResult],
     chunks: Sequence[RetrievalResult],
     fallback_used: bool = False,
+    fallback_sources: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    clean_fallback_sources = [clean_text(source) for source in fallback_sources or [] if clean_text(source)]
     return {
         "question": clean_text(question),
         "queries": list(queries),
         "candidate_count": len(candidates),
         "chunk_count": len(chunks),
-        "fallback_used": bool(fallback_used),
+        "fallback_used": bool(fallback_used or clean_fallback_sources),
+        "fallback_sources": clean_fallback_sources,
         "chunks": list(chunks),
     }
+
+
+def browser_question_context_retrieve(
+    question: str,
+    queries: Sequence[str],
+    browser_results: Sequence[Any],
+    top_k: int,
+    question_source_urls: dict[str, list[str]] | None = None,
+) -> list[RetrievalResult]:
+    """Build per-question evidence chunks from already extracted browser sources."""
+
+    helpers = generation_helpers()
+    if not browser_results:
+        return []
+
+    query_text = clean_text(" ".join([question, *queries]))
+    query_terms = helpers.query_tokens(query_text)
+    source_urls = helpers.question_source_urls_for(question, question_source_urls)
+    candidates = []
+    for result_index, browser_result in enumerate(browser_results):
+        if not isinstance(browser_result, dict):
+            continue
+        task_context = clean_text(browser_result.get("query_context"))
+        for source_index, source in enumerate(browser_result.get("sources") or []):
+            if not isinstance(source, dict):
+                continue
+            url = clean_text(source.get("url"))
+            title = clean_text(source.get("title")) or url or f"Browser source {source_index + 1}"
+            metadata = {
+                "url": url,
+                "source_url": url,
+                "title": title,
+                "source_type": clean_text(source.get("source_type")),
+                "source_quality": clean_text(source.get("source_quality")),
+                "source_authority": clean_text(source.get("source_authority")),
+                "query_contexts": task_context,
+            }
+            for snippet_index, snippet in enumerate(browser_source_snippets(source, query_terms=query_terms)):
+                content = clean_text(snippet)
+                if not helpers.is_meaningful_evidence(content):
+                    continue
+                candidates.append(
+                    RetrievalResult(
+                        id=browser_question_chunk_id(url, content, result_index, source_index, snippet_index),
+                        document=content,
+                        metadata=metadata,
+                        score=0.0,
+                        semantic_score=0.0,
+                        bm25_score=0.0,
+                        authority_score=1.0 if helpers.is_primary_source(metadata) else 0.0,
+                    )
+                )
+
+    ranked = rank_collection_scan_results(
+        question=question,
+        queries=queries,
+        candidates=candidates,
+        question_source_urls=question_source_urls,
+    )
+    return ranked[: max(1, top_k)]
+
+
+def browser_source_snippets(source: dict[str, Any], query_terms: set[str], max_snippets: int = 8) -> list[str]:
+    """Return compact source snippets likely to answer a planner sub-question."""
+
+    snippets = []
+    for key in ("full_content", "content_preview"):
+        text = clean_text(source.get(key))
+        if text:
+            snippets.extend(text_windows_for_terms(text, query_terms=query_terms))
+
+    for key in ("important_sections", "extracted_facts", "evidence"):
+        for item in source.get(key) or []:
+            text = browser_source_item_text(item)
+            if text:
+                snippets.append(text)
+
+    seen = set()
+    unique = []
+    for snippet in snippets:
+        value = clean_text(snippet)
+        if not value:
+            continue
+        key = value[:300].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(value)
+        if len(unique) >= max_snippets:
+            break
+    return unique
+
+
+def browser_source_item_text(item: Any) -> str:
+    if isinstance(item, str):
+        return clean_text(item)
+    if not isinstance(item, dict):
+        return clean_text(item)
+    parts = []
+    for key in ("heading", "title", "section", "fact", "evidence", "content", "text", "summary"):
+        value = clean_text(item.get(key))
+        if value:
+            parts.append(value)
+    return clean_text(" ".join(parts))
+
+
+def text_windows_for_terms(text: str, query_terms: set[str], max_windows: int = 4, window_chars: int = 900) -> list[str]:
+    value = clean_text(text)
+    if not value:
+        return []
+    lowered = value.lower()
+    positions = []
+    for term in sorted(query_terms, key=len, reverse=True):
+        if len(term) < 3:
+            continue
+        match = re.search(rf"\b{re.escape(term.lower())}\b", lowered)
+        if match:
+            positions.append(match.start())
+        if len(positions) >= max_windows:
+            break
+    if not positions:
+        positions = [0]
+
+    windows = []
+    for position in positions:
+        start = max(0, position - (window_chars // 3))
+        end = min(len(value), start + window_chars)
+        windows.append(value[start:end])
+    return windows
+
+
+def browser_question_chunk_id(url: str, content: str, result_index: int, source_index: int, snippet_index: int) -> str:
+    digest = hashlib.sha1(f"{url}|{content}".encode("utf-8", errors="ignore")).hexdigest()[:24]
+    return f"browser-question-{result_index}-{source_index}-{snippet_index}-{digest}"
 
 
 def collection_scan_question_retrieve(
@@ -375,6 +553,7 @@ def sub_question_context_counts(groups: Sequence[dict[str, Any]]) -> list[dict[s
             "candidate_count": int(group.get("candidate_count") or 0),
             "chunk_count": int(group.get("chunk_count") or 0),
             "fallback_used": bool(group.get("fallback_used")),
+            "fallback_sources": list(group.get("fallback_sources", [])),
         }
         for group in groups
         if isinstance(group, dict)
@@ -533,7 +712,7 @@ def groq_sub_question_retrieval_query_result(
                 {
                     "role": "system",
                     "content": (
-                        "You rewrite planner sub-questions into broad, complementary RAG retrieval "
+                        "You rewrite planner sub-questions into compact keyword-style RAG search "
                         "queries that maximize recall across papers, docs, reports, and web extracts. "
                         "Return JSON only."
                     ),
@@ -573,19 +752,20 @@ def sub_question_rewrite_prompt(objective: str, questions: Sequence[str], tasks:
 Planner sub-questions and optional task details:
 {format_sub_question_rewrite_items(questions, tasks)}
 
-Rewrite each planner sub-question into 2-3 broad, high-recall RAG retrieval queries.
+Rewrite each planner sub-question into 2-3 compact, high-recall RAG search queries.
 Requirements:
 - Return exactly 2 or 3 queries for every sub-question, in the same order as the planner list.
-- Write each query as a broad natural-language retrieval question, not a short keyword label.
-- For each sub-question, create complementary queries: one broad concept/context query, one evidence/detail query, and one source/section query when source details exist.
-- Do not output only narrow labels like "entity + equation"; include surrounding vocabulary that may appear near the answer in papers, docs, reports, or extracted web text.
+- Write compact keyword-style queries, not full sentences or questions.
+- Do not start queries with "what", "which", "where", "how", or phrases like "source-backed context", "which evidence gives", or "authoritative sources discuss".
+- For each sub-question, create complementary queries: one broad topic query, one exact evidence query, and one source-targeted query when source details exist.
+- Prefer noun phrases that can match both semantic search and BM25 keyword search.
 - Keep each query tied to one planner sub-question. Do not let benchmark, limitation, or formula queries drift into unrelated sub-question groups.
 - Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, aliases, and important technical terms from the planner/task details.
 - For equation/formula questions, include nearby evidence terms such as equation, formula, derivation, score function, alignment, matrix, variables, components, or operation names when relevant.
 - For benchmark questions, include dataset names, metrics, result table, scores, comparison, performance, and evaluation terms when relevant.
 - For API/implementation questions, include official documentation, class/function names, signature, parameters, usage, and example terms when relevant.
 - For limitation/complexity questions, include complexity, memory, runtime, scaling, tradeoffs, bottleneck, sparse, efficient, or alternatives when relevant.
-- Prefer 8-22 words per query.
+- Prefer 6-14 words per query. Do not exceed 18 words unless a URL or API name requires it.
 - Do not answer the question and do not add citations.
 - Do not include reasoning, <think> text, or explanations.
 - Never output placeholder labels or generic query names.
