@@ -5,12 +5,28 @@ from __future__ import annotations
 import os
 import re
 import hashlib
-import json
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
 from src.agents.change_detection_agent import objective_key
 from src.rag.indexing import get_collection
+from src.rag.sub_question_context import (
+    clean_model_name,
+    complete_sub_question_query_coverage,
+    empty_llm_query_result,
+    generated_query_output_is_noise,
+    is_valid_generated_query,
+    is_valid_retrieval_query,
+    llm_sub_question_retrieval_query_result,
+    parse_llm_retrieval_queries,
+    retrieve_sub_question_context,
+    retrieve_sub_question_context_groups,
+    select_question_first_synthesis_context,
+    strip_thinking_blocks,
+    sub_question_context_counts,
+    sub_question_retrieval_max_workers,
+    sub_question_retrieval_queries,
+    valid_retrieval_queries,
+)
 from src.rag.retrieval import (
     DEFAULT_BM25_K,
     DEFAULT_BM25_SCAN_LIMIT,
@@ -22,7 +38,6 @@ from src.rag.retrieval import (
     DEFAULT_SEMANTIC_K,
     RetrievalResult,
     display_document_preview,
-    expand_parent_context_results,
     multi_query_hybrid_retrieve,
     normalize_source_url,
     result_source_urls_from_metadata,
@@ -35,7 +50,6 @@ from src.tools.text_utils import clean_text
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
 DEFAULT_GAP_QUERY_MODEL = "qwen/qwen3.6-27b"
-DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL = "qwen/qwen3.6-27b"
 DEFAULT_MAX_CONTEXT_CHARS = 18000
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_REPORT_MAX_TOKENS = 1400
@@ -54,9 +68,6 @@ DEFAULT_GAP_RETRIEVAL_TOP_K = 12
 DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
 DEFAULT_PRECISION_QUERY_LIMIT = 8
-DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
-DEFAULT_SUBQUESTION_RETRIEVAL_MAX_WORKERS = 4
-DEFAULT_SUBQUESTION_RERANK_MAX_WORKERS = 2
 DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 48
 DEFAULT_SYNTHESIS_CANDIDATE_CHUNKS_PER_QUESTION = 20
 DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 6
@@ -196,16 +207,6 @@ def rag_generation_model(model: str | None = None) -> str:
         clean_model_name(model)
         or clean_model_name(os.environ.get("RESEARCH_PLANNER_MODEL"))
         or DEFAULT_RAG_GENERATION_MODEL
-    )
-
-
-def sub_question_query_rewrite_model(model: str | None = None) -> str:
-    """Model used only for rewriting planner sub-questions into retrieval queries."""
-
-    return (
-        clean_model_name(os.environ.get("RAG_SUBQUESTION_QUERY_MODEL"))
-        or DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL
-        or rag_generation_model(model)
     )
 
 
@@ -470,6 +471,8 @@ def synthesize_report_from_research_plan(
     payload["sub_question_final_chunks_per_question"] = DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION
     payload["llm_sub_question_retrieval_queries"] = llm_sub_question_queries
     payload["llm_sub_question_query_model"] = llm_query_result["model"]
+    payload["llm_sub_question_query_provider"] = llm_query_result.get("provider", "")
+    payload["llm_sub_question_query_fallback_reason"] = llm_query_result.get("fallback_reason", "")
     payload["llm_sub_question_query_error"] = llm_query_result["error"]
     payload["llm_sub_question_query_raw_response"] = llm_query_result["raw_response"]
     payload["precision_retrieval_queries"] = precision_queries
@@ -607,720 +610,6 @@ def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
     if objective:
         queries.append(objective)
     return dedupe_preserve_order(queries)
-
-
-def sub_question_retrieval_queries(
-    question: str,
-    objective: str = "",
-    task_details: str = "",
-    max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
-) -> list[str]:
-    """Rewrite one planner sub-question into broad retrieval intents."""
-
-    question = clean_text(question)
-    objective = clean_text(objective)
-    task_details = clean_text(task_details)
-    if not question:
-        return []
-
-    source_terms = source_query_terms(task_details)
-    topic = retrieval_topic_phrase(f"{question} {task_details}", limit=12)
-    key_terms = " ".join(query_keywords(question, limit=10)) or topic or objective
-    hints = " ".join(broad_query_hints(f"{question} {task_details}"))
-    variants = [
-        clean_text(f"What source-backed context explains {topic} {hints}?"),
-        clean_text(f"Which evidence gives {key_terms} details, examples, equations, benchmarks, or limitations?"),
-        clean_text(f"Where do authoritative sources discuss {objective} {topic} {source_terms} source sections evidence?"),
-    ]
-    return dedupe_preserve_order(variant[:700] for variant in variants)[: max(1, max_variants)]
-
-
-def retrieve_sub_question_context(
-    research_plan: dict[str, Any],
-    questions: Sequence[str],
-    objective: str,
-    chroma_path: str,
-    collection_name: str,
-    history_keys: Sequence[str] | None,
-    candidate_chunks: int,
-    final_chunks: int,
-    per_query_k: int,
-    semantic_k: int,
-    bm25_k: int,
-    semantic_weight: float,
-    bm25_weight: float,
-    authority_weight: float,
-    bm25_scan_limit: int,
-    embedding_device: str,
-    rerank: bool,
-    reranker_model: str,
-    rerank_k: int,
-    rerank_weight: float,
-) -> list[RetrievalResult]:
-    """Retrieve and rerank an independent evidence set for each planner sub-question."""
-
-    return flatten_sub_question_context_groups(
-        retrieve_sub_question_context_groups(
-            research_plan=research_plan,
-            questions=questions,
-            objective=objective,
-            chroma_path=chroma_path,
-            collection_name=collection_name,
-            history_keys=history_keys,
-            candidate_chunks=candidate_chunks,
-            final_chunks=final_chunks,
-            per_query_k=per_query_k,
-            semantic_k=semantic_k,
-            bm25_k=bm25_k,
-            semantic_weight=semantic_weight,
-            bm25_weight=bm25_weight,
-            authority_weight=authority_weight,
-            bm25_scan_limit=bm25_scan_limit,
-            embedding_device=embedding_device,
-            rerank=rerank,
-            reranker_model=reranker_model,
-            rerank_k=rerank_k,
-            rerank_weight=rerank_weight,
-        )
-    )
-
-
-def retrieve_sub_question_context_groups(
-    research_plan: dict[str, Any],
-    questions: Sequence[str],
-    objective: str,
-    chroma_path: str,
-    collection_name: str,
-    history_keys: Sequence[str] | None,
-    candidate_chunks: int,
-    final_chunks: int,
-    per_query_k: int,
-    semantic_k: int,
-    bm25_k: int,
-    semantic_weight: float,
-    bm25_weight: float,
-    authority_weight: float,
-    bm25_scan_limit: int,
-    embedding_device: str,
-    rerank: bool,
-    reranker_model: str,
-    rerank_k: int,
-    rerank_weight: float,
-) -> list[dict[str, Any]]:
-    """Retrieve an inspectable chunk group for each planner sub-question."""
-
-    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
-    candidate_chunks = max(1, candidate_chunks)
-    final_chunks = max(1, min(final_chunks, candidate_chunks))
-    clean_questions = dedupe_preserve_order(questions)
-    question_source_urls = planner_question_source_urls(research_plan)
-
-    def retrieve_question(question: str) -> dict[str, Any]:
-        query_set = per_question_context_queries(question, objective=objective, tasks=tasks)
-        if not query_set:
-            return sub_question_context_group(question, [], [], [])
-        fallback_used = False
-        candidates = multi_query_hybrid_retrieve(
-            queries=query_set,
-            chroma_path=chroma_path,
-            collection_name=collection_name,
-            top_k=candidate_chunks,
-            per_query_k=max(1, min(per_query_k, candidate_chunks)),
-            semantic_k=semantic_k,
-            bm25_k=bm25_k,
-            history_keys=history_keys,
-            semantic_weight=semantic_weight,
-            bm25_weight=bm25_weight,
-            authority_weight=authority_weight,
-            bm25_scan_limit=bm25_scan_limit,
-            embedding_device=embedding_device,
-            diversify_urls=False,
-            rerank=rerank,
-            reranker_model=reranker_model,
-            rerank_k=max(rerank_k, candidate_chunks),
-            rerank_weight=rerank_weight,
-        )
-        if len(candidates) < final_chunks:
-            fallback_candidates = collection_scan_question_retrieve(
-                question=question,
-                queries=query_set,
-                chroma_path=chroma_path,
-                collection_name=collection_name,
-                history_keys=history_keys,
-                top_k=candidate_chunks,
-                scan_limit=bm25_scan_limit,
-                question_source_urls=question_source_urls,
-            )
-            fallback_used = bool(fallback_candidates)
-            candidates = merge_retrieved_context(candidates, fallback_candidates)
-        selected = meaningful_retrieval_results(candidates) or list(candidates)
-        tagged = [tag_result_for_question(result, question) for result in selected[:final_chunks]]
-        return sub_question_context_group(question, query_set, candidates, tagged, fallback_used=fallback_used)
-
-    max_workers = sub_question_retrieval_max_workers(len(clean_questions), rerank=rerank)
-    if max_workers <= 1:
-        return [retrieve_question(question) for question in clean_questions]
-    else:
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rag-subquestion") as executor:
-            return list(executor.map(retrieve_question, clean_questions))
-
-
-def sub_question_context_group(
-    question: str,
-    queries: Sequence[str],
-    candidates: Sequence[RetrievalResult],
-    chunks: Sequence[RetrievalResult],
-    fallback_used: bool = False,
-) -> dict[str, Any]:
-    return {
-        "question": clean_text(question),
-        "queries": list(queries),
-        "candidate_count": len(candidates),
-        "chunk_count": len(chunks),
-        "fallback_used": bool(fallback_used),
-        "chunks": list(chunks),
-    }
-
-
-def collection_scan_question_retrieve(
-    question: str,
-    queries: Sequence[str],
-    chroma_path: str,
-    collection_name: str,
-    history_keys: Sequence[str] | None,
-    top_k: int,
-    scan_limit: int,
-    question_source_urls: dict[str, list[str]] | None = None,
-) -> list[RetrievalResult]:
-    """Fallback per-question retrieval by directly scoring Chroma rows."""
-
-    try:
-        collection = get_collection(chroma_path, collection_name)
-        raw = collection.get(
-            include=["documents", "metadatas"],
-            limit=max(1, scan_limit, top_k * 25),
-        )
-    except Exception as error:
-        print(f"[synthesis] per-question collection scan failed: {error}")
-        return []
-
-    ids = raw.get("ids", []) if isinstance(raw, dict) else []
-    documents = raw.get("documents", []) if isinstance(raw, dict) else []
-    metadatas = raw.get("metadatas", []) if isinstance(raw, dict) else []
-    allowed_history_keys = set(clean_string_list(history_keys or []))
-    candidates = []
-    for index, document in enumerate(documents):
-        metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
-        if allowed_history_keys and clean_text(metadata.get("history_key")) not in allowed_history_keys:
-            continue
-        item_id = clean_text(ids[index] if index < len(ids) else "")
-        content = clean_text(document)
-        if not item_id or not content:
-            continue
-        candidates.append(
-            RetrievalResult(
-                id=item_id,
-                document=content,
-                metadata=metadata,
-                score=0.0,
-                semantic_score=0.0,
-                bm25_score=0.0,
-                authority_score=1.0 if is_primary_source(metadata) else 0.0,
-            )
-        )
-
-    ranked = rank_collection_scan_results(
-        question=question,
-        queries=queries,
-        candidates=candidates,
-        question_source_urls=question_source_urls,
-    )
-    selected = ranked[: max(1, top_k)]
-    return expand_parent_context_results(selected, chroma_path=chroma_path)
-
-
-def rank_collection_scan_results(
-    question: str,
-    queries: Sequence[str],
-    candidates: Sequence[RetrievalResult],
-    question_source_urls: dict[str, list[str]] | None = None,
-) -> list[RetrievalResult]:
-    """Rank direct collection rows for one planner question."""
-
-    query_text = clean_text(" ".join([question, *queries]))
-    query_terms = query_tokens(query_text)
-    topic_terms = {term for term in query_terms if term not in COVERAGE_GENERIC_TERMS}
-    evidence_types = infer_question_evidence_types(question)
-    source_urls = question_source_urls_for(question, question_source_urls)
-    scored = []
-    fallback = []
-
-    for position, result in enumerate(candidates):
-        metadata = result.metadata if isinstance(result.metadata, dict) else {}
-        chunk = retrieved_chunk_preview(result.document, metadata, max_chars=DEFAULT_CONTEXT_BLOCK_CHARS * 2)
-        if not is_meaningful_evidence(chunk):
-            continue
-        fallback.append(result)
-        text = retrieval_result_text(result)
-        text_terms = query_tokens(text)
-        overlap = len(query_terms & text_terms)
-        topic_overlap = len(topic_terms & text_terms)
-        evidence_score = evidence_type_score(text, evidence_types)
-        preferred_source = result_matches_source_urls(result, source_urls)
-        if not (overlap or topic_overlap or evidence_score or preferred_source):
-            continue
-        score = (
-            (topic_overlap * 4.0)
-            + (overlap * 1.5)
-            + (evidence_score * 3.0)
-            + (8.0 if preferred_source else 0.0)
-            + retrieval_result_priority(result)
-            + (1.0 / (position + 1))
-        )
-        scored.append((score, result))
-
-    ranked = [
-        collection_scan_scored_result(result, score)
-        for score, result in sorted(scored, key=lambda item: item[0], reverse=True)
-    ]
-    if ranked:
-        return unique_retrieval_results(ranked)
-    return source_balanced_results(fallback)
-
-
-def collection_scan_scored_result(result: RetrievalResult, score: float) -> RetrievalResult:
-    return RetrievalResult(
-        id=result.id,
-        document=result.document,
-        metadata=result.metadata,
-        score=float(score),
-        semantic_score=result.semantic_score,
-        bm25_score=result.bm25_score,
-        authority_score=result.authority_score,
-        rerank_score=result.rerank_score,
-        semantic_rank=result.semantic_rank,
-        bm25_rank=result.bm25_rank,
-    )
-
-
-def flatten_sub_question_context_groups(groups: Sequence[dict[str, Any]]) -> list[RetrievalResult]:
-    results = []
-    for group in groups:
-        chunks = group.get("chunks", []) if isinstance(group, dict) else []
-        results = merge_retrieved_context(results, chunks)
-    return results
-
-
-def sub_question_context_counts(groups: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "question": clean_text(group.get("question")),
-            "query_count": len(group.get("queries", [])),
-            "candidate_count": int(group.get("candidate_count") or 0),
-            "chunk_count": int(group.get("chunk_count") or 0),
-            "fallback_used": bool(group.get("fallback_used")),
-        }
-        for group in groups
-        if isinstance(group, dict)
-    ]
-
-
-def tag_result_for_question(result: RetrievalResult, question: str) -> RetrievalResult:
-    metadata = dict(result.metadata or {})
-    metadata["synthesis_question"] = clean_text(question)
-    return RetrievalResult(
-        id=result.id,
-        document=result.document,
-        metadata=metadata,
-        score=result.score,
-        semantic_score=result.semantic_score,
-        bm25_score=result.bm25_score,
-        authority_score=result.authority_score,
-        rerank_score=result.rerank_score,
-        semantic_rank=result.semantic_rank,
-        bm25_rank=result.bm25_rank,
-    )
-
-
-def select_question_first_synthesis_context(
-    question_context_results: Sequence[RetrievalResult],
-    fallback_context: Sequence[RetrievalResult],
-    planner_questions: Sequence[str],
-    question_source_urls: dict[str, list[str]] | None = None,
-) -> list[RetrievalResult]:
-    """Prefer per-question RAG chunks; use global/browser context only as fallback."""
-
-    max_chunks = max(
-        DEFAULT_SYNTHESIS_MAX_CHUNKS,
-        len(planner_questions) * DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
-    )
-    if question_context_results:
-        selected = list(question_context_results)[:max_chunks]
-        seen = {retrieval_result_key(result) for result in selected}
-        for result in select_synthesis_context(
-            fallback_context,
-            planner_questions,
-            question_source_urls=question_source_urls,
-            max_chunks=max_chunks,
-        ):
-            if len(selected) >= max_chunks:
-                break
-            key = retrieval_result_key(result)
-            if key in seen:
-                continue
-            selected.append(result)
-            seen.add(key)
-        return selected
-    return select_synthesis_context(
-        fallback_context,
-        planner_questions,
-        question_source_urls=question_source_urls,
-        max_chunks=max_chunks,
-    )
-
-
-def sub_question_retrieval_max_workers(question_count: int, rerank: bool = False) -> int:
-    """Bound parallel sub-question retrieval, especially when CrossEncoder rerank is enabled."""
-
-    default_workers = DEFAULT_SUBQUESTION_RERANK_MAX_WORKERS if rerank else DEFAULT_SUBQUESTION_RETRIEVAL_MAX_WORKERS
-    try:
-        workers = int(os.environ.get("RAG_SUBQUESTION_RETRIEVAL_MAX_WORKERS", default_workers))
-    except (TypeError, ValueError):
-        workers = default_workers
-    return min(max(1, workers), max(1, question_count))
-
-
-def per_question_context_queries(question: str, objective: str = "", tasks: Sequence[dict[str, Any]] = ()) -> list[str]:
-    """Build broad plus exact-evidence queries for one planner sub-question."""
-
-    task_details = matching_task_details(question, tasks)
-    queries = sub_question_retrieval_queries(question, objective=objective, task_details=task_details)
-    exact_queries = [
-        clean_text(f"{objective} {question} {suffix} {task_details}")[:700]
-        for suffix in precision_query_suffixes(question)
-    ]
-    return dedupe_preserve_order([*queries, *exact_queries])
-
-
-def llm_sub_question_retrieval_query_result(
-    research_plan: dict[str, Any],
-    model: str | None = None,
-    max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
-) -> dict[str, Any]:
-    """Use the generation model to rewrite planner sub-questions into RAG queries."""
-
-    objective = clean_text(research_plan.get("objective"))
-    questions = planner_sub_questions(research_plan)
-    selected_model = sub_question_query_rewrite_model(model)
-    if not questions:
-        return empty_llm_query_result(model=selected_model)
-    if not os.environ.get("GROQ_API_KEY"):
-        return empty_llm_query_result(model=selected_model, error="GROQ_API_KEY is not set")
-
-    try:
-        from groq import Groq
-    except ImportError as error:
-        return empty_llm_query_result(model=selected_model, error=str(error))
-
-    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
-    prompt = f"""Research objective:
-{objective}
-
-Planner sub-questions and optional task details:
-{format_sub_question_rewrite_items(questions, tasks)}
-
-Rewrite each planner sub-question into 2-3 broad, high-recall RAG retrieval queries.
-Requirements:
-- Return exactly 2 or 3 queries for every sub-question, in the same order as the planner list.
-- Write each query as a broad natural-language retrieval question, not a short keyword label.
-- For each sub-question, create complementary queries: one broad concept/context query, one evidence/detail query, and one source/section query when source details exist.
-- Do not output only narrow labels like "entity + equation"; include surrounding vocabulary that may appear near the answer in papers, docs, reports, or extracted web text.
-- Keep each query tied to one planner sub-question. Do not let benchmark, limitation, or formula queries drift into unrelated sub-question groups.
-- Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, aliases, and important technical terms from the planner/task details.
-- For equation/formula questions, include nearby evidence terms such as equation, formula, derivation, score function, alignment, matrix, variables, components, or operation names when relevant.
-- For benchmark questions, include dataset names, metrics, result table, scores, comparison, performance, and evaluation terms when relevant.
-- For API/implementation questions, include official documentation, class/function names, signature, parameters, usage, and example terms when relevant.
-- For limitation/complexity questions, include complexity, memory, runtime, scaling, tradeoffs, bottleneck, sparse, efficient, or alternatives when relevant.
-- Prefer 8-22 words per query.
-- Do not answer the question and do not add citations.
-- Do not include reasoning, <think> text, or explanations.
-- Never output placeholder labels or generic query names.
-- Return JSON only in this shape:
-{{"items":[{{"sub_question":"...","queries":["topic overview evidence","topic method comparison source"]}}]}}"""
-
-    try:
-        response = create_chat_completion_with_retries(
-            Groq(),
-            model=selected_model,
-            temperature=0,
-            max_tokens=900,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You rewrite planner sub-questions into broad, complementary RAG retrieval "
-                        "queries that maximize recall across papers, docs, reports, and web extracts. "
-                        "Return JSON only."
-                    ),
-                },
-                {"role": "user", "content": prompt[:6000]},
-            ],
-        )
-    except Exception as error:  # pragma: no cover - exercised through integration runs.
-        return empty_llm_query_result(model=selected_model, error=str(error))
-
-    raw_response = str(response.choices[0].message.content or "")
-    queries = valid_retrieval_queries(parse_llm_retrieval_queries(raw_response), research_plan)
-    raw_response_text = clean_text(raw_response)
-    max_queries = max(1, len(questions) * max(1, max_variants))
-    if not queries:
-        return {
-            "queries": [],
-            "model": clean_text(getattr(response, "model", "")) or selected_model,
-            "error": "LLM query rewrite returned no usable queries",
-            "raw_response": raw_response_text[:1000],
-        }
-    queries = complete_sub_question_query_coverage(queries, research_plan, max_variants=max_variants)
-    return {
-        "queries": dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
-        "model": clean_text(getattr(response, "model", "")) or selected_model,
-        "error": "",
-        "raw_response": raw_response_text[:1000],
-    }
-
-
-def empty_llm_query_result(model: str = "", error: str = "") -> dict[str, Any]:
-    return {"queries": [], "model": clean_text(model), "error": clean_text(error), "raw_response": ""}
-
-
-def complete_sub_question_query_coverage(
-    queries: Sequence[str],
-    research_plan: dict[str, Any],
-    max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
-) -> list[str]:
-    questions = planner_sub_questions(research_plan)
-    if not questions:
-        return dedupe_preserve_order(queries)
-
-    objective = clean_text(research_plan.get("objective"))
-    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
-    clean_queries = dedupe_preserve_order(queries)
-    grouped = []
-    used = set()
-    min_variants = min(max(1, max_variants), 2)
-    for question in questions:
-        question_queries = [
-            query for query in clean_queries
-            if query not in used and query_matches_sub_question(question, query)
-        ][: max(1, max_variants)]
-        used.update(question_queries)
-        fallback_queries = sub_question_retrieval_queries(
-            question,
-            objective=objective,
-            task_details=matching_task_details(question, tasks),
-            max_variants=max_variants,
-        )
-        target_count = max(1, max_variants) if not question_queries else min_variants
-        for query in fallback_queries:
-            if len(question_queries) >= target_count:
-                break
-            if query not in question_queries:
-                question_queries.append(query)
-        grouped.extend(question_queries[: max(1, max_variants)])
-
-    max_queries = max(1, len(questions) * max(1, max_variants))
-    return dedupe_preserve_order(grouped)[:max_queries]
-
-
-def query_list_covers_sub_question(question: str, queries: Sequence[str]) -> bool:
-    return any(query_matches_sub_question(question, query) for query in queries)
-
-
-def query_matches_sub_question(question: str, query: str) -> bool:
-    query_terms = query_tokens(query)
-    named_terms = question_named_terms(question)
-    if named_terms and not any(term_matches_query(term, query_terms, query) for term in named_terms):
-        return False
-
-    ignored_terms = COVERAGE_GENERIC_TERMS | COVERAGE_EVIDENCE_TERMS | {"attention", "method", "methods", "topic", "topics"}
-    topic_terms = [term for term in query_keywords(question, limit=8) if term.lower() not in ignored_terms]
-    normalized = {term.lower().replace("‑", "-").replace("–", "-") for term in topic_terms}
-    evidence_terms = {
-        term.lower()
-        for term in query_keywords(question, limit=12)
-        if term.lower() in COVERAGE_EVIDENCE_TERMS
-    }
-    if not normalized:
-        if evidence_terms:
-            return bool(evidence_terms & query_terms)
-        return bool(clean_text(query))
-    topic_overlap = len(normalized & query_terms)
-    if len(normalized) == 1 and evidence_terms:
-        return topic_overlap > 0 and bool(evidence_terms & query_terms)
-    return topic_overlap >= min(2, len(normalized))
-
-
-def term_matches_query(term: str, query_terms: set[str], query: str) -> bool:
-    normalized = clean_text(term).lower().replace("‑", "-").replace("–", "-")
-    compact = normalized.replace("-", "")
-    query_text = clean_text(query).lower().replace("‑", "-").replace("–", "-")
-    return normalized in query_terms or compact in {token.replace("-", "") for token in query_terms} or normalized in query_text
-
-
-def question_named_terms(question: str) -> list[str]:
-    normalized = clean_text(question).replace("‑", "-").replace("–", "-").replace("—", "-")
-    terms = re.findall(r"\b[A-Z][A-Za-z0-9_.-]{2,}\b|\b[A-Z]{2,}\b", normalized)
-    terms.extend(re.findall(r"\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b", normalized))
-    return dedupe_preserve_order(term.lower() for term in terms if term.lower() not in OBJECTIVE_STOPWORDS)
-
-
-def format_sub_question_rewrite_items(questions: Sequence[str], tasks: Sequence[dict[str, Any]]) -> str:
-    lines = []
-    for index, question in enumerate(questions, start=1):
-        details = matching_task_details(question, tasks)
-        detail_text = f"\n   task_details: {details}" if details else ""
-        lines.append(f"{index}. {question}{detail_text}")
-    return "\n".join(lines)
-
-
-def parse_llm_retrieval_queries(raw_response: str) -> list[str]:
-    text = clean_query_generation_response(raw_response)
-    if generated_query_output_is_noise(text):
-        return []
-    try:
-        parsed = json.loads(json_payload(text))
-    except (TypeError, ValueError):
-        return fallback_json_like_queries(text) or fallback_line_queries(text)
-    return extract_query_strings(parsed)
-
-
-def clean_query_generation_response(text: Any) -> str:
-    return strip_thinking_blocks(clean_markdown_fence(str(text or "")))
-
-
-def strip_thinking_blocks(text: Any) -> str:
-    value = str(text or "")
-    value = re.sub(r"(?is)<think>.*?</think>", " ", value)
-    open_think = re.search(r"(?is)<think>", value)
-    if open_think:
-        prefix = value[: open_think.start()]
-        tail = value[open_think.end() :]
-        payload = re.search(r"(\{.*\}|\[.*\])", tail, flags=re.DOTALL)
-        value = f"{prefix}\n{payload.group(1)}" if payload else prefix
-    return value.strip()
-
-
-def json_payload(text: str) -> str:
-    text = clean_text(text)
-    if text.startswith("{") or text.startswith("["):
-        return text
-    match = re.search(r"(\{.*\}|\[.*\])", text, flags=re.DOTALL)
-    return match.group(1) if match else text
-
-
-def clean_markdown_fence(text: str) -> str:
-    return re.sub(r"^```(?:json)?|```$", "", str(text or "").strip(), flags=re.IGNORECASE).strip()
-
-
-def fallback_json_like_queries(text: str) -> list[str]:
-    """Recover query arrays when a model returns almost-JSON that json.loads rejects."""
-
-    queries = []
-    for match in re.finditer(r'"queries"\s*:\s*\[(.*?)\]', str(text or ""), flags=re.DOTALL | re.IGNORECASE):
-        queries.extend(re.findall(r'"([^"]+)"', match.group(1)))
-    return dedupe_preserve_order(queries)
-
-
-def extract_query_strings(value: Any) -> list[str]:
-    if isinstance(value, dict):
-        queries = []
-        for key, item in value.items():
-            key_name = key.lower()
-            if key_name in {"sub_question", "question"}:
-                continue
-            if key_name in {"query", "text"} and isinstance(item, str):
-                queries.append(item)
-            else:
-                queries.extend(extract_query_strings(item))
-        return dedupe_preserve_order(queries)
-    if isinstance(value, list):
-        queries = []
-        for item in value:
-            queries.extend(extract_query_strings(item))
-        return dedupe_preserve_order(queries)
-    if isinstance(value, str):
-        return fallback_line_queries(value)
-    return []
-
-
-def fallback_line_queries(text: str) -> list[str]:
-    lines = []
-    for line in str(text or "").splitlines():
-        line = re.sub(r"^\s*[-*\d.)]+\s*", "", line).strip().strip('"')
-        if clean_text(line):
-            lines.append(line)
-    return dedupe_preserve_order(lines)
-
-
-def valid_retrieval_queries(queries: Sequence[str], research_plan: dict[str, Any]) -> list[str]:
-    objective_terms = query_tokens(clean_text(research_plan.get("objective")))
-    question_terms = set()
-    for question in planner_sub_questions(research_plan):
-        question_terms.update(query_tokens(question))
-    allowed_terms = objective_terms | question_terms
-    return [
-        query
-        for query in dedupe_preserve_order(queries)
-        if is_valid_retrieval_query(query, allowed_terms)
-    ]
-
-
-def is_valid_retrieval_query(query: str, allowed_terms: set[str]) -> bool:
-    text = clean_text(query)
-    if not is_valid_generated_query(text, max_chars=420):
-        return False
-    if len(re.findall(r"\S+", text)) < 3:
-        return False
-    return True
-
-
-def is_valid_generated_query(query: str, max_chars: int = 600) -> bool:
-    text = clean_text(query)
-    lowered = text.lower()
-    if not text or len(text) > max_chars:
-        return False
-    if generated_query_output_is_noise(text):
-        return False
-    if not re.search(r"[A-Za-z]", text):
-        return False
-    if re.fullmatch(r"(?:\[\d+\]|\(?\d+\)?|and|or|,|\s)+", lowered):
-        return False
-    if re.fullmatch(r"(?:query|retrieval query|search query|example query)\s*\d*", lowered):
-        return False
-    if re.fullmatch(r"(?:query|retrieval|search|example)(?:\s+\d+)?", lowered):
-        return False
-    if re.search(r"\b(?:query|retrieval query|search query|example query)\s*\d+\b", lowered):
-        return False
-    return True
-
-
-def generated_query_output_is_noise(text: Any) -> bool:
-    lowered = clean_text(text).lower()
-    if not lowered:
-        return False
-    noise_signals = (
-        "<think",
-        "</think",
-        "thinking process",
-        "analyze user input",
-        "research objective:",
-        "planner sub-questions",
-        "requirements:",
-        "output json",
-        "return json only",
-        "do not answer",
-    )
-    return any(signal in lowered for signal in noise_signals)
 
 
 def precision_retrieval_queries(
@@ -3317,6 +2606,8 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "source_coverage_count": payload.get("source_coverage_count", 0),
         "question_source_coverage_count": payload.get("question_source_coverage_count", 0),
         "sub_question_context_counts": payload.get("sub_question_context_counts", []),
+        "llm_sub_question_query_provider": payload.get("llm_sub_question_query_provider", ""),
+        "llm_sub_question_query_fallback_reason": payload.get("llm_sub_question_query_fallback_reason", ""),
         "browser_signal_count": payload.get("browser_signal_count", 0),
         "gap_retrieval_query_count": len(payload.get("gap_retrieval_queries", [])),
         "gap_query_model": payload.get("gap_query_model", ""),
