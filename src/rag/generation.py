@@ -13,6 +13,7 @@ from src.rag.sub_question_context import (
     clean_model_name,
     complete_sub_question_query_coverage,
     empty_llm_query_result,
+    flatten_sub_question_context_groups,
     generated_query_output_is_noise,
     is_valid_generated_query,
     is_valid_retrieval_query,
@@ -351,6 +352,7 @@ def synthesize_report_from_research_plan(
         reranker_model=reranker_model,
         rerank_k=max(rerank_k, candidate_chunks_per_question),
         rerank_weight=rerank_weight,
+        browser_results=browser_results or [],
     )
     question_context_results = flatten_sub_question_context_groups(question_context_groups)
     if question_context_results:
