@@ -1114,6 +1114,90 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("28.4 BLEU", results[0].document)
         self.assertIn("WMT 2014", results[0].document)
 
+    def test_browser_question_context_promotes_exact_metric_over_generic_overlap(self):
+        browser_results = [
+            {
+                "sources": [
+                    {
+                        "url": "https://aclanthology.org/paper.pdf",
+                        "title": "Survey",
+                        "source_type": "pdf",
+                        "source_quality": "useful_authoritative",
+                        "full_content": (
+                            "Attention mechanisms have common applications in NLP and computer vision. "
+                            "The paper discusses benchmark results, performance, and limitations broadly. "
+                        ) * 12,
+                    },
+                    {
+                        "url": "https://arxiv.org/pdf/1706.03762",
+                        "title": "Primary Paper",
+                        "source_type": "pdf",
+                        "source_quality": "useful_primary",
+                        "full_content": (
+                            "The model uses attention mechanisms for machine translation. "
+                            "It achieves 28.4 BLEU on the WMT 2014 English-to-German task "
+                            "and 41.8 BLEU on English-to-French. "
+                        ) * 4,
+                    },
+                ]
+            }
+        ]
+
+        results = browser_question_context_retrieve(
+            question="What are common applications and benchmark results in NLP and computer vision?",
+            queries=["applications benchmark results NLP computer vision"],
+            browser_results=browser_results,
+            top_k=1,
+        )
+
+        self.assertEqual(results[0].metadata["url"], "https://arxiv.org/pdf/1706.03762")
+        self.assertIn("28.4 BLEU", results[0].document)
+
+    def test_evidence_packs_promote_exact_primary_benchmark(self):
+        results = [
+            RetrievalResult(
+                id="assigned-overview",
+                document=(
+                    "Attention mechanisms have common applications in NLP and computer vision. "
+                    "This assigned overview mentions benchmark results and performance broadly. "
+                )
+                * 4,
+                metadata={
+                    "title": "Assigned overview",
+                    "url": "https://example.com/overview",
+                    "synthesis_question": "What are common applications and benchmark results in NLP and computer vision?",
+                },
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="primary-metric",
+                document=(
+                    "The Transformer reports machine translation benchmark results: "
+                    "28.4 BLEU on the WMT 2014 English-to-German task and 41.8 BLEU on English-to-French. "
+                )
+                * 3,
+                metadata={"title": "Primary paper", "url": "https://arxiv.org/pdf/1706.03762", "source_type": "arxiv"},
+                score=0.2,
+                semantic_score=0.2,
+                bm25_score=0.0,
+            ),
+        ]
+        sources = [
+            {"index": 1, "id": "assigned-overview", "url": "https://example.com/overview"},
+            {"index": 2, "id": "primary-metric", "url": "https://arxiv.org/pdf/1706.03762"},
+        ]
+
+        packs = build_sub_question_evidence_packs(
+            ["What are common applications and benchmark results in NLP and computer vision?"],
+            results,
+            sources,
+            max_chunks_per_question=1,
+        )
+
+        self.assertEqual(packs[0]["chunks"][0]["id"], "primary-metric")
+
     def test_sub_question_retrieval_max_workers_is_bounded(self):
         self.assertEqual(sub_question_retrieval_max_workers(10, rerank=False), 4)
         self.assertEqual(sub_question_retrieval_max_workers(10, rerank=True), 2)
