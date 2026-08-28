@@ -102,6 +102,37 @@ BROWSER_METRIC_SIGNAL_PATTERN = re.compile(
 BROWSER_API_SIGNAL_PATTERN = re.compile(
     r"\b[A-Za-z_][A-Za-z0-9_.]*\([^)]{1,120}\)|\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*\b"
 )
+EVIDENCE_SIGNAL_PATTERNS = {
+    "api": (
+        (r"\b(?:api|class|function|method|parameter|argument|signature|constructor|official docs?|usage example)\b", 3),
+        (r"\b[A-Za-z_][A-Za-z0-9_.]*\([^)]{1,120}\)", 4),
+    ),
+    "applications": (
+        (r"\b(?:application|applications|use case|used for|task|translation|classification|vision|speech|recognition|nlp)\b", 3),
+    ),
+    "benchmark": (
+        (r"\b\d+(?:\.\d+)?\s*(?:%|bleu|rouge|f1|auc|accuracy|precision|recall|top[- ]?1|top[- ]?5|score|points?)\b", 6),
+        (r"\b(?:wmt|glue|superglue|imagenet|cifar|squad|vtab|coco|benchmark|leaderboard|test set|validation set)\b", 3),
+        (r"\b(?:achieves?|reports?|outperforms?|improv(?:e|es|ed|ing)|state-of-the-art|results?)\b", 2),
+    ),
+    "comparison": (
+        (r"\b(?:compare|comparison|versus| vs |different|difference|whereas|while|trade[- ]?off)\b", 3),
+    ),
+    "complexity": (
+        (r"\b(?:o\([^)]+\)|quadratic|linear|sub-quadratic|runtime|memory|complexity|scalability)\b", 4),
+    ),
+    "definition": (
+        (r"\b(?:defined as|definition|refers to|means|is a|are a|purpose)\b", 3),
+    ),
+    "equation": (
+        (r"(?:\\(?:frac|sum|sqrt|operatorname)|[=∑Σ√αβγδθλµπ])", 4),
+        (r"\b(?:softmax|sqrt|tanh|exp|log|equation|formula|formulation)\b", 3),
+        (r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^)]{0,80}\)\s*=", 4),
+    ),
+    "limitations": (
+        (r"\b(?:limitation|limitations|challenge|drawback|constraint|bottleneck|weakness|open question)\b", 3),
+    ),
+}
 OBJECTIVE_STOPWORDS = {
     "a",
     "an",
@@ -846,11 +877,12 @@ def coverage_matches_for_question(
         chunk_terms = coverage_question_tokens(text)
         topic_overlap = topic_terms & chunk_terms
         evidence_score = evidence_type_score(text, evidence_types)
+        signal_score = evidence_signal_score(text, evidence_types)
         if topic_terms and not topic_overlap:
             continue
-        if evidence_types and not evidence_score:
+        if evidence_types and not (evidence_score or signal_score):
             continue
-        score = len(question_terms & chunk_terms) + evidence_score + (1 if is_primary_source(metadata) else 0)
+        score = len(question_terms & chunk_terms) + evidence_score + signal_score + (2 if is_primary_source(metadata) else 0)
         matches.append(
             (
                 score,
@@ -904,6 +936,18 @@ def evidence_type_score(text: str, evidence_types: Sequence[str]) -> int:
             score += 2
         elif key and key in lowered:
             score += 1
+    return score
+
+
+def evidence_signal_score(text: str, evidence_types: Sequence[str]) -> int:
+    """Score exact evidence signals, such as formulas, API signatures, or metric values."""
+
+    lowered = clean_text(text).lower()
+    score = 0
+    for evidence_type in clean_string_list(list(evidence_types or [])):
+        for pattern, weight in EVIDENCE_SIGNAL_PATTERNS.get(evidence_type.lower(), ()):
+            if re.search(pattern, lowered):
+                score += weight
     return score
 
 
@@ -2253,8 +2297,9 @@ def rank_results_for_question(question: str, candidates: Sequence[RetrievalResul
         terms = query_tokens(text)
         overlap = len(question_terms & terms)
         evidence_score = evidence_type_score(text, evidence_types)
-        if overlap or evidence_score:
-            score = overlap * 3 + evidence_score + retrieval_result_priority(result)
+        signal_score = evidence_signal_score(text, evidence_types)
+        if overlap or evidence_score or signal_score:
+            score = overlap * 3 + evidence_score * 2 + signal_score * 3 + retrieval_result_priority(result)
             ranked.append((score, -position, result))
     return [result for _, _, result in sorted(ranked, reverse=True)]
 
@@ -2273,9 +2318,10 @@ def text_supports_question(question: str, text: str, required_evidence: Sequence
     evidence_types = clean_string_list(list(required_evidence or [])) or infer_question_evidence_types(question)
     strict_evidence = [item for item in evidence_types if item != "evidence"]
     evidence_score = evidence_type_score(text, strict_evidence)
-    if strict_evidence and not evidence_score:
+    signal_score = evidence_signal_score(text, strict_evidence)
+    if strict_evidence and not (evidence_score or signal_score):
         return False
-    return bool((question_terms & chunk_terms) or evidence_score)
+    return bool((question_terms & chunk_terms) or evidence_score or signal_score)
 
 
 def retrieval_result_text(result: RetrievalResult) -> str:
@@ -2417,20 +2463,28 @@ def build_sub_question_evidence_packs(
     packs = []
     for question in dedupe_preserve_order(planner_questions):
         question_terms = query_tokens(question)
+        evidence_types = infer_question_evidence_types(question)
         scored = []
         for chunk in chunks:
             text = " ".join([clean_text(chunk.get("title")), clean_text(chunk.get("content"))])
             overlap = len(question_terms & query_tokens(text))
             preferred = chunk_matches_source_urls(chunk, question_source_urls_for(question, question_source_urls))
             assigned = question_key(chunk.get("synthesis_question")) == question_key(question)
-            supported = text_supports_question(question, text)
+            evidence_score = evidence_type_score(text, evidence_types)
+            signal_score = evidence_signal_score(text, evidence_types)
+            supported = text_supports_question(question, text, required_evidence=evidence_types)
+            primary_exact = bool(chunk.get("is_primary_source") and signal_score)
             if overlap or preferred or assigned or supported:
                 scored.append(
                     (
+                        1 if primary_exact else 0,
+                        1 if signal_score else 0,
                         1 if assigned else 0,
                         1 if supported else 0,
                         1 if preferred else 0,
                         1 if chunk.get("is_primary_source") else 0,
+                        signal_score,
+                        evidence_score,
                         overlap,
                         float(chunk.get("score") or 0.0),
                         chunk,
@@ -2438,13 +2492,31 @@ def build_sub_question_evidence_packs(
                 )
         selected = [
             chunk
-            for *_score, chunk in sorted(scored, key=lambda item: (-item[0], -item[1], -item[2], -item[3], -item[4], -item[5]))
+            for *_score, chunk in sorted(
+                scored,
+                key=lambda item: (
+                    -item[0],
+                    -item[1],
+                    -item[2],
+                    -item[3],
+                    -item[4],
+                    -item[5],
+                    -item[6],
+                    -item[7],
+                    -item[8],
+                    -item[9],
+                ),
+            )
             [:max_chunks_per_question]
         ]
         supported_count = sum(
             1
             for chunk in selected
-            if text_supports_question(question, " ".join([clean_text(chunk.get("title")), clean_text(chunk.get("content"))]))
+            if text_supports_question(
+                question,
+                " ".join([clean_text(chunk.get("title")), clean_text(chunk.get("content"))]),
+                required_evidence=evidence_types,
+            )
         )
         packs.append(
             {

@@ -181,8 +181,14 @@ def retrieve_sub_question_context_groups(
     final_chunks = max(1, min(final_chunks, candidate_chunks))
     clean_questions = helpers.dedupe_preserve_order(questions)
     question_source_urls = helpers.planner_question_source_urls(research_plan)
+    evidence_by_question = {
+        helpers.question_key(spec.get("question")): helpers.clean_string_list(spec.get("required_evidence"))
+        for spec in helpers.planner_sub_question_specs(research_plan)
+        if clean_text(spec.get("question"))
+    }
 
     def retrieve_question(question: str) -> dict[str, Any]:
+        required_evidence = evidence_by_question.get(helpers.question_key(question)) or helpers.infer_question_evidence_types(question)
         query_set = per_question_context_queries(question, objective=objective, tasks=tasks)
         if not query_set:
             return sub_question_context_group(question, [], [], [])
@@ -234,6 +240,7 @@ def retrieve_sub_question_context_groups(
                 top_k=candidate_chunks,
                 scan_limit=bm25_scan_limit,
                 question_source_urls=question_source_urls,
+                required_evidence=required_evidence,
             )
             if fallback_candidates:
                 fallback_sources.append("collection_scan")
@@ -244,6 +251,7 @@ def retrieve_sub_question_context_groups(
             browser_results=browser_results or [],
             top_k=candidate_chunks,
             question_source_urls=question_source_urls,
+            required_evidence=required_evidence,
         )
         if browser_candidates:
             fallback_sources.append("browser_results")
@@ -255,6 +263,7 @@ def retrieve_sub_question_context_groups(
             queries=query_set,
             candidates=candidates,
             question_source_urls=question_source_urls,
+            required_evidence=required_evidence,
         )
         selected = helpers.meaningful_retrieval_results(ranked_candidates) or ranked_candidates or list(candidates)
         tagged = [tag_result_for_question(result, question) for result in selected[:final_chunks]]
@@ -299,6 +308,7 @@ def browser_question_context_retrieve(
     browser_results: Sequence[Any],
     top_k: int,
     question_source_urls: dict[str, list[str]] | None = None,
+    required_evidence: Sequence[str] | None = None,
 ) -> list[RetrievalResult]:
     """Build per-question evidence chunks from already extracted browser sources."""
 
@@ -307,7 +317,7 @@ def browser_question_context_retrieve(
         return []
 
     query_text = clean_text(" ".join([question, *queries]))
-    evidence_terms = browser_evidence_query_terms(question)
+    evidence_terms = browser_evidence_query_terms(question, required_evidence=required_evidence)
     query_terms = helpers.query_tokens(query_text) | evidence_terms
     source_urls = helpers.question_source_urls_for(question, question_source_urls)
     candidates = []
@@ -350,6 +360,7 @@ def browser_question_context_retrieve(
         queries=queries,
         candidates=candidates,
         question_source_urls=question_source_urls,
+        required_evidence=required_evidence,
     )
     return ranked[: max(1, top_k)]
 
@@ -392,12 +403,13 @@ def browser_source_snippets(
     return unique
 
 
-def browser_evidence_query_terms(question: str) -> set[str]:
+def browser_evidence_query_terms(question: str, required_evidence: Sequence[str] | None = None) -> set[str]:
     """Terms used to recover exact evidence from browser text before vector chunks lose it."""
 
     helpers = generation_helpers()
     terms = set()
-    for evidence_type in helpers.infer_question_evidence_types(question):
+    evidence_types = helpers.clean_string_list(list(required_evidence or [])) or helpers.infer_question_evidence_types(question)
+    for evidence_type in evidence_types:
         terms.update(EVIDENCE_TERMS_BY_TYPE.get(clean_text(evidence_type).lower(), set()))
     return {term.lower() for term in terms if len(term) >= 3}
 
@@ -454,6 +466,7 @@ def collection_scan_question_retrieve(
     top_k: int,
     scan_limit: int,
     question_source_urls: dict[str, list[str]] | None = None,
+    required_evidence: Sequence[str] | None = None,
 ) -> list[RetrievalResult]:
     """Fallback per-question retrieval by directly scoring Chroma rows."""
 
@@ -498,6 +511,7 @@ def collection_scan_question_retrieve(
         queries=queries,
         candidates=candidates,
         question_source_urls=question_source_urls,
+        required_evidence=required_evidence,
     )
     selected = ranked[: max(1, top_k)]
     return expand_parent_context_results(selected, chroma_path=chroma_path)
@@ -508,6 +522,7 @@ def rank_collection_scan_results(
     queries: Sequence[str],
     candidates: Sequence[RetrievalResult],
     question_source_urls: dict[str, list[str]] | None = None,
+    required_evidence: Sequence[str] | None = None,
 ) -> list[RetrievalResult]:
     """Rank direct collection rows for one planner question."""
 
@@ -515,7 +530,7 @@ def rank_collection_scan_results(
     query_text = clean_text(" ".join([question, *queries]))
     query_terms = helpers.query_tokens(query_text)
     topic_terms = {term for term in query_terms if term not in helpers.COVERAGE_GENERIC_TERMS}
-    evidence_types = helpers.infer_question_evidence_types(question)
+    evidence_types = helpers.clean_string_list(list(required_evidence or [])) or helpers.infer_question_evidence_types(question)
     source_urls = helpers.question_source_urls_for(question, question_source_urls)
     scored = []
     fallback = []
@@ -531,14 +546,19 @@ def rank_collection_scan_results(
         overlap = len(query_terms & text_terms)
         topic_overlap = len(topic_terms & text_terms)
         evidence_score = helpers.evidence_type_score(text, evidence_types)
+        signal_score = helpers.evidence_signal_score(text, evidence_types)
         preferred_source = helpers.result_matches_source_urls(result, source_urls)
-        if not (overlap or topic_overlap or evidence_score or preferred_source):
+        primary_source = helpers.is_primary_source(metadata)
+        primary_signal = primary_source and signal_score
+        if not (overlap or topic_overlap or evidence_score or signal_score or preferred_source):
             continue
         score = (
             (topic_overlap * 4.0)
             + (overlap * 1.5)
             + (evidence_score * 3.0)
-            + (8.0 if preferred_source else 0.0)
+            + (signal_score * 5.0)
+            + (10.0 if primary_signal else 0.0)
+            + (5.0 if preferred_source else 0.0)
             + helpers.retrieval_result_priority(result)
             + (1.0 / (position + 1))
         )
