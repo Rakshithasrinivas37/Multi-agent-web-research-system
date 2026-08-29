@@ -73,6 +73,7 @@ DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 48
 DEFAULT_SYNTHESIS_CANDIDATE_CHUNKS_PER_QUESTION = 20
 DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 6
 DEFAULT_SYNTHESIS_MAX_CHUNKS = 48
+DEFAULT_MIN_SYNTHESIS_CHARS = 900
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
@@ -1629,6 +1630,7 @@ def synthesize_context_for_report(
     instruction_requirement_text = format_instruction_requirements(instruction)
     client = Groq()
     last_error: Exception | None = None
+    quality_trace = []
 
     for attempt in range(3):
         context_budget = max(8000, int(max_context_chars * (0.70 ** attempt)))
@@ -1641,6 +1643,7 @@ def synthesize_context_for_report(
             question_source_urls=question_source_urls,
         )
         source_priority_guidance = build_source_priority_guidance(sources)
+        retry_guidance = format_synthesis_retry_guidance(quality_trace[-1]["issues"]) if quality_trace else ""
         prompt = f"""Research objective:
 {objective}
 
@@ -1661,6 +1664,8 @@ Per-question evidence packs:
 
 Retrieved context from multiple sources:
 {context_text}
+
+{retry_guidance}
 
 Create a detailed report-agent-ready evidence package using only the retrieved context.
 Do not write the final report. Prepare rich notes that another agent can turn into a technical report.
@@ -1726,6 +1731,36 @@ Do not invent source names, authors, dates, titles, papers, benchmark numbers, e
             raise
 
         synthesis = normalize_citation_markers(response.choices[0].message.content)
+        quality_issues = synthesis_quality_issues(
+            synthesis,
+            planner_questions or [],
+            evidence_packs,
+            sources,
+        )
+        quality_trace.append(
+            {
+                "attempt": attempt + 1,
+                "chars": len(clean_text(synthesis)),
+                "issues": quality_issues,
+            }
+        )
+        if quality_issues and attempt < 2:
+            print(
+                "[synthesis] retrying weak synthesis "
+                f"({attempt + 1}/3): {'; '.join(quality_issues[:3])}"
+            )
+            continue
+        if quality_issues:
+            print(
+                "[synthesis] using deterministic evidence-pack synthesis after weak model output: "
+                + "; ".join(quality_issues[:3])
+            )
+            synthesis = deterministic_synthesis_from_evidence_packs(
+                objective=objective,
+                synthesis_instruction=instruction,
+                planner_questions=planner_questions or [],
+                evidence_packs=evidence_packs,
+            )
         return {
             "objective": objective,
             "synthesis_instruction": instruction,
@@ -1737,11 +1772,153 @@ Do not invent source names, authors, dates, titles, papers, benchmark numbers, e
             "synthesis_attempts": attempt + 1,
             "synthesis_context_chars": context_budget,
             "synthesis_max_tokens": max(300, token_budget),
+            "synthesis_quality_issues": quality_issues,
+            "synthesis_quality_trace": quality_trace,
+            "synthesis_quality_fallback_used": bool(quality_issues),
         }
 
     if last_error:
         raise last_error
     raise RuntimeError("synthesis failed before calling the generation model")
+
+
+def synthesis_quality_issues(
+    synthesis: Any,
+    planner_questions: Sequence[str],
+    evidence_packs: Sequence[dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+) -> list[str]:
+    """Return reasons a synthesis is too weak to feed the report agent."""
+
+    text = normalize_citation_markers(synthesis)
+    lowered = clean_text(text).lower()
+    questions = dedupe_preserve_order(planner_questions or [])
+    evidence_chunk_count = sum(len(pack.get("chunks", [])) for pack in evidence_packs or [] if isinstance(pack, dict))
+    if not evidence_chunk_count:
+        return []
+
+    issues = []
+    min_chars = max(500, min(DEFAULT_MIN_SYNTHESIS_CHARS, len(questions or [None]) * 160))
+    if len(clean_text(text)) < min_chars:
+        issues.append("synthesis is too short for the retrieved evidence")
+    if "no retrieved context was available" in lowered:
+        issues.append("synthesis claims no retrieved context despite evidence chunks")
+    if sources and not citation_markers(text):
+        issues.append("synthesis has no source citations")
+
+    missing_questions = [
+        question
+        for question in questions
+        if not synthesis_mentions_question(text, question)
+    ]
+    if missing_questions:
+        issues.append(
+            "synthesis misses planner questions: "
+            + "; ".join(question[:90] for question in missing_questions[:3])
+        )
+
+    contradicted_gaps = [
+        clean_text(pack.get("question"))[:90]
+        for pack in evidence_packs or []
+        if isinstance(pack, dict)
+        and clean_text(pack.get("coverage")).lower() == "covered"
+        and pack.get("chunks")
+        and synthesis_section_claims_gap(text, clean_text(pack.get("question")))
+    ]
+    if contradicted_gaps:
+        issues.append("synthesis marks covered evidence as a gap: " + "; ".join(contradicted_gaps[:3]))
+    return dedupe_preserve_order(issues)
+
+
+def synthesis_mentions_question(synthesis: str, question: str) -> bool:
+    """Check that a synthesis has a question-specific section or enough topic words."""
+
+    if not clean_text(question):
+        return True
+    lowered = clean_text(synthesis).lower()
+    if clean_text(question).lower() in lowered:
+        return True
+    terms = coverage_question_tokens(question)
+    if not terms:
+        return True
+    return len(terms & query_tokens(synthesis)) >= max(2, min(4, len(terms)))
+
+
+def synthesis_section_claims_gap(synthesis: str, question: str) -> bool:
+    section = synthesis_section_for_question(synthesis, question) or synthesis
+    return bool(re.search(r"\b(no retrieved context|no supplied source|missing evidence|evidence gap|not present|unavailable)\b", clean_text(section).lower()))
+
+
+def format_synthesis_retry_guidance(issues: Sequence[str]) -> str:
+    issue_text = "\n".join(f"- {issue}" for issue in issues if clean_text(issue))
+    if not issue_text:
+        return ""
+    return f"""Previous synthesis attempt was rejected for these quality issues:
+{issue_text}
+
+Repair requirements:
+- Write complete notes for every planner sub-question.
+- Cite source markers for each supported claim.
+- Do not claim evidence is missing when the per-question evidence pack contains supporting chunks."""
+
+
+def deterministic_synthesis_from_evidence_packs(
+    objective: str,
+    synthesis_instruction: str,
+    planner_questions: Sequence[str],
+    evidence_packs: Sequence[dict[str, Any]],
+) -> str:
+    """Build source-backed synthesis notes when the model returns unusable notes."""
+
+    packs_by_question = evidence_packs_by_question(evidence_packs or [])
+    lines = [
+        "1. Instruction Coverage Checklist",
+        f"- Objective: {clean_text(objective)}",
+    ]
+    if clean_text(synthesis_instruction):
+        lines.append(f"- Requested scope: {clean_text(synthesis_instruction)}")
+    lines.extend(["", "2. Coverage Map"])
+    for question in dedupe_preserve_order(planner_questions or []):
+        pack = packs_by_question.get(question_key(question), {})
+        status = clean_text(pack.get("coverage")) or ("covered" if pack.get("chunks") else "missing")
+        indexes = pack_source_indexes(pack)
+        citation_text = " ".join(f"[{index}]" for index in indexes) if indexes else "no cited chunks"
+        lines.append(f"- {question}: {status}. Evidence: {citation_text}.")
+
+    lines.extend(["", "3. Section Notes By Planner Question"])
+    for question in dedupe_preserve_order(planner_questions or []):
+        pack = packs_by_question.get(question_key(question), {})
+        lines.append("")
+        lines.append(f"### {question}")
+        chunks = [chunk for chunk in pack.get("chunks", []) if isinstance(chunk, dict)]
+        if not chunks:
+            lines.append("- Missing Evidence: no retrieved chunk was mapped to this planner question.")
+            continue
+        for chunk in chunks:
+            index = chunk.get("source_index")
+            marker = f"[{index}]" if isinstance(index, int) else "[source]"
+            title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Retrieved source"
+            content = clean_text(chunk.get("content"))
+            if content:
+                lines.append(f"- {marker} {title}: {content}")
+
+    lines.extend(
+        [
+            "",
+            "4. Cross-Source Synthesis",
+            "- Use the section notes above to connect repeated findings across sources. Prefer primary papers, official documentation, and authoritative surveys for technical claims.",
+            "",
+            "5. Technical Details To Preserve",
+            "- Preserve exact equations, API signatures, benchmark values, complexity claims, definitions, and limitations only when they appear in the cited section notes.",
+            "",
+            "6. Conflicts Or Gaps",
+            "- Treat a topic as a gap only when its mapped evidence pack has no cited chunks or the cited chunks explicitly lack the requested detail.",
+            "",
+            "7. Recommended Report Structure",
+            "- Executive Summary; Introduction and Context; one section per planner sub-question; Cross-cutting Analysis and Synthesis; Limitations and Open Questions; Conclusion; Sources.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def format_planner_questions(questions: Sequence[str]) -> str:
@@ -2693,6 +2870,9 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "gap_retrieved_count": payload.get("gap_retrieved_count", 0),
         "gap_new_chunk_count": payload.get("gap_new_chunk_count", 0),
         "gap_retry_count": payload.get("gap_retry_count", 0),
+        "synthesis_quality_issues": payload.get("synthesis_quality_issues", []),
+        "synthesis_quality_trace": payload.get("synthesis_quality_trace", []),
+        "synthesis_quality_fallback_used": bool(payload.get("synthesis_quality_fallback_used")),
         "retrieval_scope": payload.get("retrieval_scope", ""),
         "retrieval_history_key_count": len(retrieval_history_keys) if isinstance(retrieval_history_keys, list) else 0,
         "allowed_history_key_count": len(allowed_history_keys) if isinstance(allowed_history_keys, list) else 0,

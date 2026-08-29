@@ -12,6 +12,7 @@ from src.rag.generation import (
     browser_signal_results,
     compact_retrieved_chunks,
     coverage_gap_items,
+    deterministic_synthesis_from_evidence_packs,
     evidence_focused_question_query,
     fallback_gap_retrieval_queries,
     high_signal_browser_snippets,
@@ -26,6 +27,8 @@ from src.rag.generation import (
     retrieval_topic_phrase,
     result_supports_question,
     select_synthesis_context,
+    synthesize_context_for_report,
+    synthesis_quality_issues,
 )
 from src.rag.sub_question_context import (
     browser_question_context_retrieve,
@@ -428,6 +431,153 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(coverage[0]["status"], "covered")
         self.assertEqual(coverage[0]["source_indexes"], [2])
         self.assertEqual(coverage[0]["evidence_count"], 1)
+
+    def test_synthesis_quality_flags_too_short_uncited_output(self):
+        question = "What benchmark results demonstrate model impact?"
+        issues = synthesis_quality_issues(
+            "Instruction Coverage Checklist. No retrieved context was available for report synthesis.",
+            [question],
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [
+                        {
+                            "source_index": 1,
+                            "content": "The primary paper reports 28.4 BLEU on a benchmark task. " * 3,
+                        }
+                    ],
+                }
+            ],
+            [{"index": 1}],
+        )
+
+        self.assertTrue(any("too short" in issue for issue in issues))
+        self.assertTrue(any("no retrieved context" in issue for issue in issues))
+        self.assertTrue(any("no source citations" in issue for issue in issues))
+
+    def test_deterministic_synthesis_from_evidence_packs_maps_questions(self):
+        question = "What is the official API?"
+        synthesis = deterministic_synthesis_from_evidence_packs(
+            objective="Library feature",
+            synthesis_instruction="Explain API usage.",
+            planner_questions=[question],
+            evidence_packs=[
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "title": "Official Docs",
+                            "content": "Official API reference lists parameters and usage examples. " * 3,
+                        }
+                    ],
+                }
+            ],
+        )
+
+        self.assertIn(question, synthesis)
+        self.assertIn("[2] Official Docs", synthesis)
+        self.assertIn("Recommended Report Structure", synthesis)
+
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key"}, clear=False)
+    @patch("src.rag.generation.create_chat_completion_with_retries")
+    def test_synthesize_context_for_report_retries_weak_synthesis(self, completion):
+        class Message:
+            def __init__(self, content):
+                self.content = content
+
+        class Choice:
+            def __init__(self, content):
+                self.message = Message(content)
+
+        class Response:
+            def __init__(self, content):
+                self.choices = [Choice(content)]
+                self.model = "test-model"
+
+        weak = "Instruction Coverage Checklist. No retrieved context was available for report synthesis."
+        strong = (
+            "1. Instruction Coverage Checklist\n"
+            "- What benchmark results demonstrate model impact? Covered [1].\n\n"
+            "2. Coverage Map\n"
+            "- What benchmark results demonstrate model impact? Covered [1].\n\n"
+            "3. Section Notes By Planner Question\n"
+            "### What benchmark results demonstrate model impact?\n"
+            "- The primary paper reports 28.4 BLEU on a benchmark task [1].\n\n"
+            "4. Cross-Source Synthesis\n"
+            "- The evidence supports the benchmark claim [1].\n\n"
+            "5. Technical Details To Preserve\n"
+            "- Preserve 28.4 BLEU [1].\n\n"
+            "6. Conflicts Or Gaps\n"
+            "- No unresolved gaps.\n\n"
+            "7. Recommended Report Structure\n"
+            "- Include the benchmark section with [1]."
+        )
+        completion.side_effect = [Response(weak), Response(strong)]
+        context = [
+            RetrievalResult(
+                id="metric",
+                document="The primary paper reports 28.4 BLEU on a benchmark task with enough evidence text. " * 3,
+                metadata={"title": "Primary Paper", "url": "https://arxiv.org/pdf/1234.5678", "source_type": "arxiv"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+
+        payload = synthesize_context_for_report(
+            objective="Model impact",
+            retrieved_context=context,
+            planner_questions=["What benchmark results demonstrate model impact?"],
+            max_context_chars=9000,
+            max_tokens=900,
+        )
+
+        self.assertEqual(completion.call_count, 2)
+        self.assertEqual(payload["synthesis_attempts"], 2)
+        self.assertFalse(payload["synthesis_quality_fallback_used"])
+        self.assertIn("28.4 BLEU", payload["synthesis"])
+
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key"}, clear=False)
+    @patch("src.rag.generation.create_chat_completion_with_retries")
+    def test_synthesize_context_for_report_falls_back_after_weak_synthesis(self, completion):
+        class Message:
+            content = "No retrieved context was available for report synthesis."
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "test-model"
+
+        completion.return_value = Response()
+        question = "What benchmark results demonstrate model impact?"
+        context = [
+            RetrievalResult(
+                id="metric",
+                document="The primary paper reports 28.4 BLEU on a benchmark task with enough evidence text. " * 3,
+                metadata={"title": "Primary Paper", "url": "https://arxiv.org/pdf/1234.5678", "source_type": "arxiv"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+
+        payload = synthesize_context_for_report(
+            objective="Model impact",
+            retrieved_context=context,
+            planner_questions=[question],
+            max_context_chars=9000,
+            max_tokens=900,
+        )
+
+        self.assertEqual(completion.call_count, 3)
+        self.assertTrue(payload["synthesis_quality_fallback_used"])
+        self.assertIn(question, payload["synthesis"])
+        self.assertIn("28.4 BLEU", payload["synthesis"])
 
     def test_parse_llm_retrieval_queries_reads_json_queries_only(self):
         raw = """```json
