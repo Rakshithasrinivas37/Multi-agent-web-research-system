@@ -21,11 +21,14 @@ from src.agents.report_agent import (
     remove_unavailable_citation_markers,
     report_context_gap_items,
     report_context_gap_queries,
+    report_evidence_gap_contradictions,
     report_generation_token_cap,
     report_quality_issues,
+    report_needs_revision,
     report_schema_issues,
     report_self_critique,
     report_sub_question_coverage_check,
+    resolve_report_coverage,
     rewrite_missing_sub_question_queries,
     sources_with_browser_results,
     slugify_filename,
@@ -628,6 +631,63 @@ Done.
         }
 
         self.assertEqual(synthesis_coverage_gap_questions(context, [question]), [])
+
+    def test_resolve_report_coverage_prefers_cited_evidence_pack(self):
+        question = "How does the method work?"
+
+        resolved = resolve_report_coverage(
+            [{"question": question, "status": "missing", "source_indexes": [], "missing_reason": "No match."}],
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 2, "content": "The method is explained with source evidence."}],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(resolved[0]["status"], "covered")
+        self.assertEqual(resolved[0]["source_indexes"], [2])
+        self.assertEqual(resolved[0]["missing_reason"], "")
+
+    def test_report_evidence_gap_contradictions_flags_false_gap(self):
+        question = "What are the main variants such as Alpha and Beta?"
+        report = """
+## Main Variants Such As Alpha And Beta
+Alpha is covered by source evidence [1].
+Beta evidence not provided in the supplied sources.
+
+## References
+[1] https://example.com
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "content": "Beta is described as a supported variant."}],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_needs_revision_for_false_evidence_gap(self):
+        self.assertTrue(
+            report_needs_revision(
+                {
+                    "report_issues": ["report marks covered evidence as a gap: What is covered?"],
+                    "schema_issues": [],
+                    "synthesis_gaps": [],
+                    "false_gap_questions": ["What is covered?"],
+                    "coverage": {"missing": []},
+                }
+            )
+        )
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(
