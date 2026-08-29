@@ -703,12 +703,44 @@ Missing Evidence: exact benchmark values are not present.
         )
         joined = " ".join(queries).lower()
 
-        self.assertIn("overview", joined)
         self.assertIn("benchmark", joined)
         self.assertIn("metrics", joined)
         self.assertFalse(any(query.lower().startswith(("what ", "which ", "where ", "how ")) for query in queries))
         self.assertNotIn("source-backed context", joined)
-        self.assertNotIn("source-backed details examples definitions equations metrics implementation limitations", joined)
+        self.assertNotIn("overview evidence", joined)
+        self.assertNotIn("evidence details examples equations benchmarks limitations", joined)
+
+    def test_sub_question_retrieval_queries_focus_listed_facets(self):
+        queries = sub_question_retrieval_queries(
+            "What are variants such as additive, multiplicative, and self-attention and how do they differ?",
+            objective="Attention mechanism",
+        )
+        joined = " ".join(queries).lower()
+
+        self.assertEqual(len(queries), 3)
+        self.assertTrue(any(query.lower().startswith("additive ") for query in queries))
+        self.assertTrue(any(query.lower().startswith("multiplicative ") for query in queries))
+        self.assertTrue(any(query.lower().startswith("self-attention ") for query in queries))
+        self.assertIn("comparison", joined)
+        self.assertNotIn("details examples equations benchmarks limitations", joined)
+
+    def test_valid_retrieval_queries_sanitizes_generic_query_tails(self):
+        plan = {"objective": "Attention mechanism", "sub_questions": ["What is attention?"]}
+
+        queries = valid_retrieval_queries(
+            [
+                "Which evidence gives attention mechanism details examples equations benchmarks limitations",
+                "Attention mechanism definition attention mechanism machine learning primary source official docs paper",
+            ],
+            plan,
+        )
+        joined = " ".join(queries).lower()
+
+        self.assertTrue(queries)
+        self.assertFalse(any(query.lower().startswith(("what ", "which ", "where ", "how ")) for query in queries))
+        self.assertNotIn("evidence gives", joined)
+        self.assertNotIn("primary source official docs paper", joined)
+        self.assertNotIn("details examples equations benchmarks limitations", joined)
 
     def test_retrieval_topic_phrase_removes_question_filler(self):
         phrase = retrieval_topic_phrase(

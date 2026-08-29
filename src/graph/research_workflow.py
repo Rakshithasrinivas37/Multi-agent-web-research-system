@@ -453,7 +453,12 @@ def refresh_synthesis_for_report_gaps(
     print(f"[report] refreshing synthesis for {len(missing_questions)} coverage gap(s)")
     gap_plan = research_plan_for_report_gaps(research_plan, missing_questions, retry_queries)
     synthesis_agent = SynthesisAgent(model=report_gap_synthesis_model(), chroma_path=chroma_path)
-    refreshed = synthesis_agent.synthesize(gap_plan)
+    refreshed = synthesis_agent.synthesize(
+        gap_plan,
+        browser_results=report_gap_browser_results(report_context, state, memory_path),
+    )
+    if not report_gap_refresh_has_context(refreshed):
+        return mark_report_gap_refresh_empty(report_context, refreshed)
     merged = merge_report_context(report_context, refreshed)
     synthesis_agent.write_to_memory(merged, memory_path)
     return merged
@@ -480,15 +485,60 @@ def research_plan_for_report_gaps(
         }
         for index, question in enumerate(questions)
     ]
+    question_keys = {coverage_question_key({"question": question}) for question in questions}
+    specs = [
+        spec
+        for spec in research_plan.get("sub_question_specs", []) or []
+        if isinstance(spec, dict) and coverage_question_key(spec) in question_keys
+    ]
     return {
         **research_plan,
         "objective": objective,
         "sub_questions": questions,
+        "sub_question_specs": specs,
         "tasks": tasks,
         "synthesis_instruction": (
             "Retrieve and synthesize only the evidence needed to answer the report's missing planner "
             "sub-questions. Preserve citations and mark gaps instead of guessing."
         ),
+    }
+
+
+def report_gap_browser_results(
+    report_context: dict[str, Any],
+    state: ResearchState,
+    memory_path: str,
+) -> list[dict[str, Any]]:
+    browser_results = report_context.get("browser_results", []) if isinstance(report_context, dict) else []
+    if not browser_results:
+        browser_results = state.get("browser_results", [])
+    if not browser_results:
+        browser_results = SharedMemory(memory_path).read_agent_output("browser").get("results", [])
+    return browser_results if isinstance(browser_results, list) else []
+
+
+def report_gap_refresh_has_context(refreshed: dict[str, Any]) -> bool:
+    if not isinstance(refreshed, dict):
+        return False
+    if refreshed.get("supporting_chunks") or refreshed.get("retrieved_chunks"):
+        return True
+    return any((pack.get("chunks") if isinstance(pack, dict) else None) for pack in refreshed.get("evidence_packs", []) or [])
+
+
+def mark_report_gap_refresh_empty(original: dict[str, Any], refreshed: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = original.get("diagnostics", {}) if isinstance(original.get("diagnostics"), dict) else {}
+    refreshed_diag = refreshed.get("diagnostics", {}) if isinstance(refreshed, dict) and isinstance(refreshed.get("diagnostics"), dict) else {}
+    print("[report] gap refresh found no usable chunks; keeping existing synthesis context")
+    return {
+        **original,
+        "diagnostics": {
+            **diagnostics,
+            "report_gap_retry": True,
+            "report_gap_refresh_empty": True,
+            "report_gap_retry_queries": refreshed.get("retrieval_queries", []) if isinstance(refreshed, dict) else [],
+            "report_gap_refresh_counts": refreshed.get("sub_question_context_counts", []) if isinstance(refreshed, dict) else [],
+            "report_gap_refresh_diagnostics": refreshed_diag,
+        },
     }
 
 
