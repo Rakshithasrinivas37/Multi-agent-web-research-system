@@ -130,6 +130,13 @@ EVIDENCE_SIGNAL_PATTERNS = {
         (r"\b(?:softmax|sqrt|tanh|exp|log|equation|formula|formulation)\b", 3),
         (r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^)]{0,80}\)\s*=", 4),
     ),
+    "examples": (
+        (r"\b(?:example|case study|task|application|introduced|proposed|experiment)\b", 2),
+    ),
+    "implementation": (
+        (r"\b(?:implementation|api|class|function|method|parameter|argument|signature|constructor|usage example|official docs?)\b", 3),
+        (r"\b[A-Za-z_][A-Za-z0-9_.]*\([^)]{1,120}\)", 4),
+    ),
     "limitations": (
         (r"\b(?:limitation|limitations|challenge|drawback|constraint|bottleneck|weakness|open question)\b", 3),
     ),
@@ -193,6 +200,8 @@ COVERAGE_EVIDENCE_TERMS = {
     "results",
     "score",
     "scores",
+    "cost",
+    "costs",
 }
 QUERY_FILLER_TERMS = OBJECTIVE_STOPWORDS | {
     "about",
@@ -229,7 +238,33 @@ EVIDENCE_QUERY_HINTS = {
     "complexity": ["time complexity", "memory complexity", "big O", "scaling"],
     "definition": ["definition", "overview", "purpose", "concept"],
     "equation": ["equation", "formula", "mathematical derivation", "score function", "variables"],
+    "examples": ["examples", "cases", "tasks"],
+    "implementation": ["implementation", "api signature", "parameters", "usage example"],
     "limitations": ["limitations", "challenges", "bottlenecks", "open questions"],
+}
+COVERAGE_FACET_STOPWORDS = QUERY_FILLER_TERMS | COVERAGE_GENERIC_TERMS | COVERAGE_EVIDENCE_TERMS | {
+    "academic",
+    "authoritative",
+    "background",
+    "concept",
+    "concepts",
+    "detail",
+    "details",
+    "example",
+    "examples",
+    "official",
+    "paper",
+    "papers",
+    "primary",
+    "source",
+    "sources",
+    "topic",
+    "topics",
+    "trade",
+    "off",
+    "have",
+    "has",
+    "key",
 }
 
 
@@ -829,11 +864,23 @@ def build_coverage_by_question(
         )
         context_indexes = [match["source_index"] for match in context_matches]
         source_indexes_for_question = dedupe_ints([*cited, *pack_indexes, *context_indexes])
-        if status == "covered" and cited and not pack_indexes and not context_matches:
-            status = "partial"
-        if pack_indexes:
-            status = merge_coverage_status(status, clean_text(pack.get("coverage")) or "partial")
-        status = merge_coverage_status(status, infer_context_coverage_status(context_matches, section))
+        coverage_details = {
+            "required_facets": clean_string_list(pack.get("required_facets")) if isinstance(pack, dict) else [],
+            "covered_facets": clean_string_list(pack.get("covered_facets")) if isinstance(pack, dict) else [],
+            "missing_facets": clean_string_list(pack.get("missing_facets")) if isinstance(pack, dict) else [],
+            "covered_evidence_types": clean_string_list(pack.get("covered_evidence_types")) if isinstance(pack, dict) else [],
+            "missing_evidence_types": clean_string_list(pack.get("missing_evidence_types")) if isinstance(pack, dict) else [],
+            "missing_facet_evidence": clean_string_list(pack.get("missing_facet_evidence")) if isinstance(pack, dict) else [],
+        }
+        pack_status = clean_text(pack.get("coverage")).lower() if isinstance(pack, dict) else ""
+        if pack_status in {"covered", "partial", "missing"}:
+            status = pack_status
+            if status == "missing" and context_matches:
+                status = infer_context_coverage_status(context_matches, section)
+        else:
+            if status == "covered" and cited and not pack_indexes and not context_matches:
+                status = "partial"
+            status = merge_coverage_status(status, infer_context_coverage_status(context_matches, section))
         coverage.append(
             {
                 "question_id": clean_text(spec.get("question_id")) if isinstance(spec, dict) else "",
@@ -843,7 +890,8 @@ def build_coverage_by_question(
                 "source_indexes": source_indexes_for_question,
                 "has_citations": bool(source_indexes_for_question),
                 "evidence_count": (len(pack.get("chunks", [])) if isinstance(pack, dict) else 0) + len(context_matches),
-                "missing_reason": coverage_missing_reason(status, context_matches, section),
+                "missing_reason": coverage_missing_reason(status, context_matches, section, coverage_details),
+                **coverage_details,
             }
         )
     return coverage
@@ -915,6 +963,167 @@ def coverage_question_tokens(text: str) -> set[str]:
     }
 
 
+def question_required_facets(question: str) -> list[str]:
+    """Extract named/listed facets that a compound planner question expects."""
+
+    text = clean_text(question).replace("‑", "-").replace("–", "-").replace("—", "-")
+    candidates: list[str] = []
+
+    def add(raw: str) -> None:
+        candidates.extend(split_facet_candidates(raw))
+
+    for match in re.findall(r"\(([^)]{2,160})\)", text):
+        add(match)
+    for pattern in (
+        r"\b(?:e\.g\.|eg|including|includes?|such as|like)\s+([^?.;:()]+)",
+        r"\b(?:between|among|across|beyond)\s+([^?.;:()]+)",
+        r"\b(?:compared\s+(?:with|to)|versus|vs\.?)\s+([^?.;:()]+)",
+        r"\b(?:in|for)\s+([A-Z][A-Za-z0-9_.-]*(?:\s+(?:and|or|/)\s+[A-Za-z0-9_.-]+(?:\s+[A-Za-z0-9_.-]+){0,2})+)",
+    ):
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            add(match.group(1))
+    for match in re.finditer(r"\b(?:[A-Z]{2,}[A-Za-z0-9_.-]*|[A-Z][a-z]+(?:[A-Z][A-Za-z0-9_.-]+)+)\b", text):
+        candidates.append(match.group(0))
+    for match in re.finditer(
+        r"\b([A-Za-z0-9][A-Za-z0-9_.+-]*(?:\s+[A-Za-z0-9][A-Za-z0-9_.+-]*){0,2})\s+"
+        r"(attention|api|dataset|benchmark|model|architecture|framework|library|method|task|application)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        modifier = match.group(1)
+        head = match.group(2)
+        if re.search(r"\b(?:and|or)\b", modifier, flags=re.IGNORECASE):
+            candidates.extend(f"{part} {head}" for part in re.split(r"\b(?:and|or)\b", modifier, flags=re.IGNORECASE))
+        else:
+            candidates.append(f"{modifier} {head}")
+
+    return dedupe_preserve_order(
+        facet for facet in (normalize_facet(candidate) for candidate in candidates)
+        if facet
+    )
+
+
+def split_facet_candidates(text: str) -> list[str]:
+    cleaned = clean_text(text)
+    cleaned = re.sub(r"\b(?:and how|and what|where|why|when)\b.*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:e\.g\.|eg|i\.e\.|ie)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:and|or|versus|vs\.?)\b|/", ",", cleaned, flags=re.IGNORECASE)
+    return [
+        normalized
+        for part in cleaned.split(",")
+        if (normalized := normalize_facet(part))
+    ]
+
+
+def normalize_facet(value: Any) -> str:
+    text = clean_text(value).strip(" .,:;()[]{}")
+    text = text.replace("‑", "-").replace("–", "-").replace("—", "-")
+    text = re.sub(r"^(?:the|a|an|of|to|in|for|with|without)\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(?:introduced|trade[- ]?offs?|trade\s+off|proposes?|proposed|compares?|compared|addresses?|addressed|works?)\b.*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    tokens = []
+    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.+#/-]*", text):
+        cleaned = token.strip("._/#-")
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in COVERAGE_FACET_STOPWORDS:
+            continue
+        tokens.append(cleaned)
+    if tokens == ["attention"]:
+        return ""
+    if len(tokens) == 1 and (len(tokens[0]) < 3 or tokens[0].lower() in COVERAGE_FACET_STOPWORDS):
+        return ""
+    return " ".join(tokens)[:90]
+
+
+def facet_present(facet: str, text: str) -> bool:
+    normalized = normalize_facet(facet)
+    if not normalized:
+        return False
+    lowered_text = clean_text(text).replace("‑", "-").replace("–", "-").replace("—", "-").lower()
+    lowered_facet = normalized.lower()
+    if lowered_facet in lowered_text:
+        return True
+    facet_tokens = coverage_question_tokens(lowered_facet)
+    text_tokens = coverage_question_tokens(lowered_text)
+    return bool(facet_tokens and facet_tokens <= text_tokens)
+
+
+def facet_evidence_window(facet: str, text: str) -> str:
+    normalized = normalize_facet(facet).lower()
+    if not normalized:
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+|\n+", clean_text(text))
+    windows = [
+        sentence
+        for sentence in sentences
+        if facet_present(normalized, sentence)
+    ]
+    return " ".join(windows) or text
+
+
+def chunk_evidence_text(chunk: dict[str, Any]) -> str:
+    return clean_text(
+        " ".join(
+            [
+                clean_text(chunk.get("title")),
+                clean_text(chunk.get("url")),
+                clean_text(chunk.get("content")),
+            ]
+        )
+    )
+
+
+def coverage_evidence_details(
+    question: str,
+    chunks: Sequence[dict[str, Any]],
+    required_evidence: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    text = clean_text(" ".join(chunk_evidence_text(chunk) for chunk in chunks if isinstance(chunk, dict)))
+    evidence_types = clean_string_list(list(required_evidence or [])) or infer_question_evidence_types(question)
+    strict_evidence = [item for item in evidence_types if item != "evidence"]
+    required_facets = question_required_facets(question)
+    covered_facets = [facet for facet in required_facets if facet_present(facet, text)]
+    missing_facets = [facet for facet in required_facets if facet not in covered_facets]
+    covered_evidence_types = [
+        evidence_type
+        for evidence_type in strict_evidence
+        if evidence_type_score(text, [evidence_type]) or evidence_signal_score(text, [evidence_type])
+    ]
+    missing_evidence_types = [
+        evidence_type for evidence_type in strict_evidence
+        if evidence_type not in covered_evidence_types
+    ]
+    facet_sensitive = {"api", "benchmark", "complexity", "equation", "implementation", "limitations"}
+    missing_facet_evidence = [
+        f"{facet}: {evidence_type}"
+        for facet in covered_facets
+        for evidence_type in strict_evidence
+        if evidence_type in facet_sensitive
+        and not (
+            evidence_type_score(facet_evidence_window(facet, text), [evidence_type])
+            or evidence_signal_score(facet_evidence_window(facet, text), [evidence_type])
+        )
+    ]
+    status = "missing"
+    if chunks:
+        status = "partial" if (missing_facets or missing_evidence_types or missing_facet_evidence) else "covered"
+    return {
+        "status": status,
+        "required_facets": required_facets,
+        "covered_facets": covered_facets,
+        "missing_facets": missing_facets,
+        "covered_evidence_types": covered_evidence_types,
+        "missing_evidence_types": missing_evidence_types,
+        "missing_facet_evidence": dedupe_preserve_order(missing_facet_evidence),
+    }
+
+
 def evidence_type_score(text: str, evidence_types: Sequence[str]) -> int:
     lowered = clean_text(text).lower()
     if not evidence_types:
@@ -927,6 +1136,8 @@ def evidence_type_score(text: str, evidence_types: Sequence[str]) -> int:
         "complexity": r"\b(complexity|runtime|memory|quadratic|linear|o\(|o\(n|efficient|scalability)\b",
         "definition": r"\b(definition|defined as|refers to|means|is a|are a|purpose)\b",
         "equation": r"(?:\\(?:frac|sum|sqrt)|[=∑Σ√]|softmax|equation|formula|where\s+[A-Za-z])",
+        "examples": r"\b(example|case|task|paper|introduced|proposed|contribution|experiment|application)\b",
+        "implementation": r"\b(implementation|api|class|function|method|parameter|argument|signature|constructor|usage example|official docs?)\b",
         "limitations": r"\b(limitation|challenge|drawback|constraint|bottleneck|weakness|open question)\b",
     }
     score = 0
@@ -968,9 +1179,21 @@ def merge_coverage_status(*statuses: str) -> str:
     return best
 
 
-def coverage_missing_reason(status: str, matches: Sequence[dict[str, Any]], section: str) -> str:
+def coverage_missing_reason(
+    status: str,
+    matches: Sequence[dict[str, Any]],
+    section: str,
+    details: dict[str, Any] | None = None,
+) -> str:
     if status == "covered":
         return ""
+    details = details or {}
+    if details.get("missing_facets"):
+        return "Missing facet coverage: " + ", ".join(clean_string_list(details.get("missing_facets"))[:6])
+    if details.get("missing_evidence_types"):
+        return "Missing required evidence signals: " + ", ".join(clean_string_list(details.get("missing_evidence_types"))[:6])
+    if details.get("missing_facet_evidence"):
+        return "Missing per-facet evidence signals: " + ", ".join(clean_string_list(details.get("missing_facet_evidence"))[:6])
     if not matches:
         return "No retrieved chunk matched both the planner topic and required evidence signals."
     if not citation_markers(section):
@@ -2686,20 +2909,13 @@ def build_sub_question_evidence_packs(
             )
             [:max_chunks_per_question]
         ]
-        supported_count = sum(
-            1
-            for chunk in selected
-            if text_supports_question(
-                question,
-                " ".join([clean_text(chunk.get("title")), clean_text(chunk.get("content"))]),
-                required_evidence=evidence_types,
-            )
-        )
+        coverage_details = coverage_evidence_details(question, selected, evidence_types)
         packs.append(
             {
                 "question": question,
-                "coverage": "covered" if supported_count else ("partial" if selected else "missing"),
+                "coverage": coverage_details["status"],
                 "planned_source_urls": question_source_urls_for(question, question_source_urls),
+                **coverage_details,
                 "chunks": selected,
             }
         )
@@ -2721,7 +2937,15 @@ def format_evidence_packs_for_prompt(evidence_packs: Sequence[dict[str, Any]]) -
     for pack in evidence_packs:
         question = clean_text(pack.get("question")) if isinstance(pack, dict) else ""
         coverage = clean_text(pack.get("coverage")) if isinstance(pack, dict) else "missing"
-        lines.append(f"- {question} ({coverage})")
+        details = []
+        if isinstance(pack, dict) and pack.get("missing_facets"):
+            details.append("missing facets: " + ", ".join(clean_string_list(pack.get("missing_facets"))[:5]))
+        if isinstance(pack, dict) and pack.get("missing_evidence_types"):
+            details.append("missing evidence: " + ", ".join(clean_string_list(pack.get("missing_evidence_types"))[:5]))
+        if isinstance(pack, dict) and pack.get("missing_facet_evidence"):
+            details.append("missing facet evidence: " + ", ".join(clean_string_list(pack.get("missing_facet_evidence"))[:5]))
+        detail_text = f"; {'; '.join(details)}" if details else ""
+        lines.append(f"- {question} ({coverage}{detail_text})")
         for chunk in (pack.get("chunks", []) if isinstance(pack, dict) else []):
             marker = f"[{chunk.get('source_index')}]"
             title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Retrieved chunk"
