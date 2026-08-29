@@ -246,6 +246,7 @@ COVERAGE_FACET_STOPWORDS = QUERY_FILLER_TERMS | COVERAGE_GENERIC_TERMS | COVERAG
     "academic",
     "authoritative",
     "background",
+    "common",
     "concept",
     "concepts",
     "detail",
@@ -1020,7 +1021,8 @@ def normalize_facet(value: Any) -> str:
     text = text.replace("‑", "-").replace("–", "-").replace("—", "-")
     text = re.sub(r"^(?:the|a|an|of|to|in|for|with|without)\s+", "", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"\b(?:introduced|trade[- ]?offs?|trade\s+off|proposes?|proposed|compares?|compared|addresses?|addressed|works?)\b.*",
+        r"\b(?:introduced|trade[- ]?offs?|trade\s+off|proposes?|proposed|compares?|compared|addresses?|addressed|"
+        r"works?|reduces?|improves?|uses?|reports?|achieves?|provides?|describes?)\b.*",
         "",
         text,
         flags=re.IGNORECASE,

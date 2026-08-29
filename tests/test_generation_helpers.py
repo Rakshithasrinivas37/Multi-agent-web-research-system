@@ -1172,6 +1172,78 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(groups[0]["chunk_count"], 3)
         self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], "What is alpha topic?")
 
+    def test_retrieve_sub_question_context_groups_rescues_missing_facets(self):
+        question = "What efficient methods such as Linformer, Performer, and Longformer reduce attention cost?"
+        initial = [
+            RetrievalResult(
+                id="linformer",
+                document="Linformer reduces attention complexity with low-rank projections. " * 4,
+                metadata={"title": "Linformer", "url": "https://arxiv.org/pdf/2006.04768"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="longformer",
+                document="Longformer uses sparse local and global attention for long sequence complexity. " * 4,
+                metadata={"title": "Longformer", "url": "https://arxiv.org/pdf/2004.05150"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="generic",
+                document="Efficient attention methods reduce memory and runtime for long contexts. " * 4,
+                metadata={"title": "Generic", "url": "https://example.com/generic"},
+                score=0.8,
+                semantic_score=0.8,
+                bm25_score=0.0,
+            ),
+        ]
+        rescued = [
+            RetrievalResult(
+                id="performer",
+                document="Performer approximates softmax attention with random features for linear attention complexity. " * 4,
+                metadata={"title": "Performer", "url": "https://arxiv.org/pdf/2009.14794"},
+                score=0.7,
+                semantic_score=0.7,
+                bm25_score=0.0,
+            )
+        ]
+
+        with (
+            patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", return_value=initial),
+            patch("src.rag.sub_question_context.facet_rescue_context_retrieve", return_value=rescued) as facet_scan,
+        ):
+            groups = retrieve_sub_question_context_groups(
+                research_plan={"sub_questions": [question]},
+                questions=[question],
+                objective="Attention mechanism",
+                chroma_path="/tmp/chroma",
+                collection_name="test",
+                history_keys=[],
+                candidate_chunks=8,
+                final_chunks=3,
+                per_query_k=25,
+                semantic_k=10,
+                bm25_k=10,
+                semantic_weight=0.3,
+                bm25_weight=0.3,
+                authority_weight=0.4,
+                bm25_scan_limit=100,
+                embedding_device="",
+                rerank=False,
+                reranker_model="cross-encoder",
+                rerank_k=8,
+                rerank_weight=0.7,
+            )
+
+        selected_ids = {result.id for result in groups[0]["chunks"]}
+
+        facet_scan.assert_called_once()
+        self.assertIn("facet_scan", groups[0]["fallback_sources"])
+        self.assertEqual({"linformer", "longformer", "performer"}, selected_ids)
+
     def test_retrieve_sub_question_context_groups_scans_collection_when_hybrid_empty(self):
         class FakeCollection:
             def get(self, **kwargs):
