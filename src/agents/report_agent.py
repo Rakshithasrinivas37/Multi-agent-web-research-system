@@ -106,6 +106,14 @@ class ReportAgent:
         evidence_packs = report_context.get("evidence_packs", [])
         coverage_questions = dedupe_text([*planner_questions, *evidence_pack_questions(evidence_packs)])
         sources = sources_with_browser_results(report_context.get("sources", []), report_context.get("browser_results", []))
+        coverage_by_question = resolve_report_coverage(
+            report_context.get("coverage_by_question", []),
+            evidence_packs,
+            coverage_questions,
+        )
+        coverage_conflicts = report_coverage_conflicts(report_context.get("coverage_by_question", []), evidence_packs)
+        if coverage_conflicts:
+            print(f"[report] resolved {len(coverage_conflicts)} stale coverage gap(s) from evidence packs")
         evidence = format_question_focused_evidence(report_context, coverage_questions, sources=sources, evidence_packs=evidence_packs)
         if not evidence:
             evidence = format_supporting_evidence(report_context, sources=sources)
@@ -119,7 +127,7 @@ class ReportAgent:
             "evidence": evidence,
             "sources": sources,
             "citation_policy": clean_text(report_context.get("citation_policy")),
-            "coverage_by_question": report_context.get("coverage_by_question", []),
+            "coverage_by_question": coverage_by_question,
             "evidence_packs": evidence_packs,
         }
         prompt = build_report_prompt(**prompt_inputs)
@@ -135,13 +143,19 @@ class ReportAgent:
             tool="groq",
             metadata={"model": self.model},
         )
-        report, model = generate_single_report(Groq(), self.model, prompt, fallback_prompt=fallback_prompt)
+        client = Groq()
+        report, model = generate_single_report(client, self.model, prompt, fallback_prompt=fallback_prompt)
         report = normalize_final_report(report, sources)
-        synthesis_gaps = synthesis_coverage_gap_questions(report_context, coverage_questions)
-        coverage = report_sub_question_coverage_check(report, coverage_questions)
-        schema_issues = report_schema_issues(report, coverage_questions)
-        report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}\n{pack_text}")
-        review = report_self_critique(report_issues, coverage, schema_issues)
+        validation = validate_report_output(report, sources, coverage_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
+        review_trace = [validation["review"]]
+        if report_needs_revision(validation):
+            feedback = format_report_revision_feedback(validation)
+            print(f"[report] retrying after self-critique: {clean_text(feedback)[:240]}")
+            repair_prompt = build_report_prompt(**prompt_inputs, compact=True, repair_feedback=feedback)
+            report, model = generate_single_report(client, self.model, repair_prompt, fallback_prompt=repair_prompt)
+            report = normalize_final_report(report, sources)
+            validation = validate_report_output(report, sources, coverage_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
+            review_trace.append(validation["review"])
 
         return {
             "objective": objective,
@@ -156,13 +170,19 @@ class ReportAgent:
                 "retrieved_chunk_count": len(report_context.get("retrieved_chunks", []) or []),
                 "report_length": len(report),
                 "report_generation_mode": "single",
-                "report_issues": report_issues,
-                "report_schema_issues": schema_issues,
-                "report_missing_sub_questions": coverage["missing"],
-                "report_evidence_gap_questions": synthesis_gaps,
-                "report_coverage_check": coverage,
-                "report_retry_queries": rewrite_missing_sub_question_queries(objective, dedupe_text([*coverage["missing"], *synthesis_gaps])),
-                "report_review_trace": [review],
+                "report_issues": validation["report_issues"],
+                "report_schema_issues": validation["schema_issues"],
+                "report_missing_sub_questions": validation["coverage"]["missing"],
+                "report_evidence_gap_questions": validation["synthesis_gaps"],
+                "report_false_gap_questions": validation["false_gap_questions"],
+                "report_coverage_conflicts": coverage_conflicts,
+                "report_coverage_check": validation["coverage"],
+                "report_retry_queries": rewrite_missing_sub_question_queries(
+                    objective,
+                    dedupe_text([*validation["coverage"]["missing"], *validation["synthesis_gaps"], *validation["false_gap_questions"]]),
+                ),
+                "report_review_trace": review_trace,
+                "report_revision_attempts": len(review_trace) - 1,
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
                 "report_prompt_chars": len(prompt),
                 "report_fallback_prompt_chars": len(fallback_prompt),
@@ -191,6 +211,7 @@ def build_report_prompt(
     coverage_by_question: Sequence[dict[str, Any]] | None = None,
     evidence_packs: Sequence[dict[str, Any]] | None = None,
     compact: bool = False,
+    repair_feedback: str = "",
 ) -> str:
     source_text = format_sources(sources)
     evidence_text = clean_markdown(evidence)
@@ -240,6 +261,8 @@ Synthesis notes:
 
 Synthesis coverage by planner question:
 {coverage_text}
+
+{format_repair_feedback(repair_feedback)}
 
 Evidence gaps from synthesis:
 {format_missing_evidence_constraints(synthesis)}
@@ -711,6 +734,208 @@ def report_sub_question_coverage_check(
         "missing": missing,
         "items": [{"question": q, "heading": planner_question_heading(q), "status": "missing" if normalize_heading(q) in missing_keys else "covered"} for q in questions],
     }
+
+
+def validate_report_output(
+    report: str,
+    sources: Sequence[dict[str, Any]],
+    planner_questions: Sequence[str],
+    evidence: str,
+    synthesis: str,
+    pack_text: str,
+    evidence_packs: Sequence[dict[str, Any]],
+    report_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Run separate, inspectable checks for final report quality."""
+
+    synthesis_gaps = synthesis_coverage_gap_questions(report_context, planner_questions)
+    coverage = report_sub_question_coverage_check(report, planner_questions)
+    schema_issues = report_schema_issues(report, planner_questions)
+    false_gaps = report_evidence_gap_contradictions(report, evidence_packs, planner_questions)
+    report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}\n{pack_text}")
+    report_issues.extend(f"report marks covered evidence as a gap: {question}" for question in false_gaps)
+    review = report_self_critique(report_issues, coverage, schema_issues)
+    return {
+        "coverage": coverage,
+        "schema_issues": schema_issues,
+        "synthesis_gaps": synthesis_gaps,
+        "false_gap_questions": false_gaps,
+        "report_issues": dedupe_text(report_issues),
+        "review": review,
+    }
+
+
+def report_needs_revision(validation: dict[str, Any]) -> bool:
+    return bool(
+        validation.get("report_issues")
+        or validation.get("schema_issues")
+        or validation.get("synthesis_gaps")
+        or validation.get("false_gap_questions")
+        or validation.get("coverage", {}).get("missing")
+    )
+
+
+def format_report_revision_feedback(validation: dict[str, Any]) -> str:
+    issues = [
+        *validation.get("report_issues", []),
+        *validation.get("schema_issues", []),
+        *(f"missing planner topic: {q}" for q in validation.get("coverage", {}).get("missing", [])),
+        *(f"synthesis gap to respect: {q}" for q in validation.get("synthesis_gaps", [])),
+    ]
+    return "\n".join(f"- {issue}" for issue in dedupe_text(issues)) or "- No unresolved issue."
+
+
+def format_repair_feedback(repair_feedback: str) -> str:
+    feedback = clean_text(repair_feedback)
+    if not feedback:
+        return ""
+    return f"""Repair feedback from previous draft:
+{repair_feedback}
+
+Revise the report to fix every item above. If a topic has covered cited evidence, do not write it as an evidence gap."""
+
+
+def resolve_report_coverage(
+    coverage_by_question: Sequence[dict[str, Any]],
+    evidence_packs: Sequence[dict[str, Any]],
+    planner_questions: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Prefer cited per-question evidence packs over stale missing coverage rows."""
+
+    raw_by_question = {
+        normalize_heading(item.get("question")): dict(item)
+        for item in coverage_by_question or []
+        if isinstance(item, dict) and clean_text(item.get("question"))
+    }
+    packs_by_question = {
+        normalize_heading(pack.get("question")): pack
+        for pack in evidence_packs or []
+        if isinstance(pack, dict) and clean_text(pack.get("question"))
+    }
+    questions = dedupe_text([*planner_questions, *(pack.get("question") for pack in evidence_packs or [] if isinstance(pack, dict))])
+    resolved = []
+    for index, question in enumerate(questions, 1):
+        key = normalize_heading(question)
+        item = raw_by_question.get(key, {"question_id": f"q{index:03d}", "question": question})
+        pack = packs_by_question.get(key)
+        pack_indexes = pack_source_indexes(pack) if isinstance(pack, dict) else []
+        if pack_indexes and evidence_pack_has_cited_evidence(pack):
+            item["status"] = clean_text(pack.get("coverage")) or "covered"
+            item["source_indexes"] = dedupe_ints([*item.get("source_indexes", []), *pack_indexes])
+            item["has_citations"] = True
+            item["evidence_count"] = max(int(item.get("evidence_count") or 0), len(pack.get("chunks", []) or []))
+            item["missing_reason"] = ""
+        resolved.append(item)
+    return resolved
+
+
+def report_coverage_conflicts(
+    coverage_by_question: Sequence[dict[str, Any]],
+    evidence_packs: Sequence[dict[str, Any]],
+) -> list[str]:
+    packs_by_question = {
+        normalize_heading(pack.get("question")): pack
+        for pack in evidence_packs or []
+        if isinstance(pack, dict) and evidence_pack_has_cited_evidence(pack)
+    }
+    conflicts = []
+    for item in coverage_by_question or []:
+        if not isinstance(item, dict) or not synthesis_coverage_status_is_gap(item.get("status")):
+            continue
+        question = clean_text(item.get("question"))
+        if normalize_heading(question) in packs_by_question:
+            conflicts.append(question)
+    return dedupe_text(conflicts)
+
+
+def report_evidence_gap_contradictions(
+    report: str,
+    evidence_packs: Sequence[dict[str, Any]],
+    planner_questions: Sequence[str] | None = None,
+) -> list[str]:
+    """Find sections that call a covered evidence pack missing."""
+
+    canonical = {normalize_heading(q): q for q in planner_questions or [] if clean_text(q)}
+    contradictions = []
+    for pack in evidence_packs or []:
+        if not isinstance(pack, dict) or not evidence_pack_has_cited_evidence(pack):
+            continue
+        question = clean_text(pack.get("question"))
+        section = report_section_for_question(report, question)
+        if section and section_claims_missing_supported_evidence(section, question, pack):
+            contradictions.append(canonical.get(normalize_heading(question), question))
+    return dedupe_text(contradictions)
+
+
+def report_section_for_question(report: str, question: str) -> str:
+    expected = normalize_heading(planner_question_heading(question))
+    question_terms = detail_terms(question)
+    best = ""
+    best_score = 0
+    for heading, section in markdown_sections(report):
+        actual = normalize_heading(heading)
+        score = 0
+        if expected and headings_match(expected, actual):
+            score += 5
+        score += len(question_terms & detail_terms(heading))
+        if score > best_score:
+            best_score = score
+            best = section
+    return best if best_score else ""
+
+
+def markdown_sections(markdown: str) -> list[tuple[str, str]]:
+    sections: list[tuple[str, list[str]]] = []
+    heading = ""
+    lines: list[str] = []
+    in_fence = False
+    for line in clean_markdown(markdown).splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+        match = None if in_fence else re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if match:
+            if lines:
+                sections.append((heading, lines))
+            heading, lines = match.group(1).strip(), [line]
+        else:
+            lines.append(line)
+    if lines:
+        sections.append((heading, lines))
+    return [(heading, "\n".join(lines)) for heading, lines in sections]
+
+
+def section_claims_missing_supported_evidence(section: str, question: str, pack: dict[str, Any]) -> bool:
+    lowered = clean_text(section).lower()
+    if not citation_markers(section) and re.search(r"\b(evidence gap|no source-backed|cannot be given|none .* provide|not available)\b", lowered):
+        return True
+    gap_terms = r"(evidence not provided|not provided|missing evidence|no source-backed|lack(?:s|ing)? .* evidence|absent from .* evidence)"
+    for term in named_terms(question):
+        if term in lowered and re.search(rf"\b{re.escape(term)}\b.{{0,140}}{gap_terms}|{gap_terms}.{{0,140}}\b{re.escape(term)}\b", lowered):
+            return True
+    return False
+
+
+def pack_source_indexes(pack: dict[str, Any]) -> list[int]:
+    return dedupe_ints(
+        chunk.get("source_index")
+        for chunk in pack.get("chunks", []) or []
+        if isinstance(chunk, dict)
+    )
+
+
+def dedupe_ints(values: Sequence[Any]) -> list[int]:
+    deduped = []
+    seen = set()
+    for value in values or []:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, bool) or number in seen:
+            continue
+        seen.add(number)
+        deduped.append(number)
+    return deduped
 
 
 def synthesis_coverage_gap_questions(
