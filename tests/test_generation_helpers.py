@@ -15,6 +15,7 @@ from src.rag.generation import (
     deterministic_synthesis_from_evidence_packs,
     evidence_focused_question_query,
     fallback_gap_retrieval_queries,
+    format_evidence_packs_for_prompt,
     high_signal_browser_snippets,
     parse_gap_query_lines,
     planner_question_source_urls,
@@ -219,6 +220,66 @@ class GenerationHelperTests(unittest.TestCase):
 
         self.assertEqual(packs[0]["coverage"], "partial")
         self.assertEqual(packs[0]["chunks"][0]["source_index"], 1)
+
+    def test_evidence_pack_keeps_compound_api_question_partial_until_all_facets_exist(self):
+        question = "What official API usage exists in PyTorch and TensorFlow?"
+        results = [
+            RetrievalResult(
+                id="pytorch-api",
+                document="PyTorch official API documentation explains the class, parameters, and usage examples. " * 3,
+                metadata={"title": "PyTorch docs", "url": "https://pytorch.org/docs/stable/generated/api.html"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 1, "id": "pytorch-api", "url": "https://pytorch.org/docs/stable/generated/api.html"}]
+
+        packs = build_sub_question_evidence_packs([question], results, sources)
+        coverage = build_coverage_by_question(
+            f"{question}\nThe APIs are covered [1].",
+            [{"question_id": "q001", "question": question, "required_evidence": ["api"]}],
+            sources,
+            evidence_packs=packs,
+        )
+
+        self.assertEqual(packs[0]["coverage"], "partial")
+        self.assertIn("PyTorch", packs[0]["covered_facets"])
+        self.assertIn("TensorFlow", packs[0]["missing_facets"])
+        self.assertEqual(coverage[0]["status"], "partial")
+        self.assertIn("TensorFlow", coverage[0]["missing_reason"])
+
+    def test_evidence_pack_tracks_missing_listed_method_facets(self):
+        question = "What efficient methods such as Linformer, Performer, and Longformer trade off performance and cost?"
+        results = [
+            RetrievalResult(
+                id="linformer",
+                document="Linformer reports benchmark accuracy of 91.0% and linear memory complexity. " * 3,
+                metadata={"title": "Linformer paper", "url": "https://arxiv.org/pdf/2006.04768"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="longformer",
+                document="Longformer benchmark results discuss accuracy, memory cost, and long sequence complexity. " * 3,
+                metadata={"title": "Longformer paper", "url": "https://arxiv.org/pdf/2004.05150"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            ),
+        ]
+        sources = [
+            {"index": 1, "id": "linformer", "url": "https://arxiv.org/pdf/2006.04768"},
+            {"index": 2, "id": "longformer", "url": "https://arxiv.org/pdf/2004.05150"},
+        ]
+
+        packs = build_sub_question_evidence_packs([question], results, sources)
+        prompt_context = format_evidence_packs_for_prompt(packs)
+
+        self.assertEqual(packs[0]["coverage"], "partial")
+        self.assertIn("Performer", packs[0]["missing_facets"])
+        self.assertIn("missing facets: Performer", prompt_context)
 
     def test_planner_question_source_urls_maps_task_context_ids(self):
         plan = {
