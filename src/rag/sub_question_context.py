@@ -25,6 +25,17 @@ DEFAULT_SYNTHESIS_MAX_CHUNKS = 48
 DEFAULT_CONTEXT_BLOCK_CHARS = 750
 DEFAULT_HF_QUERY_MAX_INPUT_TOKENS = 4096
 DEFAULT_HF_QUERY_MAX_NEW_TOKENS = 900
+GENERIC_QUERY_PHRASES = (
+    r"\boverview evidence definition concept\b",
+    r"\bevidence details examples equations benchmarks limitations\b",
+    r"\bdetails examples equations benchmarks limitations\b",
+    r"\bprimary source official docs paper\b",
+    r"\bsource-backed context explains\b",
+    r"\bwhich evidence gives\b",
+    r"\bevidence gives\b",
+    r"\bwhere do authoritative sources discuss\b",
+    r"\bauthoritative sources discuss\b",
+)
 EVIDENCE_TERMS_BY_TYPE = {
     "api": {"api", "class", "function", "method", "parameter", "argument", "signature", "usage", "example"},
     "applications": {"application", "applications", "task", "tasks", "used for", "nlp", "vision", "computer vision", "image", "classification", "translation", "speech", "recognition"},
@@ -86,16 +97,71 @@ def sub_question_retrieval_queries(
     if not question:
         return []
 
+    evidence_types = helpers.infer_question_evidence_types(f"{question} {task_details}")
+    evidence_terms = query_evidence_terms(evidence_types)
+    facets = helpers.question_required_facets(f"{question} {task_details}")
     source_terms = helpers.source_query_terms(task_details)
     topic = helpers.retrieval_topic_phrase(f"{question} {task_details}", limit=12)
-    key_terms = " ".join(helpers.query_keywords(question, limit=10)) or topic or objective
-    hints = " ".join(helpers.broad_query_hints(f"{question} {task_details}"))
-    variants = [
-        clean_text(f"{topic} {hints}"),
-        clean_text(f"{key_terms} evidence details examples equations benchmarks limitations"),
-        clean_text(f"{objective} {topic} {source_terms} primary source official docs paper"),
-    ]
-    return helpers.dedupe_preserve_order(variant[:220] for variant in variants if variant)[: max(1, max_variants)]
+    key_terms = " ".join(helpers.query_keywords(f"{question} {task_details}", limit=10)) or topic or objective
+    variants = []
+    for facet in facets[: max(1, max_variants)]:
+        variants.append(clean_retrieval_query(f"{facet} {objective} {topic_without_other_facets(topic, facet, facets)} {evidence_terms}"))
+    variants.extend(
+        [
+            clean_retrieval_query(f"{topic} {evidence_terms}"),
+            clean_retrieval_query(f"{key_terms} {evidence_terms}"),
+            clean_retrieval_query(f"{objective} {topic} {evidence_terms}"),
+            clean_retrieval_query(f"{source_terms} {topic} {evidence_terms}"),
+        ]
+    )
+    return helpers.dedupe_preserve_order(variant for variant in variants if variant)[: max(1, max_variants)]
+
+
+def topic_without_other_facets(topic: str, facet: str, facets: Sequence[str]) -> str:
+    text = clean_text(topic)
+    for other in facets:
+        if clean_text(other).lower() == clean_text(facet).lower():
+            continue
+        text = re.sub(rf"\b{re.escape(clean_text(other))}\b", " ", text, flags=re.IGNORECASE)
+    return clean_text(text)
+
+
+def query_evidence_terms(evidence_types: Sequence[str]) -> str:
+    term_map = {
+        "api": ["official documentation", "api signature", "parameters", "usage"],
+        "applications": ["applications", "use cases", "tasks"],
+        "benchmark": ["benchmark", "results", "scores", "metrics"],
+        "comparison": ["comparison", "differences", "tradeoffs"],
+        "complexity": ["complexity", "runtime", "memory", "scaling"],
+        "definition": ["definition", "purpose"],
+        "equation": ["equation", "formula", "variables", "components"],
+        "examples": ["examples", "cases"],
+        "implementation": ["implementation", "api signature", "parameters"],
+        "limitations": ["limitations", "challenges", "bottlenecks"],
+    }
+    terms = []
+    for evidence_type in evidence_types or ["evidence"]:
+        terms.extend(term_map.get(clean_text(evidence_type).lower(), []))
+    return clean_text(" ".join(generation_helpers().dedupe_preserve_order(terms)))
+
+
+def clean_retrieval_query(query: str, max_words: int = 18) -> str:
+    text = clean_text(query)
+    text = re.sub(r"^(?:what|which|where|how)\s+(?:is|are|does|do|did|can|should|has|have)?\s*", "", text, flags=re.IGNORECASE)
+    for phrase in GENERIC_QUERY_PHRASES:
+        text = re.sub(phrase, " ", text, flags=re.IGNORECASE)
+    tokens = []
+    seen = set()
+    for token in re.findall(r"https?://[^\s]+|[A-Za-z0-9_+#./-]+", text):
+        cleaned = token.strip(".,;:()[]{}\"'")
+        if not cleaned:
+            continue
+        key = cleaned.lower().replace("‑", "-").replace("–", "-")
+        if key in seen:
+            continue
+        seen.add(key)
+        tokens.append(cleaned)
+    return clean_text(" ".join(tokens[:max_words]))[:300]
 
 
 def retrieve_sub_question_context(
@@ -907,9 +973,11 @@ Planner sub-questions and optional task details:
 Rewrite each planner sub-question into 2-3 compact, high-recall RAG search queries.
 Requirements:
 - Return exactly 2 or 3 queries for every sub-question, in the same order as the planner list.
-- Write compact keyword-style queries, not full sentences or questions.
+- Write compact keyword-style queries as noun phrases, not full sentences or questions.
 - Do not start queries with "what", "which", "where", "how", or phrases like "source-backed context", "which evidence gives", or "authoritative sources discuss".
-- For each sub-question, create complementary queries: one broad topic query, one exact evidence query, and one source-targeted query when source details exist.
+- Do not append catch-all tails like "evidence details examples equations benchmarks limitations" or "overview evidence definition concept".
+- For each sub-question, create complementary queries: one core topic query, one exact evidence query, and one source-targeted query or facet-targeted query when source details or named facets exist.
+- For compound/list questions, each query should focus on a named facet, dataset, method, framework, metric, or source from the question instead of repeating the whole question.
 - Prefer noun phrases that can match both semantic search and BM25 keyword search.
 - Keep each query tied to one planner sub-question. Do not let benchmark, limitation, or formula queries drift into unrelated sub-question groups.
 - Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, aliases, and important technical terms from the planner/task details.
@@ -921,8 +989,10 @@ Requirements:
 - Do not answer the question and do not add citations.
 - Do not include reasoning, <think> text, or explanations.
 - Never output placeholder labels or generic query names.
+- Good shape: "named method equation formula variables"; "named dataset benchmark scores metrics"; "framework API signature parameters".
+- Bad shape: "topic evidence details examples equations benchmarks limitations"; "Which evidence gives topic details".
 - Return JSON only in this shape:
-{{"items":[{{"sub_question":"...","queries":["topic overview evidence","topic method comparison source"]}}]}}"""
+{{"items":[{{"sub_question":"...","queries":["named topic exact evidence terms","named facet comparison terms"]}}]}}"""
 
 
 def hf_sub_question_retrieval_query_result(
@@ -1283,9 +1353,10 @@ def valid_retrieval_queries(queries: Sequence[str], research_plan: dict[str, Any
         question_terms.update(helpers.query_tokens(question))
     allowed_terms = objective_terms | question_terms
     return [
-        query
+        cleaned
         for query in helpers.dedupe_preserve_order(queries)
-        if is_valid_retrieval_query(query, allowed_terms)
+        if (cleaned := clean_retrieval_query(query))
+        if is_valid_retrieval_query(cleaned, allowed_terms)
     ]
 
 

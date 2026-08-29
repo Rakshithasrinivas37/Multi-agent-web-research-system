@@ -8,9 +8,12 @@ from langgraph.graph import END
 from src.graph.research_workflow import (
     DEFAULT_REPORT_GAP_SYNTHESIS_MODEL,
     format_exception_details,
+    mark_report_gap_refresh_empty,
     next_node_or_end,
     print_retry_response_error,
+    report_gap_refresh_has_context,
     report_gap_synthesis_model,
+    research_plan_for_report_gaps,
     validate_rag_index,
 )
 
@@ -61,6 +64,41 @@ class ResearchWorkflowRoutingTests(unittest.TestCase):
         index = {"status": "success", "indexed_chunks": 0, "stored_chunks": 0}
 
         self.assertEqual(validate_rag_index(index), ["rag_index indexed zero chunks"])
+
+    def test_research_plan_for_report_gaps_keeps_matching_specs(self):
+        question = "What is the scaled dot-product attention equation?"
+        plan = {
+            "objective": "Attention mechanism",
+            "sub_questions": [question, "What is self-attention?"],
+            "sub_question_specs": [
+                {"question_id": "q001", "question": question, "required_evidence": ["equation"]},
+                {"question_id": "q002", "question": "What is self-attention?", "required_evidence": ["definition"]},
+            ],
+        }
+
+        gap_plan = research_plan_for_report_gaps(plan, [question], ["scaled dot product attention equation"])
+
+        self.assertEqual(gap_plan["sub_questions"], [question])
+        self.assertEqual(gap_plan["sub_question_specs"], [plan["sub_question_specs"][0]])
+        self.assertEqual(gap_plan["tasks"][0]["query_context"], question)
+        self.assertEqual(gap_plan["tasks"][0]["url"], "scaled dot product attention equation")
+
+    def test_empty_report_gap_refresh_is_marked_without_overwriting_context(self):
+        original = {"synthesis": "existing synthesis", "diagnostics": {"existing": True}}
+        refreshed = {
+            "retrieval_queries": ["gap query"],
+            "sub_question_context_counts": [{"question": "Q", "chunk_count": 0}],
+            "diagnostics": {"retrieved_count": 0},
+        }
+
+        self.assertFalse(report_gap_refresh_has_context(refreshed))
+        marked = mark_report_gap_refresh_empty(original, refreshed)
+
+        self.assertEqual(marked["synthesis"], "existing synthesis")
+        self.assertTrue(marked["diagnostics"]["existing"])
+        self.assertTrue(marked["diagnostics"]["report_gap_retry"])
+        self.assertTrue(marked["diagnostics"]["report_gap_refresh_empty"])
+        self.assertEqual(marked["diagnostics"]["report_gap_retry_queries"], ["gap query"])
 
 
 if __name__ == "__main__":
