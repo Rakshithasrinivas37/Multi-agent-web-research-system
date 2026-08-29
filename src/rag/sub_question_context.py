@@ -256,6 +256,23 @@ def retrieve_sub_question_context_groups(
         if browser_candidates:
             fallback_sources.append("browser_results")
             candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
+        missing_facets = missing_facets_for_results(question, candidates)
+        if missing_facets:
+            facet_candidates = facet_rescue_context_retrieve(
+                question=question,
+                missing_facets=missing_facets,
+                queries=query_set,
+                chroma_path=chroma_path,
+                collection_name=collection_name,
+                history_keys=history_keys,
+                top_k=candidate_chunks,
+                scan_limit=bm25_scan_limit,
+                question_source_urls=question_source_urls,
+                required_evidence=required_evidence,
+            )
+            if facet_candidates:
+                fallback_sources.append("facet_scan")
+                candidates = helpers.merge_retrieved_context(candidates, facet_candidates)
         if not candidates:
             print(f"[synthesis] no per-question chunks found for: {question[:120]}")
         ranked_candidates = rank_collection_scan_results(
@@ -266,6 +283,7 @@ def retrieve_sub_question_context_groups(
             required_evidence=required_evidence,
         )
         selected = helpers.meaningful_retrieval_results(ranked_candidates) or ranked_candidates or list(candidates)
+        selected = select_facet_covered_results(question, selected, final_chunks)
         tagged = [tag_result_for_question(result, question) for result in selected[:final_chunks]]
         return sub_question_context_group(
             question,
@@ -318,7 +336,9 @@ def browser_question_context_retrieve(
 
     query_text = clean_text(" ".join([question, *queries]))
     evidence_terms = browser_evidence_query_terms(question, required_evidence=required_evidence)
-    query_terms = helpers.query_tokens(query_text) | evidence_terms
+    facet_terms = {facet.lower() for facet in helpers.question_required_facets(question)}
+    query_terms = helpers.query_tokens(query_text) | evidence_terms | facet_terms
+    priority_terms = evidence_terms | facet_terms
     source_urls = helpers.question_source_urls_for(question, question_source_urls)
     candidates = []
     for result_index, browser_result in enumerate(browser_results):
@@ -339,7 +359,7 @@ def browser_question_context_retrieve(
                 "source_authority": clean_text(source.get("source_authority")),
                 "query_contexts": task_context,
             }
-            for snippet_index, snippet in enumerate(browser_source_snippets(source, query_terms=query_terms, priority_terms=evidence_terms)):
+            for snippet_index, snippet in enumerate(browser_source_snippets(source, query_terms=query_terms, priority_terms=priority_terms)):
                 content = clean_text(snippet)
                 if not helpers.is_meaningful_evidence(content):
                     continue
@@ -517,6 +537,81 @@ def collection_scan_question_retrieve(
     return expand_parent_context_results(selected, chroma_path=chroma_path)
 
 
+def missing_facets_for_results(question: str, results: Sequence[RetrievalResult]) -> list[str]:
+    helpers = generation_helpers()
+    facets = helpers.question_required_facets(question)
+    if not facets:
+        return []
+    text = clean_text(" ".join(helpers.retrieval_result_text(result) for result in results))
+    return [facet for facet in facets if not helpers.facet_present(facet, text)]
+
+
+def facet_rescue_context_retrieve(
+    question: str,
+    missing_facets: Sequence[str],
+    queries: Sequence[str],
+    chroma_path: str,
+    collection_name: str,
+    history_keys: Sequence[str] | None,
+    top_k: int,
+    scan_limit: int,
+    question_source_urls: dict[str, list[str]] | None = None,
+    required_evidence: Sequence[str] | None = None,
+) -> list[RetrievalResult]:
+    helpers = generation_helpers()
+    evidence_terms = " ".join(sorted(browser_evidence_query_terms(question, required_evidence=required_evidence))[:8])
+    facet_queries = helpers.dedupe_preserve_order(
+        clean_text(f"{facet} {evidence_terms}") for facet in missing_facets if clean_text(facet)
+    )
+    if not facet_queries:
+        return []
+    return collection_scan_question_retrieve(
+        question=question,
+        queries=helpers.dedupe_preserve_order([*queries, *facet_queries]),
+        chroma_path=chroma_path,
+        collection_name=collection_name,
+        history_keys=history_keys,
+        top_k=max(1, top_k),
+        scan_limit=scan_limit,
+        question_source_urls=question_source_urls,
+        required_evidence=required_evidence,
+    )
+
+
+def select_facet_covered_results(
+    question: str,
+    ranked_results: Sequence[RetrievalResult],
+    limit: int,
+) -> list[RetrievalResult]:
+    helpers = generation_helpers()
+    results = list(ranked_results)
+    facets = helpers.question_required_facets(question)
+    if not facets or not results:
+        return results[: max(1, limit)]
+
+    selected = []
+    seen = set()
+    for facet in facets:
+        for result in results:
+            key = helpers.retrieval_result_key(result)
+            if key in seen:
+                continue
+            if helpers.facet_present(facet, helpers.retrieval_result_text(result)):
+                selected.append(result)
+                seen.add(key)
+                break
+
+    for result in results:
+        if len(selected) >= max(1, limit):
+            break
+        key = helpers.retrieval_result_key(result)
+        if key in seen:
+            continue
+        selected.append(result)
+        seen.add(key)
+    return selected[: max(1, limit)]
+
+
 def rank_collection_scan_results(
     question: str,
     queries: Sequence[str],
@@ -532,6 +627,7 @@ def rank_collection_scan_results(
     topic_terms = {term for term in query_terms if term not in helpers.COVERAGE_GENERIC_TERMS}
     evidence_types = helpers.clean_string_list(list(required_evidence or [])) or helpers.infer_question_evidence_types(question)
     source_urls = helpers.question_source_urls_for(question, question_source_urls)
+    facets = helpers.question_required_facets(question)
     scored = []
     fallback = []
 
@@ -547,16 +643,20 @@ def rank_collection_scan_results(
         topic_overlap = len(topic_terms & text_terms)
         evidence_score = helpers.evidence_type_score(text, evidence_types)
         signal_score = helpers.evidence_signal_score(text, evidence_types)
+        facet_score = sum(1 for facet in facets if helpers.facet_present(facet, text))
         preferred_source = helpers.result_matches_source_urls(result, source_urls)
         primary_source = helpers.is_primary_source(metadata)
         primary_signal = primary_source and signal_score
-        if not (overlap or topic_overlap or evidence_score or signal_score or preferred_source):
+        exact_signal = signal_score >= 10
+        if not (overlap or topic_overlap or evidence_score or signal_score or facet_score or preferred_source):
             continue
         score = (
             (topic_overlap * 4.0)
             + (overlap * 1.5)
+            + (facet_score * 5.0)
             + (evidence_score * 3.0)
             + (signal_score * 5.0)
+            + (20.0 if exact_signal else 0.0)
             + (10.0 if primary_signal else 0.0)
             + (5.0 if preferred_source else 0.0)
             + helpers.retrieval_result_priority(result)
