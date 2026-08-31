@@ -31,6 +31,7 @@ from src.rag.evidence_spans import supporting_chunks_from_evidence_spans
 from src.rag.query_helpers import broad_query_hints, retrieval_topic_phrase
 from src.rag.sub_question_context import (
     browser_question_context_retrieve,
+    clean_retrieval_query,
     complete_sub_question_query_coverage,
     is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
@@ -787,6 +788,13 @@ Missing Evidence: exact benchmark values are not present.
         self.assertNotIn("primary source official docs paper", joined)
         self.assertNotIn("details examples equations benchmarks limitations", joined)
 
+    def test_clean_retrieval_query_removes_prompt_instruction_terms(self):
+        query = clean_retrieval_query(
+            "known limitations challenges attention mechanisms Extract source-backed evidence answering authoritative source https"
+        )
+
+        self.assertEqual(query, "known limitations challenges attention mechanisms")
+
     def test_retrieval_topic_phrase_removes_question_filler(self):
         phrase = retrieval_topic_phrase(
             "What recent efficient-attention architectures (e.g., Linformer, Performer, Longformer) "
@@ -948,6 +956,8 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("compact, high-recall RAG search queries", prompt)
         self.assertIn("keyword-style queries", prompt)
         self.assertIn("Do not start queries with", prompt)
+        self.assertIn("actual planner sub-question topic", prompt)
+        self.assertIn('no "extract"', prompt)
         self.assertIn("source-targeted query", prompt)
         self.assertNotIn('"query 1"', prompt)
 
