@@ -66,6 +66,7 @@ QUERY_INSTRUCTION_TERMS = {
     "discuss",
     "evidence",
     "extract",
+    "https",
     "retrieval",
     "source",
     "source-backed",
