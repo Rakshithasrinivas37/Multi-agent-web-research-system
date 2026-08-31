@@ -47,12 +47,30 @@ GENERIC_QUERY_PHRASES = (
     r"\bevidence details examples equations benchmarks limitations\b",
     r"\bdetails examples equations benchmarks limitations\b",
     r"\bprimary source official docs paper\b",
+    r"\bextract source-backed evidence\b",
+    r"\bsource-backed evidence\b",
     r"\bsource-backed context explains\b",
     r"\bwhich evidence gives\b",
     r"\bevidence gives\b",
     r"\bwhere do authoritative sources discuss\b",
     r"\bauthoritative sources discuss\b",
+    r"\banswering authoritative source\b",
+    r"\bauthoritative source https\b",
+    r"\bsource context\b",
 )
+QUERY_INSTRUCTION_TERMS = {
+    "answer",
+    "answering",
+    "authoritative",
+    "backed",
+    "discuss",
+    "evidence",
+    "extract",
+    "retrieval",
+    "source",
+    "source-backed",
+    "sources",
+}
 EVIDENCE_TERMS_BY_TYPE = {
     "api": {"api", "class", "function", "method", "parameter", "argument", "signature", "usage", "example"},
     "applications": {"application", "applications", "task", "tasks", "used for", "nlp", "vision", "computer vision", "image", "classification", "translation", "speech", "recognition"},
@@ -168,6 +186,8 @@ def clean_retrieval_query(query: str, max_words: int = 18) -> str:
             continue
         key = cleaned.lower().replace("‑", "-").replace("–", "-")
         if key in seen:
+            continue
+        if key in QUERY_INSTRUCTION_TERMS:
             continue
         seen.add(key)
         tokens.append(cleaned)
@@ -1095,11 +1115,14 @@ Planner sub-questions and optional task details:
 Rewrite each planner sub-question into 2-3 compact, high-recall RAG search queries.
 Requirements:
 - Return exactly 2 or 3 queries for every sub-question, in the same order as the planner list.
+- Base each query on the actual planner sub-question topic and named entities. Task details may add source names, URLs, APIs, datasets, metrics, or paper titles only when they match that sub-question.
 - Write compact keyword-style queries as noun phrases, not full sentences or questions.
+- Do not copy instruction words into queries: no "extract", "source-backed", "authoritative", "evidence gives", "source context", or "answering".
 - Do not start queries with "what", "which", "where", "how", or phrases like "source-backed context", "which evidence gives", or "authoritative sources discuss".
 - Do not append catch-all tails like "evidence details examples equations benchmarks limitations" or "overview evidence definition concept".
-- For each sub-question, create complementary queries: one core topic query, one exact evidence query, and one source-targeted query or facet-targeted query when source details or named facets exist.
+- For each sub-question, create complementary queries: one broad concept query, one exact evidence query, and one source-targeted query for a named facet, source, API, dataset, or metric when present.
 - For compound/list questions, each query should focus on a named facet, dataset, method, framework, metric, or source from the question instead of repeating the whole question.
+- If a sub-question names multiple facets, split them across queries rather than mixing all facets into every query.
 - Prefer noun phrases that can match both semantic search and BM25 keyword search.
 - Keep each query tied to one planner sub-question. Do not let benchmark, limitation, or formula queries drift into unrelated sub-question groups.
 - Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, aliases, and important technical terms from the planner/task details.
