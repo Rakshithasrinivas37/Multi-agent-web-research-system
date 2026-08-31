@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -30,7 +31,7 @@ DEFAULT_PARENT_STORE_NAME = "parent_chunks.sqlite3"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
-DEFAULT_METADATA_SCHEMA_VERSION = 8
+DEFAULT_METADATA_SCHEMA_VERSION = 9
 TOKEN_PATTERN = re.compile(r"\S+")
 SECTION_HEADING_PATTERN = re.compile(
     r"(?i)^\s*(?:#{1,6}\s+|\d+(?:\.\d+)*[.)]\s+)?"
@@ -374,7 +375,22 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
         )
         for chunk in special_signal_chunks(content, max_tokens=max(120, max_tokens // 2))
     ]
-    return dedupe_documents([*regular_documents, *special_documents])
+    table_documents = [
+        Document(
+            page_content=chunk,
+            metadata={
+                **document.metadata,
+                **parent_child_metadata(chunk, parent_chunks, document.metadata),
+                "chunking_strategy": "table_json_v1",
+                "chunk_kind": "table",
+                "token_count": token_count(chunk),
+                **metadata,
+                **chunk_signal_metadata(chunk),
+            },
+        )
+        for chunk, metadata in table_json_chunks(content)
+    ]
+    return dedupe_documents([*regular_documents, *special_documents, *table_documents])
 
 
 def parent_context_chunks(text: str) -> list[str]:
@@ -687,6 +703,76 @@ def special_signal_chunks(text: str, max_tokens: int, context_lines: int = 3) ->
     return dedupe_preserve_order(chunks)
 
 
+def table_json_chunks(text: str) -> list[tuple[str, dict[str, Any]]]:
+    chunks = []
+    for table_index, rows in enumerate(extract_table_rows(text), start=1):
+        headers = unique_table_headers(rows[0])
+        data_rows = rows[1:] if len(rows) > 1 else []
+        payload = {
+            "table_index": table_index,
+            "headers": headers,
+            "rows": data_rows,
+            "records": [table_record(headers, row) for row in data_rows],
+        }
+        chunk = "Table data JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+        chunks.append(
+            (
+                chunk,
+                {
+                    "has_table_signal": True,
+                    "table_index": table_index,
+                    "table_row_count": len(data_rows),
+                    "table_column_count": max(len(row) for row in rows),
+                },
+            )
+        )
+    return chunks
+
+
+def extract_table_rows(text: str) -> list[list[list[str]]]:
+    tables = []
+    current = []
+    for raw_line in str(text or "").splitlines():
+        cells = table_row_cells(raw_line)
+        if cells:
+            if not table_separator_row(cells):
+                current.append(cells)
+            continue
+        if len(current) >= 2:
+            tables.append(current)
+        current = []
+    if len(current) >= 2:
+        tables.append(current)
+    return tables
+
+
+def table_row_cells(line: str) -> list[str]:
+    if "|" not in str(line):
+        return []
+    cells = [clean_text(cell) for cell in str(line).strip().strip("|").split("|")]
+    cells = [cell for cell in cells if cell]
+    return cells if len(cells) >= 2 else []
+
+
+def table_separator_row(cells: Sequence[str]) -> bool:
+    return bool(cells) and all(re.fullmatch(r":?-{2,}:?", cell.replace(" ", "")) for cell in cells)
+
+
+def unique_table_headers(cells: Sequence[str]) -> list[str]:
+    headers = []
+    seen = {}
+    for index, cell in enumerate(cells, start=1):
+        header = clean_text(cell) or f"column_{index}"
+        key = header.lower()
+        seen[key] = seen.get(key, 0) + 1
+        headers.append(header if seen[key] == 1 else f"{header}_{seen[key]}")
+    return headers
+
+
+def table_record(headers: Sequence[str], row: Sequence[str]) -> dict[str, str]:
+    return {header: clean_text(row[index]) if index < len(row) else "" for index, header in enumerate(headers)}
+
+
 def chunk_signal_metadata(chunk: str) -> dict[str, Any]:
     value = str(chunk or "")
     lowered = value.lower()
@@ -695,10 +781,11 @@ def chunk_signal_metadata(chunk: str) -> dict[str, Any]:
             re.search(r"\\(?:frac|sum|sqrt|top|operatorname)|\b(?:softmax|sqrt)\s*\(", value, flags=re.I)
             or re.search(r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}", value)
         ),
+        "has_table_signal": bool("Table data JSON:" in value or re.search(r"\|[^|\n]+\|", value)),
         "has_api_signal": bool(re.search(r"\b(?:torch\.|tf\.|keras\.)[A-Za-z0-9_.]+", value)),
         "has_benchmark_signal": any(
             term in lowered
-            for term in ("benchmark", "accuracy", "bleu", "glue", "imagenet", "top-1", "f1", "auc")
+            for term in ("benchmark", "accuracy", "bleu", "glue", "imagenet", "top-1", "f1", "auc", "score")
         ),
     }
 

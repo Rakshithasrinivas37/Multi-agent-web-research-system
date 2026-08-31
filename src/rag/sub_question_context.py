@@ -709,6 +709,7 @@ def rank_collection_scan_results(
         topic_overlap = len(topic_terms & text_terms)
         evidence_score = helpers.evidence_type_score(text, evidence_types)
         signal_score = helpers.evidence_signal_score(text, evidence_types)
+        table_score = metadata_table_signal_score(metadata, evidence_types)
         facet_score = sum(1 for facet in facets if helpers.facet_present(facet, text))
         preferred_source = helpers.result_matches_source_urls(result, source_urls)
         primary_source = helpers.is_primary_source(metadata)
@@ -722,6 +723,7 @@ def rank_collection_scan_results(
             + (facet_score * 5.0)
             + (evidence_score * 3.0)
             + (signal_score * 5.0)
+            + table_score
             + (20.0 if exact_signal else 0.0)
             + (10.0 if primary_signal else 0.0)
             + (5.0 if preferred_source else 0.0)
@@ -737,6 +739,15 @@ def rank_collection_scan_results(
     if ranked:
         return helpers.unique_retrieval_results(ranked)
     return helpers.source_balanced_results(fallback)
+
+
+def metadata_table_signal_score(metadata: dict[str, Any], evidence_types: Sequence[str]) -> float:
+    if not (metadata.get("chunk_kind") == "table" or metadata.get("has_table_signal")):
+        return 0.0
+    evidence = {clean_text(item).lower() for item in evidence_types}
+    if evidence & {"benchmark", "comparison", "applications"}:
+        return 8.0
+    return 3.0
 
 
 def collection_scan_scored_result(result: RetrievalResult, score: float) -> RetrievalResult:
