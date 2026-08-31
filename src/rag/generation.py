@@ -8,25 +8,45 @@ import hashlib
 from typing import Any, Sequence
 
 from src.agents.change_detection_agent import objective_key
+from src.rag.evidence_spans import (
+    DEFAULT_EVIDENCE_PACK_CHUNK_CHARS,
+    DEFAULT_EVIDENCE_SPANS_PER_QUESTION,
+    DEFAULT_REPORT_EVIDENCE_SPANS_PER_QUESTION,
+    EVIDENCE_SIGNAL_PATTERNS,
+    evidence_spans_for_question,
+    merge_supporting_chunks,
+    supporting_chunks_from_evidence_spans,
+)
 from src.rag.indexing import get_collection
-from src.rag.sub_question_context import (
+from src.rag.query_helpers import (
+    COVERAGE_EVIDENCE_TERMS,
+    EVIDENCE_QUERY_HINTS,
+    OBJECTIVE_STOPWORDS,
+    URL_PATTERN,
+    broad_query_hints,
     clean_model_name,
-    complete_sub_question_query_coverage,
+    clean_string_list,
+    coverage_question_tokens,
+    dedupe_preserve_order,
+    facet_evidence_window,
+    facet_present,
+    infer_question_evidence_types,
+    query_keywords,
+    query_tokens,
+    question_key,
+    question_required_facets,
+)
+from src.rag.sub_question_context import (
     empty_llm_query_result,
     flatten_sub_question_context_groups,
-    generated_query_output_is_noise,
     is_valid_generated_query,
-    is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
-    parse_llm_retrieval_queries,
-    retrieve_sub_question_context,
+    planner_tasks_to_rag_queries,
+    precision_retrieval_queries,
     retrieve_sub_question_context_groups,
     select_question_first_synthesis_context,
     strip_thinking_blocks,
     sub_question_context_counts,
-    sub_question_retrieval_max_workers,
-    sub_question_retrieval_queries,
-    valid_retrieval_queries,
 )
 from src.rag.retrieval import (
     DEFAULT_BM25_K,
@@ -68,7 +88,6 @@ DEFAULT_BROWSER_SIGNAL_CANDIDATES = 40
 DEFAULT_GAP_RETRIEVAL_TOP_K = 12
 DEFAULT_GAP_RETRIEVAL_PER_QUERY_K = 4
 DEFAULT_GAP_RETRIEVAL_MAX_QUERIES = 6
-DEFAULT_PRECISION_QUERY_LIMIT = 8
 DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 48
 DEFAULT_SYNTHESIS_CANDIDATE_CHUNKS_PER_QUESTION = 20
 DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 6
@@ -78,7 +97,6 @@ MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
 DEFAULT_OBJECTIVE_SCOPE_MAX_KEYS = 6
-URL_PATTERN = re.compile(r"https?://[^\s\])}>\"']+")
 OBJECTIVE_TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9_]+")
 BROWSER_SIGNAL_PATTERN = re.compile(
     r"(?i)\b("
@@ -103,172 +121,6 @@ BROWSER_METRIC_SIGNAL_PATTERN = re.compile(
 BROWSER_API_SIGNAL_PATTERN = re.compile(
     r"\b[A-Za-z_][A-Za-z0-9_.]*\([^)]{1,120}\)|\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*\b"
 )
-EVIDENCE_SIGNAL_PATTERNS = {
-    "api": (
-        (r"\b(?:api|class|function|method|parameter|argument|signature|constructor|official docs?|usage example)\b", 3),
-        (r"\b[A-Za-z_][A-Za-z0-9_.]*\([^)]{1,120}\)", 4),
-    ),
-    "applications": (
-        (r"\b(?:application|applications|use case|used for|task|translation|classification|vision|speech|recognition|nlp)\b", 3),
-    ),
-    "benchmark": (
-        (r"\b\d+(?:\.\d+)?\s*(?:%|bleu|rouge|f1|auc|accuracy|precision|recall|top[- ]?1|top[- ]?5|score|points?)\b", 6),
-        (r"\b(?:wmt|glue|superglue|imagenet|cifar|squad|vtab|coco|benchmark|leaderboard|test set|validation set)\b", 3),
-        (r"\b(?:achieves?|reports?|outperforms?|improv(?:e|es|ed|ing)|state-of-the-art|results?)\b", 2),
-    ),
-    "comparison": (
-        (r"\b(?:compare|comparison|versus| vs |different|difference|whereas|while|trade[- ]?off)\b", 3),
-    ),
-    "complexity": (
-        (r"\b(?:o\([^)]+\)|quadratic|linear|sub-quadratic|runtime|memory|complexity|scalability)\b", 4),
-    ),
-    "definition": (
-        (r"\b(?:defined as|definition|refers to|means|is a|are a|purpose)\b", 3),
-    ),
-    "equation": (
-        (r"(?:\\(?:frac|sum|sqrt|operatorname)|[=∑Σ√αβγδθλµπ])", 4),
-        (r"\b(?:softmax|sqrt|tanh|exp|log|equation|formula|formulation)\b", 3),
-        (r"\b[A-Za-z_][A-Za-z0-9_]*\s*\([^)]{0,80}\)\s*=", 4),
-    ),
-    "examples": (
-        (r"\b(?:example|case study|task|application|introduced|proposed|experiment)\b", 2),
-    ),
-    "implementation": (
-        (r"\b(?:implementation|api|class|function|method|parameter|argument|signature|constructor|usage example|official docs?)\b", 3),
-        (r"\b[A-Za-z_][A-Za-z0-9_.]*\([^)]{1,120}\)", 4),
-    ),
-    "limitations": (
-        (r"\b(?:limitation|limitations|challenge|drawback|constraint|bottleneck|weakness|open question)\b", 3),
-    ),
-}
-OBJECTIVE_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "architecture",
-    "architectures",
-    "based",
-    "compare",
-    "different",
-    "for",
-    "from",
-    "how",
-    "in",
-    "is",
-    "of",
-    "on",
-    "research",
-    "the",
-    "to",
-    "what",
-    "with",
-}
-COVERAGE_GENERIC_TERMS = OBJECTIVE_STOPWORDS | {
-    "based",
-    "core",
-    "deep",
-    "evidence",
-    "known",
-    "learning",
-    "main",
-    "major",
-    "mechanism",
-    "mechanisms",
-    "recent",
-    "research",
-    "standard",
-}
-COVERAGE_EVIDENCE_TERMS = {
-    "api",
-    "application",
-    "applications",
-    "benchmark",
-    "benchmarks",
-    "challenge",
-    "challenges",
-    "complexity",
-    "definition",
-    "equation",
-    "formula",
-    "implementation",
-    "limitation",
-    "limitations",
-    "metric",
-    "metrics",
-    "performance",
-    "result",
-    "results",
-    "score",
-    "scores",
-    "cost",
-    "costs",
-}
-QUERY_FILLER_TERMS = OBJECTIVE_STOPWORDS | {
-    "about",
-    "also",
-    "are",
-    "be",
-    "been",
-    "being",
-    "can",
-    "could",
-    "did",
-    "does",
-    "doing",
-    "eg",
-    "e.g",
-    "its",
-    "main",
-    "should",
-    "such",
-    "their",
-    "them",
-    "they",
-    "using",
-    "versus",
-    "was",
-    "were",
-    "would",
-}
-EVIDENCE_QUERY_HINTS = {
-    "api": ["official documentation", "api signature", "parameters", "usage example"],
-    "applications": ["applications", "use cases", "examples"],
-    "benchmark": ["benchmark", "results table", "scores", "metrics"],
-    "comparison": ["comparison", "differences", "tradeoffs"],
-    "complexity": ["time complexity", "memory complexity", "big O", "scaling"],
-    "definition": ["definition", "overview", "purpose", "concept"],
-    "equation": ["equation", "formula", "mathematical derivation", "score function", "variables"],
-    "examples": ["examples", "cases", "tasks"],
-    "implementation": ["implementation", "api signature", "parameters", "usage example"],
-    "limitations": ["limitations", "challenges", "bottlenecks", "open questions"],
-}
-COVERAGE_FACET_STOPWORDS = QUERY_FILLER_TERMS | COVERAGE_GENERIC_TERMS | COVERAGE_EVIDENCE_TERMS | {
-    "academic",
-    "authoritative",
-    "background",
-    "common",
-    "concept",
-    "concepts",
-    "detail",
-    "details",
-    "example",
-    "examples",
-    "official",
-    "paper",
-    "papers",
-    "primary",
-    "source",
-    "sources",
-    "topic",
-    "topics",
-    "trade",
-    "off",
-    "have",
-    "has",
-    "key",
-}
-
-
 def rag_generation_model(model: str | None = None) -> str:
     """Use the same default model selection as the planner agent."""
 
@@ -287,12 +139,6 @@ def gap_query_model(model: str | None = None) -> str:
         or DEFAULT_GAP_QUERY_MODEL
         or rag_generation_model(model)
     )
-
-
-def clean_model_name(value: Any) -> str:
-    """Normalize env-provided model names without changing valid ids."""
-
-    return clean_text(value).strip("\"'“”‘’")
 
 
 def retrieve_full_collection_enabled() -> bool:
@@ -597,6 +443,11 @@ def synthesize_report_from_research_plan(
             ]
         ),
     )
+    payload["supporting_chunks"] = merge_supporting_chunks(
+        supporting_chunks_from_evidence_spans(payload.get("evidence_packs", [])),
+        payload["supporting_chunks"],
+        max_chunks=max(supporting_chunk_count, len(planner_questions) * DEFAULT_REPORT_EVIDENCE_SPANS_PER_QUESTION),
+    )
     payload["diagnostics"] = synthesis_diagnostics(payload, retrieved_context)
     if include_retrieved_chunks:
         payload["retrieved_chunks"] = compact_retrieved_chunks(
@@ -632,166 +483,6 @@ def print_synthesis_chunks(retrieved_context: Sequence[RetrievalResult], label: 
         )
     if len(retrieved_context) > limit:
         print(f"[synthesis] ... {len(retrieved_context) - limit} more chunk(s) not printed")
-
-
-def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
-    """Build retrieval queries from PlannerAgent output.
-
-    Sub-questions are the primary retrieval queries because they are already
-    concise search intents. Task details are used only as a fallback.
-    """
-    objective = clean_text(research_plan.get("objective"))
-    sub_question_queries = []
-    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
-
-    for sub_question in research_plan.get("sub_questions", []):
-        query = clean_text(sub_question)
-        if query:
-            sub_question_queries.extend(
-                sub_question_retrieval_queries(
-                    query,
-                    objective=objective,
-                    task_details=matching_task_details(query, tasks),
-                )
-            )
-
-    if sub_question_queries:
-        if objective:
-            sub_question_queries.append(objective)
-        return dedupe_preserve_order(sub_question_queries)
-
-    queries = []
-    for task in research_plan.get("tasks", []):
-        if not isinstance(task, dict):
-            continue
-        expected_signals = task.get("expected_signals", [])
-        expected_signals_text = " ".join(clean_text(item) for item in expected_signals if clean_text(item))
-        parts = [
-            task.get("query_context"),
-            task.get("extraction_goal"),
-            task.get("target_name"),
-            task.get("url"),
-            expected_signals_text,
-        ]
-        query = clean_text(" ".join(clean_text(part) for part in parts if clean_text(part)))
-        if query:
-            queries.append(query)
-
-    if objective:
-        queries.append(objective)
-    return dedupe_preserve_order(queries)
-
-
-def precision_retrieval_queries(
-    research_plan: dict[str, Any],
-    objective: str = "",
-    max_queries: int = DEFAULT_PRECISION_QUERY_LIMIT,
-) -> list[str]:
-    """Build deterministic high-signal queries for exact evidence retrieval."""
-
-    objective_text = clean_text(objective or research_plan.get("objective"))
-    synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
-    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
-    candidates = [
-        *planner_sub_questions(research_plan),
-        *instruction_requirement_items(synthesis_instruction),
-    ]
-    queries = []
-    for item in dedupe_preserve_order(candidates):
-        base = clean_text(f"{objective_text} {item} {matching_task_details(item, tasks)}")
-        suffixes = precision_query_suffixes(item)
-        if not base or not suffixes:
-            continue
-        for suffix in suffixes:
-            queries.append(clean_text(f"{base} {suffix}")[:700])
-            if len(queries) >= max(1, max_queries):
-                return dedupe_preserve_order(queries)
-    return dedupe_preserve_order(queries)[: max(1, max_queries)]
-
-
-def precision_query_suffixes(text: str) -> list[str]:
-    lowered = clean_text(text).lower()
-    suffixes = []
-    if re.search(r"\b(equation|formula|mathematical|formulation|derive|scaled|additive|multiplicative)\b", lowered):
-        suffixes.append("exact equation formula derivation symbols softmax sqrt sum matrix alignment")
-    if re.search(r"\b(benchmark|result|score|performance|accuracy|bleu|glue|imagenet|top-1|metric)\b", lowered):
-        suffixes.append("benchmark table results scores metrics accuracy BLEU GLUE ImageNet top-1")
-    if re.search(r"\b(api|implementation|framework|library|pytorch|tensorflow|keras|hugging face|transformers)\b", lowered):
-        suffixes.append("official documentation API signature parameters usage example class function")
-    if re.search(r"\b(complexity|efficient|variant|limitation|memory|time|quadratic|linear|sparse|low-rank)\b", lowered):
-        suffixes.append("computational complexity time memory O(n^2) O(n) algorithm approximation limitation")
-    if re.search(r"\b(paper|contribution|introduced|architecture|method|model|et al)\b", lowered):
-        suffixes.append("original paper method contribution architecture equations results")
-    return dedupe_preserve_order(suffixes)
-
-
-def matching_task_details(question: str, tasks: Sequence[dict[str, Any]]) -> str:
-    """Return task details that make a planner sub-question more retrievable."""
-
-    question_tokens = query_tokens(question)
-    parts = []
-    for task in tasks:
-        context = clean_text(task.get("query_context"))
-        context_tokens = query_tokens(context)
-        if not context_tokens:
-            continue
-        overlap = len(question_tokens & context_tokens) / max(1, min(len(question_tokens), len(context_tokens)))
-        if context.lower() != clean_text(question).lower() and overlap < 0.45:
-            continue
-        expected_signals = " ".join(clean_text(item) for item in task.get("expected_signals", []) if clean_text(item))
-        parts.extend([task.get("extraction_goal"), expected_signals, task.get("url")])
-    return clean_text(" ".join(clean_text(part) for part in parts if clean_text(part)))
-
-
-def query_tokens(text: str) -> set[str]:
-    text = clean_text(text).replace("‑", "-").replace("–", "-").replace("—", "-")
-    stopwords = {"and", "are", "for", "from", "how", "the", "what", "with"}
-    return {
-        token.lower()
-        for token in re.findall(r"[A-Za-z0-9_+#.-]+", text)
-        if len(token) > 2 and token.lower() not in stopwords
-    }
-
-
-def query_keywords(text: str, limit: int = 10) -> list[str]:
-    keywords = []
-    for token in re.findall(r"[A-Za-z0-9_+#.-]+", clean_text(text)):
-        lowered = token.lower().strip(".")
-        if len(lowered) <= 2 or lowered in QUERY_FILLER_TERMS:
-            continue
-        keywords.append(token.strip(".,;:()[]{}"))
-    return dedupe_preserve_order(keywords)[: max(1, limit)]
-
-
-def retrieval_topic_phrase(text: str, limit: int = 14) -> str:
-    normalized = clean_text(text).replace("‑", "-").replace("–", "-").replace("—", "-")
-    normalized = re.sub(r"(?i)\b(?:what|how|why|when|where|which)\s+(?:is|are|does|do|did|can|should)?\b", " ", normalized)
-    normalized = re.sub(r"(?i)\b(?:as|e\.g\.|eg)\b", " ", normalized)
-    return " ".join(query_keywords(normalized, limit=limit))
-
-
-def source_query_terms(text: str, limit: int = 8) -> str:
-    urls = [match.group(0).rstrip(".,;:") for match in URL_PATTERN.finditer(clean_text(text))]
-    terms = [term for term in query_keywords(text, limit=limit) if not URL_PATTERN.search(term)]
-    return clean_text(" ".join([*urls[:2], *terms[:limit]]))[:300]
-
-
-def broad_query_hints(text: str) -> list[str]:
-    lowered = clean_text(text).lower()
-    hints = ["overview", "evidence"]
-    hint_rules = [
-        (r"\b(defin|concept|what is)\b", ["definition", "concept"]),
-        (r"\b(equation|formula|mathematical|formulation)\b", ["formula", "equation"]),
-        (r"\b(benchmark|metric|score|accuracy|performance|result)\b", ["benchmark", "metrics"]),
-        (r"\b(api|implementation|framework|library|function|class)\b", ["implementation", "api"]),
-        (r"\b(complexity|limitation|memory|runtime|efficient|trade[- ]?off)\b", ["complexity", "limitations"]),
-        (r"\b(compare|comparison|versus|difference|variant|type)\b", ["comparison", "variants"]),
-        (r"\b(application|use case|example)\b", ["applications", "examples"]),
-    ]
-    for pattern, words in hint_rules:
-        if re.search(pattern, lowered):
-            hints.extend(words)
-    return dedupe_preserve_order(hints)
 
 
 def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
@@ -954,119 +645,6 @@ def coverage_matches_for_question(
         for score, chunk in sorted(matches, key=lambda item: -item[0])[: max(1, limit)]
         if chunk.get("source_index") is not None
     ]
-
-
-def coverage_question_tokens(text: str) -> set[str]:
-    return {
-        token
-        for token in query_tokens(text)
-        if token not in COVERAGE_GENERIC_TERMS
-    }
-
-
-def question_required_facets(question: str) -> list[str]:
-    """Extract named/listed facets that a compound planner question expects."""
-
-    text = clean_text(question).replace("‑", "-").replace("–", "-").replace("—", "-")
-    candidates: list[str] = []
-
-    def add(raw: str) -> None:
-        candidates.extend(split_facet_candidates(raw))
-
-    for match in re.findall(r"\(([^)]{2,160})\)", text):
-        add(match)
-    for pattern in (
-        r"\b(?:e\.g\.|eg|including|includes?|such as|like)\s+([^?.;:()]+)",
-        r"\b(?:between|among|across|beyond)\s+([^?.;:()]+)",
-        r"\b(?:compared\s+(?:with|to)|versus|vs\.?)\s+([^?.;:()]+)",
-        r"\b(?:in|for)\s+([A-Z][A-Za-z0-9_.-]*(?:\s+(?:and|or|/)\s+[A-Za-z0-9_.-]+(?:\s+[A-Za-z0-9_.-]+){0,2})+)",
-    ):
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            add(match.group(1))
-    for match in re.finditer(r"\b(?:[A-Z]{2,}[A-Za-z0-9_.-]*|[A-Z][a-z]+(?:[A-Z][A-Za-z0-9_.-]+)+)\b", text):
-        candidates.append(match.group(0))
-    for match in re.finditer(
-        r"\b([A-Za-z0-9][A-Za-z0-9_.+-]*(?:\s+[A-Za-z0-9][A-Za-z0-9_.+-]*){0,2})\s+"
-        r"(attention|api|dataset|benchmark|model|architecture|framework|library|method|task|application)\b",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        modifier = match.group(1)
-        head = match.group(2)
-        if re.search(r"\b(?:and|or)\b", modifier, flags=re.IGNORECASE):
-            candidates.extend(f"{part} {head}" for part in re.split(r"\b(?:and|or)\b", modifier, flags=re.IGNORECASE))
-        else:
-            candidates.append(f"{modifier} {head}")
-
-    return dedupe_preserve_order(
-        facet for facet in (normalize_facet(candidate) for candidate in candidates)
-        if facet
-    )
-
-
-def split_facet_candidates(text: str) -> list[str]:
-    cleaned = clean_text(text)
-    cleaned = re.sub(r"\b(?:and how|and what|where|why|when)\b.*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:e\.g\.|eg|i\.e\.|ie)\b", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:and|or|versus|vs\.?)\b|/", ",", cleaned, flags=re.IGNORECASE)
-    return [
-        normalized
-        for part in cleaned.split(",")
-        if (normalized := normalize_facet(part))
-    ]
-
-
-def normalize_facet(value: Any) -> str:
-    text = clean_text(value).strip(" .,:;()[]{}")
-    text = text.replace("‑", "-").replace("–", "-").replace("—", "-")
-    text = re.sub(r"^(?:the|a|an|of|to|in|for|with|without)\s+", "", text, flags=re.IGNORECASE)
-    text = re.sub(
-        r"\b(?:introduced|trade[- ]?offs?|trade\s+off|proposes?|proposed|compares?|compared|addresses?|addressed|"
-        r"works?|reduces?|improves?|uses?|reports?|achieves?|provides?|describes?)\b.*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    tokens = []
-    for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.+#/-]*", text):
-        cleaned = token.strip("._/#-")
-        if not cleaned:
-            continue
-        lowered = cleaned.lower()
-        if lowered in COVERAGE_FACET_STOPWORDS:
-            continue
-        tokens.append(cleaned)
-    if tokens == ["attention"]:
-        return ""
-    if len(tokens) == 1 and (len(tokens[0]) < 3 or tokens[0].lower() in COVERAGE_FACET_STOPWORDS):
-        return ""
-    return " ".join(tokens)[:90]
-
-
-def facet_present(facet: str, text: str) -> bool:
-    normalized = normalize_facet(facet)
-    if not normalized:
-        return False
-    lowered_text = clean_text(text).replace("‑", "-").replace("–", "-").replace("—", "-").lower()
-    lowered_facet = normalized.lower()
-    if lowered_facet in lowered_text:
-        return True
-    facet_tokens = coverage_question_tokens(lowered_facet)
-    text_tokens = coverage_question_tokens(lowered_text)
-    return bool(facet_tokens and facet_tokens <= text_tokens)
-
-
-def facet_evidence_window(facet: str, text: str) -> str:
-    normalized = normalize_facet(facet).lower()
-    if not normalized:
-        return ""
-    sentences = re.split(r"(?<=[.!?])\s+|\n+", clean_text(text))
-    windows = [
-        sentence
-        for sentence in sentences
-        if facet_present(normalized, sentence)
-    ]
-    return " ".join(windows) or text
 
 
 def chunk_evidence_text(chunk: dict[str, Any]) -> str:
@@ -1288,32 +866,6 @@ def dedupe_ints(values: Sequence[Any]) -> list[int]:
         seen.add(number)
         deduped.append(number)
     return deduped
-
-
-def question_key(question: Any) -> str:
-    return clean_text(question).lower()
-
-
-def infer_question_evidence_types(question: str) -> list[str]:
-    lowered = clean_text(question).lower()
-    checks = [
-        ("definition", r"\b(what is|definition|define|purpose|overview)\b"),
-        ("equation", r"\b(equations?|formulas?|formulations?|mathematical|components?)\b"),
-        ("comparison", r"\b(compare|comparison|versus| vs |differ|differences?)\b"),
-        ("benchmark", r"\b(benchmark|score|performance|metric|accuracy|bleu|glue|imagenet|result)\b"),
-        ("api", r"\b(api|pytorch|tensorflow|keras|implementation|code|signature|usage)\b"),
-        ("complexity", r"\b(complexity|memory|time|efficient|linear|quadratic|scalability)\b"),
-        ("applications", r"\b(application|use case|vision|nlp|computer vision)\b"),
-        ("limitations", r"\b(limitation|challenge|drawback|open question)\b"),
-    ]
-    evidence = [name for name, pattern in checks if re.search(pattern, lowered)]
-    return evidence or ["evidence"]
-
-
-def clean_string_list(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [clean_text(item) for item in value if clean_text(item)]
 
 
 def planner_context_query(research_plan: dict[str, Any], fallback_queries: Sequence[str]) -> str:
@@ -1563,16 +1115,6 @@ def nested_values(value: Any) -> list[Any]:
             values.extend(nested_values(item))
         return values
     return [value]
-
-
-def missing_source_urls(
-    planned_urls: Sequence[str],
-    retrieved_context: Sequence[RetrievalResult],
-) -> list[str]:
-    covered_urls = set()
-    for result in retrieved_context:
-        covered_urls.update(result_source_urls_from_metadata(result.metadata))
-    return [url for url in planned_urls if url not in covered_urls]
 
 
 def missing_or_weak_source_urls(
@@ -2119,6 +1661,13 @@ def deterministic_synthesis_from_evidence_packs(
         if not chunks:
             lines.append("- Missing Evidence: no retrieved chunk was mapped to this planner question.")
             continue
+        for span in [item for item in pack.get("evidence_spans", []) if isinstance(item, dict)]:
+            index = span.get("source_index")
+            marker = f"[{index}]" if isinstance(index, int) else "[source]"
+            evidence_type = clean_text(span.get("evidence_type")) or "evidence"
+            text = clean_text(span.get("text"))
+            if text:
+                lines.append(f"- {marker} Evidence span ({evidence_type}): {text}")
         for chunk in chunks:
             index = chunk.get("source_index")
             marker = f"[{index}]" if isinstance(index, int) else "[source]"
@@ -2185,26 +1734,6 @@ def instruction_requirement_items(instruction: str) -> list[str]:
         if line.strip().startswith(("-", "*"))
     ]
     return dedupe_preserve_order(item for item in bullet_items if item) or [text]
-
-
-def synthesis_gap_retrieval_queries(
-    synthesis: Any,
-    objective: str = "",
-    synthesis_instruction: str = "",
-    sources: Sequence[dict[str, Any]] | None = None,
-    model: str | None = None,
-    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
-) -> list[str]:
-    """Build LLM-generated retrieval queries from synthesis coverage gaps."""
-
-    return synthesis_gap_retrieval_plan(
-        synthesis,
-        objective=objective,
-        synthesis_instruction=synthesis_instruction,
-        sources=sources,
-        model=model,
-        max_queries=max_queries,
-    )["queries"]
 
 
 def synthesis_gap_retrieval_plan(
@@ -2293,26 +1822,6 @@ def fallback_gap_retrieval_queries(
         if query:
             queries.append(query[:600])
     return dedupe_preserve_order(queries)[: max(1, max_queries)]
-
-
-def llm_gap_retrieval_queries(
-    gaps: Sequence[str],
-    objective: str = "",
-    synthesis_instruction: str = "",
-    sources: Sequence[dict[str, Any]] | None = None,
-    model: str | None = None,
-    max_queries: int = DEFAULT_GAP_RETRIEVAL_MAX_QUERIES,
-) -> list[str]:
-    """Ask the generation LLM for precise RAG queries for missing evidence."""
-
-    return llm_gap_retrieval_query_result(
-        gaps,
-        objective=objective,
-        synthesis_instruction=synthesis_instruction,
-        sources=sources,
-        model=model,
-        max_queries=max_queries,
-    )["queries"]
 
 
 def llm_gap_retrieval_query_result(
@@ -2864,7 +2373,7 @@ def build_sub_question_evidence_packs(
 
     chunks = [
         chunk
-        for chunk in compact_retrieved_chunks(retrieved_context, sources=sources, max_chars=500)
+        for chunk in compact_retrieved_chunks(retrieved_context, sources=sources, max_chars=DEFAULT_EVIDENCE_PACK_CHUNK_CHARS)
         if chunk.get("source_index") is not None
     ]
     packs = []
@@ -2916,13 +2425,17 @@ def build_sub_question_evidence_packs(
             )
             [:max_chunks_per_question]
         ]
+        evidence_spans = evidence_spans_for_question(question, selected, evidence_types)
         coverage_details = coverage_evidence_details(question, selected, evidence_types)
         packs.append(
             {
                 "question": question,
                 "coverage": coverage_details["status"],
+                "evidence_span_count": len(evidence_spans),
+                "evidence_span_coverage": "covered" if evidence_spans else ("partial" if selected else "missing"),
                 "planned_source_urls": question_source_urls_for(question, question_source_urls),
                 **coverage_details,
+                "evidence_spans": evidence_spans,
                 "chunks": selected,
             }
         )
@@ -2953,6 +2466,13 @@ def format_evidence_packs_for_prompt(evidence_packs: Sequence[dict[str, Any]]) -
             details.append("missing facet evidence: " + ", ".join(clean_string_list(pack.get("missing_facet_evidence"))[:5]))
         detail_text = f"; {'; '.join(details)}" if details else ""
         lines.append(f"- {question} ({coverage}{detail_text})")
+        spans = pack.get("evidence_spans", []) if isinstance(pack, dict) else []
+        for span in [item for item in spans if isinstance(item, dict)][:DEFAULT_EVIDENCE_SPANS_PER_QUESTION]:
+            marker = f"[{span.get('source_index')}]" if isinstance(span.get("source_index"), int) else "[source]"
+            evidence_type = clean_text(span.get("evidence_type")) or "evidence"
+            text = clean_text(span.get("text"))
+            if text:
+                lines.append(f"  - Evidence span ({evidence_type}) {marker}: {text}")
         for chunk in (pack.get("chunks", []) if isinstance(pack, dict) else []):
             marker = f"[{chunk.get('source_index')}]"
             title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Retrieved chunk"
@@ -3269,19 +2789,6 @@ def context_block_char_limit(
 def primary_source_url(metadata: dict[str, Any]) -> str:
     urls = result_source_urls_from_metadata(metadata)
     return urls[0] if urls else clean_text(metadata.get("url"))
-
-
-def dedupe_preserve_order(items: Sequence[str]) -> list[str]:
-    seen = set()
-    deduped = []
-    for item in items:
-        text = clean_text(item)
-        key = text.lower()
-        if not text or key in seen:
-            continue
-        seen.add(key)
-        deduped.append(text)
-    return deduped
 
 
 def dedupe_source_urls(urls: Sequence[str]) -> list[str]:
