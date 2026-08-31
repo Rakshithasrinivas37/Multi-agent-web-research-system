@@ -10,6 +10,22 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
 from src.rag.indexing import get_collection
+from src.rag.query_helpers import (
+    COVERAGE_EVIDENCE_TERMS,
+    COVERAGE_GENERIC_TERMS,
+    OBJECTIVE_STOPWORDS,
+    clean_model_name,
+    clean_string_list,
+    dedupe_preserve_order,
+    facet_present,
+    infer_question_evidence_types,
+    query_keywords,
+    query_tokens,
+    question_key,
+    question_required_facets,
+    retrieval_topic_phrase,
+    source_query_terms,
+)
 from src.rag.retrieval import RetrievalResult, expand_parent_context_results, multi_query_hybrid_retrieve, source_url_coverage_retrieve
 from src.tools.groq_retry import create_chat_completion_with_retries
 from src.tools.text_utils import clean_text
@@ -23,6 +39,7 @@ DEFAULT_SUBQUESTION_RERANK_MAX_WORKERS = 2
 DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 6
 DEFAULT_SYNTHESIS_MAX_CHUNKS = 48
 DEFAULT_CONTEXT_BLOCK_CHARS = 750
+DEFAULT_PRECISION_QUERY_LIMIT = 8
 DEFAULT_HF_QUERY_MAX_INPUT_TOKENS = 4096
 DEFAULT_HF_QUERY_MAX_NEW_TOKENS = 900
 GENERIC_QUERY_PHRASES = (
@@ -55,12 +72,6 @@ def generation_helpers() -> Any:
     return generation
 
 
-def clean_model_name(value: Any) -> str:
-    """Normalize env-provided model names without changing valid ids."""
-
-    return clean_text(value).strip("\"'“”‘’")
-
-
 def sub_question_query_rewrite_model(model: str | None = None) -> str:
     """Model used only for rewriting planner sub-questions into retrieval queries."""
 
@@ -90,19 +101,18 @@ def sub_question_retrieval_queries(
 ) -> list[str]:
     """Rewrite one planner sub-question into compact retrieval queries."""
 
-    helpers = generation_helpers()
     question = clean_text(question)
     objective = clean_text(objective)
     task_details = clean_text(task_details)
     if not question:
         return []
 
-    evidence_types = helpers.infer_question_evidence_types(f"{question} {task_details}")
+    evidence_types = infer_question_evidence_types(f"{question} {task_details}")
     evidence_terms = query_evidence_terms(evidence_types)
-    facets = helpers.question_required_facets(f"{question} {task_details}")
-    source_terms = helpers.source_query_terms(task_details)
-    topic = helpers.retrieval_topic_phrase(f"{question} {task_details}", limit=12)
-    key_terms = " ".join(helpers.query_keywords(f"{question} {task_details}", limit=10)) or topic or objective
+    facets = question_required_facets(f"{question} {task_details}")
+    source_terms = source_query_terms(task_details)
+    topic = retrieval_topic_phrase(f"{question} {task_details}", limit=12)
+    key_terms = " ".join(query_keywords(f"{question} {task_details}", limit=10)) or topic or objective
     variants = []
     for facet in facets[: max(1, max_variants)]:
         variants.append(clean_retrieval_query(f"{facet} {objective} {topic_without_other_facets(topic, facet, facets)} {evidence_terms}"))
@@ -114,7 +124,7 @@ def sub_question_retrieval_queries(
             clean_retrieval_query(f"{source_terms} {topic} {evidence_terms}"),
         ]
     )
-    return helpers.dedupe_preserve_order(variant for variant in variants if variant)[: max(1, max_variants)]
+    return dedupe_preserve_order(variant for variant in variants if variant)[: max(1, max_variants)]
 
 
 def topic_without_other_facets(topic: str, facet: str, facets: Sequence[str]) -> str:
@@ -142,7 +152,7 @@ def query_evidence_terms(evidence_types: Sequence[str]) -> str:
     terms = []
     for evidence_type in evidence_types or ["evidence"]:
         terms.extend(term_map.get(clean_text(evidence_type).lower(), []))
-    return clean_text(" ".join(generation_helpers().dedupe_preserve_order(terms)))
+    return clean_text(" ".join(dedupe_preserve_order(terms)))
 
 
 def clean_retrieval_query(query: str, max_words: int = 18) -> str:
@@ -162,6 +172,108 @@ def clean_retrieval_query(query: str, max_words: int = 18) -> str:
         seen.add(key)
         tokens.append(cleaned)
     return clean_text(" ".join(tokens[:max_words]))[:300]
+
+
+def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
+    """Build retrieval queries from PlannerAgent output."""
+
+    objective = clean_text(research_plan.get("objective"))
+    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
+    sub_question_queries = []
+    for sub_question in research_plan.get("sub_questions", []):
+        query = clean_text(sub_question)
+        if query:
+            sub_question_queries.extend(
+                sub_question_retrieval_queries(
+                    query,
+                    objective=objective,
+                    task_details=matching_task_details(query, tasks),
+                )
+            )
+    if sub_question_queries:
+        return dedupe_preserve_order([*sub_question_queries, objective])
+
+    queries = []
+    for task in tasks:
+        expected_signals_text = " ".join(clean_text(item) for item in task.get("expected_signals", []) if clean_text(item))
+        query = clean_text(
+            " ".join(
+                clean_text(part)
+                for part in [
+                    task.get("query_context"),
+                    task.get("extraction_goal"),
+                    task.get("target_name"),
+                    task.get("url"),
+                    expected_signals_text,
+                ]
+                if clean_text(part)
+            )
+        )
+        if query:
+            queries.append(query)
+    return dedupe_preserve_order([*queries, objective])
+
+
+def precision_retrieval_queries(
+    research_plan: dict[str, Any],
+    objective: str = "",
+    max_queries: int = DEFAULT_PRECISION_QUERY_LIMIT,
+) -> list[str]:
+    """Build deterministic high-signal queries for exact evidence retrieval."""
+
+    helpers = generation_helpers()
+    objective_text = clean_text(objective or research_plan.get("objective"))
+    synthesis_instruction = clean_text(research_plan.get("synthesis_instruction"))
+    tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
+    candidates = [
+        *helpers.planner_sub_questions(research_plan),
+        *helpers.instruction_requirement_items(synthesis_instruction),
+    ]
+    queries = []
+    for item in dedupe_preserve_order(candidates):
+        base = clean_text(f"{objective_text} {item} {matching_task_details(item, tasks)}")
+        suffixes = precision_query_suffixes(item)
+        if not base or not suffixes:
+            continue
+        for suffix in suffixes:
+            queries.append(clean_text(f"{base} {suffix}")[:700])
+            if len(queries) >= max(1, max_queries):
+                return dedupe_preserve_order(queries)
+    return dedupe_preserve_order(queries)[: max(1, max_queries)]
+
+
+def precision_query_suffixes(text: str) -> list[str]:
+    lowered = clean_text(text).lower()
+    suffixes = []
+    if re.search(r"\b(equation|formula|mathematical|formulation|derive|scaled|additive|multiplicative)\b", lowered):
+        suffixes.append("exact equation formula derivation symbols softmax sqrt sum matrix alignment")
+    if re.search(r"\b(benchmark|result|score|performance|accuracy|bleu|glue|imagenet|top-1|metric)\b", lowered):
+        suffixes.append("benchmark table results scores metrics accuracy BLEU GLUE ImageNet top-1")
+    if re.search(r"\b(api|implementation|framework|library|pytorch|tensorflow|keras|hugging face|transformers)\b", lowered):
+        suffixes.append("official documentation API signature parameters usage example class function")
+    if re.search(r"\b(complexity|efficient|variant|limitation|memory|time|quadratic|linear|sparse|low-rank)\b", lowered):
+        suffixes.append("computational complexity time memory O(n^2) O(n) algorithm approximation limitation")
+    if re.search(r"\b(paper|contribution|introduced|architecture|method|model|et al)\b", lowered):
+        suffixes.append("original paper method contribution architecture equations results")
+    return dedupe_preserve_order(suffixes)
+
+
+def matching_task_details(question: str, tasks: Sequence[dict[str, Any]]) -> str:
+    """Return task details that make a planner sub-question more retrievable."""
+
+    question_terms = query_tokens(question)
+    parts = []
+    for task in tasks:
+        context = clean_text(task.get("query_context"))
+        context_terms = query_tokens(context)
+        if not context_terms:
+            continue
+        overlap = len(question_terms & context_terms) / max(1, min(len(question_terms), len(context_terms)))
+        if context.lower() != clean_text(question).lower() and overlap < 0.45:
+            continue
+        expected_signals = " ".join(clean_text(item) for item in task.get("expected_signals", []) if clean_text(item))
+        parts.extend([task.get("extraction_goal"), expected_signals, task.get("url")])
+    return clean_text(" ".join(clean_text(part) for part in parts if clean_text(part)))
 
 
 def retrieve_sub_question_context(
@@ -245,16 +357,16 @@ def retrieve_sub_question_context_groups(
     tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
     candidate_chunks = max(1, candidate_chunks)
     final_chunks = max(1, min(final_chunks, candidate_chunks))
-    clean_questions = helpers.dedupe_preserve_order(questions)
+    clean_questions = dedupe_preserve_order(questions)
     question_source_urls = helpers.planner_question_source_urls(research_plan)
     evidence_by_question = {
-        helpers.question_key(spec.get("question")): helpers.clean_string_list(spec.get("required_evidence"))
+        question_key(spec.get("question")): clean_string_list(spec.get("required_evidence"))
         for spec in helpers.planner_sub_question_specs(research_plan)
         if clean_text(spec.get("question"))
     }
 
     def retrieve_question(question: str) -> dict[str, Any]:
-        required_evidence = evidence_by_question.get(helpers.question_key(question)) or helpers.infer_question_evidence_types(question)
+        required_evidence = evidence_by_question.get(question_key(question)) or infer_question_evidence_types(question)
         query_set = per_question_context_queries(question, objective=objective, tasks=tasks)
         if not query_set:
             return sub_question_context_group(question, [], [], [])
@@ -402,8 +514,8 @@ def browser_question_context_retrieve(
 
     query_text = clean_text(" ".join([question, *queries]))
     evidence_terms = browser_evidence_query_terms(question, required_evidence=required_evidence)
-    facet_terms = {facet.lower() for facet in helpers.question_required_facets(question)}
-    query_terms = helpers.query_tokens(query_text) | evidence_terms | facet_terms
+    facet_terms = {facet.lower() for facet in question_required_facets(question)}
+    query_terms = query_tokens(query_text) | evidence_terms | facet_terms
     priority_terms = evidence_terms | facet_terms
     source_urls = helpers.question_source_urls_for(question, question_source_urls)
     candidates = []
@@ -492,9 +604,8 @@ def browser_source_snippets(
 def browser_evidence_query_terms(question: str, required_evidence: Sequence[str] | None = None) -> set[str]:
     """Terms used to recover exact evidence from browser text before vector chunks lose it."""
 
-    helpers = generation_helpers()
     terms = set()
-    evidence_types = helpers.clean_string_list(list(required_evidence or [])) or helpers.infer_question_evidence_types(question)
+    evidence_types = clean_string_list(list(required_evidence or [])) or infer_question_evidence_types(question)
     for evidence_type in evidence_types:
         terms.update(EVIDENCE_TERMS_BY_TYPE.get(clean_text(evidence_type).lower(), set()))
     return {term.lower() for term in terms if len(term) >= 3}
@@ -570,7 +681,7 @@ def collection_scan_question_retrieve(
     ids = raw.get("ids", []) if isinstance(raw, dict) else []
     documents = raw.get("documents", []) if isinstance(raw, dict) else []
     metadatas = raw.get("metadatas", []) if isinstance(raw, dict) else []
-    allowed_history_keys = set(helpers.clean_string_list(history_keys or []))
+    allowed_history_keys = set(clean_string_list(history_keys or []))
     candidates = []
     for index, document in enumerate(documents):
         metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
@@ -605,11 +716,11 @@ def collection_scan_question_retrieve(
 
 def missing_facets_for_results(question: str, results: Sequence[RetrievalResult]) -> list[str]:
     helpers = generation_helpers()
-    facets = helpers.question_required_facets(question)
+    facets = question_required_facets(question)
     if not facets:
         return []
     text = clean_text(" ".join(helpers.retrieval_result_text(result) for result in results))
-    return [facet for facet in facets if not helpers.facet_present(facet, text)]
+    return [facet for facet in facets if not facet_present(facet, text)]
 
 
 def facet_rescue_context_retrieve(
@@ -626,14 +737,14 @@ def facet_rescue_context_retrieve(
 ) -> list[RetrievalResult]:
     helpers = generation_helpers()
     evidence_terms = " ".join(sorted(browser_evidence_query_terms(question, required_evidence=required_evidence))[:8])
-    facet_queries = helpers.dedupe_preserve_order(
+    facet_queries = dedupe_preserve_order(
         clean_text(f"{facet} {evidence_terms}") for facet in missing_facets if clean_text(facet)
     )
     if not facet_queries:
         return []
     return collection_scan_question_retrieve(
         question=question,
-        queries=helpers.dedupe_preserve_order([*queries, *facet_queries]),
+        queries=dedupe_preserve_order([*queries, *facet_queries]),
         chroma_path=chroma_path,
         collection_name=collection_name,
         history_keys=history_keys,
@@ -651,7 +762,7 @@ def select_facet_covered_results(
 ) -> list[RetrievalResult]:
     helpers = generation_helpers()
     results = list(ranked_results)
-    facets = helpers.question_required_facets(question)
+    facets = question_required_facets(question)
     if not facets or not results:
         return results[: max(1, limit)]
 
@@ -662,7 +773,7 @@ def select_facet_covered_results(
             key = helpers.retrieval_result_key(result)
             if key in seen:
                 continue
-            if helpers.facet_present(facet, helpers.retrieval_result_text(result)):
+            if facet_present(facet, helpers.retrieval_result_text(result)):
                 selected.append(result)
                 seen.add(key)
                 break
@@ -689,11 +800,11 @@ def rank_collection_scan_results(
 
     helpers = generation_helpers()
     query_text = clean_text(" ".join([question, *queries]))
-    query_terms = helpers.query_tokens(query_text)
-    topic_terms = {term for term in query_terms if term not in helpers.COVERAGE_GENERIC_TERMS}
-    evidence_types = helpers.clean_string_list(list(required_evidence or [])) or helpers.infer_question_evidence_types(question)
+    query_terms = query_tokens(query_text)
+    topic_terms = {term for term in query_terms if term not in COVERAGE_GENERIC_TERMS}
+    evidence_types = clean_string_list(list(required_evidence or [])) or infer_question_evidence_types(question)
     source_urls = helpers.question_source_urls_for(question, question_source_urls)
-    facets = helpers.question_required_facets(question)
+    facets = question_required_facets(question)
     scored = []
     fallback = []
 
@@ -704,13 +815,13 @@ def rank_collection_scan_results(
             continue
         fallback.append(result)
         text = helpers.retrieval_result_text(result)
-        text_terms = helpers.query_tokens(text)
+        text_terms = query_tokens(text)
         overlap = len(query_terms & text_terms)
         topic_overlap = len(topic_terms & text_terms)
         evidence_score = helpers.evidence_type_score(text, evidence_types)
         signal_score = helpers.evidence_signal_score(text, evidence_types)
         table_score = metadata_table_signal_score(metadata, evidence_types)
-        facet_score = sum(1 for facet in facets if helpers.facet_present(facet, text))
+        facet_score = sum(1 for facet in facets if facet_present(facet, text))
         preferred_source = helpers.result_matches_source_urls(result, source_urls)
         primary_source = helpers.is_primary_source(metadata)
         primary_signal = primary_source and signal_score
@@ -859,13 +970,13 @@ def per_question_context_queries(question: str, objective: str = "", tasks: Sequ
     """Build broad plus exact-evidence queries for one planner sub-question."""
 
     helpers = generation_helpers()
-    task_details = helpers.matching_task_details(question, tasks)
+    task_details = matching_task_details(question, tasks)
     queries = sub_question_retrieval_queries(question, objective=objective, task_details=task_details)
     exact_queries = [
         clean_text(f"{objective} {question} {suffix} {task_details}")[:700]
-        for suffix in helpers.precision_query_suffixes(question)
+        for suffix in precision_query_suffixes(question)
     ]
-    return helpers.dedupe_preserve_order([*queries, *exact_queries])
+    return dedupe_preserve_order([*queries, *exact_queries])
 
 
 def llm_sub_question_retrieval_query_result(
@@ -966,7 +1077,7 @@ def groq_sub_question_retrieval_query_result(
         }
     queries = complete_sub_question_query_coverage(queries, research_plan, max_variants=max_variants)
     return {
-        "queries": helpers.dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
+        "queries": dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
         "model": clean_text(getattr(response, "model", "")) or selected_model,
         "error": "",
         "raw_response": raw_response_text[:1000],
@@ -1073,7 +1184,7 @@ def hf_sub_question_retrieval_query_result(
         }
     queries = complete_sub_question_query_coverage(queries, research_plan, max_variants=max_variants)
     return {
-        "queries": helpers.dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
+        "queries": dedupe_preserve_order(query[:700] for query in queries)[:max_queries],
         "model": selected_model,
         "error": "",
         "raw_response": raw_response_text[:1000],
@@ -1188,11 +1299,11 @@ def complete_sub_question_query_coverage(
     helpers = generation_helpers()
     questions = helpers.planner_sub_questions(research_plan)
     if not questions:
-        return helpers.dedupe_preserve_order(queries)
+        return dedupe_preserve_order(queries)
 
     objective = clean_text(research_plan.get("objective"))
     tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
-    clean_queries = helpers.dedupe_preserve_order(queries)
+    clean_queries = dedupe_preserve_order(queries)
     grouped = []
     used = set()
     min_variants = min(max(1, max_variants), 2)
@@ -1205,7 +1316,7 @@ def complete_sub_question_query_coverage(
         fallback_queries = sub_question_retrieval_queries(
             question,
             objective=objective,
-            task_details=helpers.matching_task_details(question, tasks),
+            task_details=matching_task_details(question, tasks),
             max_variants=max_variants,
         )
         target_count = max(1, max_variants) if not question_queries else min_variants
@@ -1217,7 +1328,7 @@ def complete_sub_question_query_coverage(
         grouped.extend(question_queries[: max(1, max_variants)])
 
     max_queries = max(1, len(questions) * max(1, max_variants))
-    return helpers.dedupe_preserve_order(grouped)[:max_queries]
+    return dedupe_preserve_order(grouped)[:max_queries]
 
 
 def query_list_covers_sub_question(question: str, queries: Sequence[str]) -> bool:
@@ -1225,19 +1336,18 @@ def query_list_covers_sub_question(question: str, queries: Sequence[str]) -> boo
 
 
 def query_matches_sub_question(question: str, query: str) -> bool:
-    helpers = generation_helpers()
-    query_terms = helpers.query_tokens(query)
+    query_terms = query_tokens(query)
     named_terms = question_named_terms(question)
     if named_terms and not any(term_matches_query(term, query_terms, query) for term in named_terms):
         return False
 
-    ignored_terms = helpers.COVERAGE_GENERIC_TERMS | helpers.COVERAGE_EVIDENCE_TERMS | {"attention", "method", "methods", "topic", "topics"}
-    topic_terms = [term for term in helpers.query_keywords(question, limit=8) if term.lower() not in ignored_terms]
+    ignored_terms = COVERAGE_GENERIC_TERMS | COVERAGE_EVIDENCE_TERMS | {"attention", "method", "methods", "topic", "topics"}
+    topic_terms = [term for term in query_keywords(question, limit=8) if term.lower() not in ignored_terms]
     normalized = {term.lower().replace("‑", "-").replace("–", "-") for term in topic_terms}
     evidence_terms = {
         term.lower()
-        for term in helpers.query_keywords(question, limit=12)
-        if term.lower() in helpers.COVERAGE_EVIDENCE_TERMS
+        for term in query_keywords(question, limit=12)
+        if term.lower() in COVERAGE_EVIDENCE_TERMS
     }
     if not normalized:
         if evidence_terms:
@@ -1257,18 +1367,17 @@ def term_matches_query(term: str, query_terms: set[str], query: str) -> bool:
 
 
 def question_named_terms(question: str) -> list[str]:
-    helpers = generation_helpers()
     normalized = clean_text(question).replace("‑", "-").replace("–", "-").replace("—", "-")
     terms = re.findall(r"\b[A-Z][A-Za-z0-9_.-]{2,}\b|\b[A-Z]{2,}\b", normalized)
     terms.extend(re.findall(r"\b[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b", normalized))
-    return helpers.dedupe_preserve_order(term.lower() for term in terms if term.lower() not in helpers.OBJECTIVE_STOPWORDS)
+    return dedupe_preserve_order(term.lower() for term in terms if term.lower() not in OBJECTIVE_STOPWORDS)
 
 
 def format_sub_question_rewrite_items(questions: Sequence[str], tasks: Sequence[dict[str, Any]]) -> str:
     helpers = generation_helpers()
     lines = []
     for index, question in enumerate(questions, start=1):
-        details = helpers.matching_task_details(question, tasks)
+        details = matching_task_details(question, tasks)
         detail_text = f"\n   task_details: {details}" if details else ""
         lines.append(f"{index}. {question}{detail_text}")
     return "\n".join(lines)
@@ -1316,15 +1425,13 @@ def clean_markdown_fence(text: str) -> str:
 def fallback_json_like_queries(text: str) -> list[str]:
     """Recover query arrays when a model returns almost-JSON that json.loads rejects."""
 
-    helpers = generation_helpers()
     queries = []
     for match in re.finditer(r'"queries"\s*:\s*\[(.*?)\]', str(text or ""), flags=re.DOTALL | re.IGNORECASE):
         queries.extend(re.findall(r'"([^"]+)"', match.group(1)))
-    return helpers.dedupe_preserve_order(queries)
+    return dedupe_preserve_order(queries)
 
 
 def extract_query_strings(value: Any) -> list[str]:
-    helpers = generation_helpers()
     if isinstance(value, dict):
         queries = []
         for key, item in value.items():
@@ -1335,37 +1442,36 @@ def extract_query_strings(value: Any) -> list[str]:
                 queries.append(item)
             else:
                 queries.extend(extract_query_strings(item))
-        return helpers.dedupe_preserve_order(queries)
+        return dedupe_preserve_order(queries)
     if isinstance(value, list):
         queries = []
         for item in value:
             queries.extend(extract_query_strings(item))
-        return helpers.dedupe_preserve_order(queries)
+        return dedupe_preserve_order(queries)
     if isinstance(value, str):
         return fallback_line_queries(value)
     return []
 
 
 def fallback_line_queries(text: str) -> list[str]:
-    helpers = generation_helpers()
     lines = []
     for line in str(text or "").splitlines():
         line = re.sub(r"^\s*[-*\d.)]+\s*", "", line).strip().strip('"')
         if clean_text(line):
             lines.append(line)
-    return helpers.dedupe_preserve_order(lines)
+    return dedupe_preserve_order(lines)
 
 
 def valid_retrieval_queries(queries: Sequence[str], research_plan: dict[str, Any]) -> list[str]:
     helpers = generation_helpers()
-    objective_terms = helpers.query_tokens(clean_text(research_plan.get("objective")))
+    objective_terms = query_tokens(clean_text(research_plan.get("objective")))
     question_terms = set()
     for question in helpers.planner_sub_questions(research_plan):
-        question_terms.update(helpers.query_tokens(question))
+        question_terms.update(query_tokens(question))
     allowed_terms = objective_terms | question_terms
     return [
         cleaned
-        for query in helpers.dedupe_preserve_order(queries)
+        for query in dedupe_preserve_order(queries)
         if (cleaned := clean_retrieval_query(query))
         if is_valid_retrieval_query(cleaned, allowed_terms)
     ]

@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 from src.rag.generation import (
     audit_synthesis_citations,
-    broad_query_hints,
     build_sub_question_evidence_packs,
     build_coverage_by_question,
     build_generation_context,
@@ -20,23 +19,23 @@ from src.rag.generation import (
     parse_gap_query_lines,
     planner_question_source_urls,
     planner_sub_question_specs,
-    precision_retrieval_queries,
     print_synthesis_chunks,
-    planner_tasks_to_rag_queries,
     report_supporting_chunks,
     retrieve_full_collection_enabled,
-    retrieval_topic_phrase,
     result_supports_question,
     select_synthesis_context,
     synthesize_context_for_report,
     synthesis_quality_issues,
 )
+from src.rag.evidence_spans import supporting_chunks_from_evidence_spans
+from src.rag.query_helpers import broad_query_hints, retrieval_topic_phrase
 from src.rag.sub_question_context import (
     browser_question_context_retrieve,
     complete_sub_question_query_coverage,
     is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
     parse_llm_retrieval_queries,
+    precision_retrieval_queries,
     retrieve_sub_question_context_groups,
     retrieve_sub_question_context,
     select_question_first_synthesis_context,
@@ -280,6 +279,52 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertEqual(packs[0]["coverage"], "partial")
         self.assertIn("Performer", packs[0]["missing_facets"])
         self.assertIn("missing facets: Performer", prompt_context)
+
+    def test_evidence_pack_extracts_formula_span(self):
+        question = "What equation defines the method?"
+        results = [
+            RetrievalResult(
+                id="formula",
+                document="The method equation is y = softmax(x), where x is the input score vector. " * 3,
+                metadata={"title": "Formula source", "url": "https://arxiv.org/abs/1234.5678", "has_formula_signal": True},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 1, "id": "formula", "url": "https://arxiv.org/abs/1234.5678"}]
+
+        packs = build_sub_question_evidence_packs([question], results, sources)
+
+        self.assertGreater(packs[0]["evidence_span_count"], 0)
+        self.assertEqual(packs[0]["evidence_spans"][0]["evidence_type"], "equation")
+        self.assertIn("y = softmax(x)", packs[0]["evidence_spans"][0]["text"])
+
+    def test_evidence_pack_extracts_table_span(self):
+        question = "What benchmark table reports BLEU scores?"
+        table_json = (
+            'Table data JSON:\n{"headers":["Model","BLEU"],'
+            '"records":[{"Model":"Transformer","BLEU":"28.4"},{"Model":"Baseline","BLEU":"24.6"}]}'
+        )
+        results = [
+            RetrievalResult(
+                id="table",
+                document=table_json,
+                metadata={"title": "Benchmark table", "url": "https://example.com/results", "chunk_kind": "table", "has_table_signal": True},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 1, "id": "table", "url": "https://example.com/results"}]
+
+        packs = build_sub_question_evidence_packs([question], results, sources)
+        span_chunks = supporting_chunks_from_evidence_spans(packs, max_spans_per_question=1)
+
+        self.assertEqual(packs[0]["evidence_spans"][0]["evidence_type"], "table")
+        self.assertIn("Table columns: Model, BLEU", packs[0]["evidence_spans"][0]["text"])
+        self.assertEqual(span_chunks[0]["chunk_kind"], "evidence_span")
+        self.assertIn("Evidence type: table", span_chunks[0]["content"])
 
     def test_planner_question_source_urls_maps_task_context_ids(self):
         plan = {
