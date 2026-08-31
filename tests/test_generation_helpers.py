@@ -948,7 +948,7 @@ Missing Evidence: exact benchmark values are not present.
             {"objective": "X research", "sub_questions": ["What is X?"]},
         )
 
-        self.assertEqual(result["queries"], ["x research overview", "x research evidence details"])
+        self.assertEqual(result["queries"], ["x research overview", "x research details"])
         self.assertEqual(result["model"], "llama-test")
         self.assertEqual(result["error"], "")
         self.assertEqual(completion.call_args.kwargs["model"], "llama-test")
