@@ -2842,6 +2842,11 @@ def compact_retrieved_chunks(
                 "source_quality": clean_text(metadata.get("source_quality")),
                 "is_primary_source": is_primary_source(metadata),
                 "synthesis_question": clean_text(metadata.get("synthesis_question")),
+                "chunk_kind": clean_text(metadata.get("chunk_kind")),
+                "has_table_signal": bool(metadata.get("has_table_signal")),
+                "has_formula_signal": bool(metadata.get("has_formula_signal")),
+                "has_api_signal": bool(metadata.get("has_api_signal")),
+                "has_benchmark_signal": bool(metadata.get("has_benchmark_signal")),
                 "content": content,
             }
         )

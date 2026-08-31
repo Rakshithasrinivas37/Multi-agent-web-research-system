@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 
@@ -86,6 +87,32 @@ ImageNet top-1 accuracy improves by 1.00%.
         self.assertTrue(any(chunk.metadata.get("has_formula_signal") for chunk in signal_chunks))
         self.assertTrue(any(chunk.metadata.get("has_api_signal") for chunk in signal_chunks))
         self.assertTrue(any(chunk.metadata.get("has_benchmark_signal") for chunk in signal_chunks))
+
+    def test_split_document_adds_table_json_chunk(self):
+        Document, _ = langchain_ingestion_classes()
+        document = Document(
+            page_content="""Benchmark section.
+
+Model | BLEU | Params
+Transformer | 28.4 | 65M
+RNN baseline | 24.6 | 80M
+
+The table above should stay intact.
+""",
+            metadata={"url": "https://example.com/results", "history_key": "test"},
+        )
+
+        chunks = split_document(document)
+        table_chunks = [chunk for chunk in chunks if chunk.metadata.get("chunk_kind") == "table"]
+
+        self.assertEqual(len(table_chunks), 1)
+        self.assertTrue(table_chunks[0].metadata.get("has_table_signal"))
+        self.assertTrue(table_chunks[0].metadata.get("has_benchmark_signal"))
+        self.assertEqual(table_chunks[0].metadata.get("table_row_count"), 2)
+
+        payload = json.loads(table_chunks[0].page_content.removeprefix("Table data JSON:\n"))
+        self.assertEqual(payload["headers"], ["Model", "BLEU", "Params"])
+        self.assertEqual(payload["records"][0]["Model"], "Transformer")
 
     def test_split_document_adds_parent_context_metadata(self):
         Document, _ = langchain_ingestion_classes()
@@ -190,6 +217,13 @@ ImageNet top-1 accuracy improves by 1.00%.
         self.assertGreater(metadata_signal_score("equation formula softmax", metadata), 0)
         self.assertGreater(metadata_signal_score("PyTorch API usage", metadata), 0)
         self.assertGreater(metadata_signal_score("ImageNet benchmark accuracy", metadata), 0)
+
+        table_metadata = {
+            "chunk_kind": "table",
+            "has_table_signal": True,
+            "has_benchmark_signal": True,
+        }
+        self.assertGreater(metadata_signal_score("benchmark table results", table_metadata), 0)
 
     def test_source_records_preserve_browser_authority_metadata(self):
         browser_results = [
