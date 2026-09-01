@@ -42,6 +42,9 @@ DEFAULT_CONTEXT_BLOCK_CHARS = 750
 DEFAULT_PRECISION_QUERY_LIMIT = 8
 DEFAULT_HF_QUERY_MAX_INPUT_TOKENS = 4096
 DEFAULT_HF_QUERY_MAX_NEW_TOKENS = 900
+DEFAULT_QUERY_MAX_WORDS = 14
+DEFAULT_EVIDENCE_TAIL_TERMS = 2
+DEFAULT_NEAR_DUPLICATE_SIMILARITY = 0.72
 GENERIC_QUERY_PHRASES = (
     r"\boverview evidence definition concept\b",
     r"\bevidence details examples equations benchmarks limitations\b",
@@ -112,13 +115,50 @@ def hf_sub_question_query_model() -> str:
     return clean_model_name(os.environ.get("RAG_SUBQUESTION_HF_MODEL")) or DEFAULT_SUBQUESTION_HF_QUERY_MODEL
 
 
+def dedupe_near_duplicate_queries(
+    queries: Sequence[str],
+    similarity_threshold: float = DEFAULT_NEAR_DUPLICATE_SIMILARITY,
+) -> list[str]:
+    """Drop queries that are token-reorderings or near-duplicates of an earlier query.
+
+    LLM query rewrites frequently produce queries that share the same bag of
+    words in a different order (or with one word swapped), which look like
+    distinct strings but retrieve nearly identical chunks. This keeps only
+    the first occurrence of each sufficiently distinct token set, using
+    Jaccard similarity over normalized tokens rather than exact string match.
+    """
+
+    kept: list[str] = []
+    kept_token_sets: list[set[str]] = []
+    for query in queries:
+        text = clean_text(query)
+        if not text:
+            continue
+        tokens = set(query_tokens(text))
+        if not tokens:
+            continue
+        is_duplicate = False
+        for existing_tokens in kept_token_sets:
+            union = len(tokens | existing_tokens)
+            if union == 0:
+                continue
+            overlap = len(tokens & existing_tokens)
+            if (overlap / union) >= similarity_threshold:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            kept.append(text)
+            kept_token_sets.append(tokens)
+    return kept
+
+
 def sub_question_retrieval_queries(
     question: str,
     objective: str = "",
     task_details: str = "",
     max_variants: int = DEFAULT_SUBQUESTION_QUERY_VARIANTS,
 ) -> list[str]:
-    """Rewrite one planner sub-question into compact retrieval queries."""
+    """Rewrite one planner sub-question into compact, mutually distinct retrieval queries."""
 
     question = clean_text(question)
     objective = clean_text(objective)
@@ -127,23 +167,39 @@ def sub_question_retrieval_queries(
         return []
 
     evidence_types = infer_question_evidence_types(f"{question} {task_details}")
-    evidence_terms = query_evidence_terms(evidence_types)
     facets = question_required_facets(f"{question} {task_details}")
     source_terms = source_query_terms(task_details)
     topic = retrieval_topic_phrase(f"{question} {task_details}", limit=12)
     key_terms = " ".join(query_keywords(f"{question} {task_details}", limit=10)) or topic or objective
+
     variants = []
+    variant_index = 0
+
     for facet in facets[: max(1, max_variants)]:
-        variants.append(clean_retrieval_query(f"{facet} {objective} {topic_without_other_facets(topic, facet, facets)} {evidence_terms}"))
-    variants.extend(
-        [
-            clean_retrieval_query(f"{topic} {evidence_terms}"),
-            clean_retrieval_query(f"{key_terms} {evidence_terms}"),
-            clean_retrieval_query(f"{objective} {topic} {evidence_terms}"),
-            clean_retrieval_query(f"{source_terms} {topic} {evidence_terms}"),
-        ]
-    )
-    return dedupe_preserve_order(variant for variant in variants if variant)[: max(1, max_variants)]
+        evidence_terms = query_evidence_terms(evidence_types, variant_index=variant_index)
+        variants.append(
+            clean_retrieval_query(
+                f"{facet} {objective} {topic_without_other_facets(topic, facet, facets)} {evidence_terms}"
+            )
+        )
+        variant_index += 1
+
+    # Each remaining template pulls a different rotation of evidence terms
+    # (see query_evidence_terms) so variants for the same sub-question
+    # emphasize different facets instead of repeating the same tail.
+    remaining_templates = [
+        lambda idx: f"{topic} {query_evidence_terms(evidence_types, variant_index=idx)}",
+        lambda idx: f"{key_terms} {query_evidence_terms(evidence_types, variant_index=idx)}",
+        lambda idx: f"{objective} {topic} {query_evidence_terms(evidence_types, variant_index=idx)}",
+        lambda idx: f"{source_terms} {topic} {query_evidence_terms(evidence_types, variant_index=idx)}",
+    ]
+    for template in remaining_templates:
+        variants.append(clean_retrieval_query(template(variant_index)))
+        variant_index += 1
+
+    candidates = dedupe_preserve_order(variant for variant in variants if variant)
+    candidates = dedupe_near_duplicate_queries(candidates)
+    return candidates[: max(1, max_variants)]
 
 
 def topic_without_other_facets(topic: str, facet: str, facets: Sequence[str]) -> str:
@@ -155,7 +211,19 @@ def topic_without_other_facets(topic: str, facet: str, facets: Sequence[str]) ->
     return clean_text(text)
 
 
-def query_evidence_terms(evidence_types: Sequence[str]) -> str:
+def query_evidence_terms(
+    evidence_types: Sequence[str],
+    variant_index: int = 0,
+    max_terms: int = DEFAULT_EVIDENCE_TAIL_TERMS,
+) -> str:
+    """Return a short, rotating slice of evidence terms for one query variant.
+
+    Capped to max_terms (default 2) so the evidence tail never dominates the
+    query, and rotated by variant_index so multiple queries built for the
+    same sub-question surface different evidence terms instead of repeating
+    an identical tail on every variant.
+    """
+
     term_map = {
         "api": ["official documentation", "api signature", "parameters", "usage"],
         "applications": ["applications", "use cases", "tasks"],
@@ -171,10 +239,18 @@ def query_evidence_terms(evidence_types: Sequence[str]) -> str:
     terms = []
     for evidence_type in evidence_types or ["evidence"]:
         terms.extend(term_map.get(clean_text(evidence_type).lower(), []))
-    return clean_text(" ".join(dedupe_preserve_order(terms)))
+    unique_terms = dedupe_preserve_order(terms)
+    if not unique_terms:
+        return ""
+
+    if len(unique_terms) > max_terms:
+        start = (variant_index * max(1, max_terms)) % len(unique_terms)
+        unique_terms = unique_terms[start:] + unique_terms[:start]
+
+    return clean_text(" ".join(unique_terms[: max(1, max_terms)]))
 
 
-def clean_retrieval_query(query: str, max_words: int = 18) -> str:
+def clean_retrieval_query(query: str, max_words: int = DEFAULT_QUERY_MAX_WORDS) -> str:
     text = clean_text(query)
     text = re.sub(r"^(?:what|which|where|how)\s+(?:is|are|does|do|did|can|should|has|have)?\s*", "", text, flags=re.IGNORECASE)
     for phrase in GENERIC_QUERY_PHRASES:
@@ -997,7 +1073,8 @@ def per_question_context_queries(question: str, objective: str = "", tasks: Sequ
         clean_text(f"{objective} {question} {suffix} {task_details}")[:700]
         for suffix in precision_query_suffixes(question)
     ]
-    return dedupe_preserve_order([*queries, *exact_queries])
+    combined = dedupe_preserve_order([*queries, *exact_queries])
+    return dedupe_near_duplicate_queries(combined)
 
 
 def llm_sub_question_retrieval_query_result(
@@ -1075,7 +1152,8 @@ def groq_sub_question_retrieval_query_result(
                     "content": (
                         "You rewrite planner sub-questions into compact keyword-style RAG search "
                         "queries that maximize recall across papers, docs, reports, and web extracts. "
-                        "Return JSON only."
+                        "Every query you produce must be lexically distinct from every other query, "
+                        "not just reworded. Return JSON only."
                     ),
                 },
                 {"role": "user", "content": prompt[:6000]},
@@ -1114,30 +1192,32 @@ Planner sub-questions and optional task details:
 {format_sub_question_rewrite_items(questions, tasks)}
 
 Rewrite each planner sub-question into 2-3 compact, high-recall RAG search queries.
-Requirements:
-- Return exactly 2 or 3 queries for every sub-question, in the same order as the planner list.
+
+HARD REQUIREMENTS (a query that violates any of these is invalid):
+- Length: every query MUST be 5-10 words. Never write 11+ words. Do not pad a query to hit a target length.
+- Distinctness: within one sub-question's group of 2-3 queries, no two queries may share more than half their words, even in a different order or with one word substituted. Reordered or lightly-reworded duplicates are treated as failures, not variety. Before finalizing, check each pair of queries in a group and rewrite any pair that overlaps too much.
+- Evidence tail: append AT MOST 2 evidence-intent words per query (choose from: definition, equation, formula, benchmark, results, comparison, complexity, limitations, api, implementation, applications). Never stack 3+ of these onto one query, and never use the same 2-word tail on more than one query in the same group.
+- New information per query: each query in a group must introduce at least one element the other queries in that group do not have — a different named method/paper/framework/dataset, a different facet of the sub-question, or a different evidence angle. If you cannot think of a genuinely different angle, write fewer queries for that sub-question rather than padding with a near-duplicate.
+
+STYLE REQUIREMENTS:
 - Base each query on the actual planner sub-question topic and named entities. Task details may add source names, URLs, APIs, datasets, metrics, or paper titles only when they match that sub-question.
 - Write compact keyword-style queries as noun phrases, not full sentences or questions.
 - Do not copy instruction words into queries: no "extract", "source-backed", "authoritative", "evidence gives", "source context", or "answering".
 - Do not start queries with "what", "which", "where", "how", or phrases like "source-backed context", "which evidence gives", or "authoritative sources discuss".
-- Do not append catch-all tails like "evidence details examples equations benchmarks limitations" or "overview evidence definition concept".
-- For each sub-question, create complementary queries: one broad concept query, one exact evidence query, and one source-targeted query for a named facet, source, API, dataset, or metric when present.
-- For compound/list questions, each query should focus on a named facet, dataset, method, framework, metric, or source from the question instead of repeating the whole question.
-- If a sub-question names multiple facets, split them across queries rather than mixing all facets into every query.
-- Prefer noun phrases that can match both semantic search and BM25 keyword search.
-- Keep each query tied to one planner sub-question. Do not let benchmark, limitation, or formula queries drift into unrelated sub-question groups.
-- Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, aliases, and important technical terms from the planner/task details.
-- For equation/formula questions, include nearby evidence terms such as equation, formula, derivation, score function, alignment, matrix, variables, components, or operation names when relevant.
-- For benchmark questions, include dataset names, metrics, result table, scores, comparison, performance, and evaluation terms when relevant.
-- For API/implementation questions, include official documentation, class/function names, signature, parameters, usage, and example terms when relevant.
-- For limitation/complexity questions, include complexity, memory, runtime, scaling, tradeoffs, bottleneck, sparse, efficient, or alternatives when relevant.
-- Prefer 6-14 words per query. Do not exceed 18 words unless a URL or API name requires it.
-- Do not answer the question and do not add citations.
-- Do not include reasoning, <think> text, or explanations.
+- For each sub-question, aim for complementary angles: one broad concept query, one exact-evidence query (equation/benchmark/api as applicable), and one source- or facet-targeted query naming a specific method, dataset, framework, or metric when the sub-question mentions more than one.
+- For compound/list questions, split named facets across separate queries instead of naming all of them in every query.
+- Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, and aliases from the planner/task details — these count toward the "new information per query" requirement.
+- Prefer noun phrases that work for both semantic search and BM25 keyword search.
+- Do not answer the question and do not add citations, reasoning, or <think> text.
 - Never output placeholder labels or generic query names.
-- Good shape: "named method equation formula variables"; "named dataset benchmark scores metrics"; "framework API signature parameters".
-- Bad shape: "topic evidence details examples equations benchmarks limitations"; "Which evidence gives topic details".
-- Return JSON only in this shape:
+
+SELF-CHECK before returning: for every sub-question's query group, confirm (a) each query is 5-10 words, (b) no two queries in the group share more than half their words, (c) each query has a distinct evidence tail or none at all, (d) each query names something the others don't.
+
+GOOD (5-10 words, distinct angles): "additive attention Bahdanau alignment formula"; "scaled dot-product attention softmax normalization"; "multi-head attention PyTorch nn.MultiheadAttention parameters"
+BAD (reordered near-duplicates): "attention mechanism definition mathematical formulation equation"; "definition mathematical formulation attention mechanism equation" — these are the same query and must never both appear.
+BAD (evidence tail overload): "attention mechanism definition purpose equation formula variables components" — 6 evidence words is too many; pick at most 2.
+
+Return JSON only in this shape:
 {{"items":[{{"sub_question":"...","queries":["named topic exact evidence terms","named facet comparison terms"]}}]}}"""
 
 
@@ -1323,7 +1403,7 @@ def complete_sub_question_query_coverage(
     helpers = generation_helpers()
     questions = helpers.planner_sub_questions(research_plan)
     if not questions:
-        return dedupe_preserve_order(queries)
+        return dedupe_near_duplicate_queries(dedupe_preserve_order(queries))
 
     objective = clean_text(research_plan.get("objective"))
     tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
@@ -1335,7 +1415,10 @@ def complete_sub_question_query_coverage(
         question_queries = [
             query for query in clean_queries
             if query not in used and query_matches_sub_question(question, query)
-        ][: max(1, max_variants)]
+        ]
+        # Drop near-duplicate LLM queries within this sub-question's own group
+        # before deciding whether fallback templates are still needed.
+        question_queries = dedupe_near_duplicate_queries(question_queries)[: max(1, max_variants)]
         used.update(question_queries)
         fallback_queries = sub_question_retrieval_queries(
             question,
@@ -1347,12 +1430,17 @@ def complete_sub_question_query_coverage(
         for query in fallback_queries:
             if len(question_queries) >= target_count:
                 break
+            candidate_group = [*question_queries, query]
+            if dedupe_near_duplicate_queries(candidate_group) != candidate_group:
+                # The fallback query is a near-duplicate of one already in this
+                # group; skip it rather than pad the group with redundancy.
+                continue
             if query not in question_queries:
                 question_queries.append(query)
         grouped.extend(question_queries[: max(1, max_variants)])
 
     max_queries = max(1, len(questions) * max(1, max_variants))
-    return dedupe_preserve_order(grouped)[:max_queries]
+    return dedupe_near_duplicate_queries(dedupe_preserve_order(grouped))[:max_queries]
 
 
 def query_list_covers_sub_question(question: str, queries: Sequence[str]) -> bool:
@@ -1493,12 +1581,13 @@ def valid_retrieval_queries(queries: Sequence[str], research_plan: dict[str, Any
     for question in helpers.planner_sub_questions(research_plan):
         question_terms.update(query_tokens(question))
     allowed_terms = objective_terms | question_terms
-    return [
+    candidates = [
         cleaned
         for query in dedupe_preserve_order(queries)
         if (cleaned := clean_retrieval_query(query))
         if is_valid_retrieval_query(cleaned, allowed_terms)
     ]
+    return dedupe_near_duplicate_queries(candidates)
 
 
 def is_valid_retrieval_query(query: str, allowed_terms: set[str]) -> bool:
