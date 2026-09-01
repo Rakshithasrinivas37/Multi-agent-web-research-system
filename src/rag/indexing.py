@@ -31,6 +31,9 @@ DEFAULT_PARENT_STORE_NAME = "parent_chunks.sqlite3"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
+DEFAULT_EMBEDDING_BATCH_SIZE = 16
+DEFAULT_CUDA_EMBEDDING_BATCH_SIZE = 4
+DEFAULT_CHROMA_UPSERT_BATCH_SIZE = 8
 DEFAULT_METADATA_SCHEMA_VERSION = 9
 TOKEN_PATTERN = re.compile(r"\S+")
 SECTION_HEADING_PATTERN = re.compile(
@@ -84,14 +87,25 @@ class SentenceTransformerEmbeddingFunction:
 
     def __call__(self, input: list[str]) -> list[list[float]]:
         model = self.model()
-        embeddings = model.encode(
-            input,
-            batch_size=max(1, to_int(os.environ.get("RAG_EMBEDDING_BATCH_SIZE"), 32)),
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        return embeddings.tolist()
+        batch_size = embedding_batch_size(self.device)
+        while True:
+            try:
+                embeddings = model.encode(
+                    input,
+                    batch_size=batch_size,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+                return embeddings.tolist()
+            except RuntimeError as error:
+                if not is_cuda_oom_error(error) or batch_size <= 1:
+                    raise
+                batch_size = max(1, batch_size // 2)
+                print(f"[rag_index] CUDA OOM while embedding; retrying with batch_size={batch_size}")
+                clear_embedding_model_memory()
+            finally:
+                clear_embedding_model_memory()
 
     def name(self) -> str:
         """Stable Chroma embedding function name used when reopening collections."""
@@ -172,6 +186,57 @@ def select_embedding_device(requested_device: str = DEFAULT_EMBEDDING_DEVICE) ->
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def embedding_batch_size(device: str) -> int:
+    """Return a conservative encode batch size for the selected device."""
+
+    if os.environ.get("RAG_EMBEDDING_BATCH_SIZE"):
+        return max(1, to_int(os.environ.get("RAG_EMBEDDING_BATCH_SIZE"), DEFAULT_EMBEDDING_BATCH_SIZE))
+    if clean_text(device).lower().startswith("cuda"):
+        return DEFAULT_CUDA_EMBEDDING_BATCH_SIZE
+    return DEFAULT_EMBEDDING_BATCH_SIZE
+
+
+def upsert_batch_size() -> int:
+    return max(1, to_int(os.environ.get("RAG_CHROMA_UPSERT_BATCH_SIZE"), DEFAULT_CHROMA_UPSERT_BATCH_SIZE))
+
+
+def upsert_collection_batches(
+    collection: Any,
+    ids: Sequence[str],
+    documents: Sequence[str],
+    metadatas: Sequence[dict[str, Any]],
+) -> int:
+    """Upsert Chroma chunks in small batches to avoid embedding-time GPU spikes."""
+
+    total = 0
+    batch_size = upsert_batch_size()
+    index = 0
+    while index < len(ids):
+        end = min(len(ids), index + batch_size)
+        try:
+            collection.upsert(
+                ids=list(ids[index:end]),
+                documents=list(documents[index:end]),
+                metadatas=list(metadatas[index:end]),
+            )
+            total += end - index
+            index = end
+            clear_embedding_model_memory()
+        except RuntimeError as error:
+            if not is_cuda_oom_error(error) or batch_size <= 1:
+                raise
+            failed_batch_size = end - index
+            batch_size = max(1, min(batch_size // 2, failed_batch_size // 2))
+            print(f"[rag_index] CUDA OOM during Chroma upsert; retrying with batch_size={batch_size}")
+            clear_embedding_model_memory()
+    return total
+
+
+def is_cuda_oom_error(error: BaseException) -> bool:
+    message = clean_text(error).lower()
+    return "cuda out of memory" in message or ("out of memory" in message and "cuda" in message)
 
 
 def index_research_results(
@@ -260,16 +325,16 @@ def index_research_results(
                     )
                 )
 
-            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            upserted_chunks = upsert_collection_batches(collection, ids, documents, metadatas)
             emit_progress(
                 "tool_called",
                 "Embedded and upserted source chunks",
                 agent="change_detection",
                 tool="sentence-transformers/chromadb",
-                metadata={"url": record.url, "chunks": len(chunk_documents)},
+                metadata={"url": record.url, "chunks": upserted_chunks},
             )
             indexed_source_count += 1
-            indexed_chunk_count += len(chunk_documents)
+            indexed_chunk_count += upserted_chunks
     finally:
         embedding_function.close()
 
