@@ -197,6 +197,46 @@ class GenerationHelperTests(unittest.TestCase):
 
         self.assertEqual(packs[0]["chunks"][0]["source_index"], 2)
 
+    def test_evidence_pack_prefers_planned_facet_source_over_generic_signal(self):
+        question = "What are the key contributions and equations of the AlphaMethod paper?"
+        results = [
+            RetrievalResult(
+                id="generic-method",
+                document="General model equation formula variables components benchmark results. " * 4,
+                metadata={"title": "Generic method", "url": "https://example.org/generic-method", "source_type": "paper"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="alpha-method",
+                document="AlphaMethod paper contribution introduces the alignment model equation a(x,y)=softmax(score(x,y)). " * 3,
+                metadata={
+                    "title": "AlphaMethod paper",
+                    "url": "https://example.org/alpha-method",
+                    "source_type": "paper",
+                    "synthesis_question": question,
+                },
+                score=0.2,
+                semantic_score=0.2,
+                bm25_score=0.0,
+            ),
+        ]
+        sources = [
+            {"index": 1, "id": "generic-method", "url": "https://example.org/generic-method"},
+            {"index": 2, "id": "alpha-method", "url": "https://example.org/alpha-method"},
+        ]
+
+        packs = build_sub_question_evidence_packs(
+            [question],
+            results,
+            sources,
+            question_source_urls={question: ["https://example.org/alpha-method"]},
+            max_chunks_per_question=1,
+        )
+
+        self.assertEqual(packs[0]["chunks"][0]["id"], "alpha-method")
+
     def test_evidence_pack_does_not_mark_wrong_evidence_type_covered(self):
         results = [
             RetrievalResult(

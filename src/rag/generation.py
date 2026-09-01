@@ -2509,24 +2509,27 @@ def build_sub_question_evidence_packs(
     for question in dedupe_preserve_order(planner_questions):
         question_terms = query_tokens(question)
         evidence_types = infer_question_evidence_types(question)
+        required_facets = question_required_facets(question)
         scored = []
         for chunk in chunks:
             text = " ".join([clean_text(chunk.get("title")), clean_text(chunk.get("content"))])
             overlap = len(question_terms & query_tokens(text))
             preferred = chunk_matches_source_urls(chunk, question_source_urls_for(question, question_source_urls))
             assigned = question_key(chunk.get("synthesis_question")) == question_key(question)
+            facet_score = sum(1 for facet in required_facets if facet_present(facet, text))
             evidence_score = evidence_type_score(text, evidence_types)
             signal_score = evidence_signal_score(text, evidence_types)
             supported = text_supports_question(question, text, required_evidence=evidence_types)
             primary_exact = bool(chunk.get("is_primary_source") and signal_score)
-            if overlap or preferred or assigned or supported:
+            if overlap or preferred or assigned or supported or facet_score:
                 scored.append(
                     (
                         1 if primary_exact else 0,
-                        1 if signal_score else 0,
                         1 if assigned else 0,
-                        1 if supported else 0,
                         1 if preferred else 0,
+                        1 if supported else 0,
+                        facet_score,
+                        1 if signal_score else 0,
                         1 if chunk.get("is_primary_source") else 0,
                         signal_score,
                         evidence_score,
