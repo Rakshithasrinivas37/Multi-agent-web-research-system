@@ -689,10 +689,7 @@ def coverage_evidence_details(
         for facet in covered_facets
         for evidence_type in strict_evidence
         if evidence_type in facet_sensitive
-        and not (
-            evidence_type_score(facet_evidence_window(facet, text), [evidence_type])
-            or evidence_signal_score(facet_evidence_window(facet, text), [evidence_type])
-        )
+        and not facet_has_evidence_signal(facet, chunks, evidence_type)
     ]
     status = "missing"
     if chunks:
@@ -706,6 +703,26 @@ def coverage_evidence_details(
         "missing_evidence_types": missing_evidence_types,
         "missing_facet_evidence": dedupe_preserve_order(missing_facet_evidence),
     }
+
+
+def facet_has_evidence_signal(facet: str, chunks: Sequence[dict[str, Any]], evidence_type: str) -> bool:
+    """Return true when any selected chunk covers a facet and the requested evidence type."""
+
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        text = chunk_evidence_text(chunk)
+        if not facet_present(facet, text):
+            continue
+        window = facet_evidence_window(facet, text)
+        if (
+            evidence_type_score(window, [evidence_type])
+            or evidence_signal_score(window, [evidence_type])
+            or evidence_type_score(text, [evidence_type])
+            or evidence_signal_score(text, [evidence_type])
+        ):
+            return True
+    return False
 
 
 def evidence_type_score(text: str, evidence_types: Sequence[str]) -> int:

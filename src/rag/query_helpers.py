@@ -119,9 +119,13 @@ COVERAGE_FACET_STOPWORDS = QUERY_FILLER_TERMS | COVERAGE_GENERIC_TERMS | COVERAG
     "concepts",
     "detail",
     "details",
+    "documentation",
     "example",
     "examples",
+    "found",
+    "governing",
     "official",
+    "original",
     "paper",
     "papers",
     "primary",
@@ -134,6 +138,7 @@ COVERAGE_FACET_STOPWORDS = QUERY_FILLER_TERMS | COVERAGE_GENERIC_TERMS | COVERAG
     "have",
     "has",
     "key",
+    "apis",
 }
 
 
@@ -295,6 +300,8 @@ def split_facet_candidates(text: str) -> list[str]:
 def normalize_facet(value: Any) -> str:
     text = clean_text(value).strip(" .,:;()[]{}")
     text = text.replace("‑", "-").replace("–", "-").replace("—", "-")
+    if re.fullmatch(r"(?:19|20)\d{2}", text):
+        return ""
     text = re.sub(r"^(?:the|a|an|of|to|in|for|with|without)\s+", "", text, flags=re.IGNORECASE)
     text = re.sub(
         r"\b(?:introduced|trade[- ]?offs?|trade\s+off|proposes?|proposed|compares?|compared|addresses?|addressed|"
@@ -313,6 +320,10 @@ def normalize_facet(value: Any) -> str:
             continue
         tokens.append(cleaned)
     if tokens == ["attention"]:
+        return ""
+    if len(tokens) >= 2 and tokens[-1].lower() == "attention" and any("attention" in token.lower() for token in tokens[:-1]):
+        tokens = tokens[:-1]
+    if not tokens:
         return ""
     if len(tokens) == 1 and (len(tokens[0]) < 3 or tokens[0].lower() in COVERAGE_FACET_STOPWORDS):
         return ""
