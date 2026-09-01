@@ -73,7 +73,7 @@ DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
 DEFAULT_GAP_QUERY_MODEL = "qwen/qwen3.6-27b"
 DEFAULT_MAX_CONTEXT_CHARS = 12000
 DEFAULT_MAX_TOKENS = 900
-DEFAULT_REPORT_MAX_TOKENS = 1400
+DEFAULT_REPORT_MAX_TOKENS = 900
 DEFAULT_REPORT_TOP_K = 20
 DEFAULT_REPORT_PER_QUERY_K = 25
 DEFAULT_REPORT_SEMANTIC_WEIGHT = 0.30
@@ -82,6 +82,8 @@ DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.40
 DEFAULT_CONTEXT_BLOCK_CHARS = 750
 DEFAULT_REPORT_SOURCE_URL_K = 2
 DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
+DEFAULT_SYNTHESIS_MAX_PROMPT_CHARS = 22000
+DEFAULT_SYNTHESIS_MIN_CONTEXT_CHARS = 2500
 DEFAULT_BROWSER_SIGNAL_SOURCES = 6
 DEFAULT_BROWSER_SIGNAL_SNIPPETS = 2
 DEFAULT_BROWSER_SIGNAL_CANDIDATES = 40
@@ -1400,7 +1402,7 @@ def synthesize_context_for_report(
     quality_trace = []
 
     for attempt in range(3):
-        context_budget = max(8000, int(max_context_chars * (0.70 ** attempt)))
+        context_budget = max(synthesis_min_context_chars(), int(max_context_chars * (0.70 ** attempt)))
         token_budget = max(700, int(max_tokens * (0.80 ** attempt)))
         context_text, sources = build_generation_context(retrieved_context, max_context_chars=context_budget)
         evidence_packs = build_sub_question_evidence_packs(
@@ -1469,6 +1471,7 @@ Never use citation formats like 【1】, 【1†L1-L4】, footnotes, or URLs inl
 If a requested equation, number, API detail, or definition is not explicitly present in the retrieved context, mark it as missing evidence and tell the report agent not to add it.
 Before finishing, check the Instruction Coverage Checklist against the Recommended Report Structure so requested items are not silently dropped.
 Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations that are not present in the retrieved context."""
+        prompt = trim_synthesis_prompt(prompt, max_chars=synthesis_prompt_char_budget())
 
         try:
             emit_progress(
@@ -1476,7 +1479,7 @@ Do not invent source names, authors, dates, titles, papers, benchmark numbers, e
                 "Synthesis calling Groq to create report context",
                 agent="synthesis",
                 tool="groq",
-                metadata={"model": rag_generation_model(model), "attempt": attempt + 1},
+                metadata={"model": rag_generation_model(model), "attempt": attempt + 1, "prompt_chars": len(prompt)},
             )
             response = create_chat_completion_with_retries(
                 client,
@@ -2295,6 +2298,63 @@ def build_source_priority_guidance(sources: Sequence[dict[str, Any]]) -> str:
         lines.append("Secondary/background candidates:")
         lines.extend(f"- {item}" for item in secondary[:8])
     return "\n".join(lines)
+
+
+def synthesis_prompt_char_budget() -> int:
+    try:
+        value = int(os.environ.get("RAG_SYNTHESIS_MAX_PROMPT_CHARS", DEFAULT_SYNTHESIS_MAX_PROMPT_CHARS))
+    except (TypeError, ValueError):
+        value = DEFAULT_SYNTHESIS_MAX_PROMPT_CHARS
+    return max(8000, value)
+
+
+def synthesis_min_context_chars() -> int:
+    try:
+        value = int(os.environ.get("RAG_SYNTHESIS_MIN_CONTEXT_CHARS", DEFAULT_SYNTHESIS_MIN_CONTEXT_CHARS))
+    except (TypeError, ValueError):
+        value = DEFAULT_SYNTHESIS_MIN_CONTEXT_CHARS
+    return max(1000, value)
+
+
+def trim_synthesis_prompt(prompt: str, max_chars: int) -> str:
+    """Keep synthesis prompts below provider TPM limits while preserving final instructions."""
+
+    if len(prompt) <= max_chars:
+        return prompt
+    original_chars = len(prompt)
+    prompt = trim_prompt_section(
+        prompt,
+        start_marker="Per-question evidence packs:\n",
+        end_marker="\n\nRetrieved context from multiple sources:",
+        max_section_chars=max(2500, max_chars // 3),
+    )
+    if len(prompt) > max_chars:
+        prompt = trim_prompt_section(
+            prompt,
+            start_marker="Retrieved context from multiple sources:\n",
+            end_marker="\n\nCreate a detailed report-agent-ready evidence package",
+            max_section_chars=max(synthesis_min_context_chars(), max_chars - len(prompt) + max_chars // 2),
+        )
+    if len(prompt) > max_chars:
+        prompt = prompt[: max_chars - 3000].rstrip() + "\n\n[Prompt trimmed to fit synthesis token budget.]\n\n" + prompt[-2800:]
+    if len(prompt) < original_chars:
+        print(f"[synthesis] trimmed prompt from {original_chars} to {len(prompt)} chars")
+    return prompt
+
+
+def trim_prompt_section(prompt: str, start_marker: str, end_marker: str, max_section_chars: int) -> str:
+    start = prompt.find(start_marker)
+    if start < 0:
+        return prompt
+    content_start = start + len(start_marker)
+    end = prompt.find(end_marker, content_start)
+    if end < 0:
+        return prompt
+    section = prompt[content_start:end].strip()
+    if len(section) <= max_section_chars:
+        return prompt
+    trimmed = section[:max_section_chars].rstrip()
+    return f"{prompt[:content_start]}{trimmed}\n\n[Section trimmed to fit synthesis token budget.]{prompt[end:]}"
 
 
 def primary_source_url_like(url: str) -> bool:
