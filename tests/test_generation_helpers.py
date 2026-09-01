@@ -29,7 +29,7 @@ from src.rag.generation import (
     trim_synthesis_prompt,
 )
 from src.rag.evidence_spans import supporting_chunks_from_evidence_spans
-from src.rag.query_helpers import broad_query_hints, retrieval_topic_phrase
+from src.rag.query_helpers import broad_query_hints, question_required_facets, retrieval_topic_phrase
 from src.rag.sub_question_context import (
     browser_question_context_retrieve,
     clean_retrieval_query,
@@ -236,6 +236,56 @@ class GenerationHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(packs[0]["chunks"][0]["id"], "alpha-method")
+
+    def test_evidence_pack_ignores_generic_date_facets_when_exact_evidence_exists(self):
+        question = "What are the core equations governing the original method introduced by AlphaMethod et al. (2020)?"
+        results = [
+            RetrievalResult(
+                id="alpha-equation",
+                document="AlphaMethod defines the score function as a(x,y)=softmax(score(x,y)), where x and y are model states. " * 3,
+                metadata={"title": "AlphaMethod paper", "url": "https://example.org/alpha-method", "source_type": "paper"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 1, "id": "alpha-equation", "url": "https://example.org/alpha-method"}]
+
+        packs = build_sub_question_evidence_packs([question], results, sources)
+        coverage = build_coverage_by_question(
+            f"{question}\nThe equation is covered [1].",
+            [{"question_id": "q001", "question": question, "required_evidence": ["equation"]}],
+            sources,
+            evidence_packs=packs,
+        )
+
+        self.assertNotIn("2020", question_required_facets(question))
+        self.assertEqual(packs[0]["coverage"], "covered")
+        self.assertEqual(coverage[0]["status"], "covered")
+        self.assertFalse(coverage[0]["missing_reason"])
+
+    def test_evidence_pack_uses_chunk_level_signal_for_compound_equation_facets(self):
+        question = "What are the equations for Alpha attention and Beta attention?"
+        results = [
+            RetrievalResult(
+                id="compound-equations",
+                document=(
+                    "Alpha attention and Beta attention are related mechanisms. "
+                    "The shared formulation is y = softmax(QK^T / sqrt(d)) V with learned projections. "
+                )
+                * 3,
+                metadata={"title": "Compound equations", "url": "https://example.org/compound"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 1, "id": "compound-equations", "url": "https://example.org/compound"}]
+
+        packs = build_sub_question_evidence_packs([question], results, sources)
+
+        self.assertEqual(packs[0]["coverage"], "covered")
+        self.assertEqual(packs[0]["missing_facet_evidence"], [])
 
     def test_evidence_pack_does_not_mark_wrong_evidence_type_covered(self):
         results = [
