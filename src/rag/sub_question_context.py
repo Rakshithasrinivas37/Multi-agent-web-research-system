@@ -131,6 +131,7 @@ def hf_sub_question_query_model() -> str:
 
 def dedupe_near_duplicate_queries(
     queries: Sequence[str],
+    protected_terms: Sequence[str] | None = None,
     similarity_threshold: float = DEFAULT_NEAR_DUPLICATE_SIMILARITY,
 ) -> list[str]:
     """Drop queries that are token-reorderings or near-duplicates of an earlier query.
@@ -144,6 +145,8 @@ def dedupe_near_duplicate_queries(
 
     kept: list[str] = []
     kept_token_sets: list[set[str]] = []
+    kept_protected: list[set[str]] = []
+    protected = {clean_text(term).lower() for term in protected_terms or [] if clean_text(term)}
     for query in queries:
         text = clean_text(query)
         if not text:
@@ -152,17 +155,22 @@ def dedupe_near_duplicate_queries(
         if not tokens:
             continue
         is_duplicate = False
-        for existing_tokens in kept_token_sets:
+        current_protected = {term for term in protected if term in text.lower()}
+        for existing_index, existing_tokens in enumerate(kept_token_sets):
             union = len(tokens | existing_tokens)
             if union == 0:
                 continue
             overlap = len(tokens & existing_tokens)
             if (overlap / union) >= similarity_threshold:
+                existing_protected = kept_protected[existing_index]
+                if current_protected and current_protected != existing_protected:
+                    continue
                 is_duplicate = True
                 break
         if not is_duplicate:
             kept.append(text)
             kept_token_sets.append(tokens)
+            kept_protected.append({term for term in protected if term in text.lower()})
     return kept
 
 
@@ -212,7 +220,7 @@ def sub_question_retrieval_queries(
         variant_index += 1
 
     candidates = dedupe_preserve_order(variant for variant in variants if variant)
-    candidates = dedupe_near_duplicate_queries(candidates)
+    candidates = dedupe_near_duplicate_queries(candidates, protected_terms=facets)
     return candidates[: max(1, max_variants)]
 
 
@@ -1429,17 +1437,24 @@ def complete_sub_question_query_coverage(
     objective = clean_text(research_plan.get("objective"))
     tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
     clean_queries = dedupe_preserve_order(queries)
+    protected_terms = dedupe_preserve_order(
+        facet
+        for question in questions
+        for facet in [*question_required_facets(question), *question_named_terms(question)]
+        if clean_text(facet)
+    )
     grouped = []
     used = set()
     min_variants = min(max(1, max_variants), 2)
     for question in questions:
+        question_protected_terms = [*question_required_facets(question), *question_named_terms(question)]
         question_queries = [
             query for query in clean_queries
             if query not in used and query_matches_sub_question(question, query)
         ]
         # Drop near-duplicate LLM queries within this sub-question's own group
         # before deciding whether fallback templates are still needed.
-        question_queries = dedupe_near_duplicate_queries(question_queries)[: max(1, max_variants)]
+        question_queries = dedupe_near_duplicate_queries(question_queries, protected_terms=question_protected_terms)[: max(1, max_variants)]
         used.update(question_queries)
         fallback_queries = sub_question_retrieval_queries(
             question,
@@ -1452,7 +1467,7 @@ def complete_sub_question_query_coverage(
             if len(question_queries) >= target_count:
                 break
             candidate_group = [*question_queries, query]
-            if dedupe_near_duplicate_queries(candidate_group) != candidate_group:
+            if dedupe_near_duplicate_queries(candidate_group, protected_terms=question_protected_terms) != candidate_group:
                 # The fallback query is a near-duplicate of one already in this
                 # group; skip it rather than pad the group with redundancy.
                 continue
@@ -1461,7 +1476,7 @@ def complete_sub_question_query_coverage(
         grouped.extend(question_queries[: max(1, max_variants)])
 
     max_queries = max(1, len(questions) * max(1, max_variants))
-    return dedupe_near_duplicate_queries(dedupe_preserve_order(grouped))[:max_queries]
+    return dedupe_near_duplicate_queries(dedupe_preserve_order(grouped), protected_terms=protected_terms)[:max_queries]
 
 
 def query_list_covers_sub_question(question: str, queries: Sequence[str]) -> bool:
@@ -1474,7 +1489,19 @@ def query_matches_sub_question(question: str, query: str) -> bool:
     if named_terms and not any(term_matches_query(term, query_terms, query) for term in named_terms):
         return False
 
-    ignored_terms = COVERAGE_GENERIC_TERMS | COVERAGE_EVIDENCE_TERMS | {"attention", "method", "methods", "topic", "topics"}
+    ignored_terms = COVERAGE_GENERIC_TERMS | COVERAGE_EVIDENCE_TERMS | {
+        "attention",
+        "demonstrate",
+        "demonstrates",
+        "method",
+        "methods",
+        "report",
+        "reports",
+        "show",
+        "shows",
+        "topic",
+        "topics",
+    }
     topic_terms = [term for term in query_keywords(question, limit=8) if term.lower() not in ignored_terms]
     normalized = {term.lower().replace("‑", "-").replace("–", "-") for term in topic_terms}
     evidence_terms = {
