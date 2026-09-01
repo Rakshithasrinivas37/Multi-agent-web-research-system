@@ -227,7 +227,7 @@ def query_evidence_terms(
     term_map = {
         "api": ["official documentation", "api signature", "parameters", "usage"],
         "applications": ["applications", "use cases", "tasks"],
-        "benchmark": ["benchmark", "results", "scores", "metrics"],
+        "benchmark": ["benchmark", "metrics", "results", "scores"],
         "comparison": ["comparison", "differences", "tradeoffs"],
         "complexity": ["complexity", "runtime", "memory", "scaling"],
         "definition": ["definition", "purpose"],
@@ -1204,7 +1204,7 @@ STYLE REQUIREMENTS:
 - Write compact keyword-style queries as noun phrases, not full sentences or questions.
 - Do not copy instruction words into queries: no "extract", "source-backed", "authoritative", "evidence gives", "source context", or "answering".
 - Do not start queries with "what", "which", "where", "how", or phrases like "source-backed context", "which evidence gives", or "authoritative sources discuss".
-- For each sub-question, aim for complementary angles: one broad concept query, one exact-evidence query (equation/benchmark/api as applicable), and one source- or facet-targeted query naming a specific method, dataset, framework, or metric when the sub-question mentions more than one.
+- For each sub-question, aim for complementary angles: one broad concept query, one exact-evidence query (equation/benchmark/api as applicable), and one source-targeted query or facet-targeted query naming a specific method, dataset, framework, or metric when the sub-question mentions more than one.
 - For compound/list questions, split named facets across separate queries instead of naming all of them in every query.
 - Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, and aliases from the planner/task details — these count toward the "new information per query" requirement.
 - Prefer noun phrases that work for both semantic search and BM25 keyword search.

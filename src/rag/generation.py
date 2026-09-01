@@ -84,6 +84,8 @@ DEFAULT_REPORT_SOURCE_URL_K = 2
 DEFAULT_REPORT_SUPPORTING_CHUNKS = 6
 DEFAULT_SYNTHESIS_MAX_PROMPT_CHARS = 22000
 DEFAULT_SYNTHESIS_MIN_CONTEXT_CHARS = 2500
+DEFAULT_SYNTHESIS_EVIDENCE_SPANS_PER_QUESTION = 2
+DEFAULT_SYNTHESIS_EVIDENCE_CHUNKS_PER_QUESTION = 1
 DEFAULT_BROWSER_SIGNAL_SOURCES = 6
 DEFAULT_BROWSER_SIGNAL_SNIPPETS = 2
 DEFAULT_BROWSER_SIGNAL_CANDIDATES = 40
@@ -1404,7 +1406,11 @@ def synthesize_context_for_report(
     for attempt in range(3):
         context_budget = max(synthesis_min_context_chars(), int(max_context_chars * (0.70 ** attempt)))
         token_budget = max(700, int(max_tokens * (0.80 ** attempt)))
-        context_text, sources = build_generation_context(retrieved_context, max_context_chars=context_budget)
+        context_text, sources = build_generation_context(
+            retrieved_context,
+            max_context_chars=context_budget,
+            planner_questions=planner_questions or [],
+        )
         evidence_packs = build_sub_question_evidence_packs(
             planner_questions or [],
             retrieved_context,
@@ -1429,7 +1435,11 @@ Source priority guidance:
 {source_priority_guidance}
 
 Per-question evidence packs:
-{format_evidence_packs_for_prompt(evidence_packs)}
+{format_evidence_packs_for_prompt(
+    evidence_packs,
+    max_spans_per_question=synthesis_evidence_spans_per_question(),
+    max_chunks_per_question=synthesis_evidence_chunks_per_question(),
+)}
 
 Retrieved context from multiple sources:
 {context_text}
@@ -2020,6 +2030,7 @@ def is_request_too_large_error(error: Exception) -> bool:
 def build_generation_context(
     retrieved_context: Sequence[RetrievalResult],
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+    planner_questions: Sequence[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Convert retrieved chunks into compact numbered context blocks.
 
@@ -2031,7 +2042,7 @@ def build_generation_context(
     source_by_key: dict[str, dict[str, Any]] = {}
     used_chars = 0
     max_context_chars = max(1000, max_context_chars)
-    ordered_results = source_balanced_results(retrieved_context)
+    ordered_results = question_balanced_results(retrieved_context, planner_questions or [])
     block_char_limit = context_block_char_limit(ordered_results, max_context_chars)
 
     for retrieval_rank, result in enumerate(ordered_results, start=1):
@@ -2074,6 +2085,48 @@ def build_generation_context(
         used_chars += len(block)
 
     return "\n\n".join(blocks), sources
+
+
+def question_balanced_results(
+    retrieved_context: Sequence[RetrievalResult],
+    planner_questions: Sequence[str],
+) -> list[RetrievalResult]:
+    """Round-robin chunks by planner question before source balancing."""
+
+    if not planner_questions:
+        return source_balanced_results(retrieved_context)
+
+    question_order = [question_key(question) for question in planner_questions if clean_text(question)]
+    groups = {key: [] for key in question_order}
+    unassigned = []
+    for result in retrieved_context:
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        key = question_key(metadata.get("synthesis_question"))
+        if key in groups:
+            groups[key].append(result)
+        else:
+            unassigned.append(result)
+
+    ordered = []
+    seen = set()
+    balanced_groups = {key: source_balanced_results(items) for key, items in groups.items()}
+    while any(balanced_groups.values()):
+        for key in question_order:
+            items = balanced_groups.get(key) or []
+            if not items:
+                continue
+            result = items.pop(0)
+            result_key = retrieval_result_key(result)
+            if result_key not in seen:
+                ordered.append(result)
+                seen.add(result_key)
+
+    for result in source_balanced_results(unassigned):
+        result_key = retrieval_result_key(result)
+        if result_key not in seen:
+            ordered.append(result)
+            seen.add(result_key)
+    return ordered
 
 
 def source_url_key(url: Any) -> str:
@@ -2316,6 +2369,22 @@ def synthesis_min_context_chars() -> int:
     return max(1000, value)
 
 
+def synthesis_evidence_spans_per_question() -> int:
+    try:
+        value = int(os.environ.get("RAG_SYNTHESIS_EVIDENCE_SPANS_PER_QUESTION", DEFAULT_SYNTHESIS_EVIDENCE_SPANS_PER_QUESTION))
+    except (TypeError, ValueError):
+        value = DEFAULT_SYNTHESIS_EVIDENCE_SPANS_PER_QUESTION
+    return max(0, value)
+
+
+def synthesis_evidence_chunks_per_question() -> int:
+    try:
+        value = int(os.environ.get("RAG_SYNTHESIS_EVIDENCE_CHUNKS_PER_QUESTION", DEFAULT_SYNTHESIS_EVIDENCE_CHUNKS_PER_QUESTION))
+    except (TypeError, ValueError):
+        value = DEFAULT_SYNTHESIS_EVIDENCE_CHUNKS_PER_QUESTION
+    return max(0, value)
+
+
 def trim_synthesis_prompt(prompt: str, max_chars: int) -> str:
     """Keep synthesis prompts below provider TPM limits while preserving final instructions."""
 
@@ -2510,9 +2579,15 @@ def chunk_matches_source_urls(chunk: dict[str, Any], urls: Sequence[str]) -> boo
     return bool(target_urls & set(chunk_urls))
 
 
-def format_evidence_packs_for_prompt(evidence_packs: Sequence[dict[str, Any]]) -> str:
+def format_evidence_packs_for_prompt(
+    evidence_packs: Sequence[dict[str, Any]],
+    max_spans_per_question: int | None = None,
+    max_chunks_per_question: int | None = None,
+) -> str:
     if not evidence_packs:
         return "- No per-question evidence packs were built."
+    span_limit = DEFAULT_EVIDENCE_SPANS_PER_QUESTION if max_spans_per_question is None else max(0, max_spans_per_question)
+    chunk_limit = None if max_chunks_per_question is None else max(0, max_chunks_per_question)
     lines = []
     for pack in evidence_packs:
         question = clean_text(pack.get("question")) if isinstance(pack, dict) else ""
@@ -2527,13 +2602,15 @@ def format_evidence_packs_for_prompt(evidence_packs: Sequence[dict[str, Any]]) -
         detail_text = f"; {'; '.join(details)}" if details else ""
         lines.append(f"- {question} ({coverage}{detail_text})")
         spans = pack.get("evidence_spans", []) if isinstance(pack, dict) else []
-        for span in [item for item in spans if isinstance(item, dict)][:DEFAULT_EVIDENCE_SPANS_PER_QUESTION]:
+        for span in [item for item in spans if isinstance(item, dict)][:span_limit]:
             marker = f"[{span.get('source_index')}]" if isinstance(span.get("source_index"), int) else "[source]"
             evidence_type = clean_text(span.get("evidence_type")) or "evidence"
             text = clean_text(span.get("text"))
             if text:
                 lines.append(f"  - Evidence span ({evidence_type}) {marker}: {text}")
-        for chunk in (pack.get("chunks", []) if isinstance(pack, dict) else []):
+        chunks = pack.get("chunks", []) if isinstance(pack, dict) else []
+        selected_chunks = chunks if chunk_limit is None else chunks[:chunk_limit]
+        for chunk in selected_chunks:
             marker = f"[{chunk.get('source_index')}]"
             title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Retrieved chunk"
             content = clean_text(chunk.get("content"))
