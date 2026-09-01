@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from src.rag.indexing import (
     clean_document_text,
@@ -12,6 +13,7 @@ from src.rag.indexing import (
     split_document,
     structure_aware_chunks,
     strip_parent_content_metadata,
+    upsert_collection_batches,
     upsert_parent_chunks,
 )
 from src.rag.retrieval import RetrievalResult, expand_parent_context_results, metadata_signal_score
@@ -251,6 +253,27 @@ The table above should stay intact.
         self.assertEqual(records[0].source_quality, "useful_authoritative")
         self.assertEqual(records[0].source_authority, "authoritative")
         self.assertEqual(records[0].content_noise_score, 0.1)
+
+    def test_upsert_collection_batches_retries_cuda_oom_with_smaller_batch(self):
+        class OomOnceCollection:
+            def __init__(self):
+                self.calls = []
+
+            def upsert(self, ids, documents, metadatas):
+                self.calls.append(list(ids))
+                if len(ids) > 1:
+                    raise RuntimeError("CUDA out of memory")
+
+        collection = OomOnceCollection()
+        ids = ["a", "b", "c"]
+        documents = ["A", "B", "C"]
+        metadatas = [{"i": 1}, {"i": 2}, {"i": 3}]
+
+        with patch.dict("os.environ", {"RAG_CHROMA_UPSERT_BATCH_SIZE": "8"}):
+            count = upsert_collection_batches(collection, ids, documents, metadatas)
+
+        self.assertEqual(count, 3)
+        self.assertEqual(collection.calls, [["a", "b", "c"], ["a"], ["b"], ["c"]])
 
 
 if __name__ == "__main__":
