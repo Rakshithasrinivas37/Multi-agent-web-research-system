@@ -26,6 +26,7 @@ from src.rag.generation import (
     select_synthesis_context,
     synthesize_context_for_report,
     synthesis_quality_issues,
+    trim_synthesis_prompt,
 )
 from src.rag.evidence_spans import supporting_chunks_from_evidence_spans
 from src.rag.query_helpers import broad_query_hints, retrieval_topic_phrase
@@ -794,6 +795,24 @@ Missing Evidence: exact benchmark values are not present.
         )
 
         self.assertEqual(query, "known limitations challenges attention mechanisms")
+
+    def test_trim_synthesis_prompt_preserves_final_instructions(self):
+        prompt = (
+            "Research objective:\nX\n\n"
+            "Per-question evidence packs:\n"
+            + ("evidence pack detail. " * 500)
+            + "\n\nRetrieved context from multiple sources:\n"
+            + ("retrieved source chunk. " * 800)
+            + "\n\nCreate a detailed report-agent-ready evidence package\n"
+            "Do not invent source names, authors, dates, titles, papers, benchmark numbers, equations, or citations."
+        )
+
+        trimmed = trim_synthesis_prompt(prompt, max_chars=8000)
+
+        self.assertLessEqual(len(trimmed), 8000)
+        self.assertIn("Create a detailed report-agent-ready evidence package", trimmed)
+        self.assertIn("Do not invent source names", trimmed)
+        self.assertIn("Section trimmed to fit synthesis token budget", trimmed)
 
     def test_retrieval_topic_phrase_removes_question_filler(self):
         phrase = retrieval_topic_phrase(
