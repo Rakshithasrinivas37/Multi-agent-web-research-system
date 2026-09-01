@@ -42,9 +42,23 @@ DEFAULT_CONTEXT_BLOCK_CHARS = 750
 DEFAULT_PRECISION_QUERY_LIMIT = 8
 DEFAULT_HF_QUERY_MAX_INPUT_TOKENS = 4096
 DEFAULT_HF_QUERY_MAX_NEW_TOKENS = 900
-DEFAULT_QUERY_MAX_WORDS = 14
+DEFAULT_QUERY_MAX_WORDS = 10
 DEFAULT_EVIDENCE_TAIL_TERMS = 2
-DEFAULT_NEAR_DUPLICATE_SIMILARITY = 0.72
+DEFAULT_NEAR_DUPLICATE_SIMILARITY = 0.58
+QUERY_FILLER_PHRASES = (
+    r"\bhave\s+been\s+proposed\b",
+    r"\bhave\s+proposed\b",
+    r"\bhas\s+been\s+proposed\b",
+    r"\bsuch\s+as\b",
+    r"\bstandard\s+implementations?\b",
+    r"\bmajor\s+(?:deep[\s-]?learning\s+)?frameworks?\b",
+    r"\bsolutions?\s+(?:have|has)\b",
+    r"\bmechanisms?\s+differ\b",
+    r"\bdiffer\s+(?:from\s+each\s+other)?\b",
+    r"\bdemonstrate\s+(?:its\s+)?effectiveness\b",
+    r"\bkey\s+contributions?\b",
+    r"\bcomputational\s+challenges?\b",
+)
 GENERIC_QUERY_PHRASES = (
     r"\boverview evidence definition concept\b",
     r"\bevidence details examples equations benchmarks limitations\b",
@@ -255,6 +269,9 @@ def clean_retrieval_query(query: str, max_words: int = DEFAULT_QUERY_MAX_WORDS) 
     text = re.sub(r"^(?:what|which|where|how)\s+(?:is|are|does|do|did|can|should|has|have)?\s*", "", text, flags=re.IGNORECASE)
     for phrase in GENERIC_QUERY_PHRASES:
         text = re.sub(phrase, " ", text, flags=re.IGNORECASE)
+    for phrase in QUERY_FILLER_PHRASES:
+        text = re.sub(phrase, " ", text, flags=re.IGNORECASE)
+    text = clean_text(text)
     tokens = []
     seen = set()
     for token in re.findall(r"https?://[^\s]+|[A-Za-z0-9_+#./-]+", text):
@@ -1194,10 +1211,12 @@ Planner sub-questions and optional task details:
 Rewrite each planner sub-question into 2-3 compact, high-recall RAG search queries.
 
 HARD REQUIREMENTS (a query that violates any of these is invalid):
-- Length: every query MUST be 5-10 words. Never write 11+ words. Do not pad a query to hit a target length.
+- Length: every query MUST be 5-10 words. Count the words before writing the next query. If a query would need 11+ words to include everything, cut connective/filler words (e.g. "have been proposed", "such as", "standard implementations", "major frameworks", "demonstrate its effectiveness") rather than shortening the named entities.
 - Distinctness: within one sub-question's group of 2-3 queries, no two queries may share more than half their words, even in a different order or with one word substituted. Reordered or lightly-reworded duplicates are treated as failures, not variety. Before finalizing, check each pair of queries in a group and rewrite any pair that overlaps too much.
+- Alias collapsing: if a sub-question lists two or more names for the same technique (e.g. "additive/Bahdanau attention", "multiplicative/Luong attention"), generate ONE query per distinct technique that includes both names together, not one query per name. Do not treat aliases of the same method as separate query topics.
 - Evidence tail: append AT MOST 2 evidence-intent words per query (choose from: definition, equation, formula, benchmark, results, comparison, complexity, limitations, api, implementation, applications). Never stack 3+ of these onto one query, and never use the same 2-word tail on more than one query in the same group.
 - New information per query: each query in a group must introduce at least one element the other queries in that group do not have — a different named method/paper/framework/dataset, a different facet of the sub-question, or a different evidence angle. If you cannot think of a genuinely different angle, write fewer queries for that sub-question rather than padding with a near-duplicate.
+- No connective filler: never include phrases like "have been proposed", "has been proposed", "such as", "standard implementations", "major frameworks", "demonstrate its effectiveness", "key contributions", "computational challenges", or similar sentence glue. Use only content words: named entities, technical terms, and at most 2 evidence-intent words.
 
 STYLE REQUIREMENTS:
 - Base each query on the actual planner sub-question topic and named entities. Task details may add source names, URLs, APIs, datasets, metrics, or paper titles only when they match that sub-question.
@@ -1211,11 +1230,13 @@ STYLE REQUIREMENTS:
 - Do not answer the question and do not add citations, reasoning, or <think> text.
 - Never output placeholder labels or generic query names.
 
-SELF-CHECK before returning: for every sub-question's query group, confirm (a) each query is 5-10 words, (b) no two queries in the group share more than half their words, (c) each query has a distinct evidence tail or none at all, (d) each query names something the others don't.
+SELF-CHECK before returning: for every sub-question's query group, count the words in each query and confirm (a) each query is 5-10 words — if not, cut filler words and recount, (b) no two queries in the group share more than half their words, (c) each query has at most 2 evidence-intent words, (d) each query names something the others don't, (e) no two queries cover aliases of the same named technique.
 
-GOOD (5-10 words, distinct angles): "additive attention Bahdanau alignment formula"; "scaled dot-product attention softmax normalization"; "multi-head attention PyTorch nn.MultiheadAttention parameters"
+GOOD (5-10 words, distinct angles, no filler): "additive Bahdanau attention alignment formula"; "scaled dot-product attention softmax normalization"; "multi-head attention PyTorch nn.MultiheadAttention parameters"
 BAD (reordered near-duplicates): "attention mechanism definition mathematical formulation equation"; "definition mathematical formulation attention mechanism equation" — these are the same query and must never both appear.
 BAD (evidence tail overload): "attention mechanism definition purpose equation formula variables components" — 6 evidence words is too many; pick at most 2.
+BAD (alias split): "additive attention alignment formula" and "Bahdanau attention alignment formula" as two separate queries — additive attention and Bahdanau attention are the same technique; merge into one query naming both: "additive Bahdanau attention alignment formula".
+BAD (filler padding, 12 words): "Linformer attention mechanism limitations computational challenges solutions have been proposed complexity" — strip the filler to get "Linformer efficient attention linear complexity approximation" (7 words).
 
 Return JSON only in this shape:
 {{"items":[{{"sub_question":"...","queries":["named topic exact evidence terms","named facet comparison terms"]}}]}}"""
