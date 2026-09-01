@@ -506,6 +506,37 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(context.count("[1] Shared Source"), 2)
         self.assertEqual({chunk["source_index"] for chunk in chunks}, {1})
 
+    def test_build_generation_context_balances_planner_questions(self):
+        results = [
+            RetrievalResult(
+                id=f"alpha-{index}",
+                document="Alpha question evidence with enough detail. " * 5,
+                metadata={"title": f"Alpha {index}", "url": f"https://example.com/a{index}", "synthesis_question": "What is alpha?"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+            for index in range(4)
+        ] + [
+            RetrievalResult(
+                id="beta-1",
+                document="Beta question evidence with enough detail. " * 5,
+                metadata={"title": "Beta", "url": "https://example.com/b", "synthesis_question": "What is beta?"},
+                score=0.8,
+                semantic_score=0.8,
+                bm25_score=0.0,
+            )
+        ]
+
+        context, _sources = build_generation_context(
+            results,
+            max_context_chars=1800,
+            planner_questions=["What is alpha?", "What is beta?"],
+        )
+
+        self.assertIn("Alpha", context)
+        self.assertIn("Beta", context)
+
     def test_compact_retrieved_chunks_keeps_full_content_when_uncapped(self):
         tail = "critical evidence at the end"
         results = [
@@ -813,6 +844,30 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("Create a detailed report-agent-ready evidence package", trimmed)
         self.assertIn("Do not invent source names", trimmed)
         self.assertIn("Section trimmed to fit synthesis token budget", trimmed)
+
+    def test_format_evidence_packs_for_prompt_can_compact_per_question(self):
+        packs = [
+            {
+                "question": "What is alpha?",
+                "coverage": "strong",
+                "evidence_spans": [
+                    {"source_index": 1, "evidence_type": "definition", "text": "First span"},
+                    {"source_index": 2, "evidence_type": "equation", "text": "Second span"},
+                ],
+                "chunks": [
+                    {"source_index": 1, "title": "One", "content": "First chunk"},
+                    {"source_index": 2, "title": "Two", "content": "Second chunk"},
+                ],
+            }
+        ]
+
+        text = format_evidence_packs_for_prompt(packs, max_spans_per_question=1, max_chunks_per_question=1)
+
+        self.assertIn("What is alpha?", text)
+        self.assertIn("First span", text)
+        self.assertIn("First chunk", text)
+        self.assertNotIn("Second span", text)
+        self.assertNotIn("Second chunk", text)
 
     def test_retrieval_topic_phrase_removes_question_filler(self):
         phrase = retrieval_topic_phrase(
