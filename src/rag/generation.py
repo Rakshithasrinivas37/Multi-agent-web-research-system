@@ -611,7 +611,7 @@ def coverage_matches_for_question(
     for result in retrieved_context:
         metadata = result.metadata if isinstance(result.metadata, dict) else {}
         url = primary_source_url(metadata)
-        source_index = source_index_by_id.get(result.id) or source_index_by_url.get(source_url_key(url))
+        source_index = citation_index_for_result(result, source_index_by_id, source_index_by_url)
         if source_index is None:
             continue
         title = clean_text(metadata.get("title")) or url
@@ -2487,7 +2487,7 @@ def compact_retrieved_chunks(
             continue
         chunks.append(
             {
-                "source_index": source_index_by_id.get(result.id) or source_index_by_url.get(source_url_key(url)),
+                "source_index": citation_index_for_result(result, source_index_by_id, source_index_by_url),
                 "retrieval_rank": rank,
                 "id": result.id,
                 "url": url,
@@ -2736,10 +2736,30 @@ def citation_index_by_source_url(sources: Sequence[dict[str, Any]]) -> dict[str,
         if not isinstance(source, dict):
             continue
         index = source.get("index")
-        key = source_url_key(source.get("url"))
-        if key and isinstance(index, int):
-            indexes[key] = index
+        if not isinstance(index, int):
+            continue
+        for url in result_source_urls_from_metadata(source):
+            key = source_url_key(url)
+            if key:
+                indexes[key] = index
     return indexes
+
+
+def citation_index_for_result(
+    result: RetrievalResult,
+    source_index_by_id: dict[str, int],
+    source_index_by_url: dict[str, int],
+) -> int | None:
+    """Find a citation source index for a chunk using all known metadata URLs."""
+
+    direct = source_index_by_id.get(result.id)
+    if direct is not None:
+        return direct
+    for url in result_source_urls_from_metadata(result.metadata):
+        index = source_index_by_url.get(source_url_key(url))
+        if index is not None:
+            return index
+    return None
 
 
 def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[RetrievalResult]) -> dict[str, Any]:
