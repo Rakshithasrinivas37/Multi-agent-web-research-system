@@ -59,6 +59,32 @@ SPECIAL_SIGNAL_PATTERN = re.compile(
     r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}"
     r")"
 )
+STORAGE_TEXT_REPLACEMENTS = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+        "\u00a0": " ",
+        "\u202f": " ",
+        "\u2211": "sum",
+        "\u221a": "sqrt",
+        "\u2264": "<=",
+        "\u2265": ">=",
+        "\u2260": "!=",
+        "\u2248": "~=",
+        "\u00d7": "x",
+        "\u00b2": "^2",
+        "\u03b1": "alpha",
+        "\u03b2": "beta",
+        "\u03b3": "gamma",
+        "\u03bb": "lambda",
+        "\u03c3": "sigma",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -218,8 +244,8 @@ def upsert_collection_batches(
         try:
             collection.upsert(
                 ids=list(ids[index:end]),
-                documents=list(documents[index:end]),
-                metadatas=list(metadatas[index:end]),
+                documents=[storage_safe_text(document) for document in documents[index:end]],
+                metadatas=[clean_metadata(metadata) for metadata in metadatas[index:end]],
             )
             total += end - index
             index = end
@@ -1107,8 +1133,15 @@ def clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(value, float):
             clean[key] = value
         else:
-            clean[key] = clean_text(value)
+            clean[key] = storage_safe_text(value)
     return clean
+
+
+def storage_safe_text(value: Any) -> str:
+    """Normalize extracted text before handing it to storage/embedding clients."""
+
+    text = clean_text(value).translate(STORAGE_TEXT_REPLACEMENTS)
+    return text.encode("latin-1", errors="replace").decode("latin-1")
 
 
 def to_int(value: Any, default: int) -> int:
