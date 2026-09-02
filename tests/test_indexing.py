@@ -11,6 +11,7 @@ from src.rag.indexing import (
     parent_rows_from_documents,
     source_records,
     split_document,
+    storage_safe_text,
     structure_aware_chunks,
     strip_parent_content_metadata,
     upsert_collection_batches,
@@ -253,6 +254,38 @@ The table above should stay intact.
         self.assertEqual(records[0].source_quality, "useful_authoritative")
         self.assertEqual(records[0].source_authority, "authoritative")
         self.assertEqual(records[0].content_noise_score, 0.1)
+
+    def test_storage_safe_text_normalizes_smart_quotes_and_math(self):
+        text = storage_safe_text("\u201cAttention\u201d has O(n\u00b2) cost and alpha weights.")
+
+        self.assertEqual(text, '"Attention" has O(n^2) cost and alpha weights.')
+        text.encode("latin-1")
+
+    def test_upsert_collection_batches_sanitizes_documents_and_metadata(self):
+        class RecordingCollection:
+            def __init__(self):
+                self.documents = []
+                self.metadatas = []
+
+            def upsert(self, ids, documents, metadatas):
+                self.documents.extend(documents)
+                self.metadatas.extend(metadatas)
+
+        collection = RecordingCollection()
+
+        count = upsert_collection_batches(
+            collection,
+            ["smart"],
+            ['Source says \u201cattention\u201d has O(n\u00b2) cost.'],
+            [{"title": "\u201cQuoted title\u201d", "symbol": "\u2211 alpha"}],
+        )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(collection.documents[0], 'Source says "attention" has O(n^2) cost.')
+        self.assertEqual(collection.metadatas[0]["title"], '"Quoted title"')
+        self.assertEqual(collection.metadatas[0]["symbol"], "sum alpha")
+        collection.documents[0].encode("latin-1")
+        collection.metadatas[0]["title"].encode("latin-1")
 
     def test_upsert_collection_batches_retries_cuda_oom_with_smaller_batch(self):
         class OomOnceCollection:
