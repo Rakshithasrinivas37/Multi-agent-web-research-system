@@ -1,4 +1,6 @@
 import unittest
+import sys
+import types
 from contextlib import redirect_stdout
 from io import StringIO
 from unittest.mock import patch
@@ -35,6 +37,9 @@ from src.rag.sub_question_context import (
     clean_retrieval_query,
     complete_sub_question_query_coverage,
     facet_rescue_context_retrieve,
+    hf_sub_question_query_model,
+    hf_sub_question_retrieval_query_result,
+    hf_token,
     is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
     missing_facets_for_results,
@@ -598,6 +603,40 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(sources[0]["ids"], ["chunk-a", "chunk-b"])
         self.assertEqual(context.count("[1] Shared Source"), 2)
         self.assertEqual({chunk["source_index"] for chunk in chunks}, {1})
+
+    def test_compact_retrieved_chunks_maps_arxiv_abs_pdf_source_variants(self):
+        results = [
+            RetrievalResult(
+                id="bahdanau-chunk",
+                document="Bahdanau additive attention equation evidence with enough context. " * 4,
+                metadata={"title": "Bahdanau", "source_url": "https://arxiv.org/pdf/1409.0473"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 7, "url": "https://arxiv.org/abs/1409.0473", "title": "Bahdanau paper"}]
+
+        chunks = compact_retrieved_chunks(results, sources)
+
+        self.assertEqual(chunks[0]["source_index"], 7)
+
+    def test_compact_retrieved_chunks_maps_source_url_field(self):
+        results = [
+            RetrievalResult(
+                id="api-chunk",
+                document="Official API usage evidence with parameters and examples. " * 4,
+                metadata={"title": "API", "url": "https://docs.example.com/api"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 3, "source_url": "https://docs.example.com/api"}]
+
+        chunks = compact_retrieved_chunks(results, sources)
+
+        self.assertEqual(chunks[0]["source_index"], 3)
 
     def test_build_generation_context_balances_planner_questions(self):
         results = [
@@ -1209,6 +1248,101 @@ Missing Evidence: exact benchmark values are not present.
 
         self.assertEqual(result["model"], "qwen/qwen3.6-27b")
         self.assertEqual(result["error"], "GROQ_API_KEY is not set")
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_hf_sub_question_query_model_defaults_to_llama(self):
+        self.assertEqual(hf_sub_question_query_model(), "meta-llama/Llama-3.1-8B-Instruct")
+
+    @patch.dict("os.environ", {"HF_TOKEN": "hf-secret", "HUGGINGFACE_HUB_TOKEN": "hub-secret"}, clear=True)
+    def test_hf_token_prefers_hf_token(self):
+        self.assertEqual(hf_token(), "hf-secret")
+
+    @patch.dict(
+        "os.environ",
+        {
+            "RAG_SUBQUESTION_HF_MODEL": "meta-llama/Llama-3.1-8B-Instruct",
+            "RAG_SUBQUESTION_HF_DEVICE": "cpu",
+            "HF_TOKEN": "hf-secret",
+        },
+        clear=True,
+    )
+    def test_hf_sub_question_retrieval_query_result_passes_hf_token(self):
+        calls = {"tokenizer": None, "causal": None}
+
+        class FakeTensor:
+            def to(self, _device):
+                return self
+
+            @property
+            def shape(self):
+                return (1, 1)
+
+        class FakeTokenizer:
+            pad_token_id = 0
+            eos_token_id = 1
+
+            @classmethod
+            def from_pretrained(cls, model_name, **kwargs):
+                calls["tokenizer"] = (model_name, kwargs)
+                return cls()
+
+            def apply_chat_template(self, *_args, **_kwargs):
+                return "prompt"
+
+            def __call__(self, *_args, **_kwargs):
+                return {"input_ids": FakeTensor()}
+
+            def decode(self, *_args, **_kwargs):
+                return '{"items":[{"sub_question":"What is X?","queries":["x research overview"]}]}'
+
+        class FakeModel:
+            @classmethod
+            def from_pretrained(cls, model_name, **kwargs):
+                calls["causal"] = (model_name, kwargs)
+                return cls()
+
+            def to(self, _device):
+                return self
+
+            def eval(self):
+                return None
+
+            def generate(self, **_kwargs):
+                return [[0, 1]]
+
+        class FakeSeq2Seq(FakeModel):
+            pass
+
+        class FakeNoGrad:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *_args):
+                return False
+
+        fake_torch = types.SimpleNamespace(
+            float16="float16",
+            cuda=types.SimpleNamespace(is_available=lambda: False),
+            backends=types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: False)),
+            no_grad=lambda: FakeNoGrad(),
+        )
+        fake_transformers = types.SimpleNamespace(
+            AutoTokenizer=FakeTokenizer,
+            AutoModelForCausalLM=FakeModel,
+            AutoModelForSeq2SeqLM=FakeSeq2Seq,
+        )
+
+        with patch.dict(sys.modules, {"torch": fake_torch, "transformers": fake_transformers}):
+            result = hf_sub_question_retrieval_query_result(
+                {"objective": "X research", "sub_questions": ["What is X?"]},
+                max_variants=1,
+            )
+
+        self.assertEqual(result["provider"], "hf")
+        self.assertEqual(calls["tokenizer"][0], "meta-llama/Llama-3.1-8B-Instruct")
+        self.assertEqual(calls["tokenizer"][1]["token"], "hf-secret")
+        self.assertEqual(calls["causal"][1]["token"], "hf-secret")
+        self.assertTrue(result["queries"])
 
     @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SUBQUESTION_QUERY_MODEL": "llama-test", "RAG_QUERY_REWRITE_PROVIDER": "groq"}, clear=False)
     @patch("src.rag.sub_question_context.create_chat_completion_with_retries")

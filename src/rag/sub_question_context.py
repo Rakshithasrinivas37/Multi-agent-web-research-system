@@ -32,7 +32,7 @@ from src.tools.text_utils import clean_text
 
 
 DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL = "qwen/qwen3.6-27b"
-DEFAULT_SUBQUESTION_HF_QUERY_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_SUBQUESTION_HF_QUERY_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
 DEFAULT_SUBQUESTION_RETRIEVAL_MAX_WORKERS = 4
 DEFAULT_SUBQUESTION_RERANK_MAX_WORKERS = 2
@@ -141,6 +141,12 @@ def query_rewrite_provider() -> str:
 
 def hf_sub_question_query_model() -> str:
     return clean_model_name(os.environ.get("RAG_SUBQUESTION_HF_MODEL")) or DEFAULT_SUBQUESTION_HF_QUERY_MODEL
+
+
+def hf_token() -> str:
+    """Token used for gated/private Hugging Face query rewrite models."""
+
+    return clean_text(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN"))
 
 
 def dedupe_near_duplicate_queries(
@@ -1307,12 +1313,14 @@ def hf_sub_question_retrieval_query_result(
     tasks = [task for task in research_plan.get("tasks", []) if isinstance(task, dict)]
     prompt = sub_question_rewrite_prompt(objective, questions, tasks)
     device = hf_query_device(torch)
+    token = hf_token()
+    hf_load_kwargs = {"token": token} if token else {}
     tokenizer = None
     model_obj = None
     try:
-        tokenizer = AutoTokenizer.from_pretrained(selected_model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(selected_model, trust_remote_code=True, **hf_load_kwargs)
         model_cls = AutoModelForSeq2SeqLM if hf_query_model_is_seq2seq(selected_model) else AutoModelForCausalLM
-        model_kwargs = {"trust_remote_code": True}
+        model_kwargs = {"trust_remote_code": True, **hf_load_kwargs}
         if device == "cuda":
             model_kwargs["torch_dtype"] = torch.float16
         model_obj = model_cls.from_pretrained(selected_model, **model_kwargs)
