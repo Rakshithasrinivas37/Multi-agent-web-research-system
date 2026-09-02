@@ -519,13 +519,13 @@ def parent_rows_from_documents(documents: Sequence[Any]) -> list[dict[str, Any]]
         if not isinstance(metadata, dict):
             continue
         parent_id = clean_text(metadata.get("parent_id"))
-        parent_content = clean_text(metadata.get("parent_content"))
+        parent_content = storage_safe_text(metadata.get("parent_content"))
         if not parent_id or not parent_content:
             continue
         rows_by_id[parent_id] = {
             "parent_id": parent_id,
-            "history_key": clean_text(metadata.get("history_key")),
-            "url": clean_text(metadata.get("url")),
+            "history_key": storage_safe_text(metadata.get("history_key")),
+            "url": storage_safe_text(metadata.get("url")),
             "parent_index": to_int(metadata.get("parent_index"), 0),
             "token_count": to_int(metadata.get("parent_token_count"), token_count(parent_content)),
             "content_hash": hash_text(parent_content),
@@ -583,12 +583,12 @@ def upsert_parent_chunks(chroma_path: Union[str, Path], rows: Sequence[dict[str,
             [
                 (
                     clean_text(row.get("parent_id")),
-                    clean_text(row.get("history_key")),
-                    clean_text(row.get("url")),
+                    storage_safe_text(row.get("history_key")),
+                    storage_safe_text(row.get("url")),
                     to_int(row.get("parent_index"), 0),
                     to_int(row.get("token_count"), token_count(row.get("content"))),
-                    clean_text(row.get("content_hash")) or hash_text(clean_text(row.get("content"))),
-                    clean_text(row.get("content")),
+                    clean_text(row.get("content_hash")) or hash_text(storage_safe_text(row.get("content"))),
+                    storage_safe_text(row.get("content")),
                 )
                 for row in clean_rows
             ],
@@ -608,21 +608,21 @@ def parent_content_for_id(chroma_path: Union[str, Path], parent_id: str) -> str:
             ).fetchone()
     except sqlite3.Error:
         return ""
-    return clean_text(row[0]) if row else ""
+    return storage_safe_text(row[0]) if row else ""
 
 
 def best_parent_context(chunk: str, parent_chunks: Sequence[str]) -> tuple[int, str]:
     if not parent_chunks:
-        return 0, clean_text(chunk)
+        return 0, storage_safe_text(chunk)
     chunk_terms = set(TOKEN_PATTERN.findall(clean_text(chunk).lower()))
     if not chunk_terms:
-        return 0, clean_text(parent_chunks[0])
+        return 0, storage_safe_text(parent_chunks[0])
     scored = [
         (len(chunk_terms & set(TOKEN_PATTERN.findall(clean_text(parent).lower()))), index, parent)
         for index, parent in enumerate(parent_chunks)
     ]
     _, index, parent = max(scored, key=lambda item: (item[0], -item[1]))
-    return index, clean_text(parent)
+    return index, storage_safe_text(parent)
 
 
 def clean_document_text(text: Any) -> str:
@@ -645,7 +645,7 @@ def clean_document_text(text: Any) -> str:
         lines.append(line)
     cleaned = "\n".join(lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    return storage_safe_text(cleaned.strip())
 
 
 def should_drop_noise_line(line: str, normalized: str, seen_counts: dict[str, int]) -> bool:
@@ -805,7 +805,7 @@ def table_json_chunks(text: str) -> list[tuple[str, dict[str, Any]]]:
             "rows": data_rows,
             "records": [table_record(headers, row) for row in data_rows],
         }
-        chunk = "Table data JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+        chunk = storage_safe_text("Table data JSON:\n" + json.dumps(payload, ensure_ascii=True, indent=2))
         chunks.append(
             (
                 chunk,
@@ -840,7 +840,7 @@ def extract_table_rows(text: str) -> list[list[list[str]]]:
 def table_row_cells(line: str) -> list[str]:
     if "|" not in str(line):
         return []
-    cells = [clean_text(cell) for cell in str(line).strip().strip("|").split("|")]
+    cells = [storage_safe_text(cell) for cell in str(line).strip().strip("|").split("|")]
     cells = [cell for cell in cells if cell]
     return cells if len(cells) >= 2 else []
 
@@ -853,7 +853,7 @@ def unique_table_headers(cells: Sequence[str]) -> list[str]:
     headers = []
     seen = {}
     for index, cell in enumerate(cells, start=1):
-        header = clean_text(cell) or f"column_{index}"
+        header = storage_safe_text(cell) or f"column_{index}"
         key = header.lower()
         seen[key] = seen.get(key, 0) + 1
         headers.append(header if seen[key] == 1 else f"{header}_{seen[key]}")
@@ -861,7 +861,7 @@ def unique_table_headers(cells: Sequence[str]) -> list[str]:
 
 
 def table_record(headers: Sequence[str], row: Sequence[str]) -> dict[str, str]:
-    return {header: clean_text(row[index]) if index < len(row) else "" for index, header in enumerate(headers)}
+    return {header: storage_safe_text(row[index]) if index < len(row) else "" for index, header in enumerate(headers)}
 
 
 def chunk_signal_metadata(chunk: str) -> dict[str, Any]:
@@ -1021,8 +1021,8 @@ def chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = D
 
 
 def chunk_document(record: SourceRecord, chunk: str) -> str:
-    title = record.title or record.url
-    return f"Source: {title}\nURL: {record.url}\nTask: {record.query_contexts}\n\n{chunk}"
+    title = storage_safe_text(record.title or record.url)
+    return storage_safe_text(f"Source: {title}\nURL: {record.url}\nTask: {record.query_contexts}\n\n{chunk}")
 
 
 def chunk_id(history_key: str, url: str, chunk_index: int) -> str:
@@ -1140,8 +1140,12 @@ def clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
 def storage_safe_text(value: Any) -> str:
     """Normalize extracted text before handing it to storage/embedding clients."""
 
-    text = clean_text(value).translate(STORAGE_TEXT_REPLACEMENTS)
-    return text.encode("latin-1", errors="replace").decode("latin-1")
+    raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = raw.translate(STORAGE_TEXT_REPLACEMENTS).encode("latin-1", errors="replace").decode("latin-1")
+    if "\n" not in text:
+        return clean_text(text)
+    lines = [clean_text(line) for line in text.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
 def to_int(value: Any, default: int) -> int:
