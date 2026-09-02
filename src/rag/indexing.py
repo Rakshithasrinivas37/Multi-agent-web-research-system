@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Union
@@ -241,11 +242,15 @@ def upsert_collection_batches(
     index = 0
     while index < len(ids):
         end = min(len(ids), index + batch_size)
+        batch_documents = []
+        batch_metadatas = []
         try:
+            batch_documents = [storage_safe_text(document) for document in documents[index:end]]
+            batch_metadatas = [clean_metadata(metadata) for metadata in metadatas[index:end]]
             collection.upsert(
                 ids=list(ids[index:end]),
-                documents=[storage_safe_text(document) for document in documents[index:end]],
-                metadatas=[clean_metadata(metadata) for metadata in metadatas[index:end]],
+                documents=batch_documents,
+                metadatas=batch_metadatas,
             )
             total += end - index
             index = end
@@ -257,6 +262,15 @@ def upsert_collection_batches(
             batch_size = max(1, min(batch_size // 2, failed_batch_size // 2))
             print(f"[rag_index] CUDA OOM during Chroma upsert; retrying with batch_size={batch_size}")
             clear_embedding_model_memory()
+        except Exception as error:
+            print_indexing_error(
+                error,
+                stage="chroma_upsert",
+                ids=list(ids[index:end]),
+                documents=batch_documents or documents[index:end],
+                metadatas=batch_metadatas or metadatas[index:end],
+            )
+            raise
     return total
 
 
@@ -295,20 +309,31 @@ def index_research_results(
     objective = clean_text(change_detection.get("objective") or research_plan.get("objective"))
     history_key = clean_text(change_detection.get("history_key")) or objective_key(objective, research_plan)
 
-    records = list(source_records(browser_results))
-    added_urls = summary_urls(change_detection.get("added_sources"))
-    changed_urls = summary_urls(change_detection.get("changed_sources"))
-    removed_urls = summary_urls(change_detection.get("removed_sources"))
-    index_all = bool(change_detection.get("first_run")) or collection_is_empty(collection)
+    records: list[SourceRecord] = []
+    added_urls = set()
+    changed_urls = set()
+    removed_urls = set()
+    index_all = False
     indexed_source_count = 0
     indexed_chunk_count = 0
     indexed_parent_chunk_count = 0
     deleted_changed_source_count = 0
     skipped_source_count = 0
+    current_stage = "source_records"
+    current_record: SourceRecord | None = None
 
     try:
+        current_stage = "source_records"
+        records = list(source_records(browser_results))
+        added_urls = summary_urls(change_detection.get("added_sources"))
+        changed_urls = summary_urls(change_detection.get("changed_sources"))
+        removed_urls = summary_urls(change_detection.get("removed_sources"))
+        index_all = bool(change_detection.get("first_run")) or collection_is_empty(collection)
+
         for record in records:
+            current_record = record
             change_status = source_change_status(record.url, added_urls, changed_urls)
+            current_stage = "metadata_lookup"
             existing_metadata_schema_version = source_metadata_schema_version_in_collection(collection, history_key, record.url)
             metadata_is_stale = existing_metadata_schema_version < DEFAULT_METADATA_SCHEMA_VERSION
             existing_content_hash = source_content_hash_in_collection(collection, history_key, record.url)
@@ -321,19 +346,24 @@ def index_research_results(
                 skipped_source_count += 1
                 continue
 
+            current_stage = "build_document"
             source_document = build_langchain_document(record, objective, history_key, change_status if not index_all else "indexed")
+            current_stage = "split_document"
             chunk_documents = split_document(source_document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
             if not chunk_documents:
                 skipped_source_count += 1
                 continue
 
             if existing_content_hash and (existing_content_hash != record.content_hash or metadata_is_stale):
+                current_stage = "delete_stale_chunks"
                 delete_source_chunks(collection, history_key, record.url)
                 delete_source_parent_chunks(chroma_path, history_key, record.url)
                 if existing_content_hash != record.content_hash:
                     deleted_changed_source_count += 1
 
+            current_stage = "parent_upsert"
             indexed_parent_chunk_count += upsert_parent_chunks(chroma_path, parent_rows_from_documents(chunk_documents))
+            current_stage = "prepare_child_chunks"
             ids = []
             documents = []
             metadatas = []
@@ -351,6 +381,7 @@ def index_research_results(
                     )
                 )
 
+            current_stage = "child_upsert"
             upserted_chunks = upsert_collection_batches(collection, ids, documents, metadatas)
             emit_progress(
                 "tool_called",
@@ -361,6 +392,13 @@ def index_research_results(
             )
             indexed_source_count += 1
             indexed_chunk_count += upserted_chunks
+    except Exception as error:
+        print_indexing_error(
+            error,
+            stage=current_stage,
+            record=current_record,
+        )
+        raise
     finally:
         embedding_function.close()
 
@@ -1146,6 +1184,58 @@ def storage_safe_text(value: Any) -> str:
         return clean_text(text)
     lines = [clean_text(line) for line in text.splitlines()]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def print_indexing_error(
+    error: BaseException,
+    stage: str,
+    record: SourceRecord | None = None,
+    ids: Sequence[str] | None = None,
+    documents: Sequence[Any] | None = None,
+    metadatas: Sequence[dict[str, Any]] | None = None,
+) -> None:
+    """Print compact diagnostics for indexing failures that are otherwise opaque."""
+
+    print(f"[rag_index] failed during {clean_text(stage) or 'unknown_stage'}: {type(error).__name__}: {error}")
+    if record is not None:
+        print(f"[rag_index] source url={record.url or '<missing>'} title={record.title[:160] or '<missing>'}")
+        print_latin1_diagnostics("record.title", record.title)
+        print_latin1_diagnostics("record.query_contexts", record.query_contexts)
+        print_latin1_diagnostics("record.content", record.content)
+    if ids:
+        print(f"[rag_index] batch ids={list(ids)[:5]} count={len(ids)}")
+    for index, document in enumerate(list(documents or [])[:3], start=1):
+        print_latin1_diagnostics(f"batch.document.{index}", document)
+    for index, metadata in enumerate(list(metadatas or [])[:3], start=1):
+        if not isinstance(metadata, dict):
+            continue
+        for key, value in metadata.items():
+            print_latin1_diagnostics(f"batch.metadata.{index}.{key}", value)
+    details = "".join(traceback.format_exception(type(error), error, error.__traceback__)).strip()
+    if details:
+        print(f"[rag_index] traceback:\n{details}")
+
+
+def print_latin1_diagnostics(label: str, value: Any) -> None:
+    unsafe = latin1_unsafe_characters(value)
+    if not unsafe:
+        return
+    preview = clean_text(value)[:220]
+    chars = ", ".join(f"U+{ord(char):04X} {repr(char)}" for char in unsafe[:8])
+    print(f"[rag_index] latin-1 unsafe in {label}: {chars}; preview={preview}")
+
+
+def latin1_unsafe_characters(value: Any) -> list[str]:
+    seen = set()
+    unsafe = []
+    for char in str(value or ""):
+        try:
+            char.encode("latin-1")
+        except UnicodeEncodeError:
+            if char not in seen:
+                seen.add(char)
+                unsafe.append(char)
+    return unsafe
 
 
 def to_int(value: Any, default: int) -> int:

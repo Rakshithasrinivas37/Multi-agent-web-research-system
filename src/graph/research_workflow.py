@@ -707,8 +707,10 @@ def index_rag_after_change_detection(
             change_detection=change_detection,
             chroma_path=chroma_path,
         )
-    except RuntimeError as error:
-        index_summary = {"status": "error", "error": str(error), "chroma_path": chroma_path}
+    except Exception as error:
+        error_details = format_exception_details(error)
+        print(f"[rag_index] error:\n{error_details}")
+        index_summary = {"status": "error", "error": str(error), "traceback": error_details, "chroma_path": chroma_path}
         memory = SharedMemory(memory_path)
         memory.write_agent_output("rag_index", {"index": index_summary})
         return index_summary
