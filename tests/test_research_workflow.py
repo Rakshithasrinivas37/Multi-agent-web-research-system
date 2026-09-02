@@ -14,6 +14,7 @@ from src.graph.research_workflow import (
     report_gap_refresh_has_context,
     report_gap_synthesis_model,
     research_plan_for_report_gaps,
+    index_rag_after_change_detection,
     validate_rag_index,
 )
 
@@ -64,6 +65,22 @@ class ResearchWorkflowRoutingTests(unittest.TestCase):
         index = {"status": "success", "indexed_chunks": 0, "stored_chunks": 0}
 
         self.assertEqual(validate_rag_index(index), ["rag_index indexed zero chunks"])
+
+    @patch("src.graph.research_workflow.SharedMemory")
+    @patch("src.graph.research_workflow.index_research_results")
+    def test_index_rag_after_change_detection_logs_traceback(self, indexer, memory_cls):
+        indexer.side_effect = UnicodeEncodeError("latin-1", "\u201c", 0, 1, "ordinal not in range(256)")
+        buffer = StringIO()
+
+        with redirect_stdout(buffer):
+            summary = index_rag_after_change_detection([], {}, {}, "memory.json", "data/chroma")
+
+        output = buffer.getvalue()
+        self.assertEqual(summary["status"], "error")
+        self.assertIn("UnicodeEncodeError", summary["traceback"])
+        self.assertIn("[rag_index] error:", output)
+        self.assertIn("UnicodeEncodeError", output)
+        memory_cls.return_value.write_agent_output.assert_called_once_with("rag_index", {"index": summary})
 
     def test_research_plan_for_report_gaps_keeps_matching_specs(self):
         question = "What is the scaled dot-product attention equation?"

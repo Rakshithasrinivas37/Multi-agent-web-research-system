@@ -1,6 +1,8 @@
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 
 from src.rag.indexing import (
@@ -345,6 +347,27 @@ The table above should stay intact.
         self.assertEqual(collection.metadatas[0]["symbol"], "sum alpha")
         collection.documents[0].encode("latin-1")
         collection.metadatas[0]["title"].encode("latin-1")
+
+    def test_upsert_collection_batches_logs_non_oom_failures(self):
+        class FailingCollection:
+            def upsert(self, ids, documents, metadatas):
+                raise UnicodeEncodeError("latin-1", "\u201c", 0, 1, "ordinal not in range(256)")
+
+        buffer = StringIO()
+
+        with self.assertRaises(UnicodeEncodeError):
+            with redirect_stdout(buffer):
+                upsert_collection_batches(
+                    FailingCollection(),
+                    ["bad"],
+                    ["Raw \u201cquote\u201d should be sanitized before logging."],
+                    [{"title": "\u201cBad title\u201d"}],
+                )
+
+        output = buffer.getvalue()
+        self.assertIn("[rag_index] failed during chroma_upsert", output)
+        self.assertIn("batch ids=['bad']", output)
+        self.assertIn("UnicodeEncodeError", output)
 
     def test_upsert_collection_batches_retries_cuda_oom_with_smaller_batch(self):
         class OomOnceCollection:
