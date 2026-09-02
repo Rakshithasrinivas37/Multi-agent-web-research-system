@@ -117,6 +117,21 @@ The table above should stay intact.
         self.assertEqual(payload["headers"], ["Model", "BLEU", "Params"])
         self.assertEqual(payload["records"][0]["Model"], "Transformer")
 
+    def test_split_document_sanitizes_table_json_chunk_text(self):
+        Document, _ = langchain_ingestion_classes()
+        document = Document(
+            page_content='Model | Note\nAlpha | Uses \u201csmart quotes\u201d and O(n\u00b2)',
+            metadata={"url": "https://example.com/results", "history_key": "test"},
+        )
+
+        chunks = split_document(document)
+        table_chunks = [chunk for chunk in chunks if chunk.metadata.get("chunk_kind") == "table"]
+
+        self.assertEqual(len(table_chunks), 1)
+        table_chunks[0].page_content.encode("latin-1")
+        payload = json.loads(table_chunks[0].page_content.removeprefix("Table data JSON:\n"))
+        self.assertEqual(payload["records"][0]["Note"], 'Uses "smart quotes" and O(n^2)')
+
     def test_split_document_adds_parent_context_metadata(self):
         Document, _ = langchain_ingestion_classes()
         document = Document(
@@ -146,6 +161,21 @@ The table above should stay intact.
             self.assertGreater(stored, 0)
             self.assertIn("attention formulas", parent_content_for_id(tmpdir, parent_id))
             self.assertNotIn("parent_content", strip_parent_content_metadata(chunks[0].metadata))
+
+    def test_parent_rows_sanitize_unicode_content_before_storage(self):
+        Document, _ = langchain_ingestion_classes()
+        document = Document(
+            page_content='\u201cAttention\u201d with O(n\u00b2) context. ' * 80,
+            metadata={"url": "https://example.com", "history_key": "test"},
+        )
+        chunks = split_document(document, chunk_size=120, chunk_overlap=20)
+
+        rows = parent_rows_from_documents(chunks)
+
+        self.assertTrue(rows)
+        rows[0]["content"].encode("latin-1")
+        self.assertIn('"Attention"', rows[0]["content"])
+        self.assertIn("O(n^2)", rows[0]["content"])
 
     def test_expand_parent_context_results_dedupes_same_parent(self):
         parent_content = "Parent context with formula and surrounding explanation. " * 20
