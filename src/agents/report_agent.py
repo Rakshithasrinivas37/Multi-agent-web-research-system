@@ -371,6 +371,11 @@ def format_evidence_packs(
         lines.append(f"- {coverage}: {question}")
         chunks = pack.get("chunks", [])
         chunks = chunks if isinstance(chunks, list) else []
+        source_markers = ", ".join(f"[{index}]" for index in pack_source_indexes(pack))
+        if source_markers:
+            lines.append(f"  - Use cited evidence from {source_markers} for supported claims; do not call cited evidence absent.")
+        if evidence_pack_has_formula_evidence(pack):
+            lines.append(f"  - Formula/equation evidence is present in {source_markers or 'cited chunks'}; include it with citation before naming any remaining gap.")
         selected_chunks = chunks
         if max_chunks_per_pack is not None:
             selected_chunks = rank_question_chunks(question, chunks)[: max(0, max_chunks_per_pack)]
@@ -861,7 +866,7 @@ def report_evidence_gap_contradictions(
     canonical = {normalize_heading(q): q for q in planner_questions or [] if clean_text(q)}
     contradictions = []
     for pack in evidence_packs or []:
-        if not isinstance(pack, dict) or not evidence_pack_has_cited_evidence(pack):
+        if not isinstance(pack, dict) or not evidence_pack_has_usable_cited_evidence(pack):
             continue
         question = clean_text(pack.get("question"))
         section = report_section_for_question(report, question)
@@ -915,7 +920,7 @@ def section_claims_missing_supported_evidence(section: str, question: str, pack:
         r"do\s+not\s+(?:contain|provide|include)|does\s+not\s+(?:contain|provide|include)|"
         r"none\s+.*\s+provide|not\s+available|absent\s+from\s+.*\s+evidence)"
     )
-    if re.search(gap_terms, lowered) and not section_cites_pack_source(section, pack):
+    if re.search(gap_terms, lowered) and (evidence_pack_has_formula_evidence(pack) or not section_cites_pack_source(section, pack)):
         return True
     for term in named_terms(question):
         if term in lowered and re.search(rf"\b{re.escape(term)}\b.{{0,140}}{gap_terms}|{gap_terms}.{{0,140}}\b{re.escape(term)}\b", lowered):
@@ -981,6 +986,23 @@ def evidence_pack_has_cited_evidence(pack: dict[str, Any]) -> bool:
     if synthesis_coverage_status_is_gap(coverage):
         return False
     return any(isinstance(chunk, dict) and isinstance(chunk.get("source_index"), int) and clean_text(chunk.get("content")) for chunk in pack.get("chunks", []) or [])
+
+
+def evidence_pack_has_usable_cited_evidence(pack: dict[str, Any]) -> bool:
+    return any(isinstance(chunk, dict) and isinstance(chunk.get("source_index"), int) and clean_text(chunk.get("content")) for chunk in pack.get("chunks", []) or [])
+
+
+def evidence_pack_has_formula_evidence(pack: dict[str, Any]) -> bool:
+    question = clean_text(pack.get("question"))
+    if not re.search(r"\b(equations?|formulas?|mathematical|formulation|compatibility|alignment|score)\b", question, flags=re.IGNORECASE):
+        return False
+    for chunk in pack.get("chunks", []) or []:
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("source_index"), int):
+            continue
+        text = clean_text(chunk.get("content"))
+        if text and re.search(r"(=|softmax|tanh|sqrt|\\bsum\\b|∑|⊤|\\^T|\\bwhere\\b.+\\bmatrix|\\bscore function\\b)", text, flags=re.IGNORECASE):
+            return True
+    return False
 
 
 def synthesis_coverage_status_is_gap(status: Any) -> bool:

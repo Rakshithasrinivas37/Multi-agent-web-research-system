@@ -299,6 +299,26 @@ Supported [1]. Unsupported [9].
         self.assertIn("[2] Benchmark", formatted)
         self.assertEqual(evidence_pack_questions(packs), ["What benchmark result is reported?"])
 
+    def test_format_evidence_packs_marks_formula_evidence_as_usable(self):
+        formatted = format_evidence_packs(
+            [
+                {
+                    "question": "What are the equations of additive attention?",
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "title": "Bahdanau paper",
+                            "content": "The alignment model is a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertIn("Use cited evidence from [2]", formatted)
+        self.assertIn("Formula/equation evidence is present", formatted)
+
     def test_format_supporting_evidence_uses_chunks_once(self):
         context = {
             "supporting_chunks": [
@@ -695,6 +715,35 @@ Evidence Gap: The provided sources mention Bahdanau attention but do not contain
                         {
                             "source_index": 7,
                             "content": "The additive attention compatibility function is available in this source.",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_evidence_gap_contradictions_detects_partial_formula_denial(self):
+        question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Bahdanau Attention Mechanism
+The supplied evidence does not contain the explicit additive-attention formulas from the original Bahdanau paper [2].
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj), where Wa and Ua are matrices.",
                         }
                     ],
                 }
