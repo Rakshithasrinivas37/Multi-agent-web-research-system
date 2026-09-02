@@ -26,6 +26,7 @@ from src.agents.report_agent import (
     report_generation_token_cap,
     report_quality_issues,
     report_needs_revision,
+    report_pack_citation_gaps,
     report_schema_issues,
     report_self_critique,
     report_sub_question_coverage_check,
@@ -753,6 +754,64 @@ The supplied evidence does not contain the explicit additive-attention formulas 
 
         self.assertEqual(false_gaps, [question])
 
+    def test_report_pack_citation_gaps_flags_uncited_matching_section(self):
+        question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Bahdanau Attention Mechanism
+Bahdanau additive attention uses an alignment score with a tanh compatibility function.
+
+## References
+[3] https://example.com/other
+"""
+
+        gaps = report_pack_citation_gaps(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(gaps, [question])
+
+    def test_report_pack_citation_gaps_allows_pack_citation(self):
+        question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Bahdanau Attention Mechanism
+Bahdanau additive attention uses an alignment score with a tanh compatibility function [2].
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+
+        gaps = report_pack_citation_gaps(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(gaps, [])
+
     def test_report_needs_revision_for_false_evidence_gap(self):
         self.assertTrue(
             report_needs_revision(
@@ -780,6 +839,23 @@ The supplied evidence does not contain the explicit additive-attention formulas 
         )
 
         self.assertIn("false evidence gap to remove", feedback)
+        self.assertIn(question, feedback)
+
+    def test_report_revision_feedback_includes_pack_citation_gaps(self):
+        question = "What source-backed topic needs a citation?"
+
+        feedback = format_report_revision_feedback(
+            {
+                "report_issues": [],
+                "schema_issues": [],
+                "coverage": {"missing": []},
+                "synthesis_gaps": [],
+                "false_gap_questions": [],
+                "pack_citation_gap_questions": [question],
+            }
+        )
+
+        self.assertIn("missing evidence-pack citation", feedback)
         self.assertIn(question, feedback)
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):

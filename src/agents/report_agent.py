@@ -52,6 +52,7 @@ Coverage requirement (mandatory):
 - Every planner sub-question must map to exactly one topic section under heading 3.
 - Treat synthesis coverage as a signal, but cited per-question evidence overrides stale gap notes.
 - If a per-question evidence pack is covered and includes cited chunks, the matching section must use those chunks and cite at least one of their source markers.
+- If any per-question evidence pack lists source markers, the matching section must cite at least one listed marker whenever it makes supported claims for that sub-question.
 - Never label a covered evidence pack as an evidence gap. If exact details are incomplete, write the supported answer first with citations, then name only the missing detail as a caveat.
 - If a question is marked missing and no cited evidence is supplied for it, write a short evidence-gap subsection instead of inventing an answer.
 - Treat per-question evidence packs as the strongest topic-by-topic evidence map. Covered packs must be explained in the matching section; partial packs must include caveats.
@@ -177,11 +178,19 @@ class ReportAgent:
                 "report_missing_sub_questions": validation["coverage"]["missing"],
                 "report_evidence_gap_questions": validation["synthesis_gaps"],
                 "report_false_gap_questions": validation["false_gap_questions"],
+                "report_pack_citation_gap_questions": validation["pack_citation_gap_questions"],
                 "report_coverage_conflicts": coverage_conflicts,
                 "report_coverage_check": validation["coverage"],
                 "report_retry_queries": rewrite_missing_sub_question_queries(
                     objective,
-                    dedupe_text([*validation["coverage"]["missing"], *validation["synthesis_gaps"], *validation["false_gap_questions"]]),
+                    dedupe_text(
+                        [
+                            *validation["coverage"]["missing"],
+                            *validation["synthesis_gaps"],
+                            *validation["false_gap_questions"],
+                            *validation["pack_citation_gap_questions"],
+                        ]
+                    ),
                 ),
                 "report_review_trace": review_trace,
                 "report_revision_attempts": len(review_trace) - 1,
@@ -759,14 +768,17 @@ def validate_report_output(
     coverage = report_sub_question_coverage_check(report, planner_questions)
     schema_issues = report_schema_issues(report, planner_questions)
     false_gaps = report_evidence_gap_contradictions(report, evidence_packs, planner_questions)
+    pack_citation_gaps = report_pack_citation_gaps(report, evidence_packs, planner_questions)
     report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}\n{pack_text}")
     report_issues.extend(f"report marks covered evidence as a gap: {question}" for question in false_gaps)
+    report_issues.extend(f"report section does not cite its evidence pack: {question}" for question in pack_citation_gaps)
     review = report_self_critique(report_issues, coverage, schema_issues)
     return {
         "coverage": coverage,
         "schema_issues": schema_issues,
         "synthesis_gaps": synthesis_gaps,
         "false_gap_questions": false_gaps,
+        "pack_citation_gap_questions": pack_citation_gaps,
         "report_issues": dedupe_text(report_issues),
         "review": review,
     }
@@ -778,6 +790,7 @@ def report_needs_revision(validation: dict[str, Any]) -> bool:
         or validation.get("schema_issues")
         or validation.get("synthesis_gaps")
         or validation.get("false_gap_questions")
+        or validation.get("pack_citation_gap_questions")
         or validation.get("coverage", {}).get("missing")
     )
 
@@ -789,6 +802,7 @@ def format_report_revision_feedback(validation: dict[str, Any]) -> str:
         *(f"missing planner topic: {q}" for q in validation.get("coverage", {}).get("missing", [])),
         *(f"synthesis gap to respect: {q}" for q in validation.get("synthesis_gaps", [])),
         *(f"false evidence gap to remove and replace with cited evidence: {q}" for q in validation.get("false_gap_questions", [])),
+        *(f"missing evidence-pack citation to add in matching section: {q}" for q in validation.get("pack_citation_gap_questions", [])),
     ]
     return "\n".join(f"- {issue}" for issue in dedupe_text(issues)) or "- No unresolved issue."
 
@@ -873,6 +887,36 @@ def report_evidence_gap_contradictions(
         if section and section_claims_missing_supported_evidence(section, question, pack):
             contradictions.append(canonical.get(normalize_heading(question), question))
     return dedupe_text(contradictions)
+
+
+def report_pack_citation_gaps(
+    report: str,
+    evidence_packs: Sequence[dict[str, Any]],
+    planner_questions: Sequence[str] | None = None,
+) -> list[str]:
+    """Find planner sections that use a topic but omit its evidence-pack source markers."""
+
+    canonical = {normalize_heading(q): q for q in planner_questions or [] if clean_text(q)}
+    gaps = []
+    for pack in evidence_packs or []:
+        if not isinstance(pack, dict) or not evidence_pack_has_usable_cited_evidence(pack):
+            continue
+        question = clean_text(pack.get("question"))
+        section = report_section_for_question(report, question)
+        if not section or section_cites_pack_source(section, pack):
+            continue
+        if section_mentions_pack_topic(section, question):
+            gaps.append(canonical.get(normalize_heading(question), question))
+    return dedupe_text(gaps)
+
+
+def section_mentions_pack_topic(section: str, question: str) -> bool:
+    text_terms = detail_terms(section)
+    question_terms = [term for term in detail_terms(question) if term not in STOPWORDS]
+    named = named_terms(question)
+    if named and any(term in text_terms for term in named):
+        return True
+    return len(set(question_terms[:8]) & text_terms) >= 2
 
 
 def report_section_for_question(report: str, question: str) -> str:
