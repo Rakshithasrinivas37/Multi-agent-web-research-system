@@ -51,6 +51,8 @@ Required report schema:
 Coverage requirement (mandatory):
 - Every planner sub-question must map to exactly one topic section under heading 3.
 - Treat synthesis coverage as a signal, but cited per-question evidence overrides stale gap notes.
+- If a per-question evidence pack is covered and includes cited chunks, the matching section must use those chunks and cite at least one of their source markers.
+- Never label a covered evidence pack as an evidence gap. If exact details are incomplete, write the supported answer first with citations, then name only the missing detail as a caveat.
 - If a question is marked missing and no cited evidence is supplied for it, write a short evidence-gap subsection instead of inventing an answer.
 - Treat per-question evidence packs as the strongest topic-by-topic evidence map. Covered packs must be explained in the matching section; partial packs must include caveats.
 - For missing coverage items, do not include formulas, API names, benchmark values, examples, or detailed explanations.
@@ -781,6 +783,7 @@ def format_report_revision_feedback(validation: dict[str, Any]) -> str:
         *validation.get("schema_issues", []),
         *(f"missing planner topic: {q}" for q in validation.get("coverage", {}).get("missing", [])),
         *(f"synthesis gap to respect: {q}" for q in validation.get("synthesis_gaps", [])),
+        *(f"false evidence gap to remove and replace with cited evidence: {q}" for q in validation.get("false_gap_questions", [])),
     ]
     return "\n".join(f"- {issue}" for issue in dedupe_text(issues)) or "- No unresolved issue."
 
@@ -906,13 +909,22 @@ def markdown_sections(markdown: str) -> list[tuple[str, str]]:
 
 def section_claims_missing_supported_evidence(section: str, question: str, pack: dict[str, Any]) -> bool:
     lowered = clean_text(section).lower()
-    if not citation_markers(section) and re.search(r"\b(evidence gap|no source-backed|cannot be given|none .* provide|not available)\b", lowered):
+    gap_terms = (
+        r"(evidence\s+gap|evidence\s+not\s+provided|not\s+provided|missing\s+evidence|"
+        r"no\s+source-backed|cannot\s+be\s+(?:given|reproduced|answered)|"
+        r"do\s+not\s+(?:contain|provide|include)|does\s+not\s+(?:contain|provide|include)|"
+        r"none\s+.*\s+provide|not\s+available|absent\s+from\s+.*\s+evidence)"
+    )
+    if re.search(gap_terms, lowered) and not section_cites_pack_source(section, pack):
         return True
-    gap_terms = r"(evidence not provided|not provided|missing evidence|no source-backed|lack(?:s|ing)? .* evidence|absent from .* evidence)"
     for term in named_terms(question):
         if term in lowered and re.search(rf"\b{re.escape(term)}\b.{{0,140}}{gap_terms}|{gap_terms}.{{0,140}}\b{re.escape(term)}\b", lowered):
             return True
     return False
+
+
+def section_cites_pack_source(section: str, pack: dict[str, Any]) -> bool:
+    return bool(set(citation_markers(section)) & set(pack_source_indexes(pack)))
 
 
 def pack_source_indexes(pack: dict[str, Any]) -> list[int]:

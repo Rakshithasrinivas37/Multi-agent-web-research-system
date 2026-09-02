@@ -11,6 +11,7 @@ from src.agents.report_agent import (
     format_evidence_packs,
     format_question_coverage,
     format_question_focused_evidence,
+    format_report_revision_feedback,
     format_report_section_outline,
     format_supporting_evidence,
     generate_single_report,
@@ -214,6 +215,7 @@ Supported [1]. Unsupported [9].
         self.assertIn("Per-question evidence packs", prompt)
         self.assertIn("covered: How is the API used?", prompt)
         self.assertIn("Covered packs must be explained", prompt)
+        self.assertIn("Never label a covered evidence pack as an evidence gap", prompt)
 
     def test_build_report_prompt_keeps_full_evidence_and_synthesis(self):
         evidence_tail = "retrieved evidence tail should remain"
@@ -676,6 +678,32 @@ Beta evidence not provided in the supplied sources.
 
         self.assertEqual(false_gaps, [question])
 
+    def test_report_evidence_gap_contradictions_detects_covered_source_denial(self):
+        question = "What are the core equations governing the original Bahdanau additive attention mechanism?"
+        report = """
+## Core Equations Governing Bahdanau Additive Attention
+Evidence Gap: The provided sources mention Bahdanau attention but do not contain the explicit compatibility function.
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [
+                        {
+                            "source_index": 7,
+                            "content": "The additive attention compatibility function is available in this source.",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
     def test_report_needs_revision_for_false_evidence_gap(self):
         self.assertTrue(
             report_needs_revision(
@@ -688,6 +716,22 @@ Beta evidence not provided in the supplied sources.
                 }
             )
         )
+
+    def test_report_revision_feedback_includes_false_gap_questions(self):
+        question = "What are the core equations governing Bahdanau attention?"
+
+        feedback = format_report_revision_feedback(
+            {
+                "report_issues": [],
+                "schema_issues": [],
+                "coverage": {"missing": []},
+                "synthesis_gaps": [],
+                "false_gap_questions": [question],
+            }
+        )
+
+        self.assertIn("false evidence gap to remove", feedback)
+        self.assertIn(question, feedback)
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(
