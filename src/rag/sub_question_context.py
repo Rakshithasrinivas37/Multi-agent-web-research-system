@@ -83,11 +83,25 @@ QUERY_INSTRUCTION_TERMS = {
     "discuss",
     "evidence",
     "extract",
+    "found",
+    "including",
     "https",
     "retrieval",
     "source",
     "source-backed",
     "sources",
+    "that",
+}
+QUERY_TERM_REPAIRS = {
+    "menchanism": "mechanism",
+    "menchanisms": "mechanisms",
+}
+QUERY_SOURCE_NOISE_TERMS = {
+    "face",
+    "hugging",
+    "ibm",
+    "youtube",
+    "youtu.be",
 }
 EVIDENCE_TERMS_BY_TYPE = {
     "api": {"api", "class", "function", "method", "parameter", "argument", "signature", "usage", "example"},
@@ -199,11 +213,7 @@ def sub_question_retrieval_queries(
 
     for facet in facets[: max(1, max_variants)]:
         evidence_terms = query_evidence_terms(evidence_types, variant_index=variant_index)
-        variants.append(
-            clean_retrieval_query(
-                f"{facet} {objective} {topic_without_other_facets(topic, facet, facets)} {evidence_terms}"
-            )
-        )
+        variants.append(clean_retrieval_query(f"{facet} {objective} {evidence_terms}"))
         variant_index += 1
 
     # Each remaining template pulls a different rotation of evidence terms
@@ -286,14 +296,23 @@ def clean_retrieval_query(query: str, max_words: int = DEFAULT_QUERY_MAX_WORDS) 
         cleaned = token.strip(".,;:()[]{}\"'")
         if not cleaned:
             continue
+        if re.match(r"https?://", cleaned, flags=re.IGNORECASE):
+            continue
         key = cleaned.lower().replace("‑", "-").replace("–", "-")
+        key = QUERY_TERM_REPAIRS.get(key, key)
         if key in seen:
             continue
         if key in QUERY_INSTRUCTION_TERMS:
             continue
         seen.add(key)
-        tokens.append(cleaned)
+        tokens.append(query_token_with_original_case(cleaned, key))
     return clean_text(" ".join(tokens[:max_words]))[:300]
+
+
+def query_token_with_original_case(original: str, repaired_key: str) -> str:
+    if original.lower().replace("‑", "-").replace("–", "-") == repaired_key:
+        return original
+    return repaired_key
 
 
 def planner_tasks_to_rag_queries(research_plan: dict[str, Any]) -> list[str]:
@@ -493,7 +512,27 @@ def retrieve_sub_question_context_groups(
         if not query_set:
             return sub_question_context_group(question, [], [], [])
         fallback_sources = []
-        candidates = multi_query_hybrid_retrieve(
+        planned_source_urls = helpers.question_source_urls_for(question, question_source_urls)
+        try:
+            source_candidates = source_url_coverage_retrieve(
+                source_urls=planned_source_urls,
+                query=query_set,
+                chroma_path=chroma_path,
+                collection_name=collection_name,
+                history_keys=history_keys,
+                top_k_per_url=candidate_chunks,
+                scan_limit=bm25_scan_limit,
+            )
+        except Exception as error:
+            print(f"[synthesis] per-question source URL retrieval failed: {error}")
+            source_candidates = []
+
+        candidates = []
+        if source_candidates:
+            fallback_sources.append("source_url")
+            candidates = helpers.merge_retrieved_context(candidates, source_candidates)
+
+        hybrid_candidates = multi_query_hybrid_retrieve(
             queries=query_set,
             chroma_path=chroma_path,
             collection_name=collection_name,
@@ -513,23 +552,8 @@ def retrieve_sub_question_context_groups(
             rerank_k=max(rerank_k, candidate_chunks),
             rerank_weight=rerank_weight,
         )
-        if len(candidates) < final_chunks:
-            try:
-                source_candidates = source_url_coverage_retrieve(
-                    source_urls=helpers.question_source_urls_for(question, question_source_urls),
-                    query=query_set,
-                    chroma_path=chroma_path,
-                    collection_name=collection_name,
-                    history_keys=history_keys,
-                    top_k_per_url=candidate_chunks,
-                    scan_limit=bm25_scan_limit,
-                )
-            except Exception as error:
-                print(f"[synthesis] per-question source URL retrieval failed: {error}")
-                source_candidates = []
-            if source_candidates:
-                fallback_sources.append("source_url")
-                candidates = helpers.merge_retrieved_context(candidates, source_candidates)
+        if hybrid_candidates:
+            candidates = helpers.merge_retrieved_context(candidates, hybrid_candidates)
         if len(candidates) < final_chunks:
             fallback_candidates = collection_scan_question_retrieve(
                 question=question,
@@ -1225,15 +1249,17 @@ HARD REQUIREMENTS (a query that violates any of these is invalid):
 - Evidence tail: append AT MOST 2 evidence-intent words per query (choose from: definition, equation, formula, benchmark, results, comparison, complexity, limitations, api, implementation, applications). Never stack 3+ of these onto one query, and never use the same 2-word tail on more than one query in the same group.
 - New information per query: each query in a group must introduce at least one element the other queries in that group do not have — a different named method/paper/framework/dataset, a different facet of the sub-question, or a different evidence angle. If you cannot think of a genuinely different angle, write fewer queries for that sub-question rather than padding with a near-duplicate.
 - No connective filler: never include phrases like "have been proposed", "has been proposed", "such as", "standard implementations", "major frameworks", "demonstrate its effectiveness", "key contributions", "computational challenges", or similar sentence glue. Use only content words: named entities, technical terms, and at most 2 evidence-intent words.
+- No raw URLs: never put http/https URLs in the query text. Source URLs from task details are handled separately by retrieval. If a source matters, use the paper title, organization/product name, API name, dataset, or method name instead.
+- Spelling: copy technical terms from the planner exactly. Do not invent alternate spellings.
 
 STYLE REQUIREMENTS:
-- Base each query on the actual planner sub-question topic and named entities. Task details may add source names, URLs, APIs, datasets, metrics, or paper titles only when they match that sub-question.
+- Base each query on the actual planner sub-question topic and named entities. Task details may add source names, APIs, datasets, metrics, or paper titles only when they match that sub-question.
 - Write compact keyword-style queries as noun phrases, not full sentences or questions.
 - Do not copy instruction words into queries: no "extract", "source-backed", "authoritative", "evidence gives", "source context", or "answering".
 - Do not start queries with "what", "which", "where", "how", or phrases like "source-backed context", "which evidence gives", or "authoritative sources discuss".
 - For each sub-question, aim for complementary angles: one broad concept query, one exact-evidence query (equation/benchmark/api as applicable), and one source-targeted query or facet-targeted query naming a specific method, dataset, framework, or metric when the sub-question mentions more than one.
 - For compound/list questions, split named facets across separate queries instead of naming all of them in every query.
-- Preserve named entities, URLs, titles, years, model names, datasets, metrics, APIs, equations, and aliases from the planner/task details — these count toward the "new information per query" requirement.
+- Preserve named entities, titles, years, model names, datasets, metrics, APIs, equations, and aliases from the planner/task details — these count toward the "new information per query" requirement.
 - Prefer noun phrases that work for both semantic search and BM25 keyword search.
 - Do not answer the question and do not add citations, reasoning, or <think> text.
 - Never output placeholder labels or generic query names.
@@ -1632,10 +1658,26 @@ def valid_retrieval_queries(queries: Sequence[str], research_plan: dict[str, Any
     candidates = [
         cleaned
         for query in dedupe_preserve_order(queries)
-        if (cleaned := clean_retrieval_query(query))
+        if (cleaned := clean_generated_retrieval_query(query, allowed_terms))
         if is_valid_retrieval_query(cleaned, allowed_terms)
     ]
     return dedupe_near_duplicate_queries(candidates)
+
+
+def clean_generated_retrieval_query(query: str, allowed_terms: set[str]) -> str:
+    """Clean LLM-produced retrieval queries without hard-coding a research topic."""
+
+    text = clean_retrieval_query(query)
+    if not text:
+        return ""
+    kept = []
+    allowed = {clean_text(term).lower() for term in allowed_terms if clean_text(term)}
+    for token in text.split():
+        key = token.lower().replace("‑", "-").replace("–", "-")
+        if key in QUERY_SOURCE_NOISE_TERMS and key not in allowed:
+            continue
+        kept.append(token)
+    return clean_retrieval_query(" ".join(kept))
 
 
 def is_valid_retrieval_query(query: str, allowed_terms: set[str]) -> bool:

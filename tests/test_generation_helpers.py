@@ -910,6 +910,43 @@ Missing Evidence: exact benchmark values are not present.
         self.assertNotIn("primary source official docs paper", joined)
         self.assertNotIn("details examples equations benchmarks limitations", joined)
 
+    def test_valid_retrieval_queries_repairs_typos_and_removes_unrequested_sources(self):
+        plan = {
+            "objective": "Attention mechanism",
+            "sub_questions": [
+                "What is the definition of the attention mechanism in neural networks?",
+                "What seminal papers introduced attention mechanisms?",
+                "What official APIs exist for TensorFlow and PyTorch?",
+            ],
+        }
+
+        queries = valid_retrieval_queries(
+            [
+                "formulation attention menchanism definition mathematical mechanism neural networks purpose",
+                "https://www.ibm.com/think/topics/attention-mechanism seminal papers that introduced attention mechanisms",
+                "PyTorch Attention menchanism official API layers found Hugging documentation signature",
+                "Hugging Face Attention menchanism official API layers found documentation signature",
+            ],
+            plan,
+        )
+        joined = " ".join(queries).lower()
+
+        self.assertIn("attention mechanism", joined)
+        self.assertNotIn("menchanism", joined)
+        self.assertNotIn("http", joined)
+        self.assertNotIn("ibm", joined)
+        self.assertNotIn("hugging", joined)
+        self.assertTrue(any("pytorch" in query.lower() for query in queries))
+
+    def test_sub_question_retrieval_queries_do_not_create_descriptor_only_facets(self):
+        queries = sub_question_retrieval_queries(
+            "What seminal papers introduced attention mechanisms?",
+            objective="Attention mechanism",
+        )
+
+        self.assertIn("seminal papers introduced attention mechanisms", queries)
+        self.assertNotIn("seminal Attention mechanism", queries)
+
     def test_clean_retrieval_query_removes_prompt_instruction_terms(self):
         query = clean_retrieval_query(
             "known limitations challenges attention mechanisms Extract source-backed evidence answering authoritative source https"
@@ -1422,6 +1459,66 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(groups[0]["candidate_count"], 8)
         self.assertEqual(groups[0]["chunk_count"], 3)
         self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], "What is alpha topic?")
+
+    def test_retrieve_sub_question_context_groups_prefers_planner_source_url(self):
+        question = "What equation defines AlphaMethod?"
+        planned = [
+            RetrievalResult(
+                id="planned-alpha",
+                document="AlphaMethod official paper defines the equation y = softmax(x) with variables. " * 3,
+                metadata={"title": "AlphaMethod paper", "url": "https://example.org/alpha"},
+                score=0.2,
+                semantic_score=0.2,
+                bm25_score=0.0,
+            )
+        ]
+        hybrid = [
+            RetrievalResult(
+                id="generic-alpha",
+                document="AlphaMethod tutorial mentions equation formula variables in a general overview. " * 3,
+                metadata={"title": "Generic AlphaMethod", "url": "https://example.org/generic"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            )
+        ]
+        plan = {
+            "objective": "AlphaMethod",
+            "sub_questions": [question],
+            "tasks": [{"query_context": "q001", "url": "https://example.org/alpha"}],
+        }
+
+        with (
+            patch("src.rag.sub_question_context.source_url_coverage_retrieve", return_value=planned) as source_retrieve,
+            patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", return_value=hybrid),
+        ):
+            groups = retrieve_sub_question_context_groups(
+                research_plan=plan,
+                questions=[question],
+                objective="AlphaMethod",
+                chroma_path="/tmp/chroma",
+                collection_name="test",
+                history_keys=[],
+                candidate_chunks=8,
+                final_chunks=1,
+                per_query_k=25,
+                semantic_k=10,
+                bm25_k=10,
+                semantic_weight=0.3,
+                bm25_weight=0.3,
+                authority_weight=0.4,
+                bm25_scan_limit=100,
+                embedding_device="",
+                rerank=False,
+                reranker_model="cross-encoder",
+                rerank_k=8,
+                rerank_weight=0.7,
+            )
+
+        source_retrieve.assert_called_once()
+        self.assertIn("source_url", groups[0]["fallback_sources"])
+        self.assertEqual(groups[0]["chunks"][0].id, "planned-alpha")
+        self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], question)
 
     def test_retrieve_sub_question_context_groups_rescues_missing_facets(self):
         question = "What efficient methods such as Linformer, Performer, and Longformer reduce attention cost?"
