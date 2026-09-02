@@ -888,17 +888,24 @@ def facet_rescue_context_retrieve(
     )
     if not facet_queries:
         return []
-    return collection_scan_question_retrieve(
-        question=question,
-        queries=dedupe_preserve_order([*queries, *facet_queries]),
-        chroma_path=chroma_path,
-        collection_name=collection_name,
-        history_keys=history_keys,
-        top_k=max(1, top_k),
-        scan_limit=scan_limit,
-        question_source_urls=question_source_urls,
-        required_evidence=required_evidence,
-    )
+    rescued = []
+    per_facet_k = max(1, min(top_k, max(2, top_k // max(1, len(facet_queries)))))
+    for facet_query in facet_queries:
+        rescued = helpers.merge_retrieved_context(
+            rescued,
+            collection_scan_question_retrieve(
+                question=question,
+                queries=dedupe_preserve_order([facet_query, *queries]),
+                chroma_path=chroma_path,
+                collection_name=collection_name,
+                history_keys=history_keys,
+                top_k=per_facet_k,
+                scan_limit=scan_limit,
+                question_source_urls=question_source_urls,
+                required_evidence=required_evidence,
+            ),
+        )
+    return rescued[: max(1, top_k)]
 
 
 def select_facet_covered_results(
