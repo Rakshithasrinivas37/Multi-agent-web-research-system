@@ -34,12 +34,15 @@ from src.rag.sub_question_context import (
     browser_question_context_retrieve,
     clean_retrieval_query,
     complete_sub_question_query_coverage,
+    facet_rescue_context_retrieve,
     is_valid_retrieval_query,
     llm_sub_question_retrieval_query_result,
+    missing_facets_for_results,
     parse_llm_retrieval_queries,
     precision_retrieval_queries,
     retrieve_sub_question_context_groups,
     retrieve_sub_question_context,
+    select_facet_covered_results,
     select_question_first_synthesis_context,
     sub_question_retrieval_max_workers,
     sub_question_retrieval_queries,
@@ -947,6 +950,83 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("seminal papers introduced attention mechanisms", queries)
         self.assertNotIn("seminal Attention mechanism", queries)
 
+    def test_question_required_facets_filters_generic_phrase_artifacts(self):
+        self.assertEqual(
+            question_required_facets(
+                "What official APIs and implementation details exist for attention in major frameworks such as PyTorch and TensorFlow?"
+            ),
+            ["PyTorch", "TensorFlow"],
+        )
+        self.assertEqual(
+            question_required_facets(
+                "How have attention models performed on standard benchmarks (e.g., WMT translation, GLUE) compared to prior architectures?"
+            ),
+            ["WMT translation", "GLUE"],
+        )
+
+    def test_missing_facets_for_results_uses_source_metadata(self):
+        results = [
+            RetrievalResult(
+                id="linformer",
+                document="This chunk discusses efficient attention with runtime and memory tradeoffs.",
+                metadata={"title": "Linformer original paper", "url": "https://arxiv.org/abs/2006.04768"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="performer",
+                document="This chunk discusses efficient attention with runtime and memory tradeoffs.",
+                metadata={"title": "Performer original paper", "url": "https://arxiv.org/abs/2009.14794"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+        ]
+
+        missing = missing_facets_for_results(
+            "What efficient attention variants such as Linformer and Performer improve complexity?",
+            results,
+        )
+
+        self.assertEqual(missing, [])
+
+    def test_select_facet_covered_results_uses_source_metadata(self):
+        results = [
+            RetrievalResult(
+                id="generic",
+                document="General attention background with enough useful context for synthesis.",
+                metadata={"title": "General attention overview", "url": "https://example.com/general"},
+                score=3.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="tensorflow",
+                document="Layer usage documentation with parameters and examples.",
+                metadata={"title": "tf.keras.layers.Attention", "url": "https://www.tensorflow.org/api_docs/python/tf/keras/layers/Attention"},
+                score=2.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="pytorch",
+                document="Module usage documentation with parameters and examples.",
+                metadata={"title": "torch.nn.MultiheadAttention", "url": "https://docs.pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+        ]
+
+        selected = select_facet_covered_results(
+            "What official APIs exist in PyTorch and TensorFlow?",
+            results,
+            limit=2,
+        )
+
+        self.assertEqual([result.id for result in selected], ["pytorch", "tensorflow"])
+
     def test_clean_retrieval_query_removes_prompt_instruction_terms(self):
         query = clean_retrieval_query(
             "known limitations challenges attention mechanisms Extract source-backed evidence answering authoritative source https"
@@ -1519,6 +1599,41 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("source_url", groups[0]["fallback_sources"])
         self.assertEqual(groups[0]["chunks"][0].id, "planned-alpha")
         self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], question)
+
+    def test_facet_rescue_context_retrieve_queries_each_missing_facet(self):
+        calls = []
+
+        def fake_scan(**kwargs):
+            calls.append(kwargs["queries"][0])
+            facet = kwargs["queries"][0].split()[0].lower()
+            return [
+                RetrievalResult(
+                    id=f"{facet}-chunk",
+                    document=f"{facet} method has complexity evidence and detailed context. " * 3,
+                    metadata={"title": facet, "url": f"https://example.org/{facet}"},
+                    score=1.0,
+                    semantic_score=1.0,
+                    bm25_score=0.0,
+                )
+            ]
+
+        with patch("src.rag.sub_question_context.collection_scan_question_retrieve", side_effect=fake_scan):
+            results = facet_rescue_context_retrieve(
+                question="What do Alpha and Beta methods improve?",
+                missing_facets=["Alpha", "Beta"],
+                queries=["methods improve complexity"],
+                chroma_path="/tmp/chroma",
+                collection_name="test",
+                history_keys=[],
+                top_k=4,
+                scan_limit=100,
+                required_evidence=["complexity"],
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0].startswith("Alpha "))
+        self.assertTrue(calls[1].startswith("Beta "))
+        self.assertEqual({result.id for result in results}, {"alpha-chunk", "beta-chunk"})
 
     def test_retrieve_sub_question_context_groups_rescues_missing_facets(self):
         question = "What efficient methods such as Linformer, Performer, and Longformer reduce attention cost?"

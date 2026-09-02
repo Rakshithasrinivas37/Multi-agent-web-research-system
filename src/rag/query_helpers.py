@@ -18,6 +18,7 @@ OBJECTIVE_STOPWORDS = {
     "based",
     "compare",
     "different",
+    "do",
     "for",
     "from",
     "how",
@@ -36,6 +37,8 @@ COVERAGE_GENERIC_TERMS = OBJECTIVE_STOPWORDS | {
     "core",
     "deep",
     "evidence",
+    "exist",
+    "exists",
     "known",
     "learning",
     "main",
@@ -45,6 +48,7 @@ COVERAGE_GENERIC_TERMS = OBJECTIVE_STOPWORDS | {
     "recent",
     "research",
     "standard",
+    "variants",
 }
 COVERAGE_EVIDENCE_TERMS = {
     "api",
@@ -123,6 +127,7 @@ COVERAGE_FACET_STOPWORDS = QUERY_FILLER_TERMS | COVERAGE_GENERIC_TERMS | COVERAG
     "detail",
     "details",
     "documentation",
+    "formulation",
     "example",
     "examples",
     "found",
@@ -132,6 +137,8 @@ COVERAGE_FACET_STOPWORDS = QUERY_FILLER_TERMS | COVERAGE_GENERIC_TERMS | COVERAG
     "paper",
     "papers",
     "primary",
+    "prior",
+    "references",
     "seminal",
     "source",
     "sources",
@@ -283,10 +290,24 @@ def question_required_facets(question: str) -> list[str]:
         else:
             candidates.append(f"{modifier} {head}")
 
-    return dedupe_preserve_order(
+    return remove_subsumed_facets(dedupe_preserve_order(
         facet for facet in (normalize_facet(candidate) for candidate in candidates)
         if facet
-    )
+    ))
+
+
+def remove_subsumed_facets(facets: Sequence[str]) -> list[str]:
+    """Drop shorter facets already covered by a more specific facet."""
+
+    normalized = dedupe_preserve_order(facets)
+    kept = []
+    lowered = [facet.lower() for facet in normalized]
+    for index, facet in enumerate(normalized):
+        text = lowered[index]
+        if any(index != other_index and text in other for other_index, other in enumerate(lowered)):
+            continue
+        kept.append(facet)
+    return kept
 
 
 def split_facet_candidates(text: str) -> list[str]:
