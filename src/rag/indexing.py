@@ -954,9 +954,9 @@ def langchain_ingestion_classes() -> tuple[Any, Any]:
 def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceRecord]:
     grouped: dict[str, dict[str, Any]] = {}
     for result in browser_results:
-        task_id = clean_text(result.get("task_id"))
+        task_id = storage_safe_text(result.get("task_id"))
         task_url = normalize_http_url(result.get("task_url"))
-        query_context = clean_text(result.get("query_context"))
+        query_context = storage_safe_text(result.get("query_context"))
         for source in result.get("sources", []):
             if not isinstance(source, dict):
                 continue
@@ -969,13 +969,13 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
                 url,
                 {
                     "url": url,
-                    "title": clean_text(source.get("title")),
+                    "title": storage_safe_text(source.get("title")),
                     "task_urls": [],
                     "task_ids": [],
                     "query_contexts": [],
-                    "source_type": clean_text(source.get("source_type")),
-                    "source_quality": clean_text(source.get("source_quality")),
-                    "source_authority": clean_text(source.get("source_authority")),
+                    "source_type": storage_safe_text(source.get("source_type")),
+                    "source_quality": storage_safe_text(source.get("source_quality")),
+                    "source_authority": storage_safe_text(source.get("source_authority")),
                     "content_noise_score": to_float(source.get("content_noise_score"), 0.0),
                     "content": content,
                 },
@@ -988,26 +988,26 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
                 record["query_contexts"].append(query_context)
 
             if source_quality_rank(source.get("source_quality")) > source_quality_rank(record["source_quality"]):
-                record["source_quality"] = clean_text(source.get("source_quality"))
+                record["source_quality"] = storage_safe_text(source.get("source_quality"))
             if source_authority_rank(source.get("source_authority")) > source_authority_rank(record["source_authority"]):
-                record["source_authority"] = clean_text(source.get("source_authority"))
+                record["source_authority"] = storage_safe_text(source.get("source_authority"))
             if len(content) > len(record["content"]):
                 record["content"] = content
-                record["title"] = clean_text(source.get("title")) or record["title"]
-                record["source_type"] = clean_text(source.get("source_type")) or record["source_type"]
+                record["title"] = storage_safe_text(source.get("title")) or record["title"]
+                record["source_type"] = storage_safe_text(source.get("source_type")) or record["source_type"]
                 record["content_noise_score"] = to_float(source.get("content_noise_score"), record["content_noise_score"])
 
     for record in grouped.values():
-        content = record["content"]
+        content = storage_safe_text(record["content"])
         yield SourceRecord(
             url=record["url"],
-            title=record["title"],
-            task_urls=" | ".join(record["task_urls"]),
-            task_ids=", ".join(record["task_ids"]),
-            query_contexts=" | ".join(record["query_contexts"]),
-            source_type=record["source_type"],
-            source_quality=record["source_quality"],
-            source_authority=record["source_authority"],
+            title=storage_safe_text(record["title"]),
+            task_urls=storage_safe_text(" | ".join(record["task_urls"])),
+            task_ids=storage_safe_text(", ".join(record["task_ids"])),
+            query_contexts=storage_safe_text(" | ".join(record["query_contexts"])),
+            source_type=storage_safe_text(record["source_type"]),
+            source_quality=storage_safe_text(record["source_quality"]),
+            source_authority=storage_safe_text(record["source_authority"]),
             content_noise_score=record["content_noise_score"],
             content_hash=hash_text(content),
             content=content,

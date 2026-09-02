@@ -285,6 +285,35 @@ The table above should stay intact.
         self.assertEqual(records[0].source_authority, "authoritative")
         self.assertEqual(records[0].content_noise_score, 0.1)
 
+    def test_source_records_sanitize_unicode_metadata_and_content(self):
+        browser_results = [
+            {
+                "task_id": "task_\u201c001\u201d",
+                "query_context": "Find \u201cquoted\u201d evidence with O(n\u00b2).",
+                "task_url": "SEARCH:quoted evidence",
+                "sources": [
+                    {
+                        "url": "https://example.edu/source",
+                        "title": "\u201cQuoted Source\u201d",
+                        "source_type": "webpage",
+                        "source_quality": "primary",
+                        "source_authority": "authoritative",
+                        "full_content": "\u201cDetailed\u201d evidence with alpha and O(n\u00b2). " * 20,
+                    }
+                ],
+            }
+        ]
+
+        record = list(source_records(browser_results))[0]
+
+        self.assertEqual(record.title, '"Quoted Source"')
+        self.assertIn('"quoted"', record.query_contexts)
+        self.assertIn("O(n^2)", record.query_contexts)
+        self.assertIn('"Detailed"', record.content)
+        self.assertIn("O(n^2)", record.content)
+        for value in (record.title, record.task_ids, record.query_contexts, record.content):
+            value.encode("latin-1")
+
     def test_storage_safe_text_normalizes_smart_quotes_and_math(self):
         text = storage_safe_text("\u201cAttention\u201d has O(n\u00b2) cost and alpha weights.")
 
