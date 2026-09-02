@@ -36,6 +36,8 @@ DEFAULT_EMBEDDING_BATCH_SIZE = 16
 DEFAULT_CUDA_EMBEDDING_BATCH_SIZE = 4
 DEFAULT_CHROMA_UPSERT_BATCH_SIZE = 8
 DEFAULT_METADATA_SCHEMA_VERSION = 9
+HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")
+TOKEN_WRAPPER_QUOTES = "\"'\u201c\u201d\u2018\u2019"
 TOKEN_PATTERN = re.compile(r"\S+")
 SECTION_HEADING_PATTERN = re.compile(
     r"(?i)^\s*(?:#{1,6}\s+|\d+(?:\.\d+)*[.)]\s+)?"
@@ -142,6 +144,7 @@ class SentenceTransformerEmbeddingFunction:
     def model(self) -> Any:
         if self._model is not None:
             return self._model
+        normalize_huggingface_token_env()
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as error:
@@ -164,6 +167,27 @@ class SentenceTransformerEmbeddingFunction:
                 pass
         self._model = None
         clear_embedding_model_memory()
+
+
+def normalize_huggingface_token_env() -> None:
+    """Normalize copied Hugging Face tokens before HTTP requests use them."""
+
+    for name in HF_TOKEN_ENV_VARS:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        cleaned = str(value).strip().strip(TOKEN_WRAPPER_QUOTES)
+        try:
+            cleaned.encode("latin-1")
+        except UnicodeEncodeError as error:
+            unsafe = ", ".join(f"U+{ord(char):04X} {repr(char)}" for char in latin1_unsafe_characters(cleaned)[:8])
+            raise RuntimeError(
+                f"{name} contains characters that cannot be sent in HTTP headers: {unsafe}. "
+                f"Re-export it with plain ASCII characters, for example: export {name}=hf_..."
+            ) from error
+        if cleaned != value:
+            os.environ[name] = cleaned
+            print(f"[rag_index] normalized {name}; removed surrounding quotes/whitespace")
 
 
 def clear_embedding_model_memory() -> None:

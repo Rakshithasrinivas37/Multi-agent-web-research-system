@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -8,6 +9,7 @@ from unittest.mock import patch
 from src.rag.indexing import (
     clean_document_text,
     langchain_ingestion_classes,
+    normalize_huggingface_token_env,
     parent_content_for_id,
     parent_context_chunks,
     parent_rows_from_documents,
@@ -347,6 +349,21 @@ The table above should stay intact.
         self.assertEqual(collection.metadatas[0]["symbol"], "sum alpha")
         collection.documents[0].encode("latin-1")
         collection.metadatas[0]["title"].encode("latin-1")
+
+    @patch.dict("os.environ", {"HF_TOKEN": " \u201chf_test_token\u201d "}, clear=True)
+    def test_normalize_huggingface_token_env_removes_copied_quotes(self):
+        buffer = StringIO()
+
+        with redirect_stdout(buffer):
+            normalize_huggingface_token_env()
+
+        self.assertEqual(os.environ["HF_TOKEN"], "hf_test_token")
+        self.assertIn("normalized HF_TOKEN", buffer.getvalue())
+
+    @patch.dict("os.environ", {"HF_TOKEN": "hf_\u2603_bad"}, clear=True)
+    def test_normalize_huggingface_token_env_rejects_header_unsafe_tokens(self):
+        with self.assertRaisesRegex(RuntimeError, "HF_TOKEN contains characters"):
+            normalize_huggingface_token_env()
 
     def test_upsert_collection_batches_logs_non_oom_failures(self):
         class FailingCollection:
