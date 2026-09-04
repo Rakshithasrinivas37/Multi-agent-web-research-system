@@ -96,6 +96,7 @@ DEFAULT_PRECISION_QUERY_LIMIT = 8
 DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
 DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 30
 DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 3
+DEFAULT_SYNTHESIS_CANDIDATE_CHUNKS_PER_QUESTION = 20
 DEFAULT_SYNTHESIS_MAX_CHUNKS = 18
 DEFAULT_SYNTHESIS_MODE = "per_question"
 DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS = 4
@@ -1423,12 +1424,18 @@ def synthesize_context_for_report(
     client = Groq()
     last_error: Exception | None = None
     questions = planner_sub_question_list(planner_questions or [])
+    quality_trace: list[dict[str, Any]] = []
 
     if synthesis_mode() == "per_question" and questions:
         source_context_budget = max(max_context_chars, len(retrieved_context) * (DEFAULT_CONTEXT_BLOCK_CHARS + 200))
         context_text, sources = build_generation_context(
             retrieved_context,
             max_context_chars=source_context_budget,
+        )
+        evidence_packs = build_sub_question_evidence_packs(
+            questions,
+            retrieved_context,
+            sources,
         )
         per_question_notes = synthesize_per_question_notes(
             client=client,
@@ -1451,6 +1458,7 @@ def synthesize_context_for_report(
             "planner_questions": questions,
             "synthesis": synthesis,
             "sources": sources,
+            "evidence_packs": evidence_packs,
             "model": rag_generation_model(model),
             "synthesis_attempts": max((item.get("attempts", 1) for item in per_question_notes), default=1),
             "synthesis_context_chars": len(context_text),
@@ -1616,6 +1624,56 @@ Do not invent source names, authors, dates, titles, papers, benchmark numbers, e
     if last_error:
         raise last_error
     raise RuntimeError("synthesis failed before calling the generation model")
+
+
+def format_synthesis_retry_guidance(issues: Sequence[str]) -> str:
+    clean_issues = [clean_text(issue) for issue in issues or [] if clean_text(issue)]
+    if not clean_issues:
+        return ""
+    return (
+        "Repair guidance from the previous weak synthesis attempt:\n"
+        + "\n".join(f"- Fix: {issue}" for issue in clean_issues)
+        + "\nThe next synthesis must cover planner questions directly, avoid false missing-context claims, "
+        "and cite retrieved source markers for supported claims."
+    )
+
+
+def synthesis_quality_issues(
+    synthesis: Any,
+    planner_questions: Sequence[str],
+    evidence_packs: Sequence[dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+) -> list[str]:
+    """Return reasons a synthesis is too weak to feed the report agent."""
+
+    text = normalize_citation_markers(synthesis)
+    lowered = clean_text(text).lower()
+    questions = planner_sub_question_list(planner_questions or [])
+    evidence_chunk_count = sum(
+        len(pack.get("chunks", []))
+        for pack in evidence_packs or []
+        if isinstance(pack, dict)
+    )
+    if not evidence_chunk_count:
+        return []
+
+    issues = []
+    min_chars = max(500, len(questions or [None]) * 160)
+    if len(clean_text(text)) < min_chars:
+        issues.append("synthesis is too short for the retrieved evidence")
+    if "no retrieved context was available" in lowered:
+        issues.append("synthesis claims no retrieved context despite evidence chunks")
+    if sources and not citation_markers(text):
+        issues.append("synthesis has no source citations")
+
+    missing_questions = [
+        question
+        for question in questions
+        if question_key(question) not in lowered and not synthesis_section_for_question(text, question)
+    ]
+    if missing_questions:
+        issues.append("synthesis misses planner questions: " + "; ".join(missing_questions[:3]))
+    return issues
 
 
 def synthesis_mode() -> str:
@@ -1847,6 +1905,78 @@ def format_per_question_gap_summary(per_question_notes: Sequence[dict[str, Any]]
         if not citation_markers(item.get("synthesis")) or "missing evidence" in synthesis:
             gaps.append(f"- {clean_text(item.get('question'))}: missing or partial cited evidence.")
     return "\n".join(gaps) or "- No missing-evidence claims were produced by per-question synthesis."
+
+
+def deterministic_synthesis_from_evidence_packs(
+    objective: str,
+    synthesis_instruction: str,
+    planner_questions: Sequence[str],
+    evidence_packs: Sequence[dict[str, Any]],
+) -> str:
+    """Build report-ready synthesis notes without an LLM when model output is weak."""
+
+    packs_by_question = {
+        question_key(pack.get("question")): pack
+        for pack in evidence_packs or []
+        if isinstance(pack, dict) and clean_text(pack.get("question"))
+    }
+    lines = [
+        "## Synthesis Overview",
+        f"Deterministic synthesis for {clean_text(objective)} using per-question retrieved evidence only.",
+        "",
+        "## Instruction Coverage Checklist",
+        format_instruction_requirements(synthesis_instruction),
+        "",
+        "## Section Notes By Planner Question",
+    ]
+    for index, question in enumerate(planner_sub_question_list(planner_questions), start=1):
+        pack = packs_by_question.get(question_key(question), {})
+        coverage = clean_text(pack.get("coverage")) or "missing"
+        lines.extend(["", f"### q{index:03d}. {question}", f"Coverage: {coverage}"])
+        chunk_lines = deterministic_pack_chunk_lines(pack)
+        if chunk_lines:
+            lines.extend(chunk_lines)
+        else:
+            lines.append("Missing Evidence: no cited retrieved chunks were available for this planner sub-question.")
+
+    lines.extend(
+        [
+            "",
+            "## Conflicts Or Gaps",
+            deterministic_pack_gap_lines(evidence_packs),
+            "",
+            "## Recommended Report Structure",
+            "Use one report section per planner sub-question in the same order as the Section Notes above.",
+        ]
+    )
+    return clean_text("\n".join(lines))
+
+
+def deterministic_pack_chunk_lines(pack: dict[str, Any], limit: int = DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS) -> list[str]:
+    chunks = pack.get("chunks", []) if isinstance(pack, dict) else []
+    lines = []
+    for chunk in [item for item in chunks if isinstance(item, dict)][:max(1, limit)]:
+        source_index = chunk.get("source_index")
+        if not isinstance(source_index, int):
+            continue
+        title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Retrieved chunk"
+        content = clean_text(chunk.get("content"))
+        if content:
+            lines.append(f"- [{source_index}] {title}: {content[:DEFAULT_CONTEXT_BLOCK_CHARS].rstrip()}")
+    return lines
+
+
+def deterministic_pack_gap_lines(evidence_packs: Sequence[dict[str, Any]]) -> str:
+    gaps = []
+    for pack in evidence_packs or []:
+        if not isinstance(pack, dict):
+            continue
+        coverage = clean_text(pack.get("coverage")).lower()
+        missing = clean_string_list(pack.get("missing_evidence_types")) + clean_string_list(pack.get("missing_facets"))
+        if "missing" in coverage or "partial" in coverage or missing:
+            detail = ", ".join(dedupe_preserve_order(missing)) or coverage or "partial evidence"
+            gaps.append(f"- {clean_text(pack.get('question'))}: {detail}")
+    return "\n".join(gaps) or "- No explicit per-question evidence gaps were detected."
 
 
 def format_planner_questions(questions: Sequence[str]) -> str:
