@@ -754,7 +754,7 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("[2] Official Docs", synthesis)
         self.assertIn("Recommended Report Structure", synthesis)
 
-    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key"}, clear=False)
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SYNTHESIS_MODE": "single"}, clear=False)
     @patch("src.rag.generation.create_chat_completion_with_retries")
     def test_synthesize_context_for_report_retries_weak_synthesis(self, completion):
         class Message:
@@ -813,7 +813,7 @@ Missing Evidence: exact benchmark values are not present.
         self.assertFalse(payload["synthesis_quality_fallback_used"])
         self.assertIn("28.4 BLEU", payload["synthesis"])
 
-    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key"}, clear=False)
+    @patch.dict("os.environ", {"GROQ_API_KEY": "test-key", "RAG_SYNTHESIS_MODE": "single"}, clear=False)
     @patch("src.rag.generation.create_chat_completion_with_retries")
     def test_synthesize_context_for_report_falls_back_after_weak_synthesis(self, completion):
         class Message:
