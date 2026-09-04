@@ -25,14 +25,14 @@ DEFAULT_RETRY_COVERAGE_CHARS = 1200
 DEFAULT_RETRY_SOURCE_CHARS = 1400
 DEFAULT_RETRY_PACK_CHARS = 220
 DEFAULT_FOCUSED_EVIDENCE_CHARS = 9000
-DEFAULT_FOCUSED_CHUNKS_PER_QUESTION = 2
-DEFAULT_FOCUSED_CHUNK_CHARS = 700
+DEFAULT_FOCUSED_CHUNKS_PER_QUESTION = 4
+DEFAULT_FOCUSED_CHUNK_CHARS = 1500
 
-DEFAULT_REPORT_GENERATION_MODE = "single"
-DEFAULT_SECTION_MAX_TOKENS = 900
+DEFAULT_REPORT_GENERATION_MODE = "sections"  # "single" or "sections"  
+DEFAULT_SECTION_MAX_TOKENS = 1500
 DEFAULT_SECTION_RETRY_ATTEMPTS = 2
 DEFAULT_SECTION_EVIDENCE_CHUNKS = 4
-DEFAULT_SECTION_EVIDENCE_CHUNK_CHARS = 1100
+DEFAULT_SECTION_EVIDENCE_CHUNK_CHARS = 1500
 DEFAULT_FRAME_MAX_TOKENS = 700
 DEFAULT_FRAME_SECTION_CHARS = 900
 
@@ -157,6 +157,21 @@ class ReportAgent:
             metadata={"model": self.model, "generation_mode": self.generation_mode},
         )
         client = Groq()
+        # Built unconditionally: the self-critique repair-retry below always
+        # falls back to the single-shot compact prompt, even when the
+        # initial draft was produced in "sections" mode, so prompt_inputs
+        # must exist regardless of which branch generated the first draft.
+        prompt_inputs = {
+            "objective": objective,
+            "output_format": output_format,
+            "planner_questions": coverage_questions,
+            "synthesis": synthesis,
+            "evidence": evidence,
+            "sources": sources,
+            "citation_policy": clean_text(report_context.get("citation_policy")),
+            "coverage_by_question": coverage_by_question,
+            "evidence_packs": evidence_packs,
+        }
         section_diagnostics: dict[str, Any] = {}
         if self.generation_mode == "sections":
             report, model, section_diagnostics = generate_report_by_sections(
@@ -170,17 +185,6 @@ class ReportAgent:
                 synthesis=synthesis,
             )
         else:
-            prompt_inputs = {
-                "objective": objective,
-                "output_format": output_format,
-                "planner_questions": coverage_questions,
-                "synthesis": synthesis,
-                "evidence": evidence,
-                "sources": sources,
-                "citation_policy": clean_text(report_context.get("citation_policy")),
-                "coverage_by_question": coverage_by_question,
-                "evidence_packs": evidence_packs,
-            }
             prompt = build_report_prompt(**prompt_inputs)
             fallback_prompt = build_report_prompt(**prompt_inputs, compact=True)
             report, model = generate_single_report(client, self.model, prompt, fallback_prompt=fallback_prompt)
