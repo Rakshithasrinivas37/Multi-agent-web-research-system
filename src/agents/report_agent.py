@@ -25,8 +25,22 @@ DEFAULT_RETRY_COVERAGE_CHARS = 1200
 DEFAULT_RETRY_SOURCE_CHARS = 1400
 DEFAULT_RETRY_PACK_CHARS = 220
 DEFAULT_FOCUSED_EVIDENCE_CHARS = 9000
-DEFAULT_FOCUSED_CHUNKS_PER_QUESTION = 4
-DEFAULT_FOCUSED_CHUNK_CHARS = 1200
+DEFAULT_FOCUSED_CHUNKS_PER_QUESTION = 2
+DEFAULT_FOCUSED_CHUNK_CHARS = 700
+
+DEFAULT_REPORT_GENERATION_MODE = "single"
+DEFAULT_SECTION_MAX_TOKENS = 900
+DEFAULT_SECTION_RETRY_ATTEMPTS = 2
+DEFAULT_SECTION_EVIDENCE_CHUNKS = 4
+DEFAULT_SECTION_EVIDENCE_CHUNK_CHARS = 1100
+DEFAULT_FRAME_MAX_TOKENS = 700
+DEFAULT_FRAME_SECTION_CHARS = 900
+
+SECTION_SYSTEM_PROMPT = (
+    "You write ONE section of a larger cited research report from supplied evidence only. "
+    "Do not use outside knowledge. Cite every claim inline with a real source marker like [1]. "
+    "Output only that one section - no other headings, no preamble, no closing remarks."
+)
 
 REPORT_SYSTEM_PROMPT = (
     "You write concise, well-structured, cited reports from supplied evidence only. "
@@ -79,13 +93,25 @@ STOPWORDS = {
 class ReportAgent:
     """Generate a final report from synthesis-agent context."""
 
-    def __init__(self, model: str | None = None) -> None:
+    def __init__(self, model: str | None = None, generation_mode: str | None = None) -> None:
         self.model = (
             clean_text(model)
             or clean_text(os.environ.get("RESEARCH_PLANNER_MODEL"))
             or clean_text(os.environ.get("RAG_GENERATION_MODEL"))
             or DEFAULT_REPORT_AGENT_MODEL
         )
+        # "single" = one completion call for the whole report (legacy).
+        # "sections" = one focused call per topic section plus small framing
+        # calls (exec summary, cross-cutting, limitations, conclusion),
+        # stitched together. Costs more calls but each call is small,
+        # grounded in only that question's evidence, and individually
+        # retried, so a weak/missing evidence pack for one sub-question
+        # can no longer degrade the whole report.
+        self.generation_mode = (
+            clean_text(generation_mode)
+            or clean_text(os.environ.get("REPORT_GENERATION_MODE"))
+            or DEFAULT_REPORT_GENERATION_MODE
+        ).lower()
 
     def generate(self, report_context: dict[str, Any], output_format: str = "report") -> dict[str, Any]:
         if not isinstance(report_context, dict) or not report_context:
@@ -122,32 +148,42 @@ class ReportAgent:
             evidence = format_supporting_evidence(report_context, sources=sources)
         pack_text = format_evidence_packs(evidence_packs)
         sources = evidence_backed_sources(sources, evidence, synthesis, pack_text)
-        prompt_inputs = {
-            "objective": objective,
-            "output_format": output_format,
-            "planner_questions": coverage_questions,
-            "synthesis": synthesis,
-            "evidence": evidence,
-            "sources": sources,
-            "citation_policy": clean_text(report_context.get("citation_policy")),
-            "coverage_by_question": coverage_by_question,
-            "evidence_packs": evidence_packs,
-        }
-        prompt = build_report_prompt(**prompt_inputs)
-        fallback_prompt = build_report_prompt(
-            **prompt_inputs,
-            compact=True,
-        )
 
         emit_progress(
             "tool_called",
             "Report agent calling Groq to generate final report",
             agent="report",
             tool="groq",
-            metadata={"model": self.model},
+            metadata={"model": self.model, "generation_mode": self.generation_mode},
         )
         client = Groq()
-        report, model = generate_single_report(client, self.model, prompt, fallback_prompt=fallback_prompt)
+        section_diagnostics: dict[str, Any] = {}
+        if self.generation_mode == "sections":
+            report, model, section_diagnostics = generate_report_by_sections(
+                client,
+                self.model,
+                objective=objective,
+                output_format=output_format,
+                coverage_questions=coverage_questions,
+                evidence_packs=evidence_packs,
+                sources=sources,
+                synthesis=synthesis,
+            )
+        else:
+            prompt_inputs = {
+                "objective": objective,
+                "output_format": output_format,
+                "planner_questions": coverage_questions,
+                "synthesis": synthesis,
+                "evidence": evidence,
+                "sources": sources,
+                "citation_policy": clean_text(report_context.get("citation_policy")),
+                "coverage_by_question": coverage_by_question,
+                "evidence_packs": evidence_packs,
+            }
+            prompt = build_report_prompt(**prompt_inputs)
+            fallback_prompt = build_report_prompt(**prompt_inputs, compact=True)
+            report, model = generate_single_report(client, self.model, prompt, fallback_prompt=fallback_prompt)
         report = normalize_final_report(report, sources)
         validation = validate_report_output(report, sources, coverage_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
         review_trace = [validation["review"]]
@@ -177,7 +213,6 @@ class ReportAgent:
                 "supporting_chunk_count": len(report_context.get("supporting_chunks", []) or []),
                 "retrieved_chunk_count": len(report_context.get("retrieved_chunks", []) or []),
                 "report_length": len(report),
-                "report_generation_mode": "single",
                 "report_issues": validation["report_issues"],
                 "report_schema_issues": validation["schema_issues"],
                 "report_missing_sub_questions": validation["coverage"]["missing"],
@@ -201,9 +236,13 @@ class ReportAgent:
                 "report_revision_attempts": len(review_trace) - 1,
                 "report_deterministic_repairs": deterministic_repairs,
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
-                "report_prompt_chars": len(prompt),
-                "report_fallback_prompt_chars": len(fallback_prompt),
-                "report_estimated_token_cap": report_generation_token_cap(len(prompt)),
+                "report_generation_mode": self.generation_mode,
+                "report_section_diagnostics": section_diagnostics,
+                "report_prompt_chars": len(prompt) if self.generation_mode != "sections" else None,
+                "report_fallback_prompt_chars": len(fallback_prompt) if self.generation_mode != "sections" else None,
+                "report_estimated_token_cap": (
+                    report_generation_token_cap(len(prompt)) if self.generation_mode != "sections" else None
+                ),
             },
         }
 
@@ -289,6 +328,265 @@ Per-question evidence packs:
 
 Write the final Markdown report. Explain each supported topic in clear prose before equations, tables, APIs, or technical details."""
     return trim_report_prompt(prompt) if compact else prompt
+
+
+def generate_report_by_sections(
+    client: Any,
+    model: str,
+    objective: str,
+    output_format: str,
+    coverage_questions: Sequence[str],
+    evidence_packs: Sequence[dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+    synthesis: str,
+) -> tuple[str, str, dict[str, Any]]:
+    """Generate the report as separate, individually-grounded section calls.
+
+    Each topic section only ever sees its own question's evidence pack, so a
+    thin or missing evidence pack for one sub-question can no longer starve
+    or corrupt the rest of the report. Framing sections (exec summary,
+    introduction, cross-cutting analysis, limitations, conclusion) are
+    generated afterwards from the already-written topic sections, so they
+    describe what was actually produced instead of guessing ahead of time.
+    """
+
+    source_text = format_sources(sources)
+    packs_by_question = {
+        normalize_heading(pack.get("question")): pack
+        for pack in evidence_packs or []
+        if isinstance(pack, dict)
+    }
+    last_model = model
+
+    topic_sections: list[str] = []
+    section_diagnostics: list[dict[str, Any]] = []
+    for question in coverage_questions:
+        pack = packs_by_question.get(normalize_heading(question), {})
+        section, used_model, retried = generate_topic_section(client, model, objective, question, pack, source_text)
+        last_model = used_model or last_model
+        topic_sections.append(section)
+        section_diagnostics.append({
+            "question": question,
+            "retried": retried,
+            "had_usable_evidence": evidence_pack_has_usable_cited_evidence(pack),
+            "chars": len(section),
+        })
+
+    topics_digest = "\n\n".join(compact_text(section, DEFAULT_FRAME_SECTION_CHARS) for section in topic_sections)
+
+    intro, last_model = generate_frame_section(
+        client, model, "Introduction and Context",
+        instructions=(
+            "Write a short introduction (3-5 sentences) that frames the research objective and previews the "
+            "topics covered below, using only claims already present in the topic sections. Cite using the "
+            "same source markers used in those sections; do not introduce a new fact without one."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    cross_cutting, last_model = generate_frame_section(
+        client, model, "Cross-cutting Analysis and Synthesis",
+        instructions=(
+            "Write a cross-cutting analysis that connects the topic sections below into a coherent narrative: "
+            "note relationships, tensions, or a progression across topics. Use only claims and citations already "
+            "present in the topic sections - do not add new facts."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    limitations, last_model = generate_frame_section(
+        client, model, "Limitations and Open Questions",
+        instructions=(
+            "List, as short bullet points, which sub-questions below have thin or missing evidence and what "
+            "specific detail is unresolved. Base this only on gaps already stated in the topic sections; do not "
+            "invent new limitations and do not repeat claims that were already supported with a citation."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    conclusion, last_model = generate_frame_section(
+        client, model, "Conclusion",
+        instructions=(
+            "Write a short conclusion (3-5 sentences) summarising what is well-supported across the topic "
+            "sections and what remains open, consistent with the limitations already identified. Do not add new "
+            "facts or citations that are not already present above."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    exec_summary, last_model = generate_frame_section(
+        client, model, "Executive Summary",
+        instructions=(
+            "Write a 3-4 sentence executive summary of the whole report below, naming the main topics covered "
+            "and, in one clause, the main limitation. Do not add new facts or citations that are not already "
+            "present above."
+        ),
+        objective=objective, source_text=source_text,
+        body_digest=f"{intro}\n\n{topics_digest}\n\n{cross_cutting}\n\n{limitations}\n\n{conclusion}",
+        fallback_model=last_model,
+    )
+
+    report = "\n\n".join([
+        f"## 1. Executive Summary\n{strip_leading_heading(exec_summary)}",
+        f"## 2. Introduction and Context\n{strip_leading_heading(intro)}",
+        "## 3. Topic Sections",
+        *(f"### 3.{i}. {planner_question_heading(q)}\n{strip_leading_heading(section)}" for i, (q, section) in enumerate(zip(coverage_questions, topic_sections), 1)),
+        f"## 4. Cross-cutting Analysis and Synthesis\n{strip_leading_heading(cross_cutting)}",
+        f"## 5. Limitations and Open Questions\n{strip_leading_heading(limitations)}",
+        f"## 6. Conclusion\n{strip_leading_heading(conclusion)}",
+    ])
+    return report, last_model, {"topic_sections": section_diagnostics}
+
+
+def generate_topic_section(
+    client: Any,
+    model: str,
+    objective: str,
+    question: str,
+    pack: dict[str, Any],
+    source_text: str,
+) -> tuple[str, str, bool]:
+    heading = planner_question_heading(question)
+    prompt = build_topic_section_prompt(objective, question, heading, pack, source_text)
+    response = create_chat_completion_with_retries(
+        client, model=model, temperature=0, max_tokens=DEFAULT_SECTION_MAX_TOKENS,
+        retry_attempts=DEFAULT_SECTION_RETRY_ATTEMPTS,
+        messages=[
+            {"role": "system", "content": SECTION_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    section = normalize_citation_markers(clean_markdown(response.choices[0].message.content))
+    used_model = clean_text(getattr(response, "model", "")) or model
+
+    retried = False
+    if section_needs_retry(section, pack):
+        retried = True
+        retry_prompt = f"""{prompt}
+
+Your previous draft failed a check: it was empty, did not cite any of the available evidence markers above, or
+wrongly called covered evidence a gap. Fix this using only the evidence given above.
+
+Previous draft:
+{section}"""
+        response = create_chat_completion_with_retries(
+            client, model=model, temperature=0, max_tokens=DEFAULT_SECTION_MAX_TOKENS,
+            retry_attempts=DEFAULT_SECTION_RETRY_ATTEMPTS,
+            messages=[
+                {"role": "system", "content": SECTION_SYSTEM_PROMPT},
+                {"role": "user", "content": retry_prompt},
+            ],
+        )
+        section = normalize_citation_markers(clean_markdown(response.choices[0].message.content))
+        used_model = clean_text(getattr(response, "model", "")) or used_model
+
+    if not section.lstrip().startswith("#"):
+        section = f"## {heading}\n\n{section}"
+    return section, used_model, retried
+
+
+def build_topic_section_prompt(
+    objective: str,
+    question: str,
+    heading: str,
+    pack: dict[str, Any],
+    source_text: str,
+) -> str:
+    evidence_text = format_single_question_evidence(question, pack)
+    return f"""Research objective:
+{objective}
+
+You are writing ONLY this section of the report:
+## {heading}
+
+Sub-question this section must answer:
+{question}
+
+Available sources:
+{source_text}
+
+Evidence retrieved for this question only:
+{evidence_text}
+
+Rules:
+- Use only the evidence above; never use outside knowledge.
+- Cite every factual claim inline with a real marker shown above, like [1].
+- If the evidence answers the question, write clear prose first, then any equation/formula/API/metric line only
+  if that exact detail appears in the evidence.
+- If the evidence above says no chunks were retrieved for this question, write one short sentence naming the
+  gap - do not invent an answer, and do not call it a gap if cited evidence is shown above.
+- Output only the section content in Markdown (you may include the "## {heading}" heading). Do not write any
+  other section, heading, or closing remarks."""
+
+
+def format_single_question_evidence(question: str, pack: dict[str, Any]) -> str:
+    chunks = pack.get("chunks", []) if isinstance(pack, dict) else []
+    ranked = rank_question_chunks(question, chunks, planned_urls=pack.get("planned_source_urls", []) if isinstance(pack, dict) else [])
+    lines = []
+    for chunk in ranked[:DEFAULT_SECTION_EVIDENCE_CHUNKS]:
+        content = sanitize_evidence_content(chunk.get("content"))[:DEFAULT_SECTION_EVIDENCE_CHUNK_CHARS].rstrip()
+        if not content:
+            continue
+        source_index = chunk.get("source_index") if isinstance(chunk.get("source_index"), int) else chunk.get("index")
+        marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
+        title = compact_text(clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Evidence chunk", 90)
+        lines.append(f"{marker} {title}:\n{content}")
+    return "\n\n".join(lines) or "No cited retrieved evidence chunks were found for this question."
+
+
+def section_needs_retry(section_text: str, pack: dict[str, Any]) -> bool:
+    if len(clean_text(strip_markdown(section_text))) < 40:
+        return True
+    has_usable_evidence = evidence_pack_has_usable_cited_evidence(pack) if isinstance(pack, dict) else False
+    if not has_usable_evidence:
+        return False
+    available = set(pack_source_indexes(pack)) if isinstance(pack, dict) else set()
+    has_cited = bool(available & set(citation_markers(section_text)))
+    has_gap_claim = bool(re.search(evidence_gap_pattern(), section_text.lower()))
+    return (not has_cited) or has_gap_claim
+
+
+def generate_frame_section(
+    client: Any,
+    model: str,
+    heading: str,
+    instructions: str,
+    objective: str,
+    source_text: str,
+    body_digest: str,
+    fallback_model: str,
+) -> tuple[str, str]:
+    prompt = f"""Research objective:
+{objective}
+
+Available sources:
+{source_text}
+
+Already-written report content (topic sections and/or earlier framing sections):
+{body_digest}
+
+Write ONLY the "{heading}" section of the report.
+{instructions}
+Never introduce a new fact, number, or citation that is not already present in the content above.
+Output only the section content in Markdown. Do not write any other heading or closing remarks."""
+    try:
+        response = create_chat_completion_with_retries(
+            client, model=model, temperature=0, max_tokens=DEFAULT_FRAME_MAX_TOKENS,
+            retry_attempts=DEFAULT_SECTION_RETRY_ATTEMPTS,
+            messages=[
+                {"role": "system", "content": SECTION_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+    except Exception as error:
+        print(f"[report] frame section '{heading}' failed ({clean_text(error)[:160]}); using digest fallback")
+        return compact_text(body_digest, DEFAULT_FRAME_SECTION_CHARS) or f"{heading} could not be generated.", fallback_model
+    section = normalize_citation_markers(clean_markdown(response.choices[0].message.content))
+    used_model = clean_text(getattr(response, "model", "")) or fallback_model
+    return section, used_model
+
+
+def strip_leading_heading(section_text: str) -> str:
+    lines = clean_markdown(section_text).splitlines()
+    if lines and lines[0].lstrip().startswith("#"):
+        lines = lines[1:]
+    return clean_markdown("\n".join(lines))
 
 
 def generate_single_report(client: Any, model: str, prompt: str, fallback_prompt: str | None = None) -> tuple[str, str]:
