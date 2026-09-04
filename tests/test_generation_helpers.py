@@ -10,7 +10,9 @@ from src.rag.generation import (
     build_sub_question_evidence_packs,
     build_coverage_by_question,
     build_generation_context,
+    build_question_context_text,
     browser_signal_results,
+    combine_per_question_synthesis,
     compact_retrieved_chunks,
     coverage_gap_items,
     deterministic_synthesis_from_evidence_packs,
@@ -2140,6 +2142,38 @@ Missing Evidence: exact benchmark values are not present.
         )
 
         self.assertEqual([result.id for result in selected], ["useful"])
+
+    def test_build_question_context_text_preserves_global_source_markers(self):
+        result = RetrievalResult(
+            id="equation",
+            document="Scaled dot-product attention uses softmax over query key scores with enough evidence text. " * 3,
+            metadata={"title": "Transformer", "url": "https://arxiv.org/pdf/1706.03762"},
+            score=1.0,
+            semantic_score=1.0,
+            bm25_score=0.0,
+        )
+        _, sources = build_generation_context([result])
+
+        context = build_question_context_text([result], sources)
+
+        self.assertIn("[1] Transformer", context)
+        self.assertIn("Scaled dot-product attention", context)
+
+    def test_combine_per_question_synthesis_keeps_question_sections(self):
+        synthesis = combine_per_question_synthesis(
+            objective="Attention mechanism",
+            synthesis_instruction="Cover every planner topic.",
+            instruction_requirement_text="- Cover every planner topic.",
+            per_question_notes=[
+                {"question": "What is attention?", "synthesis": "Attention is supported [1]."},
+                {"question": "What is missing?", "synthesis": "Missing Evidence: no chunks."},
+            ],
+        )
+
+        self.assertIn("### q001. What is attention?", synthesis)
+        self.assertIn("### q002. What is missing?", synthesis)
+        self.assertIn("Coverage: Covered/Partial", synthesis)
+        self.assertIn("Coverage: Missing Evidence", synthesis)
 
 
 if __name__ == "__main__":
