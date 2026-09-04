@@ -12,6 +12,7 @@ from src.agents.report_agent import (
     format_evidence_packs,
     format_question_coverage,
     format_question_focused_evidence,
+    format_single_question_synthesis,
     format_report_revision_feedback,
     format_report_section_outline,
     format_supporting_evidence,
@@ -24,8 +25,10 @@ from src.agents.report_agent import (
     report_context_gap_items,
     report_context_gap_queries,
     report_evidence_gap_contradictions,
+    report_per_question_synthesis_citation_gaps,
     report_generation_token_cap,
     report_quality_issues,
+    report_synthesis_gap_contradictions,
     report_needs_revision,
     report_pack_citation_gaps,
     report_schema_issues,
@@ -656,6 +659,21 @@ Done.
 
         self.assertEqual(synthesis_coverage_gap_questions(context, [question]), [])
 
+    def test_synthesis_gap_ignores_stale_partial_when_per_question_synthesis_has_citations(self):
+        question = "What are the major applications of attention mechanisms?"
+        context = {
+            "coverage_by_question": [{"question": question, "status": "partial", "source_indexes": []}],
+            "per_question_synthesis": [
+                {
+                    "question": question,
+                    "synthesis": "Attention is used in image captioning and speech recognition [5] [6].",
+                    "source_indexes": [5, 6],
+                }
+            ],
+        }
+
+        self.assertEqual(synthesis_coverage_gap_questions(context, [question]), [])
+
     def test_resolve_report_coverage_prefers_cited_evidence_pack(self):
         question = "How does the method work?"
 
@@ -813,6 +831,49 @@ Bahdanau additive attention uses an alignment score with a tanh compatibility fu
 
         self.assertEqual(gaps, [])
 
+    def test_report_synthesis_gap_contradictions_flags_false_application_gap(self):
+        question = "What are the major applications of attention mechanisms across NLP, vision, and speech?"
+        report = """
+## Major Applications Of Attention Mechanisms Across NLP Vision And Speech
+Attention is used in translation [1].
+Evidence for vision and speech applications is missing.
+"""
+
+        false_gaps = report_synthesis_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "synthesis": "Vision applications include image captioning [5]. Speech recognition is also supported [6].",
+                    "source_indexes": [5, 6],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_per_question_synthesis_citation_gaps_flags_dropped_synthesis_sources(self):
+        question = "What is the definition of attention?"
+        report = """
+## Definition Of Attention
+Attention lets a model focus on specific input elements.
+"""
+
+        gaps = report_per_question_synthesis_citation_gaps(
+            report,
+            [
+                {
+                    "question": question,
+                    "synthesis": "Attention lets a model focus on specific input elements [5].",
+                    "source_indexes": [5],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(gaps, [question])
+
     def test_report_needs_revision_for_false_evidence_gap(self):
         self.assertTrue(
             report_needs_revision(
@@ -932,6 +993,60 @@ No cited source markers were used.
         self.assertEqual(repairs, [question])
         self.assertIn("Core evidence", repaired)
         self.assertIn("[2] https://arxiv.org/pdf/1409.0473", repaired)
+
+    def test_apply_report_repairs_prefer_per_question_synthesis_over_raw_pack_chunk(self):
+        question = "What are the major applications of attention mechanisms?"
+        report = """
+## Major Applications Of Attention Mechanisms
+Evidence for vision and speech applications is missing.
+
+## References
+No cited source markers were used.
+"""
+        packs = [
+            {
+                "question": question,
+                "coverage": "covered",
+                "chunks": [
+                    {
+                        "source_index": 2,
+                        "title": "PDF",
+                        "content": "ut. The quadratic dependence on n poses a challenge for very long input sequences.",
+                    }
+                ],
+            }
+        ]
+        synthesis = [
+            {
+                "question": question,
+                "synthesis": "Attention is used for image captioning [5] and speech recognition [6].",
+                "source_indexes": [5, 6],
+            }
+        ]
+
+        repaired, repairs = apply_report_evidence_pack_repairs(
+            report,
+            packs,
+            {"false_gap_questions": [question], "pack_citation_gap_questions": []},
+            [question],
+            [{"index": 5, "url": "https://vision.example"}, {"index": 6, "url": "https://speech.example"}],
+            per_question_synthesis=synthesis,
+        )
+
+        self.assertEqual(repairs, [question])
+        self.assertIn("Per-question synthesis support", repaired)
+        self.assertIn("image captioning [5]", repaired)
+        self.assertIn("speech recognition [6]", repaired)
+        self.assertNotIn("quadratic dependence", repaired)
+
+    def test_format_single_question_synthesis_lists_source_markers(self):
+        text = format_single_question_synthesis(
+            "What is attention?",
+            {"synthesis": "Attention focuses input elements [5].", "source_indexes": [5]},
+        )
+
+        self.assertIn("Synthesis source markers: [5]", text)
+        self.assertIn("Attention focuses input elements [5].", text)
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(

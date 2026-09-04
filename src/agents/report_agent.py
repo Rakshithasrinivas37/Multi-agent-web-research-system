@@ -143,11 +143,13 @@ class ReportAgent:
         coverage_conflicts = report_coverage_conflicts(report_context.get("coverage_by_question", []), evidence_packs)
         if coverage_conflicts:
             print(f"[report] resolved {len(coverage_conflicts)} stale coverage gap(s) from evidence packs")
+        per_question_synthesis = report_context.get("per_question_synthesis", [])
         evidence = format_question_focused_evidence(report_context, coverage_questions, sources=sources, evidence_packs=evidence_packs)
         if not evidence:
             evidence = format_supporting_evidence(report_context, sources=sources)
         pack_text = format_evidence_packs(evidence_packs)
-        sources = evidence_backed_sources(sources, evidence, synthesis, pack_text)
+        per_question_synthesis_text = format_per_question_synthesis(per_question_synthesis)
+        sources = evidence_backed_sources(sources, evidence, synthesis, pack_text, per_question_synthesis_text)
 
         emit_progress(
             "tool_called",
@@ -171,6 +173,7 @@ class ReportAgent:
             "citation_policy": clean_text(report_context.get("citation_policy")),
             "coverage_by_question": coverage_by_question,
             "evidence_packs": evidence_packs,
+            "per_question_synthesis": per_question_synthesis,
         }
         section_diagnostics: dict[str, Any] = {}
         if self.generation_mode == "sections":
@@ -183,6 +186,7 @@ class ReportAgent:
                 evidence_packs=evidence_packs,
                 sources=sources,
                 synthesis=synthesis,
+                per_question_synthesis=per_question_synthesis,
             )
         else:
             prompt = build_report_prompt(**prompt_inputs)
@@ -199,7 +203,14 @@ class ReportAgent:
             report = normalize_final_report(report, sources)
             validation = validate_report_output(report, sources, coverage_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
             review_trace.append(validation["review"])
-        report, deterministic_repairs = apply_report_evidence_pack_repairs(report, evidence_packs, validation, coverage_questions, sources)
+        report, deterministic_repairs = apply_report_evidence_pack_repairs(
+            report,
+            evidence_packs,
+            validation,
+            coverage_questions,
+            sources,
+            per_question_synthesis=per_question_synthesis,
+        )
         if deterministic_repairs:
             print(f"[report] applied {len(deterministic_repairs)} deterministic evidence-pack repair(s)")
             validation = validate_report_output(report, sources, coverage_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
@@ -270,6 +281,7 @@ def build_report_prompt(
     citation_policy: str = "",
     coverage_by_question: Sequence[dict[str, Any]] | None = None,
     evidence_packs: Sequence[dict[str, Any]] | None = None,
+    per_question_synthesis: Sequence[dict[str, Any]] | None = None,
     compact: bool = False,
     repair_feedback: str = "",
 ) -> str:
@@ -278,6 +290,7 @@ def build_report_prompt(
     synthesis_text = clean_markdown(synthesis)
     coverage_text = format_question_coverage(coverage_by_question or [])
     pack_text = format_evidence_packs(evidence_packs or [])
+    per_question_synthesis_text = format_per_question_synthesis(per_question_synthesis or [])
     if compact:
         source_text = compact_text(source_text, DEFAULT_RETRY_SOURCE_CHARS)
         evidence_text = compact_text(evidence_text, DEFAULT_RETRY_EVIDENCE_CHARS)
@@ -291,6 +304,7 @@ def build_report_prompt(
             ),
             DEFAULT_RETRY_EVIDENCE_PACK_CHARS,
         )
+        per_question_synthesis_text = compact_text(per_question_synthesis_text, DEFAULT_RETRY_EVIDENCE_PACK_CHARS)
     prompt = f"""Research objective:
 {objective}
 
@@ -330,6 +344,9 @@ Evidence gaps from synthesis:
 Per-question evidence packs:
 {pack_text}
 
+Per-question synthesis notes:
+{per_question_synthesis_text}
+
 Write the final Markdown report. Explain each supported topic in clear prose before equations, tables, APIs, or technical details."""
     return trim_report_prompt(prompt) if compact else prompt
 
@@ -343,6 +360,7 @@ def generate_report_by_sections(
     evidence_packs: Sequence[dict[str, Any]],
     sources: Sequence[dict[str, Any]],
     synthesis: str,
+    per_question_synthesis: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     """Generate the report as separate, individually-grounded section calls.
 
@@ -360,19 +378,30 @@ def generate_report_by_sections(
         for pack in evidence_packs or []
         if isinstance(pack, dict)
     }
+    synthesis_by_question = per_question_synthesis_by_question(per_question_synthesis or [])
     last_model = model
 
     topic_sections: list[str] = []
     section_diagnostics: list[dict[str, Any]] = []
     for question in coverage_questions:
         pack = packs_by_question.get(normalize_heading(question), {})
-        section, used_model, retried = generate_topic_section(client, model, objective, question, pack, source_text)
+        synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
+        section, used_model, retried = generate_topic_section(
+            client,
+            model,
+            objective,
+            question,
+            pack,
+            source_text,
+            synthesis_note=synthesis_note,
+        )
         last_model = used_model or last_model
         topic_sections.append(section)
         section_diagnostics.append({
             "question": question,
             "retried": retried,
             "had_usable_evidence": evidence_pack_has_usable_cited_evidence(pack),
+            "had_per_question_synthesis": per_question_synthesis_has_cited_evidence(synthesis_note),
             "chars": len(section),
         })
 
@@ -445,9 +474,10 @@ def generate_topic_section(
     question: str,
     pack: dict[str, Any],
     source_text: str,
+    synthesis_note: dict[str, Any] | None = None,
 ) -> tuple[str, str, bool]:
     heading = planner_question_heading(question)
-    prompt = build_topic_section_prompt(objective, question, heading, pack, source_text)
+    prompt = build_topic_section_prompt(objective, question, heading, pack, source_text, synthesis_note=synthesis_note)
     response = create_chat_completion_with_retries(
         client, model=model, temperature=0, max_tokens=DEFAULT_SECTION_MAX_TOKENS,
         retry_attempts=DEFAULT_SECTION_RETRY_ATTEMPTS,
@@ -460,7 +490,7 @@ def generate_topic_section(
     used_model = clean_text(getattr(response, "model", "")) or model
 
     retried = False
-    if section_needs_retry(section, pack):
+    if section_needs_retry(section, pack, synthesis_note=synthesis_note):
         retried = True
         retry_prompt = f"""{prompt}
 
@@ -491,8 +521,10 @@ def build_topic_section_prompt(
     heading: str,
     pack: dict[str, Any],
     source_text: str,
+    synthesis_note: dict[str, Any] | None = None,
 ) -> str:
     evidence_text = format_single_question_evidence(question, pack)
+    synthesis_text = format_single_question_synthesis(question, synthesis_note or {})
     return f"""Research objective:
 {objective}
 
@@ -508,13 +540,18 @@ Available sources:
 Evidence retrieved for this question only:
 {evidence_text}
 
+Per-question synthesis notes for this question:
+{synthesis_text}
+
 Rules:
-- Use only the evidence above; never use outside knowledge.
+- Use only the retrieved evidence and per-question synthesis notes above; never use outside knowledge.
+- Treat cited per-question synthesis notes as report-ready support for this exact question.
+- If per-question synthesis notes cite sources for an answer, use those cited claims before naming any gap.
 - Cite every factual claim inline with a real marker shown above, like [1].
 - If the evidence answers the question, write clear prose first, then any equation/formula/API/metric line only
   if that exact detail appears in the evidence.
 - If the evidence above says no chunks were retrieved for this question, write one short sentence naming the
-  gap - do not invent an answer, and do not call it a gap if cited evidence is shown above.
+  gap - do not invent an answer, and do not call it a gap if cited evidence or cited synthesis is shown above.
 - Output only the section content in Markdown (you may include the "## {heading}" heading). Do not write any
   other section, heading, or closing remarks."""
 
@@ -534,13 +571,15 @@ def format_single_question_evidence(question: str, pack: dict[str, Any]) -> str:
     return "\n\n".join(lines) or "No cited retrieved evidence chunks were found for this question."
 
 
-def section_needs_retry(section_text: str, pack: dict[str, Any]) -> bool:
+def section_needs_retry(section_text: str, pack: dict[str, Any], synthesis_note: dict[str, Any] | None = None) -> bool:
     if len(clean_text(strip_markdown(section_text))) < 40:
         return True
     has_usable_evidence = evidence_pack_has_usable_cited_evidence(pack) if isinstance(pack, dict) else False
-    if not has_usable_evidence:
+    has_usable_synthesis = per_question_synthesis_has_cited_evidence(synthesis_note or {})
+    if not has_usable_evidence and not has_usable_synthesis:
         return False
     available = set(pack_source_indexes(pack)) if isinstance(pack, dict) else set()
+    available.update(per_question_synthesis_source_indexes(synthesis_note or {}))
     has_cited = bool(available & set(citation_markers(section_text)))
     has_gap_claim = bool(re.search(evidence_gap_pattern(), section_text.lower()))
     return (not has_cited) or has_gap_claim
@@ -708,6 +747,57 @@ def format_evidence_packs(
             if content:
                 lines.append(f"  - {marker} {title}: {content}")
     return "\n".join(lines) or "- No per-question evidence packs were provided."
+
+
+def format_per_question_synthesis(per_question_synthesis: Sequence[dict[str, Any]]) -> str:
+    lines = []
+    for item in per_question_synthesis or []:
+        if not isinstance(item, dict):
+            continue
+        question = clean_text(item.get("question"))
+        synthesis = clean_markdown(item.get("synthesis"))
+        if not question or not synthesis:
+            continue
+        source_markers = ", ".join(f"[{index}]" for index in per_question_synthesis_source_indexes(item))
+        lines.append(f"- {question}")
+        if source_markers:
+            lines.append(f"  - Use cited synthesis from {source_markers} before naming any evidence gap.")
+        lines.append(f"  - {compact_text(synthesis, DEFAULT_RETRY_COVERAGE_CHARS)}")
+    return "\n".join(lines) or "- No per-question synthesis notes were provided."
+
+
+def format_single_question_synthesis(question: str, synthesis_note: dict[str, Any]) -> str:
+    if not isinstance(synthesis_note, dict):
+        return "No cited per-question synthesis notes were found for this question."
+    synthesis = clean_markdown(synthesis_note.get("synthesis"))
+    if not synthesis:
+        return "No cited per-question synthesis notes were found for this question."
+    source_markers = ", ".join(f"[{index}]" for index in per_question_synthesis_source_indexes(synthesis_note))
+    header = f"Synthesis source markers: {source_markers or 'none'}"
+    return f"{header}\n{synthesis}"
+
+
+def per_question_synthesis_by_question(per_question_synthesis: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        normalize_heading(item.get("question")): item
+        for item in per_question_synthesis or []
+        if isinstance(item, dict) and clean_text(item.get("question"))
+    }
+
+
+def per_question_synthesis_source_indexes(synthesis_note: dict[str, Any]) -> list[int]:
+    if not isinstance(synthesis_note, dict):
+        return []
+    return dedupe_ints([*synthesis_note.get("source_indexes", []), *citation_markers(synthesis_note.get("synthesis"))])
+
+
+def per_question_synthesis_has_cited_evidence(synthesis_note: dict[str, Any]) -> bool:
+    if not isinstance(synthesis_note, dict):
+        return False
+    synthesis = clean_text(synthesis_note.get("synthesis"))
+    if not synthesis or re.search(evidence_gap_pattern(), synthesis.lower()) and not citation_markers(synthesis):
+        return False
+    return bool(per_question_synthesis_source_indexes(synthesis_note))
 
 
 def planner_question_heading(question: str) -> str:
@@ -1075,8 +1165,26 @@ def validate_report_output(
     synthesis_gaps = synthesis_coverage_gap_questions(report_context, planner_questions)
     coverage = report_sub_question_coverage_check(report, planner_questions)
     schema_issues = report_schema_issues(report, planner_questions)
-    false_gaps = report_evidence_gap_contradictions(report, evidence_packs, planner_questions)
-    pack_citation_gaps = report_pack_citation_gaps(report, evidence_packs, planner_questions)
+    false_gaps = dedupe_text(
+        [
+            *report_evidence_gap_contradictions(report, evidence_packs, planner_questions),
+            *report_synthesis_gap_contradictions(
+                report,
+                report_context.get("per_question_synthesis", []),
+                planner_questions,
+            ),
+        ]
+    )
+    pack_citation_gaps = dedupe_text(
+        [
+            *report_pack_citation_gaps(report, evidence_packs, planner_questions),
+            *report_per_question_synthesis_citation_gaps(
+                report,
+                report_context.get("per_question_synthesis", []),
+                planner_questions,
+            ),
+        ]
+    )
     report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}\n{pack_text}")
     report_issues.extend(f"report marks covered evidence as a gap: {question}" for question in false_gaps)
     report_issues.extend(f"report section does not cite its evidence pack: {question}" for question in pack_citation_gaps)
@@ -1131,8 +1239,9 @@ def apply_report_evidence_pack_repairs(
     validation: dict[str, Any],
     planner_questions: Sequence[str],
     sources: Sequence[dict[str, Any]],
+    per_question_synthesis: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[str, list[str]]:
-    """Patch unresolved evidence-pack failures with concise cited notes."""
+    """Patch unresolved per-question evidence failures with concise cited notes."""
 
     target_questions = dedupe_text(
         [
@@ -1147,13 +1256,15 @@ def apply_report_evidence_pack_repairs(
         for pack in evidence_packs or []
         if isinstance(pack, dict) and evidence_pack_has_usable_cited_evidence(pack)
     }
+    synthesis_by_question = per_question_synthesis_by_question(per_question_synthesis or [])
     report_text = strip_references(clean_markdown(report))
     repairs = []
     for question in target_questions:
         pack = packs_by_question.get(normalize_heading(question))
-        if not pack:
-            continue
-        note = evidence_pack_repair_note(question, pack)
+        synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
+        note = per_question_synthesis_repair_note(question, synthesis_note)
+        if not note and pack:
+            note = evidence_pack_repair_note(question, pack)
         if not note:
             continue
         report_text = upsert_section_repair_note(
@@ -1166,6 +1277,19 @@ def apply_report_evidence_pack_repairs(
     if not repairs:
         return report, []
     return normalize_final_report(report_text, sources), repairs
+
+
+def per_question_synthesis_repair_note(question: str, synthesis_note: dict[str, Any]) -> str:
+    if not per_question_synthesis_has_cited_evidence(synthesis_note):
+        return ""
+    synthesis = clean_markdown(synthesis_note.get("synthesis"))
+    if not synthesis:
+        return ""
+    snippet = compact_text(synthesis, 620)
+    source_markers = set(per_question_synthesis_source_indexes(synthesis_note))
+    if not (source_markers & set(citation_markers(snippet))):
+        snippet = f"{snippet} {format_citation_indexes(source_markers)}"
+    return f"**Per-question synthesis support:** {snippet}"
 
 
 def evidence_pack_repair_note(question: str, pack: dict[str, Any]) -> str:
@@ -1227,6 +1351,7 @@ def line_has_gap_claim(line: str) -> bool:
 def evidence_gap_pattern() -> str:
     return (
         r"(evidence\s+gap|evidence\s+not\s+provided|not\s+provided|missing\s+evidence|"
+        r"(?:is|are)\s+missing|"
         r"no\s+source-backed|cannot\s+be\s+(?:given|reproduced|answered|provided)|"
         r"do\s+not\s+(?:contain|provide|include)|does\s+not\s+(?:contain|provide|include)|"
         r"none\s+.*\s+provide|not\s+available|absent\s+from\s+.*\s+evidence|"
@@ -1327,6 +1452,59 @@ def report_pack_citation_gaps(
     return dedupe_text(gaps)
 
 
+def report_synthesis_gap_contradictions(
+    report: str,
+    per_question_synthesis: Sequence[dict[str, Any]],
+    planner_questions: Sequence[str] | None = None,
+) -> list[str]:
+    """Find sections that call cited per-question synthesis evidence missing."""
+
+    canonical = {normalize_heading(q): q for q in planner_questions or [] if clean_text(q)}
+    contradictions = []
+    for item in per_question_synthesis or []:
+        if not isinstance(item, dict) or not per_question_synthesis_has_cited_evidence(item):
+            continue
+        question = clean_text(item.get("question"))
+        section = report_section_for_question(report, question) or clean_markdown(report)
+        if section and section_claims_missing_per_question_synthesis(section, question, item):
+            contradictions.append(canonical.get(normalize_heading(question), question))
+    return dedupe_text(contradictions)
+
+
+def report_per_question_synthesis_citation_gaps(
+    report: str,
+    per_question_synthesis: Sequence[dict[str, Any]],
+    planner_questions: Sequence[str] | None = None,
+) -> list[str]:
+    """Find topic sections that drop the citations used by their per-question synthesis."""
+
+    canonical = {normalize_heading(q): q for q in planner_questions or [] if clean_text(q)}
+    gaps = []
+    for item in per_question_synthesis or []:
+        if not isinstance(item, dict) or not per_question_synthesis_has_cited_evidence(item):
+            continue
+        question = clean_text(item.get("question"))
+        section = report_section_for_question(report, question) or clean_markdown(report)
+        if not section or section_cites_per_question_synthesis(section, item):
+            continue
+        if section_mentions_pack_topic(section, question):
+            gaps.append(canonical.get(normalize_heading(question), question))
+    return dedupe_text(gaps)
+
+
+def section_claims_missing_per_question_synthesis(section: str, question: str, synthesis_note: dict[str, Any]) -> bool:
+    lowered = clean_text(section).lower()
+    gap_terms = evidence_gap_pattern()
+    if not re.search(gap_terms, lowered):
+        return False
+    if not section_cites_per_question_synthesis(section, synthesis_note):
+        return True
+    for term in named_terms(question):
+        if term in lowered and re.search(rf"\b{re.escape(term)}\b.{{0,140}}{gap_terms}|{gap_terms}.{{0,140}}\b{re.escape(term)}\b", lowered):
+            return True
+    return False
+
+
 def section_mentions_pack_topic(section: str, question: str) -> bool:
     text_terms = detail_terms(section)
     question_terms = [term for term in detail_terms(question) if term not in STOPWORDS]
@@ -1388,6 +1566,10 @@ def section_cites_pack_source(section: str, pack: dict[str, Any]) -> bool:
     return bool(set(citation_markers(section)) & set(pack_source_indexes(pack)))
 
 
+def section_cites_per_question_synthesis(section: str, synthesis_note: dict[str, Any]) -> bool:
+    return bool(set(citation_markers(section)) & set(per_question_synthesis_source_indexes(synthesis_note)))
+
+
 def pack_source_indexes(pack: dict[str, Any]) -> list[int]:
     return dedupe_ints(
         chunk.get("source_index")
@@ -1425,12 +1607,17 @@ def synthesis_coverage_gap_questions(
         for pack in report_context.get("evidence_packs", []) or []
         if isinstance(pack, dict) and evidence_pack_has_cited_evidence(pack)
     }
+    covered_synthesis = {
+        normalize_heading(item.get("question"))
+        for item in report_context.get("per_question_synthesis", []) or []
+        if isinstance(item, dict) and per_question_synthesis_has_cited_evidence(item)
+    }
     gaps = []
     for item in report_context.get("coverage_by_question", []) or []:
         if not isinstance(item, dict) or not synthesis_coverage_status_is_gap(item.get("status")):
             continue
         question = clean_text(item.get("question"))
-        if normalize_heading(question) in covered_packs:
+        if normalize_heading(question) in covered_packs or normalize_heading(question) in covered_synthesis:
             continue
         if question:
             gaps.append(canonical.get(normalize_heading(question), question))
