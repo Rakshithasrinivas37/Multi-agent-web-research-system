@@ -159,6 +159,11 @@ class ReportAgent:
             report = normalize_final_report(report, sources)
             validation = validate_report_output(report, sources, coverage_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
             review_trace.append(validation["review"])
+        report, deterministic_repairs = apply_report_evidence_pack_repairs(report, evidence_packs, validation, coverage_questions, sources)
+        if deterministic_repairs:
+            print(f"[report] applied {len(deterministic_repairs)} deterministic evidence-pack repair(s)")
+            validation = validate_report_output(report, sources, coverage_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
+            review_trace.append({**validation["review"], "source": "deterministic_repair", "repairs": deterministic_repairs})
 
         return {
             "objective": objective,
@@ -194,6 +199,7 @@ class ReportAgent:
                 ),
                 "report_review_trace": review_trace,
                 "report_revision_attempts": len(review_trace) - 1,
+                "report_deterministic_repairs": deterministic_repairs,
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
                 "report_prompt_chars": len(prompt),
                 "report_fallback_prompt_chars": len(fallback_prompt),
@@ -817,6 +823,115 @@ def format_repair_feedback(repair_feedback: str) -> str:
 Revise the report to fix every item above. If a topic has covered cited evidence, do not write it as an evidence gap."""
 
 
+def apply_report_evidence_pack_repairs(
+    report: str,
+    evidence_packs: Sequence[dict[str, Any]],
+    validation: dict[str, Any],
+    planner_questions: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    """Patch unresolved evidence-pack failures with concise cited notes."""
+
+    target_questions = dedupe_text(
+        [
+            *validation.get("false_gap_questions", []),
+            *validation.get("pack_citation_gap_questions", []),
+        ]
+    )
+    if not target_questions:
+        return report, []
+    packs_by_question = {
+        normalize_heading(pack.get("question")): pack
+        for pack in evidence_packs or []
+        if isinstance(pack, dict) and evidence_pack_has_usable_cited_evidence(pack)
+    }
+    report_text = strip_references(clean_markdown(report))
+    repairs = []
+    for question in target_questions:
+        pack = packs_by_question.get(normalize_heading(question))
+        if not pack:
+            continue
+        note = evidence_pack_repair_note(question, pack)
+        if not note:
+            continue
+        report_text = upsert_section_repair_note(
+            report_text,
+            question,
+            note,
+            remove_gap_lines=question in validation.get("false_gap_questions", []),
+        )
+        repairs.append(question)
+    if not repairs:
+        return report, []
+    return normalize_final_report(report_text, sources), repairs
+
+
+def evidence_pack_repair_note(question: str, pack: dict[str, Any]) -> str:
+    ranked_chunks = rank_question_chunks(question, pack.get("chunks", []) or [], planned_urls=pack.get("planned_source_urls", []))
+    for chunk in ranked_chunks:
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("source_index"), int):
+            continue
+        content = sanitize_evidence_content(chunk.get("content"))
+        if not content:
+            continue
+        marker = f"[{chunk['source_index']}]"
+        label = "Core evidence" if evidence_pack_has_formula_evidence(pack) else "Evidence-pack support"
+        snippet = compact_text(content, 420)
+        if marker not in snippet:
+            snippet = f"{snippet} {marker}"
+        return f"**{label}:** {snippet}"
+    return ""
+
+
+def upsert_section_repair_note(report: str, question: str, note: str, remove_gap_lines: bool = False) -> str:
+    lines = clean_markdown(report).splitlines()
+    bounds = section_bounds_for_question(lines, question)
+    if not bounds:
+        return clean_markdown(f"{report}\n\n## Evidence Pack Corrections\n\n### {planner_question_heading(question)}\n{note}")
+    start, end = bounds
+    section_lines = lines[start:end]
+    if remove_gap_lines:
+        section_lines = [line for line in section_lines if not line_has_gap_claim(line)]
+    if note not in "\n".join(section_lines):
+        section_lines.extend(["", note])
+    return clean_markdown("\n".join([*lines[:start], *section_lines, *lines[end:]]))
+
+
+def section_bounds_for_question(lines: Sequence[str], question: str) -> tuple[int, int] | None:
+    expected = normalize_heading(planner_question_heading(question))
+    question_terms = detail_terms(question)
+    best: tuple[int, int] | None = None
+    best_score = 0
+    heading_positions = [
+        (index, match.group(1).strip())
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line))
+    ]
+    for position, (start, heading) in enumerate(heading_positions):
+        end = heading_positions[position + 1][0] if position + 1 < len(heading_positions) else len(lines)
+        actual = normalize_heading(heading)
+        score = 5 if expected and headings_match(expected, actual) else 0
+        score += len(question_terms & detail_terms(heading))
+        if score > best_score:
+            best_score = score
+            best = (start, end)
+    return best if best_score else None
+
+
+def line_has_gap_claim(line: str) -> bool:
+    return bool(re.search(evidence_gap_pattern(), clean_text(line).lower()))
+
+
+def evidence_gap_pattern() -> str:
+    return (
+        r"(evidence\s+gap|evidence\s+not\s+provided|not\s+provided|missing\s+evidence|"
+        r"no\s+source-backed|cannot\s+be\s+(?:given|reproduced|answered|provided)|"
+        r"do\s+not\s+(?:contain|provide|include)|does\s+not\s+(?:contain|provide|include)|"
+        r"none\s+.*\s+provide|not\s+available|absent\s+from\s+.*\s+evidence|"
+        r"not\s+present\s+in\s+.*\s+(?:evidence|sources|material))"
+    )
+
+
 def resolve_report_coverage(
     coverage_by_question: Sequence[dict[str, Any]],
     evidence_packs: Sequence[dict[str, Any]],
@@ -958,12 +1073,7 @@ def markdown_sections(markdown: str) -> list[tuple[str, str]]:
 
 def section_claims_missing_supported_evidence(section: str, question: str, pack: dict[str, Any]) -> bool:
     lowered = clean_text(section).lower()
-    gap_terms = (
-        r"(evidence\s+gap|evidence\s+not\s+provided|not\s+provided|missing\s+evidence|"
-        r"no\s+source-backed|cannot\s+be\s+(?:given|reproduced|answered)|"
-        r"do\s+not\s+(?:contain|provide|include)|does\s+not\s+(?:contain|provide|include)|"
-        r"none\s+.*\s+provide|not\s+available|absent\s+from\s+.*\s+evidence)"
-    )
+    gap_terms = evidence_gap_pattern()
     if re.search(gap_terms, lowered) and (evidence_pack_has_formula_evidence(pack) or not section_cites_pack_source(section, pack)):
         return True
     for term in named_terms(question):

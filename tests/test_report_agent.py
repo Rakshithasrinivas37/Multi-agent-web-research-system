@@ -4,6 +4,7 @@ import src.agents.report_agent as report_agent_module
 from src.agents.report_agent import (
     DEFAULT_REPORT_PROMPT_CHARS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+    apply_report_evidence_pack_repairs,
     clean_markdown,
     build_report_prompt,
     dedupe_sources,
@@ -857,6 +858,80 @@ Bahdanau additive attention uses an alignment score with a tanh compatibility fu
 
         self.assertIn("missing evidence-pack citation", feedback)
         self.assertIn(question, feedback)
+
+    def test_apply_report_evidence_pack_repairs_removes_false_gap_and_adds_cited_note(self):
+        question = "What are the core equations of the original additive attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Attention Mechanism
+Evidence Gap: The supplied evidence does not contain the explicit formula.
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+        packs = [
+            {
+                "question": question,
+                "coverage": "partial",
+                "chunks": [
+                    {
+                        "source_index": 2,
+                        "title": "Original paper",
+                        "url": "https://arxiv.org/pdf/1409.0473",
+                        "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                    }
+                ],
+            }
+        ]
+
+        repaired, repairs = apply_report_evidence_pack_repairs(
+            report,
+            packs,
+            {"false_gap_questions": [question], "pack_citation_gap_questions": []},
+            [question],
+            [{"index": 2, "url": "https://arxiv.org/pdf/1409.0473"}],
+        )
+
+        self.assertEqual(repairs, [question])
+        self.assertNotIn("Evidence Gap", repaired)
+        self.assertIn("Core evidence", repaired)
+        self.assertIn("[2]", repaired)
+        self.assertIn("1409.0473", repaired)
+
+    def test_apply_report_evidence_pack_repairs_adds_missing_pack_citation(self):
+        question = "What are the core equations of the original additive attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Attention Mechanism
+Additive attention uses a tanh compatibility function.
+
+## References
+No cited source markers were used.
+"""
+        packs = [
+            {
+                "question": question,
+                "coverage": "partial",
+                "chunks": [
+                    {
+                        "source_index": 2,
+                        "title": "Original paper",
+                        "url": "https://arxiv.org/pdf/1409.0473",
+                        "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                    }
+                ],
+            }
+        ]
+
+        repaired, repairs = apply_report_evidence_pack_repairs(
+            report,
+            packs,
+            {"false_gap_questions": [], "pack_citation_gap_questions": [question]},
+            [question],
+            [{"index": 2, "url": "https://arxiv.org/pdf/1409.0473"}],
+        )
+
+        self.assertEqual(repairs, [question])
+        self.assertIn("Core evidence", repaired)
+        self.assertIn("[2] https://arxiv.org/pdf/1409.0473", repaired)
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(
