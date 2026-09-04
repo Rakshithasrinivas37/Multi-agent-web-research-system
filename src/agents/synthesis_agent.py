@@ -81,7 +81,7 @@ class SynthesisAgent:
         self.bm25_scan_limit = env_int("RAG_BM25_SCAN_LIMIT", bm25_scan_limit, DEFAULT_BM25_SCAN_LIMIT)
         self.embedding_device = env_text("RAG_EMBEDDING_DEVICE", embedding_device, "")
         self.diversify_urls = env_bool("RAG_DIVERSIFY_URLS", diversify_urls, True)
-        self.rerank = env_bool("RAG_RERANK", rerank, False)
+        self.rerank = env_bool("RAG_RERANK", rerank, True)
         self.reranker_model = env_text("RAG_RERANKER_MODEL", reranker_model, DEFAULT_RERANKER_MODEL)
         self.rerank_k = env_int("RAG_RERANK_K", rerank_k, DEFAULT_RERANK_K)
         self.rerank_weight = env_float("RAG_RERANK_WEIGHT", rerank_weight, DEFAULT_RERANK_WEIGHT)
@@ -91,7 +91,7 @@ class SynthesisAgent:
             True,
         )
         self.source_url_k = env_int("RAG_SOURCE_URL_K", source_url_k, DEFAULT_REPORT_SOURCE_URL_K)
-        self.rewrite_query = env_bool("RAG_REWRITE_QUERY", rewrite_query, False)
+        self.rewrite_query = env_bool("RAG_REWRITE_QUERY", rewrite_query, True)
         self.include_retrieved_chunks = env_bool("RAG_INCLUDE_RETRIEVED_CHUNKS", include_retrieved_chunks, True)
         self.max_context_chars = env_int("RAG_MAX_CONTEXT_CHARS", max_context_chars, DEFAULT_MAX_CONTEXT_CHARS)
         self.max_tokens = env_int("RAG_REPORT_MAX_TOKENS", max_tokens, DEFAULT_REPORT_MAX_TOKENS)
