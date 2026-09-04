@@ -797,13 +797,17 @@ def metadata_signal_score(query: str, metadata: Any) -> float:
     score = 0.0
     if metadata.get("chunk_kind") == "signal":
         score += 0.03
+    if metadata.get("chunk_kind") == "table" or metadata.get("has_table_signal"):
+        score += 0.04
     if metadata.get("has_formula_signal") and query_needs_formula_signal(query_text):
         score += 0.12
     if metadata.get("has_api_signal") and re.search(r"\b(api|sdk|docs?|documentation|reference|implementation|code|usage|class|function)\b", query_text):
         score += 0.10
+    if metadata.get("has_table_signal") and re.search(r"\b(table|row|column|benchmark|score|result|metric|accuracy|bleu|glue|imagenet|comparison)\b", query_text):
+        score += 0.12
     if metadata.get("has_benchmark_signal") and re.search(r"\b(benchmark|score|accuracy|bleu|glue|imagenet|metric)\b", query_text):
         score += 0.10
-    return min(score, 0.20)
+    return min(score, 0.25)
 
 
 def query_needs_formula_signal(query: str) -> bool:
@@ -1360,7 +1364,7 @@ def normalize_source_url(value: Any) -> str:
 def canonical_source_url(url: str) -> str:
     parsed = urlparse(url)
     path = parsed.path.rstrip("/")
-    match = re.match(r"^/(abs|pdf)/([0-9]{4}\.[0-9]{4,5})(?:v\d+)?(?:\.pdf)?$", path)
+    match = re.match(r"^/(abs|pdf|html)/([0-9]{4}\.[0-9]{4,5})(?:v\d+)?(?:\.pdf)?$", path)
     if parsed.netloc.lower() == "arxiv.org" and match:
         return f"{parsed.scheme}://arxiv.org/pdf/{match.group(2)}"
     return url

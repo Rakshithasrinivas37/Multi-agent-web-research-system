@@ -1,13 +1,21 @@
 import unittest
 
+import src.agents.report_agent as report_agent_module
 from src.agents.report_agent import (
+    DEFAULT_REPORT_PROMPT_CHARS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+    apply_report_evidence_pack_repairs,
     clean_markdown,
     build_report_prompt,
     dedupe_sources,
+    evidence_pack_questions,
+    format_evidence_packs,
     format_question_coverage,
+    format_question_focused_evidence,
+    format_report_revision_feedback,
     format_report_section_outline,
     format_supporting_evidence,
+    generate_single_report,
     missing_evidence_constraints,
     missing_sub_question_coverage,
     normalize_final_report,
@@ -15,14 +23,20 @@ from src.agents.report_agent import (
     remove_unavailable_citation_markers,
     report_context_gap_items,
     report_context_gap_queries,
+    report_evidence_gap_contradictions,
     report_generation_token_cap,
     report_quality_issues,
+    report_needs_revision,
+    report_pack_citation_gaps,
     report_schema_issues,
     report_self_critique,
     report_sub_question_coverage_check,
+    resolve_report_coverage,
     rewrite_missing_sub_question_queries,
+    sources_with_browser_results,
     slugify_filename,
     synthesis_coverage_gap_questions,
+    trim_report_prompt,
     unsupported_benchmark_metrics,
 )
 
@@ -115,6 +129,26 @@ Supported [1]. Unsupported [9].
 
         self.assertEqual([source["index"] for source in sources], [3, 1, 14])
 
+    def test_sources_with_browser_results_preserves_synthesis_indexes(self):
+        sources = [
+            {"index": 1, "url": "https://paper.example"},
+            {"index": 7, "url": "https://paper.example"},
+        ]
+        browser_results = [
+            {
+                "sources": [
+                    {"title": "Paper duplicate", "url": "https://paper.example"},
+                    {"title": "Docs", "url": "https://docs.example.com/api"},
+                ]
+            }
+        ]
+
+        merged = sources_with_browser_results(sources, browser_results)
+
+        self.assertEqual([source["index"] for source in merged], [1, 7, 8])
+        self.assertEqual(merged[1]["url"], "https://paper.example")
+        self.assertEqual(merged[2]["url"], "https://docs.example.com/api")
+
     def test_format_report_section_outline_uses_topic_headings(self):
         outline = format_report_section_outline(
             [
@@ -163,6 +197,81 @@ Supported [1]. Unsupported [9].
         self.assertIn("write a short evidence-gap subsection instead of inventing an answer", prompt)
         self.assertIn("do not include formulas, API names, benchmark values, examples, or detailed explanations", prompt)
 
+    def test_build_report_prompt_includes_evidence_packs(self):
+        prompt = build_report_prompt(
+            objective="Research topic",
+            output_format="report",
+            planner_questions=["How is the API used?"],
+            synthesis="API usage is covered.",
+            evidence="[1] API evidence.",
+            sources=[{"index": 1, "url": "https://docs.example.com/api"}],
+            evidence_packs=[
+                {
+                    "question": "How is the API used?",
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "title": "API docs", "content": "The API usage is documented."}],
+                }
+            ],
+        )
+
+        self.assertIn("Per-question evidence packs", prompt)
+        self.assertIn("covered: How is the API used?", prompt)
+        self.assertIn("Covered packs must be explained", prompt)
+        self.assertIn("Never label a covered evidence pack as an evidence gap", prompt)
+
+    def test_build_report_prompt_keeps_full_evidence_and_synthesis(self):
+        evidence_tail = "retrieved evidence tail should remain"
+        synthesis_tail = "synthesis tail should remain"
+        prompt = build_report_prompt(
+            objective="Large research topic",
+            output_format="report",
+            planner_questions=["What evidence should be covered?"],
+            synthesis=("Synthesis sentence. " * 1000) + synthesis_tail,
+            evidence=("[1] Evidence sentence. " * 1000) + evidence_tail,
+            sources=[{"index": 1, "url": "https://example.com"}],
+            evidence_packs=[
+                {
+                    "question": "What evidence should be covered?",
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "title": "Source", "content": "Useful evidence. " * 200}],
+                }
+            ],
+        )
+
+        self.assertIn(evidence_tail, prompt)
+        self.assertIn(synthesis_tail, prompt)
+        self.assertIn("Grounding requirement (strict - read this first)", prompt)
+        self.assertLess(prompt.index("Grounding requirement"), prompt.index("Per-question evidence packs"))
+
+    def test_build_report_prompt_can_compact_for_retry(self):
+        prompt = build_report_prompt(
+            objective="Large research topic",
+            output_format="report",
+            planner_questions=["What evidence should be covered?"],
+            synthesis="Synthesis sentence. " * 1000,
+            evidence="[1] Evidence sentence. " * 1000,
+            sources=[{"index": 1, "url": "https://example.com"}],
+            evidence_packs=[
+                {
+                    "question": "What evidence should be covered?",
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "title": "Source", "content": "Useful evidence. " * 200}],
+                }
+            ],
+            compact=True,
+        )
+
+        self.assertLessEqual(len(prompt), DEFAULT_REPORT_PROMPT_CHARS)
+        self.assertIn("Grounding requirement (strict - read this first)", prompt)
+
+    def test_trim_report_prompt_limits_prompt_size(self):
+        prompt = "Rules first.\n\n" + ("long evidence " * 2000)
+
+        trimmed = trim_report_prompt(prompt, max_chars=1000)
+
+        self.assertLessEqual(len(trimmed), 1000)
+        self.assertTrue(trimmed.startswith("Rules first."))
+
     def test_format_question_coverage_lists_status_and_sources(self):
         coverage = format_question_coverage([
             {
@@ -176,6 +285,41 @@ Supported [1]. Unsupported [9].
 
         self.assertIn("q002: covered", coverage)
         self.assertIn("sources=[1], [3]", coverage)
+
+    def test_format_evidence_packs_lists_chunks_and_questions(self):
+        packs = [
+            {
+                "question": "What benchmark result is reported?",
+                "coverage": "partial",
+                "chunks": [{"source_index": 2, "title": "Benchmark", "content": "Metric evidence appears here."}],
+            }
+        ]
+
+        formatted = format_evidence_packs(packs)
+
+        self.assertIn("partial: What benchmark result is reported?", formatted)
+        self.assertIn("[2] Benchmark", formatted)
+        self.assertEqual(evidence_pack_questions(packs), ["What benchmark result is reported?"])
+
+    def test_format_evidence_packs_marks_formula_evidence_as_usable(self):
+        formatted = format_evidence_packs(
+            [
+                {
+                    "question": "What are the equations of additive attention?",
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "title": "Bahdanau paper",
+                            "content": "The alignment model is a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertIn("Use cited evidence from [2]", formatted)
+        self.assertIn("Formula/equation evidence is present", formatted)
 
     def test_format_supporting_evidence_uses_chunks_once(self):
         context = {
@@ -199,6 +343,132 @@ Supported [1]. Unsupported [9].
 
         self.assertEqual(evidence.count("Attention evidence"), 1)
         self.assertIn("[1]", evidence)
+
+    def test_format_supporting_evidence_keeps_full_chunk_content(self):
+        tail = "important formula appears at the end"
+        context = {
+            "retrieved_chunks": [
+                {
+                    "source_index": 2,
+                    "title": "Long source",
+                    "url": "https://example.com/long",
+                    "content": f"{'context evidence ' * 700}{tail}",
+                }
+            ]
+        }
+
+        evidence = format_supporting_evidence(context)
+
+        self.assertIn(tail, evidence)
+
+    def test_format_evidence_packs_keeps_all_chunk_content(self):
+        first_tail = "first chunk tail"
+        second_tail = "second chunk tail"
+        formatted = format_evidence_packs(
+            [
+                {
+                    "question": "What evidence is available?",
+                    "coverage": "covered",
+                    "chunks": [
+                        {"source_index": 1, "title": "One", "content": f"{'alpha ' * 100}{first_tail}"},
+                        {"source_index": 2, "title": "Two", "content": f"{'beta ' * 100}{second_tail}"},
+                    ],
+                }
+            ]
+        )
+
+        self.assertIn(first_tail, formatted)
+        self.assertIn(second_tail, formatted)
+
+    def test_format_question_focused_evidence_keeps_per_question_details(self):
+        context = {
+            "planner_questions": [
+                "What is the equation?",
+                "What benchmark result is reported?",
+            ],
+            "retrieved_chunks": [
+                {
+                    "source_index": 1,
+                    "title": "Paper",
+                    "url": "https://paper.example",
+                    "content": "General background without the requested detail.",
+                },
+                {
+                    "source_index": 2,
+                    "title": "Equation paper",
+                    "url": "https://equation.example",
+                    "content": "The core formula is score(q,k)=exp(q k) and alpha=sum weights.",
+                },
+                {
+                    "source_index": 3,
+                    "title": "Benchmark paper",
+                    "url": "https://benchmark.example",
+                    "content": "The benchmark result improves BLEU from 20.1 to 24.3.",
+                },
+            ],
+        }
+
+        evidence = format_question_focused_evidence(context, context["planner_questions"])
+
+        self.assertIn("Question: What is the equation?", evidence)
+        self.assertIn("score(q,k)=exp(q k)", evidence)
+        self.assertIn("Question: What benchmark result is reported?", evidence)
+        self.assertIn("BLEU from 20.1 to 24.3", evidence)
+
+    def test_generate_single_report_sends_full_prompt(self):
+        captured = {}
+
+        class Message:
+            content = "## Executive Summary\nDone.\n\n## References\n"
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "test-model"
+
+        def fake_completion(client, **kwargs):
+            captured["prompt"] = kwargs["messages"][1]["content"]
+            return Response()
+
+        original = report_agent_module.create_chat_completion_with_retries
+        report_agent_module.create_chat_completion_with_retries = fake_completion
+        try:
+            tail = "prompt tail should remain"
+            generate_single_report(object(), "test-model", f"{'prompt content ' * 1200}{tail}")
+        finally:
+            report_agent_module.create_chat_completion_with_retries = original
+
+        self.assertIn(tail, captured["prompt"])
+
+    def test_generate_single_report_retries_with_compact_prompt_on_context_error(self):
+        calls = []
+
+        class Message:
+            content = "## Executive Summary\nDone.\n\n## References\n"
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "test-model"
+
+        def fake_completion(client, **kwargs):
+            calls.append(kwargs["messages"][1]["content"])
+            if len(calls) == 1:
+                raise RuntimeError("context_length_exceeded: Please reduce the length of the messages or completion.")
+            return Response()
+
+        original = report_agent_module.create_chat_completion_with_retries
+        report_agent_module.create_chat_completion_with_retries = fake_completion
+        try:
+            generate_single_report(object(), "test-model", "full prompt", fallback_prompt="compact prompt")
+        finally:
+            report_agent_module.create_chat_completion_with_retries = original
+
+        self.assertEqual(calls, ["full prompt", "compact prompt"])
 
     def test_missing_sub_question_coverage_flags_missing_topic(self):
         report = "The report defines attention and explains scoring."
@@ -370,6 +640,298 @@ Done.
 
         self.assertEqual(synthesis_coverage_gap_questions(context, plan["sub_questions"]), [question])
         self.assertEqual(report_context_gap_items(context, plan), [question])
+
+    def test_synthesis_gap_ignores_stale_missing_when_pack_has_cited_evidence(self):
+        question = "What equation is used?"
+        context = {
+            "coverage_by_question": [{"question": question, "status": "missing", "source_indexes": []}],
+            "evidence_packs": [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "content": "The equation is present."}],
+                }
+            ],
+        }
+
+        self.assertEqual(synthesis_coverage_gap_questions(context, [question]), [])
+
+    def test_resolve_report_coverage_prefers_cited_evidence_pack(self):
+        question = "How does the method work?"
+
+        resolved = resolve_report_coverage(
+            [{"question": question, "status": "missing", "source_indexes": [], "missing_reason": "No match."}],
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 2, "content": "The method is explained with source evidence."}],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(resolved[0]["status"], "covered")
+        self.assertEqual(resolved[0]["source_indexes"], [2])
+        self.assertEqual(resolved[0]["missing_reason"], "")
+
+    def test_report_evidence_gap_contradictions_flags_false_gap(self):
+        question = "What are the main variants such as Alpha and Beta?"
+        report = """
+## Main Variants Such As Alpha And Beta
+Alpha is covered by source evidence [1].
+Beta evidence not provided in the supplied sources.
+
+## References
+[1] https://example.com
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "content": "Beta is described as a supported variant."}],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_evidence_gap_contradictions_detects_covered_source_denial(self):
+        question = "What are the core equations governing the original Bahdanau additive attention mechanism?"
+        report = """
+## Core Equations Governing Bahdanau Additive Attention
+Evidence Gap: The provided sources mention Bahdanau attention but do not contain the explicit compatibility function.
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [
+                        {
+                            "source_index": 7,
+                            "content": "The additive attention compatibility function is available in this source.",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_evidence_gap_contradictions_detects_partial_formula_denial(self):
+        question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Bahdanau Attention Mechanism
+The supplied evidence does not contain the explicit additive-attention formulas from the original Bahdanau paper [2].
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj), where Wa and Ua are matrices.",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_pack_citation_gaps_flags_uncited_matching_section(self):
+        question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Bahdanau Attention Mechanism
+Bahdanau additive attention uses an alignment score with a tanh compatibility function.
+
+## References
+[3] https://example.com/other
+"""
+
+        gaps = report_pack_citation_gaps(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(gaps, [question])
+
+    def test_report_pack_citation_gaps_allows_pack_citation(self):
+        question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Bahdanau Attention Mechanism
+Bahdanau additive attention uses an alignment score with a tanh compatibility function [2].
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+
+        gaps = report_pack_citation_gaps(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(gaps, [])
+
+    def test_report_needs_revision_for_false_evidence_gap(self):
+        self.assertTrue(
+            report_needs_revision(
+                {
+                    "report_issues": ["report marks covered evidence as a gap: What is covered?"],
+                    "schema_issues": [],
+                    "synthesis_gaps": [],
+                    "false_gap_questions": ["What is covered?"],
+                    "coverage": {"missing": []},
+                }
+            )
+        )
+
+    def test_report_revision_feedback_includes_false_gap_questions(self):
+        question = "What are the core equations governing Bahdanau attention?"
+
+        feedback = format_report_revision_feedback(
+            {
+                "report_issues": [],
+                "schema_issues": [],
+                "coverage": {"missing": []},
+                "synthesis_gaps": [],
+                "false_gap_questions": [question],
+            }
+        )
+
+        self.assertIn("false evidence gap to remove", feedback)
+        self.assertIn(question, feedback)
+
+    def test_report_revision_feedback_includes_pack_citation_gaps(self):
+        question = "What source-backed topic needs a citation?"
+
+        feedback = format_report_revision_feedback(
+            {
+                "report_issues": [],
+                "schema_issues": [],
+                "coverage": {"missing": []},
+                "synthesis_gaps": [],
+                "false_gap_questions": [],
+                "pack_citation_gap_questions": [question],
+            }
+        )
+
+        self.assertIn("missing evidence-pack citation", feedback)
+        self.assertIn(question, feedback)
+
+    def test_apply_report_evidence_pack_repairs_removes_false_gap_and_adds_cited_note(self):
+        question = "What are the core equations of the original additive attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Attention Mechanism
+Evidence Gap: The supplied evidence does not contain the explicit formula.
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+        packs = [
+            {
+                "question": question,
+                "coverage": "partial",
+                "chunks": [
+                    {
+                        "source_index": 2,
+                        "title": "Original paper",
+                        "url": "https://arxiv.org/pdf/1409.0473",
+                        "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                    }
+                ],
+            }
+        ]
+
+        repaired, repairs = apply_report_evidence_pack_repairs(
+            report,
+            packs,
+            {"false_gap_questions": [question], "pack_citation_gap_questions": []},
+            [question],
+            [{"index": 2, "url": "https://arxiv.org/pdf/1409.0473"}],
+        )
+
+        self.assertEqual(repairs, [question])
+        self.assertNotIn("Evidence Gap", repaired)
+        self.assertIn("Core evidence", repaired)
+        self.assertIn("[2]", repaired)
+        self.assertIn("1409.0473", repaired)
+
+    def test_apply_report_evidence_pack_repairs_adds_missing_pack_citation(self):
+        question = "What are the core equations of the original additive attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Attention Mechanism
+Additive attention uses a tanh compatibility function.
+
+## References
+No cited source markers were used.
+"""
+        packs = [
+            {
+                "question": question,
+                "coverage": "partial",
+                "chunks": [
+                    {
+                        "source_index": 2,
+                        "title": "Original paper",
+                        "url": "https://arxiv.org/pdf/1409.0473",
+                        "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                    }
+                ],
+            }
+        ]
+
+        repaired, repairs = apply_report_evidence_pack_repairs(
+            report,
+            packs,
+            {"false_gap_questions": [], "pack_citation_gap_questions": [question]},
+            [question],
+            [{"index": 2, "url": "https://arxiv.org/pdf/1409.0473"}],
+        )
+
+        self.assertEqual(repairs, [question])
+        self.assertIn("Core evidence", repaired)
+        self.assertIn("[2] https://arxiv.org/pdf/1409.0473", repaired)
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(

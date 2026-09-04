@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import json
 import os
 import re
 import sqlite3
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Union
@@ -22,15 +24,20 @@ from src.tools.text_utils import clean_text
 
 DEFAULT_COLLECTION_NAME = "research_rag_bge_large"
 DEFAULT_CHROMA_PATH = "data/chroma"
-DEFAULT_CHUNK_SIZE = 1200
-DEFAULT_CHUNK_OVERLAP = 180
-DEFAULT_PARENT_CHUNK_SIZE = 3000
-DEFAULT_PARENT_CHUNK_OVERLAP = 240
+DEFAULT_CHUNK_SIZE = 1500
+DEFAULT_CHUNK_OVERLAP = 250
+DEFAULT_PARENT_CHUNK_SIZE = 4000
+DEFAULT_PARENT_CHUNK_OVERLAP = 400
 DEFAULT_PARENT_STORE_NAME = "parent_chunks.sqlite3"
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
-DEFAULT_METADATA_SCHEMA_VERSION = 8
+DEFAULT_EMBEDDING_BATCH_SIZE = 16
+DEFAULT_CUDA_EMBEDDING_BATCH_SIZE = 4
+DEFAULT_CHROMA_UPSERT_BATCH_SIZE = 8
+DEFAULT_METADATA_SCHEMA_VERSION = 9
+HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")
+TOKEN_WRAPPER_QUOTES = "\"'\u201c\u201d\u2018\u2019"
 TOKEN_PATTERN = re.compile(r"\S+")
 SECTION_HEADING_PATTERN = re.compile(
     r"(?i)^\s*(?:#{1,6}\s+|\d+(?:\.\d+)*[.)]\s+)?"
@@ -54,6 +61,32 @@ SPECIAL_SIGNAL_PATTERN = re.compile(
     r"benchmark|accuracy|bleu|glue|imagenet|top-1|f1|auc|latency|tokens?/sec)\b|"
     r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}"
     r")"
+)
+STORAGE_TEXT_REPLACEMENTS = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+        "\u00a0": " ",
+        "\u202f": " ",
+        "\u2211": "sum",
+        "\u221a": "sqrt",
+        "\u2264": "<=",
+        "\u2265": ">=",
+        "\u2260": "!=",
+        "\u2248": "~=",
+        "\u00d7": "x",
+        "\u00b2": "^2",
+        "\u03b1": "alpha",
+        "\u03b2": "beta",
+        "\u03b3": "gamma",
+        "\u03bb": "lambda",
+        "\u03c3": "sigma",
+    }
 )
 
 
@@ -83,14 +116,25 @@ class SentenceTransformerEmbeddingFunction:
 
     def __call__(self, input: list[str]) -> list[list[float]]:
         model = self.model()
-        embeddings = model.encode(
-            input,
-            batch_size=max(1, to_int(os.environ.get("RAG_EMBEDDING_BATCH_SIZE"), 32)),
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        return embeddings.tolist()
+        batch_size = embedding_batch_size(self.device)
+        while True:
+            try:
+                embeddings = model.encode(
+                    input,
+                    batch_size=batch_size,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+                return embeddings.tolist()
+            except RuntimeError as error:
+                if not is_cuda_oom_error(error) or batch_size <= 1:
+                    raise
+                batch_size = max(1, batch_size // 2)
+                print(f"[rag_index] CUDA OOM while embedding; retrying with batch_size={batch_size}")
+                clear_embedding_model_memory()
+            finally:
+                clear_embedding_model_memory()
 
     def name(self) -> str:
         """Stable Chroma embedding function name used when reopening collections."""
@@ -100,6 +144,7 @@ class SentenceTransformerEmbeddingFunction:
     def model(self) -> Any:
         if self._model is not None:
             return self._model
+        normalize_huggingface_token_env()
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as error:
@@ -122,6 +167,27 @@ class SentenceTransformerEmbeddingFunction:
                 pass
         self._model = None
         clear_embedding_model_memory()
+
+
+def normalize_huggingface_token_env() -> None:
+    """Normalize copied Hugging Face tokens before HTTP requests use them."""
+
+    for name in HF_TOKEN_ENV_VARS:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        cleaned = str(value).strip().strip(TOKEN_WRAPPER_QUOTES)
+        try:
+            cleaned.encode("latin-1")
+        except UnicodeEncodeError as error:
+            unsafe = ", ".join(f"U+{ord(char):04X} {repr(char)}" for char in latin1_unsafe_characters(cleaned)[:8])
+            raise RuntimeError(
+                f"{name} contains characters that cannot be sent in HTTP headers: {unsafe}. "
+                f"Re-export it with plain ASCII characters, for example: export {name}=hf_..."
+            ) from error
+        if cleaned != value:
+            os.environ[name] = cleaned
+            print(f"[rag_index] normalized {name}; removed surrounding quotes/whitespace")
 
 
 def clear_embedding_model_memory() -> None:
@@ -173,6 +239,70 @@ def select_embedding_device(requested_device: str = DEFAULT_EMBEDDING_DEVICE) ->
     return "cpu"
 
 
+def embedding_batch_size(device: str) -> int:
+    """Return a conservative encode batch size for the selected device."""
+
+    if os.environ.get("RAG_EMBEDDING_BATCH_SIZE"):
+        return max(1, to_int(os.environ.get("RAG_EMBEDDING_BATCH_SIZE"), DEFAULT_EMBEDDING_BATCH_SIZE))
+    if clean_text(device).lower().startswith("cuda"):
+        return DEFAULT_CUDA_EMBEDDING_BATCH_SIZE
+    return DEFAULT_EMBEDDING_BATCH_SIZE
+
+
+def upsert_batch_size() -> int:
+    return max(1, to_int(os.environ.get("RAG_CHROMA_UPSERT_BATCH_SIZE"), DEFAULT_CHROMA_UPSERT_BATCH_SIZE))
+
+
+def upsert_collection_batches(
+    collection: Any,
+    ids: Sequence[str],
+    documents: Sequence[str],
+    metadatas: Sequence[dict[str, Any]],
+) -> int:
+    """Upsert Chroma chunks in small batches to avoid embedding-time GPU spikes."""
+
+    total = 0
+    batch_size = upsert_batch_size()
+    index = 0
+    while index < len(ids):
+        end = min(len(ids), index + batch_size)
+        batch_documents = []
+        batch_metadatas = []
+        try:
+            batch_documents = [storage_safe_text(document) for document in documents[index:end]]
+            batch_metadatas = [clean_metadata(metadata) for metadata in metadatas[index:end]]
+            collection.upsert(
+                ids=list(ids[index:end]),
+                documents=batch_documents,
+                metadatas=batch_metadatas,
+            )
+            total += end - index
+            index = end
+            clear_embedding_model_memory()
+        except RuntimeError as error:
+            if not is_cuda_oom_error(error) or batch_size <= 1:
+                raise
+            failed_batch_size = end - index
+            batch_size = max(1, min(batch_size // 2, failed_batch_size // 2))
+            print(f"[rag_index] CUDA OOM during Chroma upsert; retrying with batch_size={batch_size}")
+            clear_embedding_model_memory()
+        except Exception as error:
+            print_indexing_error(
+                error,
+                stage="chroma_upsert",
+                ids=list(ids[index:end]),
+                documents=batch_documents or documents[index:end],
+                metadatas=batch_metadatas or metadatas[index:end],
+            )
+            raise
+    return total
+
+
+def is_cuda_oom_error(error: BaseException) -> bool:
+    message = clean_text(error).lower()
+    return "cuda out of memory" in message or ("out of memory" in message and "cuda" in message)
+
+
 def index_research_results(
     browser_results: list[dict[str, Any]],
     research_plan: Optional[dict[str, Any]] = None,
@@ -203,20 +333,31 @@ def index_research_results(
     objective = clean_text(change_detection.get("objective") or research_plan.get("objective"))
     history_key = clean_text(change_detection.get("history_key")) or objective_key(objective, research_plan)
 
-    records = list(source_records(browser_results))
-    added_urls = summary_urls(change_detection.get("added_sources"))
-    changed_urls = summary_urls(change_detection.get("changed_sources"))
-    removed_urls = summary_urls(change_detection.get("removed_sources"))
-    index_all = bool(change_detection.get("first_run")) or collection_is_empty(collection)
+    records: list[SourceRecord] = []
+    added_urls = set()
+    changed_urls = set()
+    removed_urls = set()
+    index_all = False
     indexed_source_count = 0
     indexed_chunk_count = 0
     indexed_parent_chunk_count = 0
     deleted_changed_source_count = 0
     skipped_source_count = 0
+    current_stage = "source_records"
+    current_record: SourceRecord | None = None
 
     try:
+        current_stage = "source_records"
+        records = list(source_records(browser_results))
+        added_urls = summary_urls(change_detection.get("added_sources"))
+        changed_urls = summary_urls(change_detection.get("changed_sources"))
+        removed_urls = summary_urls(change_detection.get("removed_sources"))
+        index_all = bool(change_detection.get("first_run")) or collection_is_empty(collection)
+
         for record in records:
+            current_record = record
             change_status = source_change_status(record.url, added_urls, changed_urls)
+            current_stage = "metadata_lookup"
             existing_metadata_schema_version = source_metadata_schema_version_in_collection(collection, history_key, record.url)
             metadata_is_stale = existing_metadata_schema_version < DEFAULT_METADATA_SCHEMA_VERSION
             existing_content_hash = source_content_hash_in_collection(collection, history_key, record.url)
@@ -229,19 +370,24 @@ def index_research_results(
                 skipped_source_count += 1
                 continue
 
+            current_stage = "build_document"
             source_document = build_langchain_document(record, objective, history_key, change_status if not index_all else "indexed")
+            current_stage = "split_document"
             chunk_documents = split_document(source_document, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
             if not chunk_documents:
                 skipped_source_count += 1
                 continue
 
             if existing_content_hash and (existing_content_hash != record.content_hash or metadata_is_stale):
+                current_stage = "delete_stale_chunks"
                 delete_source_chunks(collection, history_key, record.url)
                 delete_source_parent_chunks(chroma_path, history_key, record.url)
                 if existing_content_hash != record.content_hash:
                     deleted_changed_source_count += 1
 
+            current_stage = "parent_upsert"
             indexed_parent_chunk_count += upsert_parent_chunks(chroma_path, parent_rows_from_documents(chunk_documents))
+            current_stage = "prepare_child_chunks"
             ids = []
             documents = []
             metadatas = []
@@ -259,16 +405,24 @@ def index_research_results(
                     )
                 )
 
-            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            current_stage = "child_upsert"
+            upserted_chunks = upsert_collection_batches(collection, ids, documents, metadatas)
             emit_progress(
                 "tool_called",
                 "Embedded and upserted source chunks",
                 agent="change_detection",
                 tool="sentence-transformers/chromadb",
-                metadata={"url": record.url, "chunks": len(chunk_documents)},
+                metadata={"url": record.url, "chunks": upserted_chunks},
             )
             indexed_source_count += 1
-            indexed_chunk_count += len(chunk_documents)
+            indexed_chunk_count += upserted_chunks
+    except Exception as error:
+        print_indexing_error(
+            error,
+            stage=current_stage,
+            record=current_record,
+        )
+        raise
     finally:
         embedding_function.close()
 
@@ -374,7 +528,22 @@ def split_document(document: Any, chunk_size: int = DEFAULT_CHUNK_SIZE, chunk_ov
         )
         for chunk in special_signal_chunks(content, max_tokens=max(120, max_tokens // 2))
     ]
-    return dedupe_documents([*regular_documents, *special_documents])
+    table_documents = [
+        Document(
+            page_content=chunk,
+            metadata={
+                **document.metadata,
+                **parent_child_metadata(chunk, parent_chunks, document.metadata),
+                "chunking_strategy": "table_json_v1",
+                "chunk_kind": "table",
+                "token_count": token_count(chunk),
+                **metadata,
+                **chunk_signal_metadata(chunk),
+            },
+        )
+        for chunk, metadata in table_json_chunks(content)
+    ]
+    return dedupe_documents([*regular_documents, *special_documents, *table_documents])
 
 
 def parent_context_chunks(text: str) -> list[str]:
@@ -412,13 +581,13 @@ def parent_rows_from_documents(documents: Sequence[Any]) -> list[dict[str, Any]]
         if not isinstance(metadata, dict):
             continue
         parent_id = clean_text(metadata.get("parent_id"))
-        parent_content = clean_text(metadata.get("parent_content"))
+        parent_content = storage_safe_text(metadata.get("parent_content"))
         if not parent_id or not parent_content:
             continue
         rows_by_id[parent_id] = {
             "parent_id": parent_id,
-            "history_key": clean_text(metadata.get("history_key")),
-            "url": clean_text(metadata.get("url")),
+            "history_key": storage_safe_text(metadata.get("history_key")),
+            "url": storage_safe_text(metadata.get("url")),
             "parent_index": to_int(metadata.get("parent_index"), 0),
             "token_count": to_int(metadata.get("parent_token_count"), token_count(parent_content)),
             "content_hash": hash_text(parent_content),
@@ -476,12 +645,12 @@ def upsert_parent_chunks(chroma_path: Union[str, Path], rows: Sequence[dict[str,
             [
                 (
                     clean_text(row.get("parent_id")),
-                    clean_text(row.get("history_key")),
-                    clean_text(row.get("url")),
+                    storage_safe_text(row.get("history_key")),
+                    storage_safe_text(row.get("url")),
                     to_int(row.get("parent_index"), 0),
                     to_int(row.get("token_count"), token_count(row.get("content"))),
-                    clean_text(row.get("content_hash")) or hash_text(clean_text(row.get("content"))),
-                    clean_text(row.get("content")),
+                    clean_text(row.get("content_hash")) or hash_text(storage_safe_text(row.get("content"))),
+                    storage_safe_text(row.get("content")),
                 )
                 for row in clean_rows
             ],
@@ -501,21 +670,21 @@ def parent_content_for_id(chroma_path: Union[str, Path], parent_id: str) -> str:
             ).fetchone()
     except sqlite3.Error:
         return ""
-    return clean_text(row[0]) if row else ""
+    return storage_safe_text(row[0]) if row else ""
 
 
 def best_parent_context(chunk: str, parent_chunks: Sequence[str]) -> tuple[int, str]:
     if not parent_chunks:
-        return 0, clean_text(chunk)
+        return 0, storage_safe_text(chunk)
     chunk_terms = set(TOKEN_PATTERN.findall(clean_text(chunk).lower()))
     if not chunk_terms:
-        return 0, clean_text(parent_chunks[0])
+        return 0, storage_safe_text(parent_chunks[0])
     scored = [
         (len(chunk_terms & set(TOKEN_PATTERN.findall(clean_text(parent).lower()))), index, parent)
         for index, parent in enumerate(parent_chunks)
     ]
     _, index, parent = max(scored, key=lambda item: (item[0], -item[1]))
-    return index, clean_text(parent)
+    return index, storage_safe_text(parent)
 
 
 def clean_document_text(text: Any) -> str:
@@ -538,7 +707,7 @@ def clean_document_text(text: Any) -> str:
         lines.append(line)
     cleaned = "\n".join(lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    return storage_safe_text(cleaned.strip())
 
 
 def should_drop_noise_line(line: str, normalized: str, seen_counts: dict[str, int]) -> bool:
@@ -687,6 +856,76 @@ def special_signal_chunks(text: str, max_tokens: int, context_lines: int = 3) ->
     return dedupe_preserve_order(chunks)
 
 
+def table_json_chunks(text: str) -> list[tuple[str, dict[str, Any]]]:
+    chunks = []
+    for table_index, rows in enumerate(extract_table_rows(text), start=1):
+        headers = unique_table_headers(rows[0])
+        data_rows = rows[1:] if len(rows) > 1 else []
+        payload = {
+            "table_index": table_index,
+            "headers": headers,
+            "rows": data_rows,
+            "records": [table_record(headers, row) for row in data_rows],
+        }
+        chunk = storage_safe_text("Table data JSON:\n" + json.dumps(payload, ensure_ascii=True, indent=2))
+        chunks.append(
+            (
+                chunk,
+                {
+                    "has_table_signal": True,
+                    "table_index": table_index,
+                    "table_row_count": len(data_rows),
+                    "table_column_count": max(len(row) for row in rows),
+                },
+            )
+        )
+    return chunks
+
+
+def extract_table_rows(text: str) -> list[list[list[str]]]:
+    tables = []
+    current = []
+    for raw_line in str(text or "").splitlines():
+        cells = table_row_cells(raw_line)
+        if cells:
+            if not table_separator_row(cells):
+                current.append(cells)
+            continue
+        if len(current) >= 2:
+            tables.append(current)
+        current = []
+    if len(current) >= 2:
+        tables.append(current)
+    return tables
+
+
+def table_row_cells(line: str) -> list[str]:
+    if "|" not in str(line):
+        return []
+    cells = [storage_safe_text(cell) for cell in str(line).strip().strip("|").split("|")]
+    cells = [cell for cell in cells if cell]
+    return cells if len(cells) >= 2 else []
+
+
+def table_separator_row(cells: Sequence[str]) -> bool:
+    return bool(cells) and all(re.fullmatch(r":?-{2,}:?", cell.replace(" ", "")) for cell in cells)
+
+
+def unique_table_headers(cells: Sequence[str]) -> list[str]:
+    headers = []
+    seen = {}
+    for index, cell in enumerate(cells, start=1):
+        header = storage_safe_text(cell) or f"column_{index}"
+        key = header.lower()
+        seen[key] = seen.get(key, 0) + 1
+        headers.append(header if seen[key] == 1 else f"{header}_{seen[key]}")
+    return headers
+
+
+def table_record(headers: Sequence[str], row: Sequence[str]) -> dict[str, str]:
+    return {header: storage_safe_text(row[index]) if index < len(row) else "" for index, header in enumerate(headers)}
+
+
 def chunk_signal_metadata(chunk: str) -> dict[str, Any]:
     value = str(chunk or "")
     lowered = value.lower()
@@ -695,10 +934,11 @@ def chunk_signal_metadata(chunk: str) -> dict[str, Any]:
             re.search(r"\\(?:frac|sum|sqrt|top|operatorname)|\b(?:softmax|sqrt)\s*\(", value, flags=re.I)
             or re.search(r"[A-Za-z0-9_{}()\\]+\s*=\s*[^=\n]{4,}", value)
         ),
+        "has_table_signal": bool("Table data JSON:" in value or re.search(r"\|[^|\n]+\|", value)),
         "has_api_signal": bool(re.search(r"\b(?:torch\.|tf\.|keras\.)[A-Za-z0-9_.]+", value)),
         "has_benchmark_signal": any(
             term in lowered
-            for term in ("benchmark", "accuracy", "bleu", "glue", "imagenet", "top-1", "f1", "auc")
+            for term in ("benchmark", "accuracy", "bleu", "glue", "imagenet", "top-1", "f1", "auc", "score")
         ),
     }
 
@@ -776,9 +1016,9 @@ def langchain_ingestion_classes() -> tuple[Any, Any]:
 def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceRecord]:
     grouped: dict[str, dict[str, Any]] = {}
     for result in browser_results:
-        task_id = clean_text(result.get("task_id"))
+        task_id = storage_safe_text(result.get("task_id"))
         task_url = normalize_http_url(result.get("task_url"))
-        query_context = clean_text(result.get("query_context"))
+        query_context = storage_safe_text(result.get("query_context"))
         for source in result.get("sources", []):
             if not isinstance(source, dict):
                 continue
@@ -791,13 +1031,13 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
                 url,
                 {
                     "url": url,
-                    "title": clean_text(source.get("title")),
+                    "title": storage_safe_text(source.get("title")),
                     "task_urls": [],
                     "task_ids": [],
                     "query_contexts": [],
-                    "source_type": clean_text(source.get("source_type")),
-                    "source_quality": clean_text(source.get("source_quality")),
-                    "source_authority": clean_text(source.get("source_authority")),
+                    "source_type": storage_safe_text(source.get("source_type")),
+                    "source_quality": storage_safe_text(source.get("source_quality")),
+                    "source_authority": storage_safe_text(source.get("source_authority")),
                     "content_noise_score": to_float(source.get("content_noise_score"), 0.0),
                     "content": content,
                 },
@@ -810,26 +1050,26 @@ def source_records(browser_results: list[dict[str, Any]]) -> Iterable[SourceReco
                 record["query_contexts"].append(query_context)
 
             if source_quality_rank(source.get("source_quality")) > source_quality_rank(record["source_quality"]):
-                record["source_quality"] = clean_text(source.get("source_quality"))
+                record["source_quality"] = storage_safe_text(source.get("source_quality"))
             if source_authority_rank(source.get("source_authority")) > source_authority_rank(record["source_authority"]):
-                record["source_authority"] = clean_text(source.get("source_authority"))
+                record["source_authority"] = storage_safe_text(source.get("source_authority"))
             if len(content) > len(record["content"]):
                 record["content"] = content
-                record["title"] = clean_text(source.get("title")) or record["title"]
-                record["source_type"] = clean_text(source.get("source_type")) or record["source_type"]
+                record["title"] = storage_safe_text(source.get("title")) or record["title"]
+                record["source_type"] = storage_safe_text(source.get("source_type")) or record["source_type"]
                 record["content_noise_score"] = to_float(source.get("content_noise_score"), record["content_noise_score"])
 
     for record in grouped.values():
-        content = record["content"]
+        content = storage_safe_text(record["content"])
         yield SourceRecord(
             url=record["url"],
-            title=record["title"],
-            task_urls=" | ".join(record["task_urls"]),
-            task_ids=", ".join(record["task_ids"]),
-            query_contexts=" | ".join(record["query_contexts"]),
-            source_type=record["source_type"],
-            source_quality=record["source_quality"],
-            source_authority=record["source_authority"],
+            title=storage_safe_text(record["title"]),
+            task_urls=storage_safe_text(" | ".join(record["task_urls"])),
+            task_ids=storage_safe_text(", ".join(record["task_ids"])),
+            query_contexts=storage_safe_text(" | ".join(record["query_contexts"])),
+            source_type=storage_safe_text(record["source_type"]),
+            source_quality=storage_safe_text(record["source_quality"]),
+            source_authority=storage_safe_text(record["source_authority"]),
             content_noise_score=record["content_noise_score"],
             content_hash=hash_text(content),
             content=content,
@@ -843,8 +1083,8 @@ def chunk_text(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE, overlap: int = D
 
 
 def chunk_document(record: SourceRecord, chunk: str) -> str:
-    title = record.title or record.url
-    return f"Source: {title}\nURL: {record.url}\nTask: {record.query_contexts}\n\n{chunk}"
+    title = storage_safe_text(record.title or record.url)
+    return storage_safe_text(f"Source: {title}\nURL: {record.url}\nTask: {record.query_contexts}\n\n{chunk}")
 
 
 def chunk_id(history_key: str, url: str, chunk_index: int) -> str:
@@ -955,8 +1195,71 @@ def clean_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(value, float):
             clean[key] = value
         else:
-            clean[key] = clean_text(value)
+            clean[key] = storage_safe_text(value)
     return clean
+
+
+def storage_safe_text(value: Any) -> str:
+    """Normalize extracted text before handing it to storage/embedding clients."""
+
+    raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = raw.translate(STORAGE_TEXT_REPLACEMENTS).encode("latin-1", errors="replace").decode("latin-1")
+    if "\n" not in text:
+        return clean_text(text)
+    lines = [clean_text(line) for line in text.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def print_indexing_error(
+    error: BaseException,
+    stage: str,
+    record: SourceRecord | None = None,
+    ids: Sequence[str] | None = None,
+    documents: Sequence[Any] | None = None,
+    metadatas: Sequence[dict[str, Any]] | None = None,
+) -> None:
+    """Print compact diagnostics for indexing failures that are otherwise opaque."""
+
+    print(f"[rag_index] failed during {clean_text(stage) or 'unknown_stage'}: {type(error).__name__}: {error}")
+    if record is not None:
+        print(f"[rag_index] source url={record.url or '<missing>'} title={record.title[:160] or '<missing>'}")
+        print_latin1_diagnostics("record.title", record.title)
+        print_latin1_diagnostics("record.query_contexts", record.query_contexts)
+        print_latin1_diagnostics("record.content", record.content)
+    if ids:
+        print(f"[rag_index] batch ids={list(ids)[:5]} count={len(ids)}")
+    for index, document in enumerate(list(documents or [])[:3], start=1):
+        print_latin1_diagnostics(f"batch.document.{index}", document)
+    for index, metadata in enumerate(list(metadatas or [])[:3], start=1):
+        if not isinstance(metadata, dict):
+            continue
+        for key, value in metadata.items():
+            print_latin1_diagnostics(f"batch.metadata.{index}.{key}", value)
+    details = "".join(traceback.format_exception(type(error), error, error.__traceback__)).strip()
+    if details:
+        print(f"[rag_index] traceback:\n{details}")
+
+
+def print_latin1_diagnostics(label: str, value: Any) -> None:
+    unsafe = latin1_unsafe_characters(value)
+    if not unsafe:
+        return
+    preview = clean_text(value)[:220]
+    chars = ", ".join(f"U+{ord(char):04X} {repr(char)}" for char in unsafe[:8])
+    print(f"[rag_index] latin-1 unsafe in {label}: {chars}; preview={preview}")
+
+
+def latin1_unsafe_characters(value: Any) -> list[str]:
+    seen = set()
+    unsafe = []
+    for char in str(value or ""):
+        try:
+            char.encode("latin-1")
+        except UnicodeEncodeError:
+            if char not in seen:
+                seen.add(char)
+                unsafe.append(char)
+    return unsafe
 
 
 def to_int(value: Any, default: int) -> int:
