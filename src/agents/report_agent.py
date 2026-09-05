@@ -35,6 +35,7 @@ DEFAULT_SECTION_EVIDENCE_CHUNKS = 4
 DEFAULT_SECTION_EVIDENCE_CHUNK_CHARS = 1500
 DEFAULT_FRAME_MAX_TOKENS = 700
 DEFAULT_FRAME_SECTION_CHARS = 900
+DEFAULT_TOPIC_HEADING_MAX_CHARS = 110
 
 SECTION_SYSTEM_PROMPT = (
     "You write ONE section of a larger cited research report from supplied evidence only. "
@@ -87,6 +88,11 @@ STOPWORDS = {
     "a", "an", "and", "are", "as", "be", "by", "can", "do", "does", "for", "from",
     "how", "in", "is", "it", "of", "on", "or", "the", "their", "to", "what", "when",
     "where", "which", "with",
+}
+
+TRAILING_HEADING_WORDS = {
+    "and", "as", "be", "by", "can", "does", "for", "from", "how", "in", "including",
+    "of", "or", "sequence", "the", "to", "what", "when", "where", "which", "with",
 }
 
 
@@ -500,10 +506,11 @@ def repair_report_by_sections(
     repair_feedback: str,
     per_question_synthesis: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
-    """Repair only failed topic sections, then refresh framing sections."""
+    """Repair failed topic sections and refresh framing around them."""
 
     target_questions = report_section_repair_questions(validation, coverage_questions)
-    if not target_questions:
+    framing_needed = report_framing_needs_repair(validation)
+    if not target_questions and not framing_needed:
         return report, model, {"section_repairs": [], "framing_refreshed": False}
 
     source_text = format_sources(sources)
@@ -542,16 +549,22 @@ def repair_report_by_sections(
             }
         )
 
-    report_text, last_model = refresh_report_framing_sections(
-        client,
-        model,
-        objective=objective,
-        coverage_questions=coverage_questions,
-        report=report_text,
-        sources=sources,
-        fallback_model=last_model,
-    )
-    return report_text, last_model, {"section_repairs": repairs, "framing_refreshed": True}
+    if target_questions or framing_needed:
+        report_text, last_model = refresh_report_framing_sections(
+            client,
+            model,
+            objective=objective,
+            coverage_questions=coverage_questions,
+            report=report_text,
+            sources=sources,
+            fallback_model=last_model,
+        )
+    return report_text, last_model, {"section_repairs": repairs, "framing_refreshed": bool(target_questions or framing_needed)}
+
+
+def report_framing_needs_repair(validation: dict[str, Any]) -> bool:
+    issues = [clean_text(issue).lower() for issue in validation.get("report_issues", []) or []]
+    return any("truncated or incomplete section text" in issue for issue in issues)
 
 
 def report_section_repair_questions(validation: dict[str, Any], coverage_questions: Sequence[str]) -> list[str]:
@@ -561,6 +574,8 @@ def report_section_repair_questions(validation: dict[str, Any], coverage_questio
             *validation.get("false_gap_questions", []),
             *validation.get("pack_citation_gap_questions", []),
             *schema_missing_topic_questions(validation.get("schema_issues", []), coverage_questions),
+            *schema_malformed_topic_questions(validation.get("schema_issues", []), coverage_questions),
+            *truncated_topic_section_questions(validation.get("report_issues", []), coverage_questions),
         ]
     )
 
@@ -581,6 +596,41 @@ def schema_missing_topic_questions(schema_issues: Sequence[str], coverage_questi
     return questions
 
 
+def schema_malformed_topic_questions(schema_issues: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
+    malformed_headings = [
+        clean_text(issue).removeprefix("malformed planner topic heading appears truncated:").strip()
+        for issue in schema_issues or []
+        if clean_text(issue).startswith("malformed planner topic heading appears truncated:")
+    ]
+    return topic_questions_matching_headings(malformed_headings, coverage_questions)
+
+
+def truncated_topic_section_questions(report_issues: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
+    truncated_headings: list[str] = []
+    prefix = "report contains truncated or incomplete section text:"
+    for issue in report_issues or []:
+        text = clean_text(issue)
+        if not text.startswith(prefix):
+            continue
+        truncated_headings.extend(part.strip() for part in text.removeprefix(prefix).split(","))
+    return topic_questions_matching_headings(truncated_headings, coverage_questions)
+
+
+def topic_questions_matching_headings(headings: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
+    if not headings:
+        return []
+    questions = []
+    for question in coverage_questions:
+        expected = normalize_heading(planner_question_heading(question))
+        full_expected = normalize_heading(planner_question_heading(question, max_length=None))
+        for heading in headings:
+            actual = normalize_heading(strip_heading_numbering(heading))
+            if actual and (headings_match(expected, actual) or headings_match(full_expected, actual)):
+                questions.append(question)
+                break
+    return questions
+
+
 def replace_report_topic_section(report: str, question: str, section: str) -> str:
     lines = strip_references(clean_markdown(report)).splitlines()
     bounds = section_bounds_for_question(lines, question)
@@ -590,8 +640,7 @@ def replace_report_topic_section(report: str, question: str, section: str) -> st
     if not bounds:
         return append_topic_section(report, question, section_body)
     start, end = bounds
-    original_heading = lines[start] if start < len(lines) and lines[start].lstrip().startswith("#") else heading
-    replacement[0] = original_heading
+    replacement[0] = heading
     return clean_markdown("\n".join([*lines[:start], *replacement, *lines[end:]]))
 
 
@@ -925,7 +974,21 @@ def markdown_appears_truncated(markdown: str) -> bool:
         return True
     if re.search(r"[,;:]$", last):
         return True
+    if prose_fragment_appears_unfinished(lines[-1], last):
+        return True
     return bool(re.search(r"\b(?:a|an|and|as|because|by|for|from|in|including|of|on|or|that|the|to|while|which|with)$", last, flags=re.IGNORECASE))
+
+
+def prose_fragment_appears_unfinished(raw_line: str, plain_line: str) -> bool:
+    line = clean_text(raw_line)
+    plain = clean_text(plain_line)
+    if not plain or line.lstrip().startswith(("#", "|", "```")):
+        return False
+    if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line):
+        return False
+    if re.search(r"(?:[.!?)]|[\"']|\])$", plain):
+        return False
+    return len(plain.split()) >= 3
 
 
 def deterministic_frame_section(heading: str, body_digest: str) -> str:
@@ -1138,7 +1201,7 @@ def per_question_synthesis_has_cited_evidence(synthesis_note: dict[str, Any]) ->
     return bool(per_question_synthesis_source_indexes(synthesis_note))
 
 
-def planner_question_heading(question: str, max_length: int | None = 90) -> str:
+def planner_question_heading(question: str, max_length: int | None = DEFAULT_TOPIC_HEADING_MAX_CHARS) -> str:
     text = clean_text(question).rstrip("?")
     heading = re.sub(
         r"^(what|how|why|when|where|which)\s+(is|are|does|do|did|can|should)\s+",
@@ -1146,6 +1209,15 @@ def planner_question_heading(question: str, max_length: int | None = 90) -> str:
         text,
         flags=re.IGNORECASE,
     )
+    heading = re.sub(r"\s*\([^)]*(?:e\.g\.|eg|for example)[^)]*\)", "", heading, flags=re.IGNORECASE)
+    heading = re.sub(r"\s+and\s+how\s+do\s+they\s+differ\b", " and their differences", heading, flags=re.IGNORECASE)
+    heading = re.sub(
+        r"\s+and\s+how\s+does\s+it\s+scale\s+with\s+sequence\s+length\b",
+        " and sequence-length scaling",
+        heading,
+        flags=re.IGNORECASE,
+    )
+    heading = re.sub(r"\s+be\s+found\s+in\s+", " in ", heading, flags=re.IGNORECASE)
     heading = re.sub(r"^(what|how|why|when|where|which)\s+", "", heading, flags=re.IGNORECASE)
     heading = re.sub(r"\b(e\.g\.|eg|examples?|evidence|results?)\b", "", heading, flags=re.IGNORECASE)
     heading = re.sub(r"\s+", " ", heading).strip(" .,:;")
@@ -1159,11 +1231,18 @@ def planner_question_heading(question: str, max_length: int | None = 90) -> str:
 def truncate_heading_at_word_boundary(heading: str, max_length: int | None = 90) -> str:
     value = clean_text(heading).strip(" .,:;")
     if not max_length or len(value) <= max_length:
-        return value
+        return trim_trailing_heading_words(value)
     trimmed = value[:max_length].rstrip()
     if " " in trimmed:
         trimmed = trimmed.rsplit(" ", 1)[0]
-    return trimmed.strip(" .,:;")
+    return trim_trailing_heading_words(trimmed.strip(" .,:;"))
+
+
+def trim_trailing_heading_words(heading: str) -> str:
+    value = clean_text(heading).strip(" .,:;")
+    while value and value.split()[-1].lower() in TRAILING_HEADING_WORDS:
+        value = " ".join(value.split()[:-1]).strip(" .,:;")
+    return value
 
 
 def format_supporting_evidence(
@@ -2111,6 +2190,9 @@ def malformed_heading_issues(headings: Sequence[str], planner_questions: Sequenc
             expected_key = normalize_heading(planner_question_heading(question))
             if actual_key == expected_key:
                 continue
+            if heading_ends_with_connector(actual) and headings_match(expected_key, actual_key):
+                issues.append(f"malformed planner topic heading appears truncated: {actual}")
+                break
             if full_key.startswith(actual_key) and headings_match(expected_key, actual_key):
                 issues.append(f"malformed planner topic heading appears truncated: {actual}")
                 break
@@ -2121,6 +2203,11 @@ def strip_heading_numbering(heading: Any) -> str:
     value = strip_markdown(heading)
     value = re.sub(r"^\d+(?:\.\d+)*[.)]?\s*", "", value)
     return clean_text(value)
+
+
+def heading_ends_with_connector(heading: Any) -> bool:
+    value = clean_text(strip_heading_numbering(heading))
+    return bool(value and value.split()[-1].lower() in TRAILING_HEADING_WORDS)
 
 
 def report_self_critique(report_issues: Sequence[str], coverage_check: dict[str, Any], schema_issues: Sequence[str]) -> dict[str, Any]:
@@ -2145,6 +2232,9 @@ def report_quality_issues(
         issues.append("report contains placeholder or non-source citation markers")
     if has_dangling_markdown_bullet(text):
         issues.append("report contains empty or dangling bullet items")
+    truncated_sections = truncated_report_sections(text)
+    if truncated_sections:
+        issues.append(f"report contains truncated or incomplete section text: {', '.join(truncated_sections[:4])}")
     source_indexes = source_index_set(sources or [])
     invalid = unavailable_citation_markers(report, source_indexes)
     if invalid:
@@ -2160,6 +2250,21 @@ def has_dangling_markdown_bullet(markdown: str) -> bool:
         if re.match(r"^\s*(?:[-*+]|\d+[.)])\s*$", line):
             return True
     return False
+
+
+def truncated_report_sections(markdown: str) -> list[str]:
+    issues = []
+    for heading, section in markdown_sections(markdown):
+        label = clean_text(heading)
+        normalized = normalize_heading(label)
+        if not label or normalized in {"references", "reference", "sources", "topic sections", "topic specific sections"}:
+            continue
+        body = strip_leading_heading(section)
+        if not clean_text(strip_markdown(body)):
+            continue
+        if markdown_appears_truncated(body):
+            issues.append(strip_heading_numbering(label) or label)
+    return dedupe_text(issues)
 
 
 def normalize_markdown_headings(markdown: str) -> str:

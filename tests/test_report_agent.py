@@ -20,6 +20,7 @@ from src.agents.report_agent import (
     generate_single_report,
     frame_section_needs_retry,
     has_dangling_markdown_bullet,
+    heading_ends_with_connector,
     missing_evidence_constraints,
     markdown_appears_truncated,
     missing_sub_question_coverage,
@@ -33,6 +34,7 @@ from src.agents.report_agent import (
     report_per_question_synthesis_citation_gaps,
     report_generation_token_cap,
     report_quality_issues,
+    report_section_repair_questions,
     report_synthesis_gap_contradictions,
     report_needs_revision,
     report_pack_citation_gaps,
@@ -46,6 +48,7 @@ from src.agents.report_agent import (
     slugify_filename,
     synthesis_coverage_gap_questions,
     trim_report_prompt,
+    truncated_report_sections,
     unsupported_benchmark_metrics,
 )
 
@@ -95,6 +98,26 @@ Supported [1]. Unsupported [9].
 
         self.assertTrue(has_dangling_markdown_bullet("## Limitations\n-"))
         self.assertIn("report contains empty or dangling bullet items", issues)
+
+    def test_report_quality_flags_truncated_middle_section(self):
+        report = """
+## Executive Summary
+Summary is complete [1].
+
+## Cross-cutting Analysis and Synthesis
+Despite the computational
+
+## Conclusion
+Conclusion is complete [1].
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_quality_issues(report, [{"index": 1, "url": "https://example.com"}])
+
+        self.assertIn("Cross-cutting Analysis and Synthesis", truncated_report_sections(report))
+        self.assertIn("report contains truncated or incomplete section text", "\n".join(issues))
 
     def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
         markdown = "### ## 1. Definition\nText."
@@ -183,9 +206,26 @@ Supported [1]. Unsupported [9].
             "What are the main variants of attention mechanisms (additive, multiplicative, self-attention, multi-head) and how do they differ?"
         )
 
-        self.assertLessEqual(len(heading), 90)
+        self.assertLessEqual(len(heading), 110)
         self.assertFalse(heading.endswith("Multi-hea"))
         self.assertNotRegex(heading, r"\b\w{2,4}$")
+
+    def test_planner_question_heading_removes_common_dangling_question_tails(self):
+        variants = planner_question_heading(
+            "What are the main variants of attention mechanisms (e.g., additive, multiplicative, self-attention) and how do they differ?"
+        )
+        complexity = planner_question_heading(
+            "What is the computational complexity of attention mechanisms and how does it scale with sequence length?"
+        )
+        api = planner_question_heading(
+            "Where can official implementations and API references for attention be found in major frameworks (TensorFlow, PyTorch)?"
+        )
+
+        self.assertEqual(variants, "The Main Variants Of Attention Mechanisms And Their Differences")
+        self.assertEqual(complexity, "The Computational Complexity Of Attention Mechanisms And Sequence-length Scaling")
+        self.assertEqual(api, "Official Implementations And API References For Attention In Major Frameworks TensorFlow PyTorch")
+        self.assertFalse(heading_ends_with_connector(variants))
+        self.assertFalse(heading_ends_with_connector(complexity))
 
     def test_build_report_prompt_requires_core_equation_for_formula_questions(self):
         prompt = build_report_prompt(
@@ -652,6 +692,63 @@ Done.
         issues = report_schema_issues(report, [question])
 
         self.assertIn("malformed planner topic heading appears truncated", "\n".join(issues))
+
+    def test_report_schema_flags_connector_truncated_topic_heading(self):
+        questions = [
+            "What are the main variants of attention mechanisms (e.g., additive, multiplicative, self-attention) and how do they differ?",
+            "What is the computational complexity of attention mechanisms and how does it scale with sequence length?",
+        ]
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+### 3.3. The Main Variants Of Attention Mechanisms E.g Additive Multiplicative Self-attention And
+Variants.
+
+### 3.5. The Computational Complexity Of Attention Mechanisms And How Does It Scale With Sequence
+Complexity.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_schema_issues(report, questions)
+
+        self.assertGreaterEqual("\n".join(issues).count("malformed planner topic heading appears truncated"), 2)
+
+    def test_report_section_repair_questions_routes_malformed_and_truncated_topics(self):
+        questions = [
+            "What is the computational complexity of attention mechanisms and how does it scale with sequence length?",
+            "What are common limitations or challenges of attention mechanisms?",
+        ]
+        validation = {
+            "coverage": {"missing": []},
+            "false_gap_questions": [],
+            "pack_citation_gap_questions": [],
+            "schema_issues": [
+                "malformed planner topic heading appears truncated: The Computational Complexity Of Attention Mechanisms And How Does It Scale With Sequence"
+            ],
+            "report_issues": [
+                "report contains truncated or incomplete section text: Common Limitations Or Challenges Of Attention Mechanisms"
+            ],
+        }
+
+        repairs = report_section_repair_questions(validation, questions)
+
+        self.assertEqual(repairs, questions)
 
     def test_clean_markdown_strips_open_thinking_block(self):
         text = "Useful.\n<think>hidden reasoning that never closes"
