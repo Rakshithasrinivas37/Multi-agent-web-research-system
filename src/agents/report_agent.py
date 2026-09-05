@@ -198,8 +198,29 @@ class ReportAgent:
         if report_needs_revision(validation):
             feedback = format_report_revision_feedback(validation)
             print(f"[report] retrying after self-critique: {clean_text(feedback)[:240]}")
-            repair_prompt = build_report_prompt(**prompt_inputs, compact=True, repair_feedback=feedback)
-            report, model = generate_single_report(client, self.model, repair_prompt, fallback_prompt=repair_prompt)
+            if self.generation_mode == "sections":
+                report, model, repair_diagnostics = repair_report_by_sections(
+                    client,
+                    self.model,
+                    report=report,
+                    objective=objective,
+                    coverage_questions=coverage_questions,
+                    evidence_packs=evidence_packs,
+                    sources=sources,
+                    validation=validation,
+                    repair_feedback=feedback,
+                    per_question_synthesis=per_question_synthesis,
+                )
+                section_diagnostics["repair"] = repair_diagnostics
+            else:
+                repair_prompt = build_report_prompt(**prompt_inputs, compact=True, repair_feedback=feedback)
+                report, model = generate_single_report(
+                    client,
+                    self.model,
+                    repair_prompt,
+                    fallback_prompt=repair_prompt,
+                    label="single-shot repair report",
+                )
             report = normalize_final_report(report, sources)
             validation = validate_report_output(report, sources, coverage_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
             review_trace.append(validation["review"])
@@ -467,6 +488,213 @@ def generate_report_by_sections(
     return report, last_model, {"topic_sections": section_diagnostics}
 
 
+def repair_report_by_sections(
+    client: Any,
+    model: str,
+    report: str,
+    objective: str,
+    coverage_questions: Sequence[str],
+    evidence_packs: Sequence[dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+    validation: dict[str, Any],
+    repair_feedback: str,
+    per_question_synthesis: Sequence[dict[str, Any]] | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    """Repair only failed topic sections, then refresh framing sections."""
+
+    target_questions = report_section_repair_questions(validation, coverage_questions)
+    if not target_questions:
+        return report, model, {"section_repairs": [], "framing_refreshed": False}
+
+    source_text = format_sources(sources)
+    packs_by_question = {
+        normalize_heading(pack.get("question")): pack
+        for pack in evidence_packs or []
+        if isinstance(pack, dict)
+    }
+    synthesis_by_question = per_question_synthesis_by_question(per_question_synthesis or [])
+    report_text = strip_references(clean_markdown(report))
+    last_model = model
+    repairs = []
+    for question in target_questions:
+        pack = packs_by_question.get(normalize_heading(question), {})
+        synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
+        print(f"[report] repairing topic section: {question[:140]}")
+        section, used_model, retried = generate_topic_section(
+            client,
+            model,
+            objective,
+            question,
+            pack,
+            source_text,
+            synthesis_note=synthesis_note,
+            repair_feedback=repair_feedback,
+        )
+        report_text = replace_report_topic_section(report_text, question, section)
+        last_model = used_model or last_model
+        repairs.append(
+            {
+                "question": question,
+                "retried": retried,
+                "had_usable_evidence": evidence_pack_has_usable_cited_evidence(pack),
+                "had_per_question_synthesis": per_question_synthesis_has_cited_evidence(synthesis_note),
+                "chars": len(section),
+            }
+        )
+
+    report_text, last_model = refresh_report_framing_sections(
+        client,
+        model,
+        objective=objective,
+        coverage_questions=coverage_questions,
+        report=report_text,
+        sources=sources,
+        fallback_model=last_model,
+    )
+    return report_text, last_model, {"section_repairs": repairs, "framing_refreshed": True}
+
+
+def report_section_repair_questions(validation: dict[str, Any], coverage_questions: Sequence[str]) -> list[str]:
+    return dedupe_text(
+        [
+            *validation.get("coverage", {}).get("missing", []),
+            *validation.get("false_gap_questions", []),
+            *validation.get("pack_citation_gap_questions", []),
+            *schema_missing_topic_questions(validation.get("schema_issues", []), coverage_questions),
+        ]
+    )
+
+
+def schema_missing_topic_questions(schema_issues: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
+    missing_headings = [
+        clean_text(issue).removeprefix("missing planner topic section:").strip()
+        for issue in schema_issues or []
+        if clean_text(issue).startswith("missing planner topic section:")
+    ]
+    if not missing_headings:
+        return []
+    questions = []
+    for question in coverage_questions:
+        expected = normalize_heading(planner_question_heading(question))
+        if any(headings_match(expected, normalize_heading(heading)) for heading in missing_headings):
+            questions.append(question)
+    return questions
+
+
+def replace_report_topic_section(report: str, question: str, section: str) -> str:
+    lines = strip_references(clean_markdown(report)).splitlines()
+    bounds = section_bounds_for_question(lines, question)
+    section_body = strip_leading_heading(section)
+    heading = f"### {planner_question_heading(question)}"
+    replacement = clean_markdown(f"{heading}\n{section_body}").splitlines()
+    if not bounds:
+        return append_topic_section(report, question, section_body)
+    start, end = bounds
+    original_heading = lines[start] if start < len(lines) and lines[start].lstrip().startswith("#") else heading
+    replacement[0] = original_heading
+    return clean_markdown("\n".join([*lines[:start], *replacement, *lines[end:]]))
+
+
+def append_topic_section(report: str, question: str, section_body: str) -> str:
+    lines = strip_references(clean_markdown(report)).splitlines()
+    topic_heading_index = next(
+        (index for index, line in enumerate(lines) if normalize_heading(line.lstrip("#").strip()) in {"topic sections", "topic specific sections"}),
+        None,
+    )
+    insertion = clean_markdown(f"### {planner_question_heading(question)}\n{section_body}").splitlines()
+    if topic_heading_index is None:
+        return clean_markdown("\n".join([*lines, "", "## 3. Topic Sections", "", *insertion]))
+    next_h2 = next(
+        (index for index in range(topic_heading_index + 1, len(lines)) if re.match(r"^\s{0,3}#{1,2}\s+", lines[index])),
+        len(lines),
+    )
+    return clean_markdown("\n".join([*lines[:next_h2], "", *insertion, "", *lines[next_h2:]]))
+
+
+def refresh_report_framing_sections(
+    client: Any,
+    model: str,
+    objective: str,
+    coverage_questions: Sequence[str],
+    report: str,
+    sources: Sequence[dict[str, Any]],
+    fallback_model: str,
+) -> tuple[str, str]:
+    source_text = format_sources(sources)
+    topic_sections = [report_section_for_question(report, question) for question in coverage_questions]
+    topics_digest = "\n\n".join(compact_text(section, DEFAULT_FRAME_SECTION_CHARS) for section in topic_sections if section)
+    intro, last_model = generate_frame_section(
+        client, model, "Introduction and Context",
+        instructions=(
+            "Write a short introduction (3-5 sentences) that frames the research objective and previews the "
+            "topics covered below, using only claims already present in the topic sections. Cite using the "
+            "same source markers used in those sections; do not introduce a new fact without one."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=fallback_model,
+    )
+    cross_cutting, last_model = generate_frame_section(
+        client, model, "Cross-cutting Analysis and Synthesis",
+        instructions=(
+            "Write a cross-cutting analysis that connects the topic sections below into a coherent narrative: "
+            "note relationships, tensions, or a progression across topics. Use only claims and citations already "
+            "present in the topic sections - do not add new facts."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    limitations, last_model = generate_frame_section(
+        client, model, "Limitations and Open Questions",
+        instructions=(
+            "List, as short bullet points, which sub-questions below have thin or missing evidence and what "
+            "specific detail is unresolved. Base this only on gaps already stated in the topic sections; do not "
+            "invent new limitations and do not repeat claims that were already supported with a citation."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    conclusion, last_model = generate_frame_section(
+        client, model, "Conclusion",
+        instructions=(
+            "Write a short conclusion (3-5 sentences) summarising what is well-supported across the topic "
+            "sections and what remains open, consistent with the limitations already identified. Do not add new "
+            "facts or citations that are not already present above."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    exec_summary, last_model = generate_frame_section(
+        client, model, "Executive Summary",
+        instructions=(
+            "Write a 3-4 sentence executive summary of the whole report below, naming the main topics covered "
+            "and, in one clause, the main limitation. Do not add new facts or citations that are not already "
+            "present above."
+        ),
+        objective=objective, source_text=source_text,
+        body_digest=f"{intro}\n\n{topics_digest}\n\n{cross_cutting}\n\n{limitations}\n\n{conclusion}",
+        fallback_model=last_model,
+    )
+    refreshed = replace_named_report_section(report, "Executive Summary", strip_leading_heading(exec_summary))
+    refreshed = replace_named_report_section(refreshed, "Introduction and Context", strip_leading_heading(intro))
+    refreshed = replace_named_report_section(refreshed, "Cross-cutting Analysis and Synthesis", strip_leading_heading(cross_cutting))
+    refreshed = replace_named_report_section(refreshed, "Limitations and Open Questions", strip_leading_heading(limitations))
+    refreshed = replace_named_report_section(refreshed, "Conclusion", strip_leading_heading(conclusion))
+    return refreshed, last_model
+
+
+def replace_named_report_section(report: str, heading_name: str, body: str) -> str:
+    lines = clean_markdown(report).splitlines()
+    target = normalize_heading(heading_name)
+    heading_positions = [
+        (index, match.group(1).strip())
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line))
+    ]
+    for position, (start, heading) in enumerate(heading_positions):
+        if normalize_heading(heading) != target:
+            continue
+        end = heading_positions[position + 1][0] if position + 1 < len(heading_positions) else len(lines)
+        replacement = [lines[start], *clean_markdown(body).splitlines()]
+        return clean_markdown("\n".join([*lines[:start], *replacement, *lines[end:]]))
+    return clean_markdown(f"{report}\n\n## {heading_name}\n{body}")
+
+
 def generate_topic_section(
     client: Any,
     model: str,
@@ -475,9 +703,18 @@ def generate_topic_section(
     pack: dict[str, Any],
     source_text: str,
     synthesis_note: dict[str, Any] | None = None,
+    repair_feedback: str = "",
 ) -> tuple[str, str, bool]:
     heading = planner_question_heading(question)
-    prompt = build_topic_section_prompt(objective, question, heading, pack, source_text, synthesis_note=synthesis_note)
+    prompt = build_topic_section_prompt(
+        objective,
+        question,
+        heading,
+        pack,
+        source_text,
+        synthesis_note=synthesis_note,
+        repair_feedback=repair_feedback,
+    )
     response = create_chat_completion_with_retries(
         client, model=model, temperature=0, max_tokens=DEFAULT_SECTION_MAX_TOKENS,
         retry_attempts=DEFAULT_SECTION_RETRY_ATTEMPTS,
@@ -522,9 +759,11 @@ def build_topic_section_prompt(
     pack: dict[str, Any],
     source_text: str,
     synthesis_note: dict[str, Any] | None = None,
+    repair_feedback: str = "",
 ) -> str:
     evidence_text = format_single_question_evidence(question, pack)
     synthesis_text = format_single_question_synthesis(question, synthesis_note or {})
+    repair_text = format_topic_repair_feedback(repair_feedback, question)
     return f"""Research objective:
 {objective}
 
@@ -543,6 +782,8 @@ Evidence retrieved for this question only:
 Per-question synthesis notes for this question:
 {synthesis_text}
 
+{repair_text}
+
 Rules:
 - Use only the retrieved evidence and per-question synthesis notes above; never use outside knowledge.
 - Treat cited per-question synthesis notes as report-ready support for this exact question.
@@ -554,6 +795,23 @@ Rules:
   gap - do not invent an answer, and do not call it a gap if cited evidence or cited synthesis is shown above.
 - Output only the section content in Markdown (you may include the "## {heading}" heading). Do not write any
   other section, heading, or closing remarks."""
+
+
+def format_topic_repair_feedback(repair_feedback: str, question: str) -> str:
+    feedback = clean_markdown(repair_feedback)
+    if not feedback:
+        return ""
+    question_terms = detail_terms(question)
+    lines = []
+    for line in feedback.splitlines():
+        value = clean_text(line)
+        if not value:
+            continue
+        if question in value or len(question_terms & detail_terms(value)) >= 2:
+            lines.append(value)
+    if not lines:
+        lines = [feedback]
+    return "Repair feedback for this section:\n" + "\n".join(lines[:6])
 
 
 def format_single_question_evidence(question: str, pack: dict[str, Any]) -> str:
@@ -632,8 +890,14 @@ def strip_leading_heading(section_text: str) -> str:
     return clean_markdown("\n".join(lines))
 
 
-def generate_single_report(client: Any, model: str, prompt: str, fallback_prompt: str | None = None) -> tuple[str, str]:
-    print(f"Generating single report with model {model}...")
+def generate_single_report(
+    client: Any,
+    model: str,
+    prompt: str,
+    fallback_prompt: str | None = None,
+    label: str = "single-shot report",
+) -> tuple[str, str]:
+    print(f"[report] generating {label} with model {model}...")
     try:
         response = create_report_completion(client, model, prompt, retry_attempts=1)
     except Exception as error:
