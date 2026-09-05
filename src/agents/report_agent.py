@@ -1285,11 +1285,30 @@ def per_question_synthesis_repair_note(question: str, synthesis_note: dict[str, 
     synthesis = clean_markdown(synthesis_note.get("synthesis"))
     if not synthesis:
         return ""
-    snippet = compact_text(synthesis, 620)
+    snippet = compact_markdown_at_sentence(synthesis, 620)
     source_markers = set(per_question_synthesis_source_indexes(synthesis_note))
     if not (source_markers & set(citation_markers(snippet))):
         snippet = f"{snippet} {format_citation_indexes(source_markers)}"
     return f"**Per-question synthesis support:** {snippet}"
+
+
+def compact_markdown_at_sentence(value: Any, max_chars: int) -> str:
+    text = clean_markdown(value)
+    if len(text) <= max_chars:
+        return text
+    window = text[:max_chars].rstrip()
+    boundaries = [
+        match.end()
+        for match in re.finditer(r"(?:(?:\[\d+\])(?:\s*\[\d+\])*)[.)]?(?:\s+|$)|[.!?](?:\s+|$)|\n\s*(?:[-*]|\d+[.)])\s+", window)
+    ]
+    if boundaries:
+        trimmed = window[:boundaries[-1]].strip()
+        min_reasonable = min(120, max(40, max_chars // 3))
+        if len(trimmed) >= min_reasonable:
+            return trimmed
+    if " " in window:
+        return window.rsplit(" ", 1)[0].rstrip(" .,:;")
+    return window
 
 
 def evidence_pack_repair_note(question: str, pack: dict[str, Any]) -> str:
@@ -1354,7 +1373,7 @@ def evidence_gap_pattern() -> str:
         r"(?:is|are)\s+missing|"
         r"no\s+source-backed|cannot\s+be\s+(?:given|reproduced|answered|provided)|"
         r"do\s+not\s+(?:contain|provide|include)|does\s+not\s+(?:contain|provide|include)|"
-        r"none\s+.*\s+provide|not\s+available|absent\s+from\s+.*\s+evidence|"
+        r"none\s+.*\s+provide|not\s+available|not\s+listed|\babsent\b|absent\s+from\s+.*\s+evidence|"
         r"not\s+present\s+in\s+.*\s+(?:evidence|sources|material))"
     )
 
@@ -1497,12 +1516,46 @@ def section_claims_missing_per_question_synthesis(section: str, question: str, s
     gap_terms = evidence_gap_pattern()
     if not re.search(gap_terms, lowered):
         return False
+    synthesis = clean_text(synthesis_note.get("synthesis")).lower()
+    if synthesis_gap_supports_section_gap(section, synthesis, question):
+        return False
     if not section_cites_per_question_synthesis(section, synthesis_note):
         return True
     for term in named_terms(question):
+        if synthesis_term_has_gap_support(synthesis, term):
+            continue
         if term in lowered and re.search(rf"\b{re.escape(term)}\b.{{0,140}}{gap_terms}|{gap_terms}.{{0,140}}\b{re.escape(term)}\b", lowered):
             return True
     return False
+
+
+def synthesis_gap_supports_section_gap(section: str, synthesis: str, question: str) -> bool:
+    section_gap_terms = gap_related_terms(section, question)
+    if not section_gap_terms:
+        return bool(re.search(evidence_gap_pattern(), synthesis))
+    return all(synthesis_term_has_gap_support(synthesis, term) for term in section_gap_terms)
+
+
+def gap_related_terms(section: str, question: str) -> list[str]:
+    lowered = clean_text(section).lower()
+    gap_terms = evidence_gap_pattern()
+    terms = [term for term in [*named_terms(question), *detail_terms(question)] if term not in STOPWORDS]
+    related = []
+    for term in dedupe_text(terms):
+        pattern = rf"\b{re.escape(term)}\b.{{0,140}}{gap_terms}|{gap_terms}.{{0,140}}\b{re.escape(term)}\b"
+        if term in lowered and re.search(pattern, lowered):
+            related.append(term)
+    return related
+
+
+def synthesis_term_has_gap_support(synthesis: str, term: str) -> bool:
+    if not term:
+        return False
+    gap_terms = evidence_gap_pattern()
+    return bool(
+        term in synthesis
+        and re.search(rf"\b{re.escape(term)}\b.{{0,180}}{gap_terms}|{gap_terms}.{{0,180}}\b{re.escape(term)}\b", synthesis)
+    )
 
 
 def section_mentions_pack_topic(section: str, question: str) -> bool:
@@ -1556,6 +1609,12 @@ def section_claims_missing_supported_evidence(section: str, question: str, pack:
     gap_terms = evidence_gap_pattern()
     if re.search(gap_terms, lowered) and (evidence_pack_has_formula_evidence(pack) or not section_cites_pack_source(section, pack)):
         return True
+    if (
+        synthesis_coverage_status_is_gap(pack.get("coverage"))
+        and section_cites_pack_source(section, pack)
+        and not evidence_pack_has_formula_evidence(pack)
+    ):
+        return False
     for term in named_terms(question):
         if term in lowered and re.search(rf"\b{re.escape(term)}\b.{{0,140}}{gap_terms}|{gap_terms}.{{0,140}}\b{re.escape(term)}\b", lowered):
             return True

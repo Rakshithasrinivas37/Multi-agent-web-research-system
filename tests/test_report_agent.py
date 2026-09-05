@@ -7,6 +7,7 @@ from src.agents.report_agent import (
     apply_report_evidence_pack_repairs,
     clean_markdown,
     build_report_prompt,
+    compact_markdown_at_sentence,
     dedupe_sources,
     evidence_pack_questions,
     format_evidence_packs,
@@ -773,6 +774,34 @@ The supplied evidence does not contain the explicit additive-attention formulas 
 
         self.assertEqual(false_gaps, [question])
 
+    def test_report_evidence_gap_contradictions_allows_cited_partial_pack_gap(self):
+        question = "What are the standard implementations and APIs for attention in PyTorch and TensorFlow?"
+        report = """
+## Standard Implementations And APIs For Attention In PyTorch And TensorFlow
+TensorFlow provides an online API reference for public functions, classes, and modules [4].
+Concrete PyTorch API references are missing from the supplied evidence [4].
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "missing_facets": ["PyTorch"],
+                    "chunks": [
+                        {
+                            "source_index": 4,
+                            "content": "TensorFlow provides API documentation, but the retrieved chunk does not list PyTorch APIs.",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [])
+
     def test_report_pack_citation_gaps_flags_uncited_matching_section(self):
         question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
         report = """
@@ -852,6 +881,32 @@ Evidence for vision and speech applications is missing.
         )
 
         self.assertEqual(false_gaps, [question])
+
+    def test_report_synthesis_gap_contradictions_allows_specific_missing_detail(self):
+        question = "What are the standard implementations and APIs for attention in PyTorch and TensorFlow?"
+        report = """
+## Standard Implementations And APIs For Attention In PyTorch And TensorFlow
+TensorFlow provides an online API reference for public functions, classes, and modules [4].
+Specific PyTorch API references are missing, and exact TensorFlow attention classes are not listed [4].
+"""
+
+        false_gaps = report_synthesis_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "synthesis": (
+                        "TensorFlow provides an online API reference for public functions, classes, and modules [4]. "
+                        "The exact TensorFlow attention classes are not listed in the retrieved evidence. "
+                        "Any description of PyTorch attention APIs is absent."
+                    ),
+                    "source_indexes": [4],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [])
 
     def test_report_per_question_synthesis_citation_gaps_flags_dropped_synthesis_sources(self):
         question = "What is the definition of attention?"
@@ -1038,6 +1093,17 @@ No cited source markers were used.
         self.assertIn("image captioning [5]", repaired)
         self.assertIn("speech recognition [6]", repaired)
         self.assertNotIn("quadratic dependence", repaired)
+
+    def test_per_question_synthesis_repair_note_does_not_cut_mid_sentence(self):
+        text = (
+            "Attention is used for image captioning [5]. "
+            "Speech recognition is supported by the retrieved evidence [6]. "
+            "This final sentence should be dropped rather than clipped in the middle of a word [6]."
+        )
+
+        snippet = compact_markdown_at_sentence(text, 95)
+
+        self.assertEqual(snippet, "Attention is used for image captioning [5].")
 
     def test_format_single_question_synthesis_lists_source_markers(self):
         text = format_single_question_synthesis(
