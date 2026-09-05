@@ -1138,7 +1138,7 @@ def per_question_synthesis_has_cited_evidence(synthesis_note: dict[str, Any]) ->
     return bool(per_question_synthesis_source_indexes(synthesis_note))
 
 
-def planner_question_heading(question: str) -> str:
+def planner_question_heading(question: str, max_length: int | None = 90) -> str:
     text = clean_text(question).rstrip("?")
     heading = re.sub(
         r"^(what|how|why|when|where|which)\s+(is|are|does|do|did|can|should)\s+",
@@ -1153,7 +1153,17 @@ def planner_question_heading(question: str) -> str:
     for word in heading.split():
         clean_word = word.strip(".,:;()[]{}")
         words.append(clean_word if any(char.isupper() for char in clean_word[1:]) else clean_word.capitalize())
-    return " ".join(words)[:90].strip() or "Research Finding"
+    return truncate_heading_at_word_boundary(" ".join(words), max_length) or "Research Finding"
+
+
+def truncate_heading_at_word_boundary(heading: str, max_length: int | None = 90) -> str:
+    value = clean_text(heading).strip(" .,:;")
+    if not max_length or len(value) <= max_length:
+        return value
+    trimmed = value[:max_length].rstrip()
+    if " " in trimmed:
+        trimmed = trimmed.rsplit(" ", 1)[0]
+    return trimmed.strip(" .,:;")
 
 
 def format_supporting_evidence(
@@ -2066,7 +2076,8 @@ def missing_sub_question_coverage(report: str, planner_questions: Sequence[str])
 
 
 def report_schema_issues(report: str, planner_questions: Sequence[str]) -> list[str]:
-    headings = {normalize_heading(h) for h in h2_headings(report)}
+    raw_headings = h2_headings(report)
+    headings = {normalize_heading(h) for h in raw_headings}
     required = {
         "executive summary": ("executive summary",),
         "introduction/context": ("introduction and context", "introduction", "context"),
@@ -2083,7 +2094,33 @@ def report_schema_issues(report: str, planner_questions: Sequence[str]) -> list[
         heading = normalize_heading(planner_question_heading(question))
         if heading and not any(headings_match(heading, actual) for actual in headings):
             issues.append(f"missing planner topic section: {planner_question_heading(question)}")
+    issues.extend(malformed_heading_issues(raw_headings, planner_questions))
     return issues
+
+
+def malformed_heading_issues(headings: Sequence[str], planner_questions: Sequence[str]) -> list[str]:
+    issues = []
+    full_by_question = [(question, planner_question_heading(question, max_length=None)) for question in planner_questions]
+    for heading in headings:
+        actual = strip_heading_numbering(heading)
+        actual_key = normalize_heading(actual)
+        if not actual_key:
+            continue
+        for question, full_heading in full_by_question:
+            full_key = normalize_heading(full_heading)
+            expected_key = normalize_heading(planner_question_heading(question))
+            if actual_key == expected_key:
+                continue
+            if full_key.startswith(actual_key) and headings_match(expected_key, actual_key):
+                issues.append(f"malformed planner topic heading appears truncated: {actual}")
+                break
+    return dedupe_text(issues)
+
+
+def strip_heading_numbering(heading: Any) -> str:
+    value = strip_markdown(heading)
+    value = re.sub(r"^\d+(?:\.\d+)*[.)]?\s*", "", value)
+    return clean_text(value)
 
 
 def report_self_critique(report_issues: Sequence[str], coverage_check: dict[str, Any], schema_issues: Sequence[str]) -> dict[str, Any]:
@@ -2106,6 +2143,8 @@ def report_quality_issues(
         issues.append("report must include a References section")
     if has_placeholder_source_marker(text):
         issues.append("report contains placeholder or non-source citation markers")
+    if has_dangling_markdown_bullet(text):
+        issues.append("report contains empty or dangling bullet items")
     source_indexes = source_index_set(sources or [])
     invalid = unavailable_citation_markers(report, source_indexes)
     if invalid:
@@ -2114,6 +2153,13 @@ def report_quality_issues(
     if unsupported_metrics:
         issues.append(f"report includes benchmark metrics not present in evidence: {', '.join(unsupported_metrics[:5])}")
     return issues
+
+
+def has_dangling_markdown_bullet(markdown: str) -> bool:
+    for line in clean_markdown(markdown).splitlines():
+        if re.match(r"^\s*(?:[-*+]|\d+[.)])\s*$", line):
+            return True
+    return False
 
 
 def normalize_markdown_headings(markdown: str) -> str:
