@@ -32,6 +32,7 @@ from src.agents.report_agent import (
     report_synthesis_gap_contradictions,
     report_needs_revision,
     report_pack_citation_gaps,
+    repair_report_by_sections,
     report_schema_issues,
     report_self_critique,
     report_sub_question_coverage_check,
@@ -1113,6 +1114,83 @@ No cited source markers were used.
 
         self.assertIn("Synthesis source markers: [5]", text)
         self.assertIn("Attention focuses input elements [5].", text)
+
+    def test_repair_report_by_sections_regenerates_only_target_topics_and_framing(self):
+        question = "What benchmark result is reported?"
+        calls = []
+
+        class Message:
+            def __init__(self, content):
+                self.content = content
+
+        class Choice:
+            def __init__(self, content):
+                self.message = Message(content)
+
+        class Response:
+            def __init__(self, content):
+                self.choices = [Choice(content)]
+                self.model = "test-model"
+
+        def fake_completion(client, **kwargs):
+            prompt = kwargs["messages"][1]["content"]
+            calls.append(prompt)
+            if "Sub-question this section must answer:" in prompt:
+                return Response("The benchmark result is 28.4 BLEU, which directly answers the planner question with cited evidence [2].")
+            return Response("Updated framing uses the repaired benchmark result [2].")
+
+        original = report_agent_module.create_chat_completion_with_retries
+        original_single = report_agent_module.generate_single_report
+        report_agent_module.create_chat_completion_with_retries = fake_completion
+        report_agent_module.generate_single_report = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("single-shot repair should not run"))
+        try:
+            repaired, _, diagnostics = repair_report_by_sections(
+                object(),
+                "test-model",
+                report="""
+## 1. Executive Summary
+Old summary.
+
+## 2. Introduction and Context
+Old intro.
+
+## 3. Topic Sections
+
+### 3.1 Benchmark Result Is Reported
+The benchmark result is discussed without the expected citation.
+
+## 4. Cross-cutting Analysis and Synthesis
+Old synthesis.
+
+## 5. Limitations and Open Questions
+Old limitations.
+
+## 6. Conclusion
+Old conclusion.
+""",
+                objective="Attention mechanism",
+                coverage_questions=[question],
+                evidence_packs=[
+                    {
+                        "question": question,
+                        "coverage": "covered",
+                        "chunks": [{"source_index": 2, "title": "Paper", "content": "The benchmark result is 28.4 BLEU."}],
+                    }
+                ],
+                sources=[{"index": 2, "url": "https://example.com/paper"}],
+                validation={"pack_citation_gap_questions": [question], "false_gap_questions": [], "coverage": {"missing": []}, "schema_issues": []},
+                repair_feedback="- missing evidence-pack citation to add in matching section: What benchmark result is reported?",
+                per_question_synthesis=[],
+            )
+        finally:
+            report_agent_module.create_chat_completion_with_retries = original
+            report_agent_module.generate_single_report = original_single
+
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(diagnostics["section_repairs"][0]["question"], question)
+        self.assertTrue(diagnostics["framing_refreshed"])
+        self.assertIn("The benchmark result is 28.4 BLEU", repaired)
+        self.assertIn("Updated framing uses the repaired benchmark result [2].", repaired)
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(
