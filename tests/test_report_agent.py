@@ -19,11 +19,13 @@ from src.agents.report_agent import (
     format_supporting_evidence,
     generate_single_report,
     frame_section_needs_retry,
+    has_dangling_markdown_bullet,
     missing_evidence_constraints,
     markdown_appears_truncated,
     missing_sub_question_coverage,
     normalize_final_report,
     normalize_markdown_headings,
+    planner_question_heading,
     remove_unavailable_citation_markers,
     report_context_gap_items,
     report_context_gap_queries,
@@ -84,6 +86,15 @@ Supported [1]. Unsupported [9].
         )
 
         self.assertIn("report contains placeholder or non-source citation markers", issues)
+
+    def test_report_quality_flags_dangling_bullet(self):
+        issues = report_quality_issues(
+            "## Limitations\n-\n\n## References\n[1] https://example.com",
+            [{"index": 1, "url": "https://example.com"}],
+        )
+
+        self.assertTrue(has_dangling_markdown_bullet("## Limitations\n-"))
+        self.assertIn("report contains empty or dangling bullet items", issues)
 
     def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
         markdown = "### ## 1. Definition\nText."
@@ -166,6 +177,15 @@ Supported [1]. Unsupported [9].
 
         self.assertIn("## 1. Benchmark Demonstrate GLUE And WMT Performance", outline)
         self.assertIn("## 2. PyTorch MultiheadAttention Used", outline)
+
+    def test_planner_question_heading_truncates_at_word_boundary(self):
+        heading = planner_question_heading(
+            "What are the main variants of attention mechanisms (additive, multiplicative, self-attention, multi-head) and how do they differ?"
+        )
+
+        self.assertLessEqual(len(heading), 90)
+        self.assertFalse(heading.endswith("Multi-hea"))
+        self.assertNotRegex(heading, r"\b\w{2,4}$")
 
     def test_build_report_prompt_requires_core_equation_for_formula_questions(self):
         prompt = build_report_prompt(
@@ -602,6 +622,36 @@ Done.
         )
 
         self.assertEqual(issues, [])
+
+    def test_report_schema_flags_mid_word_truncated_topic_heading(self):
+        question = "What are the main variants of attention mechanisms (additive, multiplicative, self-attention, multi-head) and how do they differ?"
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+### The Main Variants Of Attention Mechanisms Additive Multiplicative Self-attention Multi-hea
+Variants.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_schema_issues(report, [question])
+
+        self.assertIn("malformed planner topic heading appears truncated", "\n".join(issues))
 
     def test_clean_markdown_strips_open_thinking_block(self):
         text = "Useful.\n<think>hidden reasoning that never closes"
