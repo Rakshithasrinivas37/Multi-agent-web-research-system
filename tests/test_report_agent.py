@@ -18,7 +18,9 @@ from src.agents.report_agent import (
     format_report_section_outline,
     format_supporting_evidence,
     generate_single_report,
+    frame_section_needs_retry,
     missing_evidence_constraints,
+    markdown_appears_truncated,
     missing_sub_question_coverage,
     normalize_final_report,
     normalize_markdown_headings,
@@ -1114,6 +1116,18 @@ No cited source markers were used.
 
         self.assertIn("Synthesis source markers: [5]", text)
         self.assertIn("Attention focuses input elements [5].", text)
+
+    def test_markdown_appears_truncated_detects_dangling_final_phrase(self):
+        self.assertTrue(markdown_appears_truncated("The practical impact of"))
+        self.assertFalse(markdown_appears_truncated("The practical impact is supported [2]."))
+
+    def test_frame_section_needs_retry_flags_empty_or_uncited_framing(self):
+        digest = "The benchmark result is supported [2]."
+
+        self.assertTrue(frame_section_needs_retry("", "Limitations and Open Questions", digest))
+        self.assertTrue(frame_section_needs_retry("The practical impact of", "Cross-cutting Analysis and Synthesis", digest))
+        self.assertTrue(frame_section_needs_retry("This is complete but has no citation.", "Conclusion", digest))
+        self.assertFalse(frame_section_needs_retry("This complete conclusion summarizes the repaired benchmark evidence with a valid citation [2].", "Conclusion", digest))
 
     def test_repair_report_by_sections_regenerates_only_target_topics_and_framing(self):
         question = "What benchmark result is reported?"
