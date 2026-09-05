@@ -877,10 +877,84 @@ Output only the section content in Markdown. Do not write any other heading or c
         )
     except Exception as error:
         print(f"[report] frame section '{heading}' failed ({clean_text(error)[:160]}); using digest fallback")
-        return compact_text(body_digest, DEFAULT_FRAME_SECTION_CHARS) or f"{heading} could not be generated.", fallback_model
+        return deterministic_frame_section(heading, body_digest), fallback_model
     section = normalize_citation_markers(clean_markdown(response.choices[0].message.content))
     used_model = clean_text(getattr(response, "model", "")) or fallback_model
+    if frame_section_needs_retry(section, heading, body_digest):
+        retry_prompt = f"""{prompt}
+
+Your previous draft failed validation because it was empty, uncited, or appeared truncated. Rewrite the "{heading}"
+section as complete Markdown using only the already-written report content above.
+
+Previous draft:
+{section}"""
+        response = create_chat_completion_with_retries(
+            client, model=model, temperature=0, max_tokens=DEFAULT_FRAME_MAX_TOKENS,
+            retry_attempts=DEFAULT_SECTION_RETRY_ATTEMPTS,
+            messages=[
+                {"role": "system", "content": SECTION_SYSTEM_PROMPT},
+                {"role": "user", "content": retry_prompt},
+            ],
+        )
+        section = normalize_citation_markers(clean_markdown(response.choices[0].message.content))
+        used_model = clean_text(getattr(response, "model", "")) or used_model
+    if frame_section_needs_retry(section, heading, body_digest):
+        print(f"[report] frame section '{heading}' remained weak; using deterministic fallback")
+        return deterministic_frame_section(heading, body_digest), used_model
     return section, used_model
+
+
+def frame_section_needs_retry(section_text: str, heading: str, body_digest: str) -> bool:
+    body = strip_leading_heading(section_text)
+    plain = strip_markdown(body)
+    if len(plain) < 50:
+        return True
+    if markdown_appears_truncated(body):
+        return True
+    if citation_markers(body_digest) and normalize_heading(heading) != "limitations and open questions" and not citation_markers(body):
+        return True
+    return False
+
+
+def markdown_appears_truncated(markdown: str) -> bool:
+    lines = [clean_text(line) for line in clean_markdown(markdown).splitlines() if clean_text(line)]
+    if not lines:
+        return True
+    last = strip_markdown(lines[-1]).strip()
+    if not last:
+        return True
+    if re.search(r"[,;:]$", last):
+        return True
+    return bool(re.search(r"\b(?:a|an|and|as|because|by|for|from|in|including|of|on|or|that|the|to|while|which|with)$", last, flags=re.IGNORECASE))
+
+
+def deterministic_frame_section(heading: str, body_digest: str) -> str:
+    digest = clean_markdown(body_digest)
+    cited_lines = [
+        clean_text(line)
+        for line in digest.splitlines()
+        if citation_markers(line) and not line.lstrip().startswith("#")
+    ]
+    gap_lines = [
+        clean_text(line)
+        for line in digest.splitlines()
+        if line_has_gap_claim(line) and not line.lstrip().startswith("#")
+    ]
+    normalized = normalize_heading(heading)
+    if normalized == "limitations and open questions":
+        items = gap_lines[:5] or ["No unresolved evidence gaps were explicitly stated in the repaired topic sections."]
+        return "\n".join(f"- {strip_markdown(item)}" for item in items)
+    if normalized == "executive summary":
+        items = cited_lines[:3] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
+        return " ".join(item.rstrip(".") + "." for item in items if item)
+    if normalized == "introduction and context":
+        first = cited_lines[0] if cited_lines else compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)
+        return first.rstrip(".") + "." if first else "The topic sections below summarize the available cited evidence."
+    if normalized == "conclusion":
+        items = cited_lines[-3:] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
+        return " ".join(item.rstrip(".") + "." for item in items if item)
+    items = cited_lines[:4] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
+    return "\n".join(f"- {item}" for item in items if item)
 
 
 def strip_leading_heading(section_text: str) -> str:
