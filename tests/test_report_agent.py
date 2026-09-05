@@ -20,7 +20,9 @@ from src.agents.report_agent import (
     generate_single_report,
     frame_section_needs_retry,
     has_dangling_markdown_bullet,
+    has_truncated_markdown_list_item,
     heading_ends_with_connector,
+    list_item_appears_truncated,
     missing_evidence_constraints,
     markdown_appears_truncated,
     missing_sub_question_coverage,
@@ -118,6 +120,55 @@ Conclusion is complete [1].
 
         self.assertIn("Cross-cutting Analysis and Synthesis", truncated_report_sections(report))
         self.assertIn("report contains truncated or incomplete section text", "\n".join(issues))
+
+    def test_report_quality_flags_truncated_list_items_inside_sections(self):
+        report = """
+## Executive Summary
+Summary is complete [1].
+
+## Cross-cutting Analysis and Synthesis
+- This variant can be implemen
+
+## Limitations and Open Questions
+- The models exhibit limited ability to generalize to novel compositional structures [
+
+## Conclusion
+Conclusion is complete [1].
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_quality_issues(report, [{"index": 1, "url": "https://example.com"}])
+
+        self.assertTrue(list_item_appears_truncated("- This variant can be implemen"))
+        self.assertTrue(list_item_appears_truncated("- The models exhibit limited ability to generalize to novel compositional structures ["))
+        self.assertTrue(has_truncated_markdown_list_item(report))
+        self.assertIn("Cross-cutting Analysis and Synthesis", truncated_report_sections(report))
+        self.assertIn("Limitations and Open Questions", truncated_report_sections(report))
+        self.assertIn("report contains truncated or incomplete section text", "\n".join(issues))
+
+    def test_report_quality_accepts_complete_list_items(self):
+        report = """
+## Cross-cutting Analysis and Synthesis
+- Complete synthesis bullet with a citation [1].
+- Complete limitation bullet with final punctuation.
+"""
+
+        self.assertFalse(has_truncated_markdown_list_item(report))
+        self.assertFalse(list_item_appears_truncated("- Complete synthesis bullet with a citation [1]."))
+
+    def test_report_quality_accepts_list_item_that_introduces_formula(self):
+        report = """
+## Seminal Papers
+- The attention weight matrix is computed as
+
+  \\[
+  A = softmax(QK^T)
+  \\]
+"""
+
+        self.assertFalse(has_truncated_markdown_list_item(report))
 
     def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
         markdown = "### ## 1. Definition\nText."

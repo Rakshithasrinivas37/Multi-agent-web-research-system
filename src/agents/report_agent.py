@@ -969,6 +969,8 @@ def markdown_appears_truncated(markdown: str) -> bool:
     lines = [clean_text(line) for line in clean_markdown(markdown).splitlines() if clean_text(line)]
     if not lines:
         return True
+    if has_truncated_markdown_list_item(markdown):
+        return True
     last = strip_markdown(lines[-1]).strip()
     if not last:
         return True
@@ -989,6 +991,50 @@ def prose_fragment_appears_unfinished(raw_line: str, plain_line: str) -> bool:
     if re.search(r"(?:[.!?)]|[\"']|\])$", plain):
         return False
     return len(plain.split()) >= 3
+
+
+def has_truncated_markdown_list_item(markdown: str) -> bool:
+    lines = clean_markdown(markdown).splitlines()
+    for index, line in enumerate(lines):
+        if list_item_has_continuation(lines, index):
+            continue
+        if list_item_appears_truncated(line):
+            return True
+    return False
+
+
+def list_item_has_continuation(lines: Sequence[str], index: int) -> bool:
+    if not re.match(r"^\s*(?:[-*+]|\d+[.)])\s+.+", lines[index]):
+        return False
+    next_line = next((line for line in lines[index + 1:] if clean_text(line)), "")
+    if not next_line:
+        return False
+    stripped = next_line.lstrip()
+    if re.match(r"(?:[-*+]|\d+[.)])\s+", stripped):
+        return False
+    return bool(
+        next_line.startswith((" ", "\t"))
+        or stripped.startswith((r"\[", r"\(", "$$", "|", ">"))
+    )
+
+
+def list_item_appears_truncated(line: str) -> bool:
+    match = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$", line)
+    if not match:
+        return False
+    item = clean_text(match.group(1))
+    if not item:
+        return True
+    if re.search(r"\[\s*\d*\s*$", item):
+        return True
+    if item.count("[") > item.count("]"):
+        return True
+    plain = strip_markdown(item)
+    if re.search(r"(?:[.!?)]|[\"']|\]|\})$", plain):
+        return False
+    if re.search(r"\b(?:a|an|and|as|because|by|for|from|in|including|of|on|or|that|the|to|while|which|with)$", plain, flags=re.IGNORECASE):
+        return True
+    return len(plain.split()) >= 4
 
 
 def deterministic_frame_section(heading: str, body_digest: str) -> str:
