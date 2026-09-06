@@ -17,6 +17,8 @@ from src.agents.report_agent import (
     format_report_revision_feedback,
     format_report_section_outline,
     format_supporting_evidence,
+    cleanup_report_markdown_artifacts,
+    finalize_report_output,
     generate_single_report,
     frame_section_needs_retry,
     has_dangling_markdown_bullet,
@@ -27,9 +29,11 @@ from src.agents.report_agent import (
     markdown_appears_truncated,
     missing_sub_question_coverage,
     normalize_final_report,
+    normalize_nested_markdown_bullet,
     normalize_markdown_headings,
     planner_question_heading,
     remove_unavailable_citation_markers,
+    repair_truncated_markdown_line,
     report_context_gap_items,
     report_context_gap_queries,
     report_evidence_gap_contradictions,
@@ -171,6 +175,116 @@ Conclusion is complete [1].
 """
 
         self.assertFalse(has_truncated_markdown_list_item(report))
+
+    def test_cleanup_report_markdown_artifacts_repairs_final_output_breakage(self):
+        report = """
+## 1. Executive Summary
+The core intuition is that the model learns where to look in the input sequence for ea.
+
+## 3. Topic Sections
+
+### 3.1. Definition
+Supported definition [1].
+
+**Exact missing details**
+-
+
+## 4. Cross-cutting Analysis and Synthesis
+- The model learns where to look in the input sequence for ea
+- - **Bahdanau attention** uses recurrent processing [1].
+
+## References
+[1] https://example.com
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed empty missing-details stub", repairs)
+        self.assertIn("removed truncated list item", repairs)
+        self.assertIn("normalized nested bullet marker", repairs)
+        self.assertIn("trimmed incomplete sentence fragment", repairs)
+        self.assertNotIn("Exact missing details", cleaned)
+        self.assertNotIn("\n-\n", cleaned)
+        self.assertNotIn("- -", cleaned)
+        self.assertNotIn("for ea", cleaned)
+        self.assertIn("- **Bahdanau attention** uses recurrent processing [1].", cleaned)
+
+    def test_repair_truncated_markdown_line_trims_suspicious_short_fragment(self):
+        repaired, repairs = repair_truncated_markdown_line(
+            "The evidence supports the definition [1]. The model learns where to look for ea."
+        )
+
+        self.assertEqual(repaired, "The evidence supports the definition [1].")
+        self.assertEqual(repairs, ["trimmed incomplete sentence fragment"])
+
+    def test_normalize_nested_markdown_bullet_removes_duplicate_marker(self):
+        self.assertEqual(
+            normalize_nested_markdown_bullet("- - **Bahdanau attention** uses recurrence [1]."),
+            "- **Bahdanau attention** uses recurrence [1].",
+        )
+
+    def test_finalize_report_output_reports_repaired_status_after_cleanup(self):
+        question = "What is the definition of attention?"
+        report = """
+## 1. Executive Summary
+Summary is complete [1].
+
+## 2. Introduction and Context
+The evidence supports the definition [1]. The model learns where to look for ea.
+
+## 3. Topic Sections
+
+### 3.1. Definition Of Attention
+Attention is defined with cited support [1].
+
+**Exact missing details**
+-
+
+## 4. Cross-cutting Analysis and Synthesis
+- The evidence supports the definition [1].
+- The model learns where to look for ea
+- - **Attention** focuses relevant input [1].
+
+## 5. Limitations and Open Questions
+- No unresolved evidence gaps were explicitly stated.
+
+## 6. Conclusion
+Conclusion is complete [1].
+
+## References
+[1] https://example.com
+"""
+        sources = [{"index": 1, "url": "https://example.com"}]
+        context = {
+            "coverage_by_question": [],
+            "evidence_packs": [],
+            "per_question_synthesis": [],
+        }
+        validation = {
+            "coverage": {"missing": []},
+            "schema_issues": [],
+            "synthesis_gaps": [],
+            "false_gap_questions": [],
+            "pack_citation_gap_questions": [],
+            "report_issues": ["report contains empty or dangling bullet items"],
+        }
+
+        finalized, final_validation, finalization = finalize_report_output(
+            report,
+            sources,
+            [question],
+            "Attention is defined with cited support [1].",
+            "Attention is defined with cited support [1].",
+            "",
+            [],
+            context,
+            validation,
+        )
+
+        self.assertEqual(finalization["status"], "repaired")
+        self.assertEqual(final_validation["report_issues"], [])
+        self.assertNotIn("Exact missing details", finalized)
+        self.assertNotIn("- -", finalized)
 
     def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
         markdown = "### ## 1. Definition\nText."
