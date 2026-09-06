@@ -36,6 +36,7 @@ from src.agents.report_agent import (
     remove_clipped_sentence_fragments,
     remove_unavailable_citation_markers,
     remove_duplicate_section_labels,
+    required_topic_facet_issues,
     repair_topic_headings,
     repair_weak_frame_sections,
     repair_truncated_markdown_line,
@@ -286,17 +287,24 @@ Topic fact is supported [1].
 ## 4. Cross-cutting Analysis and Synthesis
 Supported fact remains [1]. This sentence ends with representat. Next fact remains [2].
 Dot-product attention is faster due to optimized matrix-. where \\(d_k\\) is the dimension. Final fact remains [3].
+The citation marker was removed but punctuation should remain tidy .
+**Per-question synthesis support:** Debug labels should not appear [4].
 """
 
         cleaned, repairs = cleanup_report_markdown_artifacts(report)
 
         self.assertIn("removed clipped sentence fragment", repairs)
+        self.assertIn("removed orphan citation punctuation", repairs)
+        self.assertIn("removed raw repair label", repairs)
         self.assertIn("Supported fact remains [1].", cleaned)
         self.assertIn("Next fact remains [2].", cleaned)
         self.assertIn("Final fact remains [3].", cleaned)
+        self.assertIn("tidy.", cleaned)
+        self.assertIn("Debug labels should not appear [4].", cleaned)
         self.assertNotIn("representat", cleaned)
         self.assertNotIn("matrix-", cleaned)
         self.assertNotIn("where \\(d_k\\)", cleaned)
+        self.assertNotIn("Per-question synthesis support", cleaned)
 
     def test_normalize_nested_markdown_bullet_removes_duplicate_marker(self):
         self.assertEqual(
@@ -325,6 +333,7 @@ Attention is defined with cited support [1].
 - The evidence supports the definition [1].
 - The model learns where to look for ea
 - - **Attention** focuses relevant input [1].
+The citation marker was removed but punctuation should remain tidy .
 
 ## 5. Limitations and Open Questions
 - No unresolved evidence gaps were explicitly stated.
@@ -465,12 +474,20 @@ Conclusion is complete [1].
         complexity = planner_question_heading(
             "What is the computational complexity of attention mechanisms and how does it scale with sequence length?"
         )
+        quadratic = planner_question_heading(
+            "What are the main limitations and computational challenges of attention mechanisms, especially regarding quadratic complexity?"
+        )
+        improve = planner_question_heading(
+            "How does attention improve performance on machine-translation benchmarks compared to non-attention models?"
+        )
         api = planner_question_heading(
             "Where can official implementations and API references for attention be found in major frameworks (TensorFlow, PyTorch)?"
         )
 
         self.assertEqual(variants, "The Main Variants Of Attention Mechanisms And Their Differences")
         self.assertEqual(complexity, "The Computational Complexity Of Attention Mechanisms And Sequence-length Scaling")
+        self.assertEqual(quadratic, "The Main Limitations And Computational Challenges Of Attention Mechanisms Especially Regarding Quadratic Complexity")
+        self.assertEqual(improve, "How Attention Improves Performance On Machine-translation Benchmarks Compared To Non-attention Models")
         self.assertEqual(api, "Official Implementations And API References For Attention In Major Frameworks TensorFlow PyTorch")
         self.assertFalse(heading_ends_with_connector(variants))
         self.assertFalse(heading_ends_with_connector(complexity))
@@ -1490,7 +1507,8 @@ Evidence Gap: The supplied evidence does not contain the explicit formula.
 
         self.assertEqual(repairs, [question])
         self.assertNotIn("Evidence Gap", repaired)
-        self.assertIn("Core evidence", repaired)
+        self.assertNotIn("Core evidence", repaired)
+        self.assertIn("a(si-1,hj) = va^T tanh", repaired)
         self.assertIn("[2]", repaired)
         self.assertIn("1409.0473", repaired)
 
@@ -1527,7 +1545,8 @@ No cited source markers were used.
         )
 
         self.assertEqual(repairs, [question])
-        self.assertIn("Core evidence", repaired)
+        self.assertNotIn("Core evidence", repaired)
+        self.assertIn("a(si-1,hj) = va^T tanh", repaired)
         self.assertIn("[2] https://arxiv.org/pdf/1409.0473", repaired)
 
     def test_apply_report_repairs_prefer_per_question_synthesis_over_raw_pack_chunk(self):
@@ -1570,10 +1589,36 @@ No cited source markers were used.
         )
 
         self.assertEqual(repairs, [question])
-        self.assertIn("Per-question synthesis support", repaired)
+        self.assertNotIn("Per-question synthesis support", repaired)
         self.assertIn("image captioning [5]", repaired)
         self.assertIn("speech recognition [6]", repaired)
         self.assertNotIn("quadratic dependence", repaired)
+
+    def test_required_topic_facet_issues_flags_missing_compound_api_facet(self):
+        question = "What are the major open-source implementations and APIs for attention mechanisms in PyTorch and TensorFlow?"
+        report = """
+## 3. Topic Sections
+### 3.1. Major Open-source Implementations And APIs For Attention Mechanisms In PyTorch And TensorFlow
+**PyTorch**
+PyTorch provides `torch.nn.MultiheadAttention` [6].
+**TensorFlow**
+**Per-question synthesis support:** PyTorch provides `torch.nn.MultiheadAttention` [6].
+"""
+
+        issues = required_topic_facet_issues(report, [question])
+
+        self.assertEqual(issues, [f"report omits required topic facet: {question}"])
+
+    def test_required_topic_facet_issues_allows_explicit_facet_gap(self):
+        question = "What are the major open-source implementations and APIs for attention mechanisms in PyTorch and TensorFlow?"
+        report = """
+## 3. Topic Sections
+### 3.1. Major Open-source Implementations And APIs For Attention Mechanisms In PyTorch And TensorFlow
+PyTorch provides `torch.nn.MultiheadAttention` [6].
+The retrieved evidence does not list a concrete TensorFlow attention API.
+"""
+
+        self.assertEqual(required_topic_facet_issues(report, [question]), [])
 
     def test_per_question_synthesis_repair_note_does_not_cut_mid_sentence(self):
         text = (
