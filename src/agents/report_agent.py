@@ -242,6 +242,20 @@ class ReportAgent:
             print(f"[report] applied {len(deterministic_repairs)} deterministic evidence-pack repair(s)")
             validation = validate_report_output(report, sources, coverage_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
             review_trace.append({**validation["review"], "source": "deterministic_repair", "repairs": deterministic_repairs})
+        report, validation, finalization = finalize_report_output(
+            report,
+            sources,
+            coverage_questions,
+            evidence,
+            synthesis,
+            pack_text,
+            evidence_packs,
+            report_context,
+            validation,
+        )
+        if finalization["repairs"]:
+            print(f"[report] finalization {finalization['status']}: applied {len(finalization['repairs'])} cleanup repair(s)")
+            review_trace.append({**validation["review"], "source": "finalization", **finalization})
 
         return {
             "objective": objective,
@@ -277,6 +291,8 @@ class ReportAgent:
                 "report_review_trace": review_trace,
                 "report_revision_attempts": len(review_trace) - 1,
                 "report_deterministic_repairs": deterministic_repairs,
+                "report_finalization_status": finalization["status"],
+                "report_finalization_repairs": finalization["repairs"],
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
                 "report_generation_mode": self.generation_mode,
                 "report_section_diagnostics": section_diagnostics,
@@ -1777,6 +1793,123 @@ def apply_report_evidence_pack_repairs(
     if not repairs:
         return report, []
     return normalize_final_report(report_text, sources), repairs
+
+
+def finalize_report_output(
+    report: str,
+    sources: Sequence[dict[str, Any]],
+    planner_questions: Sequence[str],
+    evidence: str,
+    synthesis: str,
+    pack_text: str,
+    evidence_packs: Sequence[dict[str, Any]],
+    report_context: dict[str, Any],
+    validation: dict[str, Any],
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """Apply deterministic cleanup for hard Markdown defects before final output."""
+
+    repairs: list[str] = []
+    cleaned, cleanup_repairs = cleanup_report_markdown_artifacts(report)
+    repairs.extend(cleanup_repairs)
+    if cleanup_repairs:
+        report = normalize_final_report(cleaned, sources)
+        validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
+    if validation.get("false_gap_questions") or validation.get("pack_citation_gap_questions"):
+        repaired, evidence_repairs = apply_report_evidence_pack_repairs(
+            report,
+            evidence_packs,
+            validation,
+            planner_questions,
+            sources,
+            per_question_synthesis=report_context.get("per_question_synthesis", []),
+        )
+        if evidence_repairs:
+            repairs.extend(f"applied final evidence repair: {question}" for question in evidence_repairs)
+            report = repaired
+            validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
+
+    status = "clean" if not report_needs_revision(validation) else "blocked"
+    if repairs and status == "clean":
+        status = "repaired"
+    return report, validation, {"status": status, "repairs": repairs}
+
+
+def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
+    lines = strip_references(clean_markdown(report)).splitlines()
+    cleaned: list[str] = []
+    repairs: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if missing_details_stub_at(lines, index):
+            repairs.append("removed empty missing-details stub")
+            index = skip_empty_missing_details_stub(lines, index)
+            continue
+        if re.match(r"^\s*(?:[-*+]|\d+[.)])\s*$", line):
+            repairs.append("removed dangling bullet")
+            index += 1
+            continue
+        normalized_nested = normalize_nested_markdown_bullet(line)
+        if normalized_nested != line:
+            repairs.append("normalized nested bullet marker")
+            line = normalized_nested
+        repaired_line, line_repairs = repair_truncated_markdown_line(line)
+        repairs.extend(line_repairs)
+        if repaired_line:
+            cleaned.append(repaired_line)
+        index += 1
+    return clean_markdown("\n".join(cleaned)), dedupe_text(repairs)
+
+
+def missing_details_stub_at(lines: Sequence[str], index: int) -> bool:
+    if not re.search(r"\bexact\s+missing\s+details\b|\bmissing\s+details\b", strip_markdown(lines[index]), flags=re.IGNORECASE):
+        return False
+    next_index = next((position for position in range(index + 1, len(lines)) if clean_text(lines[position])), -1)
+    return next_index != -1 and bool(re.match(r"^\s*(?:[-*+]|\d+[.)])\s*$", lines[next_index]))
+
+
+def skip_empty_missing_details_stub(lines: Sequence[str], index: int) -> int:
+    position = index + 1
+    while position < len(lines) and not clean_text(lines[position]):
+        position += 1
+    if position < len(lines) and re.match(r"^\s*(?:[-*+]|\d+[.)])\s*$", lines[position]):
+        position += 1
+    while position < len(lines) and not clean_text(lines[position]):
+        position += 1
+    return position
+
+
+def normalize_nested_markdown_bullet(line: str) -> str:
+    return re.sub(r"^(\s*)([-*+])\s+[-*+]\s+", r"\1\2 ", line)
+
+
+def repair_truncated_markdown_line(line: str) -> tuple[str, list[str]]:
+    if not clean_text(line) or line.lstrip().startswith(("#", "|", "```")):
+        return line, []
+    if list_item_appears_truncated(line):
+        return "", ["removed truncated list item"]
+    if line_has_suspicious_terminal_fragment(line):
+        repaired = trim_incomplete_final_sentence(line)
+        if repaired != clean_text(line):
+            return repaired, ["trimmed incomplete sentence fragment"]
+        return "", ["removed incomplete sentence fragment"]
+    return line, []
+
+
+def line_has_suspicious_terminal_fragment(line: str) -> bool:
+    text = strip_markdown(line)
+    match = re.search(r"\b([A-Za-z]{1,2})\.\s*$", text)
+    if not match:
+        return False
+    return match.group(1).lower() not in {"a", "i"}
+
+
+def trim_incomplete_final_sentence(line: str) -> str:
+    text = clean_text(line)
+    trimmed = re.sub(r"\s*[^.!?]*\b[A-Za-z]{1,2}\.\s*$", "", text).strip()
+    if len(trimmed) >= 40 and re.search(r"[.!?]\s*$", trimmed):
+        return trimmed
+    return ""
 
 
 def per_question_synthesis_repair_note(question: str, synthesis_note: dict[str, Any]) -> str:
