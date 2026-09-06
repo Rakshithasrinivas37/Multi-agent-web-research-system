@@ -92,7 +92,7 @@ STOPWORDS = {
 
 TRAILING_HEADING_WORDS = {
     "and", "as", "be", "by", "can", "does", "for", "from", "how", "in", "including",
-    "of", "or", "sequence", "the", "to", "what", "when", "where", "which", "with",
+    "of", "or", "sequence", "the", "their", "to", "what", "when", "where", "which", "with",
 }
 
 
@@ -423,7 +423,7 @@ def generate_report_by_sections(
             synthesis_note=synthesis_note,
         )
         last_model = used_model or last_model
-        topic_sections.append(section)
+        topic_sections.append(strip_topic_section_headings(section))
         section_diagnostics.append({
             "question": question,
             "retried": retried,
@@ -486,7 +486,7 @@ def generate_report_by_sections(
         f"## 1. Executive Summary\n{strip_leading_heading(exec_summary)}",
         f"## 2. Introduction and Context\n{strip_leading_heading(intro)}",
         "## 3. Topic Sections",
-        *(f"### 3.{i}. {planner_question_heading(q)}\n{strip_leading_heading(section)}" for i, (q, section) in enumerate(zip(coverage_questions, topic_sections), 1)),
+        *(f"### 3.{i}. {planner_question_heading(q)}\n{strip_topic_section_headings(section)}" for i, (q, section) in enumerate(zip(coverage_questions, topic_sections), 1)),
         f"## 4. Cross-cutting Analysis and Synthesis\n{strip_leading_heading(cross_cutting)}",
         f"## 5. Limitations and Open Questions\n{strip_leading_heading(limitations)}",
         f"## 6. Conclusion\n{strip_leading_heading(conclusion)}",
@@ -526,6 +526,7 @@ def repair_report_by_sections(
     for question in target_questions:
         pack = packs_by_question.get(normalize_heading(question), {})
         synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
+        section_number = planner_topic_number(question, coverage_questions)
         print(f"[report] repairing topic section: {question[:140]}")
         section, used_model, retried = generate_topic_section(
             client,
@@ -537,7 +538,7 @@ def repair_report_by_sections(
             synthesis_note=synthesis_note,
             repair_feedback=repair_feedback,
         )
-        report_text = replace_report_topic_section(report_text, question, section)
+        report_text = replace_report_topic_section(report_text, question, section, section_number=section_number)
         last_model = used_model or last_model
         repairs.append(
             {
@@ -631,26 +632,37 @@ def topic_questions_matching_headings(headings: Sequence[str], coverage_question
     return questions
 
 
-def replace_report_topic_section(report: str, question: str, section: str) -> str:
+def planner_topic_number(question: str, coverage_questions: Sequence[str]) -> str:
+    question_key = normalize_heading(question)
+    for index, candidate in enumerate(coverage_questions or [], 1):
+        if normalize_heading(candidate) == question_key:
+            return f"3.{index}"
+    return ""
+
+
+def replace_report_topic_section(report: str, question: str, section: str, section_number: str = "") -> str:
     lines = strip_references(clean_markdown(report)).splitlines()
     bounds = section_bounds_for_question(lines, question)
-    section_body = strip_leading_heading(section)
-    heading = f"### {planner_question_heading(question)}"
+    section_body = strip_topic_section_headings(section)
+    heading_prefix = f"{section_number}. " if section_number else ""
+    heading = f"### {heading_prefix}{planner_question_heading(question)}"
     replacement = clean_markdown(f"{heading}\n{section_body}").splitlines()
     if not bounds:
-        return append_topic_section(report, question, section_body)
+        return append_topic_section(report, question, section_body, section_number=section_number)
     start, end = bounds
     replacement[0] = heading
     return clean_markdown("\n".join([*lines[:start], *replacement, *lines[end:]]))
 
 
-def append_topic_section(report: str, question: str, section_body: str) -> str:
+def append_topic_section(report: str, question: str, section_body: str, section_number: str = "") -> str:
     lines = strip_references(clean_markdown(report)).splitlines()
     topic_heading_index = next(
         (index for index, line in enumerate(lines) if normalize_heading(line.lstrip("#").strip()) in {"topic sections", "topic specific sections"}),
         None,
     )
-    insertion = clean_markdown(f"### {planner_question_heading(question)}\n{section_body}").splitlines()
+    section_body = strip_topic_section_headings(section_body)
+    heading_prefix = f"{section_number}. " if section_number else ""
+    insertion = clean_markdown(f"### {heading_prefix}{planner_question_heading(question)}\n{section_body}").splitlines()
     if topic_heading_index is None:
         return clean_markdown("\n".join([*lines, "", "## 3. Topic Sections", "", *insertion]))
     next_h2 = next(
@@ -796,9 +808,7 @@ Previous draft:
         section = normalize_citation_markers(clean_markdown(response.choices[0].message.content))
         used_model = clean_text(getattr(response, "model", "")) or used_model
 
-    if not section.lstrip().startswith("#"):
-        section = f"## {heading}\n\n{section}"
-    return section, used_model, retried
+    return strip_topic_section_headings(section), used_model, retried
 
 
 def build_topic_section_prompt(
@@ -1070,6 +1080,23 @@ def strip_leading_heading(section_text: str) -> str:
     lines = clean_markdown(section_text).splitlines()
     if lines and lines[0].lstrip().startswith("#"):
         lines = lines[1:]
+    return clean_markdown("\n".join(lines))
+
+
+def strip_topic_section_headings(section_text: str) -> str:
+    """Remove model-emitted headings from a topic body before canonical wrapping."""
+
+    lines = []
+    in_fence = False
+    for line in clean_markdown(section_text).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            lines.append(line)
+            continue
+        if not in_fence and re.match(r"^\s{0,3}#{1,6}\s+.+", line):
+            continue
+        lines.append(line)
     return clean_markdown("\n".join(lines))
 
 
@@ -2220,7 +2247,72 @@ def report_schema_issues(report: str, planner_questions: Sequence[str]) -> list[
         if heading and not any(headings_match(heading, actual) for actual in headings):
             issues.append(f"missing planner topic section: {planner_question_heading(question)}")
     issues.extend(malformed_heading_issues(raw_headings, planner_questions))
+    issues.extend(topic_heading_sequence_issues(report, planner_questions))
     return issues
+
+
+def topic_heading_sequence_issues(report: str, planner_questions: Sequence[str]) -> list[str]:
+    questions = [clean_text(question) for question in planner_questions or [] if clean_text(question)]
+    if not questions:
+        return []
+    entries = topic_section_heading_entries(report)
+    issues = []
+    entries_by_number = {entry["number"]: entry for entry in entries if entry["number"]}
+    for expected_index, question in enumerate(questions, 1):
+        expected_number = f"3.{expected_index}"
+        expected_heading = normalize_heading(planner_question_heading(question))
+        full_expected_heading = normalize_heading(planner_question_heading(question, max_length=None))
+        expected_entry = entries_by_number.get(expected_number)
+        unnumbered_match = next(
+            (entry for entry in entries if not entry["number"] and topic_entry_matches_question(entry, expected_heading, full_expected_heading)),
+            None,
+        )
+        if unnumbered_match:
+            issues.append(
+                f"planner topic heading must be numbered {expected_number}: {strip_heading_numbering(unnumbered_match['heading'])}"
+            )
+        if not expected_entry:
+            issues.append(f"missing sequential planner topic heading: {expected_number}")
+            continue
+        if expected_entry["level"] != 3:
+            issues.append(
+                f"planner topic heading must use level-3 Markdown for {expected_number}: {strip_heading_numbering(expected_entry['heading'])}"
+            )
+    return dedupe_text(issues)
+
+
+def topic_entry_matches_question(entry: dict[str, Any], expected_heading: str, full_expected_heading: str) -> bool:
+    actual = normalize_heading(strip_heading_numbering(entry.get("heading")))
+    return bool(actual and (headings_match(expected_heading, actual) or headings_match(full_expected_heading, actual)))
+
+
+def topic_section_heading_entries(report: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    in_topic_section = False
+    in_fence = False
+    for line in clean_markdown(report).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        match = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if not match:
+            continue
+        level = len(match.group(1))
+        heading = match.group(2).strip()
+        normalized = normalize_heading(heading)
+        if level <= 2 and normalized in {"topic sections", "topic specific sections"}:
+            in_topic_section = True
+            continue
+        if level <= 2 and in_topic_section:
+            break
+        number_match = re.match(r"^(3\.\d+)\.?\s+", heading)
+        if not in_topic_section and not number_match:
+            continue
+        entries.append({"level": level, "heading": heading, "number": number_match.group(1) if number_match else ""})
+    return entries
 
 
 def malformed_heading_issues(headings: Sequence[str], planner_questions: Sequence[str]) -> list[str]:
