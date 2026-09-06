@@ -19,6 +19,7 @@ from src.agents.report_agent import (
     format_supporting_evidence,
     cleanup_report_markdown_artifacts,
     finalize_report_output,
+    frame_body_needs_role_repair,
     generate_single_report,
     frame_section_needs_retry,
     has_dangling_markdown_bullet,
@@ -33,6 +34,9 @@ from src.agents.report_agent import (
     normalize_markdown_headings,
     planner_question_heading,
     remove_unavailable_citation_markers,
+    remove_duplicate_section_labels,
+    repair_topic_headings,
+    repair_weak_frame_sections,
     repair_truncated_markdown_line,
     report_context_gap_items,
     report_context_gap_queries,
@@ -208,6 +212,58 @@ Supported definition [1].
         self.assertNotIn("- -", cleaned)
         self.assertNotIn("for ea", cleaned)
         self.assertIn("- **Bahdanau attention** uses recurrent processing [1].", cleaned)
+
+    def test_cleanup_report_markdown_artifacts_repairs_section_role_polish(self):
+        report = """
+## 1. Executive Summary
+**Executive Summary**
+Summary is complete [1].
+
+## 3. Topic Sections
+
+### 3.1. The Mathematical Formulation As Introduced In "Attention Is All
+Topic fact is supported [1].
+
+## 4. Cross-cutting Analysis and Synthesis
+- Topic fact is supported [1].
+- Another topic fact is supported [1].
+
+## 6. Conclusion
+- Topic fact is supported [1]. - Another copied bullet is supported [1].
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed duplicate section label", repairs)
+        self.assertIn("trimmed incomplete topic heading", repairs)
+        self.assertIn("replaced weak cross-cutting analysis and synthesis section", repairs)
+        self.assertIn("replaced weak conclusion section", repairs)
+        self.assertNotIn("**Executive Summary**", cleaned)
+        self.assertNotIn('"Attention Is All', cleaned)
+        self.assertNotIn("\n- Topic fact", cleaned)
+
+    def test_section_role_helpers_detect_and_repair_weak_frames(self):
+        report = """
+## 3. Topic Sections
+### 3.1. Topic
+Topic fact is supported [1].
+
+## 4. Cross-cutting Analysis and Synthesis
+- Copied fact [1].
+- Copied fact two [1].
+
+## 6. Conclusion
+- Copied conclusion [1].
+"""
+
+        self.assertTrue(frame_body_needs_role_repair("Conclusion", "- Copied conclusion [1]."))
+        no_label = remove_duplicate_section_labels("## 1. Executive Summary\n**Executive Summary**\nText [1].")
+        self.assertNotIn("**Executive Summary**", no_label)
+        fixed_headings, _ = repair_topic_headings('### 3.1. Title As Introduced In "Attention Is All')
+        self.assertEqual(fixed_headings, "### 3.1. Title")
+        repaired, repairs = repair_weak_frame_sections(report)
+        self.assertIn("replaced weak conclusion section", repairs)
+        self.assertNotIn("\n- Copied conclusion", repaired)
 
     def test_repair_truncated_markdown_line_trims_suspicious_short_fragment(self):
         repaired, repairs = repair_truncated_markdown_line(
