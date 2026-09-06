@@ -33,6 +33,7 @@ from src.agents.report_agent import (
     normalize_nested_markdown_bullet,
     normalize_markdown_headings,
     planner_question_heading,
+    remove_clipped_sentence_fragments,
     remove_unavailable_citation_markers,
     remove_duplicate_section_labels,
     repair_topic_headings,
@@ -272,6 +273,30 @@ Topic fact is supported [1].
 
         self.assertEqual(repaired, "The evidence supports the definition [1].")
         self.assertEqual(repairs, ["trimmed incomplete sentence fragment"])
+
+    def test_remove_clipped_sentence_fragments_drops_known_word_fragments(self):
+        cleaned = remove_clipped_sentence_fragments(
+            "Supported fact remains [1]. This sentence ends with representat. Next fact remains [2]."
+        )
+
+        self.assertEqual(cleaned, "Supported fact remains [1]. Next fact remains [2].")
+
+    def test_cleanup_report_markdown_artifacts_removes_clipped_frame_fragments(self):
+        report = """
+## 4. Cross-cutting Analysis and Synthesis
+Supported fact remains [1]. This sentence ends with representat. Next fact remains [2].
+Dot-product attention is faster due to optimized matrix-. where \\(d_k\\) is the dimension. Final fact remains [3].
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed clipped sentence fragment", repairs)
+        self.assertIn("Supported fact remains [1].", cleaned)
+        self.assertIn("Next fact remains [2].", cleaned)
+        self.assertIn("Final fact remains [3].", cleaned)
+        self.assertNotIn("representat", cleaned)
+        self.assertNotIn("matrix-", cleaned)
+        self.assertNotIn("where \\(d_k\\)", cleaned)
 
     def test_normalize_nested_markdown_bullet_removes_duplicate_marker(self):
         self.assertEqual(

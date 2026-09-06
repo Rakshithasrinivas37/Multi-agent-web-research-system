@@ -83,6 +83,7 @@ Evidence and citation rules:
 - End with ## References, listing only sources actually cited."""
 
 EVIDENCE_SNIPPET_SIGNALS = ["definition", "equation", "formula", "benchmark", "score", "result", "complexity", "api", "limitation", "challenge"]
+CLIPPED_SENTENCE_FRAGMENT_WORDS = ("representat", "implemen", "computat", "matrix")
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "be", "by", "can", "do", "does", "for", "from",
@@ -1986,6 +1987,9 @@ def repair_truncated_markdown_line(line: str) -> tuple[str, list[str]]:
         return line, []
     if list_item_appears_truncated(line):
         return "", ["removed truncated list item"]
+    repaired = remove_clipped_sentence_fragments(line)
+    if repaired != clean_text(line):
+        return repaired, ["removed clipped sentence fragment"]
     if line_has_suspicious_terminal_fragment(line):
         repaired = trim_incomplete_final_sentence(line)
         if repaired != clean_text(line):
@@ -1994,8 +1998,50 @@ def repair_truncated_markdown_line(line: str) -> tuple[str, list[str]]:
     return line, []
 
 
+def remove_clipped_sentence_fragments(line: str) -> str:
+    text = clean_text(line)
+    while True:
+        match = clipped_sentence_fragment_match(text)
+        if not match:
+            return text
+        start = sentence_fragment_start(text, match.start())
+        suffix = text[match.end():].lstrip()
+        if re.match(r"^(?:where|which|that|and|while)\b", strip_markdown(suffix), flags=re.IGNORECASE):
+            next_boundary = re.search(r"[.!?](?:\s+|$)", suffix)
+            suffix = suffix[next_boundary.end():].lstrip() if next_boundary else ""
+        text = clean_text(f"{text[:start].rstrip()} {suffix}")
+
+
+def clipped_sentence_fragment_match(text: str) -> re.Match[str] | None:
+    fragment_words = "|".join(re.escape(word) for word in CLIPPED_SENTENCE_FRAGMENT_WORDS)
+    return re.search(rf"\b(?:{fragment_words})(?:[-‑])?\.\s*", text, flags=re.IGNORECASE)
+
+
+def sentence_fragment_start(text: str, fragment_start: int) -> int:
+    boundaries = [text.rfind(marker, 0, fragment_start) for marker in (". ", "? ", "! ")]
+    boundary = max(boundaries)
+    if boundary >= 0:
+        return boundary + 2
+    bullet_match = re.match(r"^(\s*(?:[-*+]|\d+[.)])\s+)", text)
+    return len(bullet_match.group(1)) if bullet_match else 0
+
+
+def remove_internal_clipped_sentence_fragments(line: str) -> str:
+    return remove_clipped_sentence_fragments(line)
+
+
+def clipped_word_fragment(word: str) -> bool:
+    lowered = clean_text(word).lower().rstrip("-")
+    if len(lowered) <= 2:
+        return lowered not in {"a", "i"}
+    return lowered.endswith("-") or lowered in CLIPPED_SENTENCE_FRAGMENT_WORDS
+
+
 def line_has_suspicious_terminal_fragment(line: str) -> bool:
     text = strip_markdown(line)
+    fragment_words = "|".join(re.escape(word) for word in CLIPPED_SENTENCE_FRAGMENT_WORDS)
+    if re.search(rf"\b(?:{fragment_words})(?:[-‑])?\.\s*$", text, flags=re.IGNORECASE):
+        return True
     match = re.search(r"\b([A-Za-z]{1,2})\.\s*$", text)
     if not match:
         return False
@@ -2004,7 +2050,8 @@ def line_has_suspicious_terminal_fragment(line: str) -> bool:
 
 def trim_incomplete_final_sentence(line: str) -> str:
     text = clean_text(line)
-    trimmed = re.sub(r"\s*[^.!?]*\b[A-Za-z]{1,2}\.\s*$", "", text).strip()
+    fragment_words = "|".join(re.escape(word) for word in CLIPPED_SENTENCE_FRAGMENT_WORDS)
+    trimmed = re.sub(rf"\s*[^.!?]*\b(?:[A-Za-z]{{1,2}}|{fragment_words})(?:[-‑])?\.\s*$", "", text, flags=re.IGNORECASE).strip()
     if len(trimmed) >= 40 and re.search(r"[.!?]\s*$", trimmed):
         return trimmed
     return ""
