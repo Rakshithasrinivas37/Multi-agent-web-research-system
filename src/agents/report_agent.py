@@ -591,6 +591,7 @@ def report_section_repair_questions(validation: dict[str, Any], coverage_questio
             *validation.get("coverage", {}).get("missing", []),
             *validation.get("false_gap_questions", []),
             *validation.get("pack_citation_gap_questions", []),
+            *facet_gap_questions(validation.get("report_issues", []), coverage_questions),
             *schema_missing_topic_questions(validation.get("schema_issues", []), coverage_questions),
             *schema_malformed_topic_questions(validation.get("schema_issues", []), coverage_questions),
             *truncated_topic_section_questions(validation.get("report_issues", []), coverage_questions),
@@ -632,6 +633,16 @@ def truncated_topic_section_questions(report_issues: Sequence[str], coverage_que
             continue
         truncated_headings.extend(part.strip() for part in text.removeprefix(prefix).split(","))
     return topic_questions_matching_headings(truncated_headings, coverage_questions)
+
+
+def facet_gap_questions(report_issues: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
+    prefix = "report omits required topic facet:"
+    missing = [
+        clean_text(issue).removeprefix(prefix).strip()
+        for issue in report_issues or []
+        if clean_text(issue).startswith(prefix)
+    ]
+    return [question for question in coverage_questions if question in missing]
 
 
 def topic_questions_matching_headings(headings: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
@@ -1320,6 +1331,7 @@ def planner_question_heading(question: str, max_length: int | None = DEFAULT_TOP
     heading = re.sub(r"\s+be\s+found\s+in\s+", " in ", heading, flags=re.IGNORECASE)
     heading = re.sub(r"^(what|how|why|when|where|which)\s+", "", heading, flags=re.IGNORECASE)
     heading = re.sub(r"\b(e\.g\.|eg|examples?|evidence|results?)\b", "", heading, flags=re.IGNORECASE)
+    heading = re.sub(r"^attention\s+improve\b", "how attention improves", heading, flags=re.IGNORECASE)
     heading = re.sub(r"\s+", " ", heading).strip(" .,:;")
     words = []
     for word in heading.split():
@@ -1335,6 +1347,10 @@ def truncate_heading_at_word_boundary(heading: str, max_length: int | None = 90)
     trimmed = value[:max_length].rstrip()
     if " " in trimmed:
         trimmed = trimmed.rsplit(" ", 1)[0]
+    remainder = value[len(trimmed):].strip()
+    next_word = remainder.split()[0].strip(" .,:;") if remainder else ""
+    if next_word.lower() in {"complexity", "apis", "api"} and len(f"{trimmed} {next_word}") <= max_length + 18:
+        trimmed = f"{trimmed} {next_word}"
     return trim_trailing_heading_words(trimmed.strip(" .,:;"))
 
 
@@ -1713,6 +1729,7 @@ def validate_report_output(
         ]
     )
     report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}\n{pack_text}")
+    report_issues.extend(required_topic_facet_issues(report, planner_questions))
     report_issues.extend(f"report marks covered evidence as a gap: {question}" for question in false_gaps)
     report_issues.extend(f"report section does not cite its evidence pack: {question}" for question in pack_citation_gaps)
     review = report_self_critique(report_issues, coverage, schema_issues)
@@ -1864,6 +1881,18 @@ def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
         if normalized_nested != line:
             repairs.append("normalized nested bullet marker")
             line = normalized_nested
+        normalized_punctuation = remove_orphan_citation_punctuation(line)
+        if normalized_punctuation != line:
+            repairs.append("removed orphan citation punctuation")
+            line = normalized_punctuation
+        without_repair_prefix = remove_raw_repair_prefix(line)
+        if without_repair_prefix != line:
+            repairs.append("removed raw repair label")
+            line = without_repair_prefix
+        if line_is_raw_repair_label(line):
+            repairs.append("removed raw repair label")
+            index += 1
+            continue
         repaired_line, line_repairs = repair_truncated_markdown_line(line)
         repairs.extend(line_repairs)
         if repaired_line:
@@ -1982,6 +2011,29 @@ def normalize_nested_markdown_bullet(line: str) -> str:
     return re.sub(r"^(\s*)([-*+])\s+[-*+]\s+", r"\1\2 ", line)
 
 
+def remove_orphan_citation_punctuation(line: str) -> str:
+    text = clean_text(line)
+    text = re.sub(r"\s+([.,;:])", r"\1", text)
+    text = re.sub(r"([.!?])\s+([.!?])", r"\1", text)
+    return text
+
+
+def line_is_raw_repair_label(line: str) -> bool:
+    value = normalize_heading(line)
+    return value in {"per question synthesis support", "evidence pack support", "core evidence"}
+
+
+def remove_raw_repair_prefix(line: str) -> str:
+    return clean_text(
+        re.sub(
+            r"^\*\*(?:Per-question synthesis support|Evidence-pack support|Core evidence):\*\*\s*",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def repair_truncated_markdown_line(line: str) -> tuple[str, list[str]]:
     if not clean_text(line) or line.lstrip().startswith(("#", "|", "```")):
         return line, []
@@ -2067,7 +2119,7 @@ def per_question_synthesis_repair_note(question: str, synthesis_note: dict[str, 
     source_markers = set(per_question_synthesis_source_indexes(synthesis_note))
     if not (source_markers & set(citation_markers(snippet))):
         snippet = f"{snippet} {format_citation_indexes(source_markers)}"
-    return f"**Per-question synthesis support:** {snippet}"
+    return snippet
 
 
 def compact_markdown_at_sentence(value: Any, max_chars: int) -> str:
@@ -2098,11 +2150,10 @@ def evidence_pack_repair_note(question: str, pack: dict[str, Any]) -> str:
         if not content:
             continue
         marker = f"[{chunk['source_index']}]"
-        label = "Core evidence" if evidence_pack_has_formula_evidence(pack) else "Evidence-pack support"
         snippet = compact_text(content, 420)
         if marker not in snippet:
             snippet = f"{snippet} {marker}"
-        return f"**{label}:** {snippet}"
+        return snippet
     return ""
 
 
@@ -2150,7 +2201,7 @@ def evidence_gap_pattern() -> str:
         r"(evidence\s+gap|evidence\s+not\s+provided|not\s+provided|missing\s+evidence|"
         r"(?:is|are)\s+missing|"
         r"no\s+source-backed|cannot\s+be\s+(?:given|reproduced|answered|provided)|"
-        r"do\s+not\s+(?:contain|provide|include)|does\s+not\s+(?:contain|provide|include)|"
+        r"do\s+not\s+(?:contain|provide|include|list)|does\s+not\s+(?:contain|provide|include|list)|"
         r"none\s+.*\s+provide|not\s+available|not\s+listed|\babsent\b|absent\s+from\s+.*\s+evidence|"
         r"not\s+present\s+in\s+.*\s+(?:evidence|sources|material))"
     )
@@ -2659,6 +2710,48 @@ def report_quality_issues(
     if unsupported_metrics:
         issues.append(f"report includes benchmark metrics not present in evidence: {', '.join(unsupported_metrics[:5])}")
     return issues
+
+
+def required_topic_facet_issues(report: str, planner_questions: Sequence[str]) -> list[str]:
+    issues = []
+    for question in planner_questions or []:
+        facets = required_question_facets(question)
+        if len(facets) < 2:
+            continue
+        section = report_section_for_question(report, question)
+        if not section:
+            continue
+        missing = [facet for facet in facets if not section_has_supported_or_gap_facet(section, facet)]
+        if missing:
+            issues.append(f"report omits required topic facet: {clean_text(question)}")
+    return dedupe_text(issues)
+
+
+def required_question_facets(question: str) -> list[str]:
+    text = clean_text(question)
+    facets = []
+    for facet in ("PyTorch", "TensorFlow"):
+        if re.search(rf"\b{re.escape(facet)}\b", text, flags=re.IGNORECASE):
+            facets.append(facet)
+    return facets
+
+
+def section_has_supported_or_gap_facet(section: str, facet: str) -> bool:
+    lines = [line for line in strip_leading_heading(section).splitlines() if clean_text(line)]
+    facet_pattern = rf"\b{re.escape(facet)}\b"
+    for index, line in enumerate(lines):
+        if not re.search(facet_pattern, line, flags=re.IGNORECASE):
+            continue
+        if normalize_heading(line) == normalize_heading(facet):
+            nearby = " ".join(lines[index + 1:index + 3])
+            if re.search(facet_pattern, nearby, flags=re.IGNORECASE) and (
+                citation_markers(nearby) or re.search(evidence_gap_pattern(), nearby.lower())
+            ):
+                return True
+            continue
+        if citation_markers(line) or re.search(evidence_gap_pattern(), line.lower()):
+            return True
+    return False
 
 
 def has_dangling_markdown_bullet(markdown: str) -> bool:
