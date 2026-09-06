@@ -48,8 +48,10 @@ from src.agents.report_agent import (
     rewrite_missing_sub_question_queries,
     sources_with_browser_results,
     slugify_filename,
+    strip_topic_section_headings,
     synthesis_coverage_gap_questions,
     trim_report_prompt,
+    topic_heading_sequence_issues,
     truncated_report_sections,
     unsupported_benchmark_metrics,
 )
@@ -259,7 +261,7 @@ Conclusion is complete [1].
 
         self.assertLessEqual(len(heading), 110)
         self.assertFalse(heading.endswith("Multi-hea"))
-        self.assertNotRegex(heading, r"\b\w{2,4}$")
+        self.assertFalse(heading_ends_with_connector(heading))
 
     def test_planner_question_heading_removes_common_dangling_question_tails(self):
         variants = planner_question_heading(
@@ -649,7 +651,7 @@ No cited source markers were used.
         self.assertIn("missing schema section: cross-cutting analysis/synthesis", issues)
         self.assertIn("missing planner topic section: Benchmark Demonstrate GLUE And WMT Performance", issues)
 
-    def test_report_schema_accepts_nested_markdown_headings(self):
+    def test_report_schema_accepts_sequential_topic_headings(self):
         report = """# Topic
 
 ### 1. Executive Summary
@@ -658,7 +660,7 @@ Summary.
 ### 2. Introduction and Context
 Context.
 
-### 3. Benchmark Demonstrate GLUE And WMT Performance
+### 3.1. Benchmark Demonstrate GLUE And WMT Performance
 Benchmarks.
 
 ```python
@@ -682,6 +684,75 @@ Done.
 
         self.assertEqual(issues, [])
 
+    def test_report_schema_flags_unnumbered_topic_heading(self):
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+## 3. Topic Sections
+
+### Scaled Dot-product Self-attention Work As Described In Attention Is All You Need
+Details.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = topic_heading_sequence_issues(
+            report,
+            ['How does scaled dot-product self-attention work as described in "Attention Is All You Need" (Vaswani et al., 2017)?'],
+        )
+
+        self.assertIn("planner topic heading must be numbered 3.1", "\n".join(issues))
+        self.assertIn("missing sequential planner topic heading: 3.1", issues)
+
+    def test_report_schema_flags_skipped_topic_number(self):
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+## 3. Topic Sections
+
+### 3.1. First Topic
+First.
+
+### 3.3. Second Topic
+Second.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = topic_heading_sequence_issues(report, ["What is the first topic?", "What is the second topic?"])
+
+        self.assertIn("missing sequential planner topic heading: 3.2", issues)
+
     def test_report_schema_accepts_concise_topic_heading_for_long_question(self):
         report = """# Topic
 
@@ -691,7 +762,7 @@ Summary.
 ## Introduction and Context
 Context.
 
-### Benchmark Evidence of Performance Impact
+### 3.1. Benchmark Evidence of Performance Impact
 Benchmarks.
 
 ## Cross-cutting Analysis and Synthesis
@@ -713,6 +784,20 @@ Done.
         )
 
         self.assertEqual(issues, [])
+
+    def test_strip_topic_section_headings_removes_model_emitted_headings(self):
+        section = """### Accidental Model Heading
+Supported topic prose [1].
+
+#### Extra Subheading
+More supported prose [1].
+"""
+
+        body = strip_topic_section_headings(section)
+
+        self.assertNotIn("###", body)
+        self.assertIn("Supported topic prose [1].", body)
+        self.assertIn("More supported prose [1].", body)
 
     def test_report_schema_flags_mid_word_truncated_topic_heading(self):
         question = "What are the main variants of attention mechanisms (additive, multiplicative, self-attention, multi-head) and how do they differ?"
