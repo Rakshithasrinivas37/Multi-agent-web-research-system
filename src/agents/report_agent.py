@@ -1087,9 +1087,19 @@ def deterministic_frame_section(heading: str, body_digest: str) -> str:
         return first.rstrip(".") + "." if first else "The topic sections below summarize the available cited evidence."
     if normalized == "conclusion":
         items = cited_lines[-3:] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
-        return " ".join(item.rstrip(".") + "." for item in items if item)
+        return frame_lines_as_prose(items)
     items = cited_lines[:4] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
-    return "\n".join(f"- {item}" for item in items if item)
+    return frame_lines_as_prose(items)
+
+
+def frame_lines_as_prose(lines: Sequence[str]) -> str:
+    sentences = []
+    for line in lines:
+        text = strip_markdown(normalize_nested_markdown_bullet(line))
+        text = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", text).strip()
+        if text:
+            sentences.append(text.rstrip(".") + ".")
+    return " ".join(sentences)
 
 
 def strip_leading_heading(section_text: str) -> str:
@@ -1858,7 +1868,95 @@ def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
         if repaired_line:
             cleaned.append(repaired_line)
         index += 1
-    return clean_markdown("\n".join(cleaned)), dedupe_text(repairs)
+    cleaned_report, role_repairs = cleanup_report_section_roles(clean_markdown("\n".join(cleaned)))
+    repairs.extend(role_repairs)
+    return cleaned_report, dedupe_text(repairs)
+
+
+def cleanup_report_section_roles(report: str) -> tuple[str, list[str]]:
+    text = remove_duplicate_section_labels(report)
+    repairs = ["removed duplicate section label"] if text != clean_markdown(report) else []
+    text, heading_repairs = repair_topic_headings(text)
+    repairs.extend(heading_repairs)
+    text, frame_repairs = repair_weak_frame_sections(text)
+    repairs.extend(frame_repairs)
+    return text, repairs
+
+
+def remove_duplicate_section_labels(report: str) -> str:
+    lines = clean_markdown(report).splitlines()
+    out: list[str] = []
+    previous_heading = ""
+    for line in lines:
+        heading_match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+        if heading_match:
+            previous_heading = strip_heading_numbering(heading_match.group(1))
+            out.append(line)
+            continue
+        label_match = re.match(r"^\s*\*\*(.+?)\*\*\s*$", line)
+        if label_match and previous_heading and normalize_heading(label_match.group(1)) == normalize_heading(previous_heading):
+            continue
+        out.append(line)
+    return clean_markdown("\n".join(out))
+
+
+def repair_topic_headings(report: str) -> tuple[str, list[str]]:
+    lines = clean_markdown(report).splitlines()
+    repairs: list[str] = []
+    out = []
+    for line in lines:
+        match = re.match(r"^(\s{0,3}#{3}\s+3\.\d+\.?\s+)(.+?)\s*$", line)
+        if not match:
+            out.append(line)
+            continue
+        heading = trim_incomplete_heading(match.group(2))
+        if heading != match.group(2).strip():
+            repairs.append("trimmed incomplete topic heading")
+        out.append(f"{match.group(1)}{heading}")
+    return clean_markdown("\n".join(out)), dedupe_text(repairs)
+
+
+def trim_incomplete_heading(heading: str) -> str:
+    value = clean_text(heading).strip(" .,:;")
+    quote_count = value.count('"') + value.count("“") + value.count("”")
+    if quote_count % 2 == 1:
+        value = re.sub(r'\s+(?:as\s+introduced\s+in\s+)?["“][^"”]*$', "", value, flags=re.IGNORECASE).strip(" .,:;")
+    return trim_trailing_heading_words(value)
+
+
+def repair_weak_frame_sections(report: str) -> tuple[str, list[str]]:
+    repairs: list[str] = []
+    topic_digest = "\n\n".join(section for heading, section in markdown_sections(report) if re.match(r"^3\.\d+", clean_text(heading)))
+    for heading in ("Cross-cutting Analysis and Synthesis", "Conclusion"):
+        section = named_report_section(report, heading)
+        if not section:
+            continue
+        body = strip_leading_heading(section)
+        if frame_body_needs_role_repair(heading, body):
+            report = replace_named_report_section(report, heading, deterministic_frame_section(heading, topic_digest))
+            repairs.append(f"replaced weak {heading.lower()} section")
+    return clean_markdown(report), repairs
+
+
+def named_report_section(report: str, heading_name: str) -> str:
+    target = normalize_heading(heading_name)
+    for heading, section in markdown_sections(report):
+        if normalize_heading(heading) == target:
+            return section
+    return ""
+
+
+def frame_body_needs_role_repair(heading_name: str, body: str) -> bool:
+    lines = [line for line in clean_markdown(body).splitlines() if clean_text(line)]
+    if not lines:
+        return True
+    bullet_lines = [line for line in lines if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line)]
+    normalized = normalize_heading(heading_name)
+    if normalized == "conclusion" and bullet_lines:
+        return True
+    if normalized == "cross cutting analysis and synthesis" and len(bullet_lines) >= max(2, len(lines) // 2):
+        return True
+    return False
 
 
 def missing_details_stub_at(lines: Sequence[str], index: int) -> bool:
