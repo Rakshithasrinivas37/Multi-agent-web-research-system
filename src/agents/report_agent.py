@@ -592,9 +592,11 @@ def report_section_repair_questions(validation: dict[str, Any], coverage_questio
             *validation.get("false_gap_questions", []),
             *validation.get("pack_citation_gap_questions", []),
             *facet_gap_questions(validation.get("report_issues", []), coverage_questions),
+            *canonical_source_issue_questions(validation.get("report_issues", []), coverage_questions),
             *schema_missing_topic_questions(validation.get("schema_issues", []), coverage_questions),
             *schema_malformed_topic_questions(validation.get("schema_issues", []), coverage_questions),
             *truncated_topic_section_questions(validation.get("report_issues", []), coverage_questions),
+            *incomplete_equation_questions(validation.get("report_issues", []), coverage_questions),
         ]
     )
 
@@ -643,6 +645,26 @@ def facet_gap_questions(report_issues: Sequence[str], coverage_questions: Sequen
         if clean_text(issue).startswith(prefix)
     ]
     return [question for question in coverage_questions if question in missing]
+
+
+def canonical_source_issue_questions(report_issues: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
+    prefix = "report does not cite canonical source for topic:"
+    missing = [
+        clean_text(issue).removeprefix(prefix).strip()
+        for issue in report_issues or []
+        if clean_text(issue).startswith(prefix)
+    ]
+    return [question for question in coverage_questions if question in missing]
+
+
+def incomplete_equation_questions(report_issues: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
+    headings: list[str] = []
+    prefix = "report contains incomplete equations:"
+    for issue in report_issues or []:
+        text = clean_text(issue)
+        if text.startswith(prefix):
+            headings.extend(part.strip() for part in text.removeprefix(prefix).split(","))
+    return topic_questions_matching_headings(headings, coverage_questions)
 
 
 def topic_questions_matching_headings(headings: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
@@ -869,6 +891,9 @@ Evidence retrieved for this question only:
 Per-question synthesis notes for this question:
 {synthesis_text}
 
+Source target guidance:
+{format_question_source_target_guidance(question)}
+
 {repair_text}
 
 Rules:
@@ -878,10 +903,19 @@ Rules:
 - Cite every factual claim inline with a real marker shown above, like [1].
 - If the evidence answers the question, write clear prose first, then any equation/formula/API/metric line only
   if that exact detail appears in the evidence.
+- If this section has source target guidance, prioritize that source for the named formulation and do not substitute
+  a different paper's equations for it.
 - If the evidence above says no chunks were retrieved for this question, write one short sentence naming the
   gap - do not invent an answer, and do not call it a gap if cited evidence or cited synthesis is shown above.
 - Output only the section content in Markdown (you may include the "## {heading}" heading). Do not write any
-  other section, heading, or closing remarks."""
+    other section, heading, or closing remarks."""
+
+
+def format_question_source_target_guidance(question: str) -> str:
+    source_signal = canonical_source_url_signal(question)
+    if not source_signal:
+        return "- No canonical source target detected for this question."
+    return f"- Use source URLs containing {source_signal} for the named formulation when such chunks are available."
 
 
 def format_topic_repair_feedback(repair_feedback: str, question: str) -> str:
@@ -1095,20 +1129,21 @@ def deterministic_frame_section(heading: str, body_digest: str) -> str:
         items = cited_lines[:3] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
         return " ".join(item.rstrip(".") + "." for item in items if item)
     if normalized == "introduction and context":
-        first = cited_lines[0] if cited_lines else compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)
+        first = cited_lines[0] if cited_lines else compact_text(digest, DEFAULT_FRAME_SECTION_CHARS)
         return first.rstrip(".") + "." if first else "The topic sections below summarize the available cited evidence."
     if normalized == "conclusion":
         items = cited_lines[-3:] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
         return frame_lines_as_prose(items)
-    items = cited_lines[:4] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
+    items = cited_lines[:4] or [compact_text(digest, DEFAULT_FRAME_SECTION_CHARS)]
     return frame_lines_as_prose(items)
 
 
 def frame_lines_as_prose(lines: Sequence[str]) -> str:
     sentences = []
     for line in lines:
-        text = strip_markdown(normalize_nested_markdown_bullet(line))
+        text = normalize_nested_markdown_bullet(line)
         text = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", text).strip()
+        text = clean_text(re.sub(r"[*_#|]+", " ", text))
         if text:
             sentences.append(text.rstrip(".") + ".")
     return " ".join(sentences)
@@ -1492,7 +1527,22 @@ def question_chunk_score(question: str, chunk: dict[str, Any], planned_urls: set
     score += 6 if planned else 0
     score += 4 if chunk.get("is_primary_source") else 0
     score += source_priority(source_url) * 2
+    score += canonical_source_score(question, source_url)
     score += evidence_snippet_score(text, list(terms), evidence_signals_for_question(question))
+    return score
+
+
+def canonical_source_score(question: str, source_url: str) -> int:
+    lowered = clean_text(question).lower()
+    rules = [
+        (("bahdanau", "additive"), "1409.0473"),
+        (("luong", "multiplicative"), "1508.04025"),
+        (("attention is all you need", "self-attention", "multi-head", "transformer"), "1706.03762"),
+    ]
+    score = 0
+    for terms, url_signal in rules:
+        if any(term in lowered for term in terms):
+            score += 14 if url_signal in source_url else -6
     return score
 
 
@@ -1730,6 +1780,8 @@ def validate_report_output(
     )
     report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}\n{pack_text}")
     report_issues.extend(required_topic_facet_issues(report, planner_questions))
+    report_issues.extend(canonical_source_routing_issues(report, planner_questions, sources))
+    report_issues.extend(internal_gap_contradiction_issues(report))
     report_issues.extend(f"report marks covered evidence as a gap: {question}" for question in false_gaps)
     report_issues.extend(f"report section does not cite its evidence pack: {question}" for question in pack_citation_gaps)
     review = report_self_critique(report_issues, coverage, schema_issues)
@@ -2702,6 +2754,11 @@ def report_quality_issues(
     truncated_sections = truncated_report_sections(text)
     if truncated_sections:
         issues.append(f"report contains truncated or incomplete section text: {', '.join(truncated_sections[:4])}")
+    equation_issues = incomplete_equation_issues(text)
+    if equation_issues:
+        issues.append(f"report contains incomplete equations: {', '.join(equation_issues[:4])}")
+    frame_issues = malformed_frame_section_issues(text)
+    issues.extend(frame_issues)
     source_indexes = source_index_set(sources or [])
     invalid = unavailable_citation_markers(report, source_indexes)
     if invalid:
@@ -2710,6 +2767,69 @@ def report_quality_issues(
     if unsupported_metrics:
         issues.append(f"report includes benchmark metrics not present in evidence: {', '.join(unsupported_metrics[:5])}")
     return issues
+
+
+def incomplete_equation_issues(report: str) -> list[str]:
+    issues = []
+    for heading, section in markdown_sections(report):
+        if section_has_incomplete_equation(section):
+            issues.append(strip_heading_numbering(heading) or "unheaded section")
+    return dedupe_text(issues)
+
+
+def section_has_incomplete_equation(section: str) -> bool:
+    if re.search(r"\\operatorname\{softmax\}\\!\s*(?:\\\]|$)", section, flags=re.MULTILINE):
+        return True
+    in_math = False
+    math_lines: list[str] = []
+    for line in clean_markdown(section).splitlines():
+        stripped = line.strip()
+        if stripped == r"\[":
+            in_math = True
+            math_lines = []
+            continue
+        if stripped == r"\]":
+            if math_lines and equation_block_appears_incomplete(math_lines):
+                return True
+            in_math = False
+            math_lines = []
+            continue
+        if in_math:
+            math_lines.append(stripped)
+    return in_math
+
+
+def equation_block_appears_incomplete(lines: Sequence[str]) -> bool:
+    content = clean_text(" ".join(lines))
+    if not content:
+        return True
+    if re.search(r"(=|\\!|\\frac\{[^}]*\}\{[^}]*\})\s*$", content):
+        return True
+    if "softmax" in content.lower() and not re.search(r"\)\s*[A-Za-z\\]", content):
+        return True
+    return False
+
+
+def malformed_frame_section_issues(report: str) -> list[str]:
+    issues = []
+    for heading in ("Executive Summary", "Introduction and Context", "Cross-cutting Analysis and Synthesis", "Conclusion"):
+        section = named_report_section(report, heading)
+        if not section:
+            continue
+        body = strip_leading_heading(section)
+        if normalize_heading(heading) != "limitations and open questions" and len(strip_markdown(body)) > 80 and not citation_markers(body):
+            issues.append(f"report frame section lacks citations: {heading}")
+        if frame_prose_has_broken_fragments(body):
+            issues.append(f"report frame section contains broken prose: {heading}")
+    return dedupe_text(issues)
+
+
+def frame_prose_has_broken_fragments(text: str) -> bool:
+    plain = strip_markdown(text)
+    return bool(
+        re.search(r"\b(?:is|are|of|by|with|as)\s*[.,](?:\s|$)", plain, flags=re.IGNORECASE)
+        or re.search(r"\bformulation\s+is\s*\.", plain, flags=re.IGNORECASE)
+    )
 
 
 def required_topic_facet_issues(report: str, planner_questions: Sequence[str]) -> list[str]:
@@ -2725,6 +2845,68 @@ def required_topic_facet_issues(report: str, planner_questions: Sequence[str]) -
         if missing:
             issues.append(f"report omits required topic facet: {clean_text(question)}")
     return dedupe_text(issues)
+
+
+def canonical_source_routing_issues(
+    report: str,
+    planner_questions: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+) -> list[str]:
+    source_url_by_index = {
+        source.get("index"): normalize_url(source.get("url"))
+        for source in sources or []
+        if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+    issues = []
+    for question in planner_questions or []:
+        required_url = canonical_source_url_signal(question)
+        if not required_url:
+            continue
+        section = report_section_for_question(report, question)
+        if not section:
+            continue
+        cited_urls = [source_url_by_index.get(index, "") for index in citation_markers(section)]
+        if not any(required_url in url for url in cited_urls):
+            issues.append(f"report does not cite canonical source for topic: {clean_text(question)}")
+    return dedupe_text(issues)
+
+
+def canonical_source_url_signal(question: str) -> str:
+    lowered = clean_text(question).lower()
+    if "luong" in lowered or "multiplicative" in lowered:
+        return "1508.04025"
+    if "bahdanau" in lowered or "additive" in lowered:
+        return "1409.0473"
+    if "attention is all you need" in lowered or "self-attention" in lowered or "multi-head" in lowered:
+        return "1706.03762"
+    return ""
+
+
+def internal_gap_contradiction_issues(report: str) -> list[str]:
+    cited_terms = set()
+    gap_terms = set()
+    for _, section in markdown_sections(report):
+        for line in clean_markdown(section).splitlines():
+            terms = salient_attention_terms(line)
+            if not terms:
+                continue
+            if line_has_gap_claim(line):
+                gap_terms.update(terms)
+            elif citation_markers(line):
+                cited_terms.update(terms)
+    contradictions = sorted(gap_terms & cited_terms)
+    return [f"report contains contradicted evidence gap: {term}" for term in contradictions]
+
+
+def salient_attention_terms(text: Any) -> set[str]:
+    lowered = clean_text(text).lower().replace("‑", "-").replace("–", "-").replace("—", "-")
+    terms = set()
+    for term in ("self-attention", "multi-head attention", "multiplicative", "luong", "additive", "bahdanau"):
+        if term in lowered:
+            terms.add(term)
+    if "multi-head" in lowered and "attention" in lowered:
+        terms.add("multi-head attention")
+    return terms
 
 
 def required_question_facets(question: str) -> list[str]:

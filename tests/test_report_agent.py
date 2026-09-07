@@ -7,6 +7,7 @@ from src.agents.report_agent import (
     apply_report_evidence_pack_repairs,
     clean_markdown,
     build_report_prompt,
+    canonical_source_routing_issues,
     compact_markdown_at_sentence,
     dedupe_sources,
     evidence_pack_questions,
@@ -17,6 +18,7 @@ from src.agents.report_agent import (
     format_report_revision_feedback,
     format_report_section_outline,
     format_supporting_evidence,
+    frame_lines_as_prose,
     cleanup_report_markdown_artifacts,
     finalize_report_output,
     frame_body_needs_role_repair,
@@ -28,6 +30,7 @@ from src.agents.report_agent import (
     list_item_appears_truncated,
     missing_evidence_constraints,
     markdown_appears_truncated,
+    malformed_frame_section_issues,
     missing_sub_question_coverage,
     normalize_final_report,
     normalize_nested_markdown_bullet,
@@ -37,12 +40,14 @@ from src.agents.report_agent import (
     remove_unavailable_citation_markers,
     remove_duplicate_section_labels,
     required_topic_facet_issues,
+    rank_question_chunks,
     repair_topic_headings,
     repair_weak_frame_sections,
     repair_truncated_markdown_line,
     report_context_gap_items,
     report_context_gap_queries,
     report_evidence_gap_contradictions,
+    internal_gap_contradiction_issues,
     report_per_question_synthesis_citation_gaps,
     report_generation_token_cap,
     report_quality_issues,
@@ -51,6 +56,7 @@ from src.agents.report_agent import (
     report_needs_revision,
     report_pack_citation_gaps,
     repair_report_by_sections,
+    section_has_incomplete_equation,
     report_schema_issues,
     report_self_critique,
     report_sub_question_coverage_check,
@@ -389,6 +395,42 @@ Conclusion is complete [1].
         )
 
         self.assertIn("report includes benchmark metrics not present in evidence: 77%", issues)
+
+    def test_report_quality_flags_incomplete_equation_blocks(self):
+        report = """
+## Definition
+The scaled dot-product equation is listed below [1].
+\\[
+\\text{Attention}(Q,K,V) = \\operatorname{softmax}\\!
+\\]
+
+## References
+[1] https://arxiv.org/pdf/1706.03762
+"""
+
+        issues = report_quality_issues(report, [{"index": 1, "url": "https://arxiv.org/pdf/1706.03762"}])
+
+        self.assertTrue(section_has_incomplete_equation(report))
+        self.assertIn("report contains incomplete equations: Definition", issues)
+
+    def test_malformed_frame_section_issues_flags_uncited_broken_cross_cutting(self):
+        report = """
+## 4. Cross-cutting Analysis and Synthesis
+The matrix-based formulation is. In the implementation described in the later work of, projections are normalized.
+
+## References
+[1] https://example.com
+"""
+
+        issues = malformed_frame_section_issues(report)
+
+        self.assertIn("report frame section lacks citations: Cross-cutting Analysis and Synthesis", issues)
+        self.assertIn("report frame section contains broken prose: Cross-cutting Analysis and Synthesis", issues)
+
+    def test_frame_lines_as_prose_preserves_citations(self):
+        prose = frame_lines_as_prose(["- **Attention** weights encoder states [1]."])
+
+        self.assertEqual(prose, "Attention weights encoder states [1].")
 
     def test_unsupported_benchmark_metrics_allows_evidence_numbers(self):
         report = "BLEU-4 improves from 0.386 to 0.482 [1]."
@@ -1619,6 +1661,58 @@ The retrieved evidence does not list a concrete TensorFlow attention API.
 """
 
         self.assertEqual(required_topic_facet_issues(report, [question]), [])
+
+    def test_canonical_source_routing_issues_flags_wrong_luong_source(self):
+        question = "What is the original formulation of multiplicative (Luong) attention and its core equations?"
+        report = """
+## 3. Topic Sections
+### 3.1. The Original Formulation Of Multiplicative Luong Attention And Its Core Equations
+The section gives the additive Bahdanau equation instead [1].
+"""
+        sources = [
+            {"index": 1, "url": "https://arxiv.org/pdf/1409.0473"},
+            {"index": 5, "url": "https://arxiv.org/pdf/1508.04025"},
+        ]
+
+        issues = canonical_source_routing_issues(report, [question], sources)
+
+        self.assertEqual(issues, [f"report does not cite canonical source for topic: {question}"])
+
+    def test_internal_gap_contradiction_issues_flags_self_attention_gap(self):
+        report = """
+## 3. Topic Sections
+### 3.1. Variants
+Self-attention – The provided sources do not contain a description of self-attention.
+
+### 3.2. Transformer
+Self-attention computes relationships within the same sequence [2].
+"""
+
+        self.assertEqual(
+            internal_gap_contradiction_issues(report),
+            ["report contains contradicted evidence gap: self-attention"],
+        )
+
+    def test_rank_question_chunks_prefers_canonical_luong_source(self):
+        chunks = [
+            {
+                "source_index": 1,
+                "url": "https://arxiv.org/pdf/1409.0473",
+                "content": "The alignment model uses a tanh additive attention score.",
+            },
+            {
+                "source_index": 5,
+                "url": "https://arxiv.org/pdf/1508.04025",
+                "content": "Luong multiplicative attention defines dot, general, and concat score functions.",
+            },
+        ]
+
+        ranked = rank_question_chunks(
+            "What is the original formulation of multiplicative (Luong) attention and its core equations?",
+            chunks,
+        )
+
+        self.assertEqual(ranked[0]["source_index"], 5)
 
     def test_per_question_synthesis_repair_note_does_not_cut_mid_sentence(self):
         text = (
