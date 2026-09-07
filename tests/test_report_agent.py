@@ -4,6 +4,7 @@ import src.agents.report_agent as report_agent_module
 from src.agents.report_agent import (
     DEFAULT_REPORT_PROMPT_CHARS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+    accept_topic_section,
     apply_incomplete_equation_repairs,
     apply_report_evidence_pack_repairs,
     apply_validation_limitations,
@@ -33,6 +34,7 @@ from src.agents.report_agent import (
     list_item_appears_truncated,
     missing_evidence_constraints,
     markdown_appears_truncated,
+    malformed_equation_tail_present,
     malformed_frame_section_issues,
     missing_sub_question_coverage,
     normalize_final_report,
@@ -74,6 +76,7 @@ from src.agents.report_agent import (
     synthesis_coverage_gap_questions,
     trim_report_prompt,
     topic_heading_sequence_issues,
+    topic_section_acceptance_issues,
     truncated_report_sections,
     unsupported_benchmark_metrics,
 )
@@ -226,6 +229,48 @@ Supported definition [1].
         self.assertNotIn("- -", cleaned)
         self.assertNotIn("for ea", cleaned)
         self.assertIn("- **Bahdanau attention** uses recurrent processing [1].", cleaned)
+
+    def test_cleanup_report_markdown_artifacts_removes_malformed_equation_tail(self):
+        report = r"""
+## 3. Topic Sections
+
+### 3.1. Definition
+\[
+\text{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V
+\]\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V
+\]
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed malformed equation tail", repairs)
+        self.assertFalse(malformed_equation_tail_present(cleaned))
+        self.assertNotIn(r"\]\left", cleaned)
+
+    def test_topic_section_acceptance_falls_back_for_truncated_model_output(self):
+        question = 'What is the self-attention and multi-head attention mechanism introduced in "Attention is All You Need" and its equations?'
+        section = "Multi-head attention extends self-attention by running several independent attention heads in"
+        pack = {
+            "question": question,
+            "coverage": "covered",
+            "chunks": [
+                {
+                    "source_index": 3,
+                    "url": "https://arxiv.org/pdf/1706.03762",
+                    "title": "Attention Is All You Need",
+                    "content": "Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions.",
+                }
+            ],
+        }
+        sources = [{"index": 3, "url": "https://arxiv.org/pdf/1706.03762"}]
+
+        accepted, repairs, used_fallback = accept_topic_section(question, section, pack, {}, sources)
+
+        self.assertTrue(used_fallback)
+        self.assertIn("section acceptance issue: section appears truncated", repairs)
+        self.assertIn("Multi-head attention allows the model", accepted)
+        self.assertIn("[3]", accepted)
+        self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, {}, sources))
 
     def test_cleanup_report_markdown_artifacts_repairs_section_role_polish(self):
         report = """
