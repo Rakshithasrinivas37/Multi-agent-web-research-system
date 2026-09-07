@@ -4,6 +4,7 @@ import src.agents.report_agent as report_agent_module
 from src.agents.report_agent import (
     DEFAULT_REPORT_PROMPT_CHARS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+    apply_incomplete_equation_repairs,
     apply_report_evidence_pack_repairs,
     clean_markdown,
     build_report_prompt,
@@ -20,6 +21,7 @@ from src.agents.report_agent import (
     format_supporting_evidence,
     frame_lines_as_prose,
     cleanup_report_markdown_artifacts,
+    frame_source_line_usable,
     finalize_report_output,
     frame_body_needs_role_repair,
     generate_single_report,
@@ -40,6 +42,7 @@ from src.agents.report_agent import (
     remove_unavailable_citation_markers,
     remove_duplicate_section_labels,
     required_topic_facet_issues,
+    framework_api_detail_issues,
     rank_question_chunks,
     repair_topic_headings,
     repair_weak_frame_sections,
@@ -413,6 +416,30 @@ The scaled dot-product equation is listed below [1].
         self.assertTrue(section_has_incomplete_equation(report))
         self.assertIn("report contains incomplete equations: Definition", issues)
 
+    def test_apply_incomplete_equation_repairs_fills_source_backed_scaled_dot_product_formula(self):
+        report = """
+## Definition
+The scaled dot-product equation is listed below [1].
+\\[
+\\text{Attention}(Q,K,V) = \\operatorname{softmax}\\!
+\\]
+
+## References
+[1] https://arxiv.org/pdf/1706.03762
+"""
+        evidence = r"\text{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V [1]"
+
+        repaired, repairs = apply_incomplete_equation_repairs(
+            report,
+            [{"index": 1, "url": "https://arxiv.org/pdf/1706.03762"}],
+            evidence,
+        )
+
+        self.assertEqual(repairs, ["repaired incomplete scaled dot-product equation"])
+        self.assertNotIn("\\operatorname{softmax}\\!\n\\]", repaired)
+        self.assertIn(r"\frac{QK^{\top}}{\sqrt{d_k}}\right)V", repaired)
+        self.assertFalse(section_has_incomplete_equation(repaired))
+
     def test_malformed_frame_section_issues_flags_uncited_broken_cross_cutting(self):
         report = """
 ## 4. Cross-cutting Analysis and Synthesis
@@ -431,6 +458,11 @@ The matrix-based formulation is. In the implementation described in the later wo
         prose = frame_lines_as_prose(["- **Attention** weights encoder states [1]."])
 
         self.assertEqual(prose, "Attention weights encoder states [1].")
+
+    def test_frame_source_line_usable_rejects_continuation_fragments(self):
+        self.assertFalse(frame_source_line_usable("where \\(d_k\\) is the key dimension [2]."))
+        self.assertFalse(frame_source_line_usable("Formally,."))
+        self.assertTrue(frame_source_line_usable("Scaled dot-product attention uses query-key products [2]."))
 
     def test_unsupported_benchmark_metrics_allows_evidence_numbers(self):
         report = "BLEU-4 improves from 0.386 to 0.482 [1]."
@@ -519,6 +551,9 @@ The matrix-based formulation is. In the implementation described in the later wo
         quadratic = planner_question_heading(
             "What are the main limitations and computational challenges of attention mechanisms, especially regarding quadratic complexity?"
         )
+        sequence_scaling = planner_question_heading(
+            "What are the known limitations and computational challenges of attention mechanisms, especially regarding sequence-length scaling?"
+        )
         improve = planner_question_heading(
             "How does attention improve performance on machine-translation benchmarks compared to non-attention models?"
         )
@@ -529,6 +564,7 @@ The matrix-based formulation is. In the implementation described in the later wo
         self.assertEqual(variants, "The Main Variants Of Attention Mechanisms And Their Differences")
         self.assertEqual(complexity, "The Computational Complexity Of Attention Mechanisms And Sequence-length Scaling")
         self.assertEqual(quadratic, "The Main Limitations And Computational Challenges Of Attention Mechanisms Especially Regarding Quadratic Complexity")
+        self.assertEqual(sequence_scaling, "The Known Limitations And Computational Challenges Of Attention Mechanisms")
         self.assertEqual(improve, "How Attention Improves Performance On Machine-translation Benchmarks Compared To Non-attention Models")
         self.assertEqual(api, "Official Implementations And API References For Attention In Major Frameworks TensorFlow PyTorch")
         self.assertFalse(heading_ends_with_connector(variants))
@@ -1662,6 +1698,30 @@ The retrieved evidence does not list a concrete TensorFlow attention API.
 
         self.assertEqual(required_topic_facet_issues(report, [question]), [])
 
+    def test_framework_api_detail_issues_flags_generic_framework_comparison(self):
+        question = "How do implementations of attention mechanisms differ across major deep-learning frameworks (TensorFlow, PyTorch) and what APIs are provided?"
+        report = """
+## 3. Topic Sections
+### 3.1. Implementations Of Attention Mechanisms Differ Across Major Deep-learning Frameworks TensorFlow PyTorch
+PyTorch provides `torch.nn.MultiheadAttention` for attention layers [7].
+TensorFlow uses a static graph programming model in the cited framework comparison [7].
+"""
+
+        issues = framework_api_detail_issues(report, [question])
+
+        self.assertEqual(issues, [f"report lacks concrete framework API detail: {question}"])
+
+    def test_framework_api_detail_issues_allows_concrete_api_or_explicit_gap(self):
+        question = "How do implementations of attention mechanisms differ across major deep-learning frameworks (TensorFlow, PyTorch) and what APIs are provided?"
+        report = """
+## 3. Topic Sections
+### 3.1. Implementations Of Attention Mechanisms Differ Across Major Deep-learning Frameworks TensorFlow PyTorch
+PyTorch provides `torch.nn.MultiheadAttention` for attention layers [6].
+The retrieved evidence does not list a concrete TensorFlow attention API.
+"""
+
+        self.assertEqual(framework_api_detail_issues(report, [question]), [])
+
     def test_canonical_source_routing_issues_flags_wrong_luong_source(self):
         question = "What is the original formulation of multiplicative (Luong) attention and its core equations?"
         report = """
@@ -1746,7 +1806,7 @@ Self-attention computes relationships within the same sequence [2].
         self.assertTrue(frame_section_needs_retry("This is complete but has no citation.", "Conclusion", digest))
         self.assertFalse(frame_section_needs_retry("This complete conclusion summarizes the repaired benchmark evidence with a valid citation [2].", "Conclusion", digest))
 
-    def test_repair_report_by_sections_regenerates_only_target_topics_and_framing(self):
+    def test_repair_report_by_sections_regenerates_only_target_topics_and_refreshes_framing_without_llm(self):
         question = "What benchmark result is reported?"
         calls = []
 
@@ -1766,9 +1826,8 @@ Self-attention computes relationships within the same sequence [2].
         def fake_completion(client, **kwargs):
             prompt = kwargs["messages"][1]["content"]
             calls.append(prompt)
-            if "Sub-question this section must answer:" in prompt:
-                return Response("The benchmark result is 28.4 BLEU, which directly answers the planner question with cited evidence [2].")
-            return Response("Updated framing uses the repaired benchmark result [2].")
+            self.assertIn("Sub-question this section must answer:", prompt)
+            return Response("The benchmark result is 28.4 BLEU, which directly answers the planner question with cited evidence [2].")
 
         original = report_agent_module.create_chat_completion_with_retries
         original_single = report_agent_module.generate_single_report
@@ -1817,11 +1876,11 @@ Old conclusion.
             report_agent_module.create_chat_completion_with_retries = original
             report_agent_module.generate_single_report = original_single
 
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(diagnostics["section_repairs"][0]["question"], question)
         self.assertTrue(diagnostics["framing_refreshed"])
         self.assertIn("The benchmark result is 28.4 BLEU", repaired)
-        self.assertIn("Updated framing uses the repaired benchmark result [2].", repaired)
+        self.assertIn("The benchmark result is 28.4 BLEU, which directly answers the planner question with cited evidence [2].", repaired)
 
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(
