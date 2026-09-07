@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
 from pathlib import Path
@@ -30,10 +31,11 @@ DEFAULT_FOCUSED_CHUNK_CHARS = 1500
 
 DEFAULT_REPORT_GENERATION_MODE = "sections"  # "single" or "sections"  
 DEFAULT_REPORT_FRAME_GENERATION_MODE = "deterministic"  # "deterministic" or "llm"
-DEFAULT_SECTION_MAX_TOKENS = 1500
+DEFAULT_REPORT_SECTION_CONCURRENCY = 4
+DEFAULT_SECTION_MAX_TOKENS = 1000
 DEFAULT_SECTION_RETRY_ATTEMPTS = 2
-DEFAULT_SECTION_EVIDENCE_CHUNKS = 4
-DEFAULT_SECTION_EVIDENCE_CHUNK_CHARS = 1500
+DEFAULT_SECTION_EVIDENCE_CHUNKS = 3
+DEFAULT_SECTION_EVIDENCE_CHUNK_CHARS = 1100
 DEFAULT_FRAME_MAX_TOKENS = 700
 DEFAULT_FRAME_SECTION_CHARS = 900
 DEFAULT_TOPIC_HEADING_MAX_CHARS = 110
@@ -427,29 +429,16 @@ def generate_report_by_sections(
     synthesis_by_question = per_question_synthesis_by_question(per_question_synthesis or [])
     last_model = model
 
-    topic_sections: list[str] = []
-    section_diagnostics: list[dict[str, Any]] = []
-    for question in coverage_questions:
-        pack = packs_by_question.get(normalize_heading(question), {})
-        synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
-        section, used_model, retried = generate_topic_section(
-            client,
-            model,
-            objective,
-            question,
-            pack,
-            source_text,
-            synthesis_note=synthesis_note,
-        )
-        last_model = used_model or last_model
-        topic_sections.append(strip_topic_section_headings(section))
-        section_diagnostics.append({
-            "question": question,
-            "retried": retried,
-            "had_usable_evidence": evidence_pack_has_usable_cited_evidence(pack),
-            "had_per_question_synthesis": per_question_synthesis_has_cited_evidence(synthesis_note),
-            "chars": len(section),
-        })
+    topic_sections, section_diagnostics, last_model = generate_topic_sections(
+        client,
+        model,
+        objective=objective,
+        coverage_questions=coverage_questions,
+        packs_by_question=packs_by_question,
+        synthesis_by_question=synthesis_by_question,
+        source_text=source_text,
+        fallback_model=last_model,
+    )
 
     topics_digest = "\n\n".join(compact_text(section, DEFAULT_FRAME_SECTION_CHARS) for section in topic_sections)
 
@@ -471,7 +460,103 @@ def generate_report_by_sections(
         f"## 5. Limitations and Open Questions\n{strip_leading_heading(frames['limitations'])}",
         f"## 6. Conclusion\n{strip_leading_heading(frames['conclusion'])}",
     ])
-    return report, last_model, {"topic_sections": section_diagnostics, "framing": frame_diagnostics}
+    return report, last_model, {
+        "topic_sections": section_diagnostics,
+        "framing": frame_diagnostics,
+        "section_concurrency": report_section_concurrency(len(coverage_questions)),
+        "topic_model_calls": sum(int(item.get("model_calls") or 0) for item in section_diagnostics),
+    }
+
+
+def generate_topic_sections(
+    client: Any,
+    model: str,
+    objective: str,
+    coverage_questions: Sequence[str],
+    packs_by_question: dict[str, dict[str, Any]],
+    synthesis_by_question: dict[str, dict[str, Any]],
+    source_text: str,
+    fallback_model: str,
+) -> tuple[list[str], list[dict[str, Any]], str]:
+    concurrency = report_section_concurrency(len(coverage_questions))
+    if concurrency <= 1 or len(coverage_questions) <= 1:
+        sections, diagnostics, last_model = [], [], fallback_model
+        for question in coverage_questions:
+            section, used_model, diagnostic = generate_topic_section_with_diagnostics(
+                client,
+                model,
+                objective,
+                question,
+                packs_by_question,
+                synthesis_by_question,
+                source_text,
+            )
+            sections.append(section)
+            diagnostics.append(diagnostic)
+            last_model = used_model or last_model
+        return sections, diagnostics, last_model
+
+    sections_by_index: dict[int, str] = {}
+    diagnostics_by_index: dict[int, dict[str, Any]] = {}
+    last_model = fallback_model
+    print(f"[report] generating {len(coverage_questions)} topic section(s) with concurrency={concurrency}")
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(
+                generate_topic_section_with_diagnostics,
+                client,
+                model,
+                objective,
+                question,
+                packs_by_question,
+                synthesis_by_question,
+                source_text,
+            ): index
+            for index, question in enumerate(coverage_questions)
+        }
+        for future in as_completed(futures):
+            index = futures[future]
+            section, used_model, diagnostic = future.result()
+            sections_by_index[index] = section
+            diagnostics_by_index[index] = diagnostic
+            last_model = used_model or last_model
+    return (
+        [sections_by_index[index] for index in range(len(coverage_questions))],
+        [diagnostics_by_index[index] for index in range(len(coverage_questions))],
+        last_model,
+    )
+
+
+def generate_topic_section_with_diagnostics(
+    client: Any,
+    model: str,
+    objective: str,
+    question: str,
+    packs_by_question: dict[str, dict[str, Any]],
+    synthesis_by_question: dict[str, dict[str, Any]],
+    source_text: str,
+    repair_feedback: str = "",
+) -> tuple[str, str, dict[str, Any]]:
+    pack = packs_by_question.get(normalize_heading(question), {})
+    synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
+    section, used_model, retried = generate_topic_section(
+        client,
+        model,
+        objective,
+        question,
+        pack,
+        source_text,
+        synthesis_note=synthesis_note,
+        repair_feedback=repair_feedback,
+    )
+    return strip_topic_section_headings(section), used_model, {
+        "question": question,
+        "retried": retried,
+        "model_calls": 2 if retried else 1,
+        "had_usable_evidence": evidence_pack_has_usable_cited_evidence(pack),
+        "had_per_question_synthesis": per_question_synthesis_has_cited_evidence(synthesis_note),
+        "chars": len(section),
+    }
 
 
 def repair_report_by_sections(
@@ -502,33 +587,24 @@ def repair_report_by_sections(
     synthesis_by_question = per_question_synthesis_by_question(per_question_synthesis or [])
     report_text = strip_references(clean_markdown(report))
     last_model = model
-    repairs = []
-    for question in target_questions:
-        pack = packs_by_question.get(normalize_heading(question), {})
-        synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
+    repairs = generate_repair_topic_sections(
+        client,
+        model,
+        objective=objective,
+        target_questions=target_questions,
+        packs_by_question=packs_by_question,
+        synthesis_by_question=synthesis_by_question,
+        source_text=source_text,
+        repair_feedback=repair_feedback,
+    )
+    for item in repairs:
+        question = item["question"]
+        section = clean_markdown(item.get("section"))
+        used_model = clean_text(item.get("model"))
         section_number = planner_topic_number(question, coverage_questions)
-        print(f"[report] repairing topic section: {question[:140]}")
-        section, used_model, retried = generate_topic_section(
-            client,
-            model,
-            objective,
-            question,
-            pack,
-            source_text,
-            synthesis_note=synthesis_note,
-            repair_feedback=repair_feedback,
-        )
         report_text = replace_report_topic_section(report_text, question, section, section_number=section_number)
         last_model = used_model or last_model
-        repairs.append(
-            {
-                "question": question,
-                "retried": retried,
-                "had_usable_evidence": evidence_pack_has_usable_cited_evidence(pack),
-                "had_per_question_synthesis": per_question_synthesis_has_cited_evidence(synthesis_note),
-                "chars": len(section),
-            }
-        )
+    repair_diagnostics = [{key: value for key, value in item.items() if key not in {"section", "model"}} for item in repairs]
 
     if target_questions or framing_needed:
         report_text, last_model = refresh_report_framing_sections(
@@ -540,7 +616,49 @@ def repair_report_by_sections(
             sources=sources,
             fallback_model=last_model,
         )
-    return report_text, last_model, {"section_repairs": repairs, "framing_refreshed": bool(target_questions or framing_needed)}
+    return report_text, last_model, {"section_repairs": repair_diagnostics, "framing_refreshed": bool(target_questions or framing_needed)}
+
+
+def generate_repair_topic_sections(
+    client: Any,
+    model: str,
+    objective: str,
+    target_questions: Sequence[str],
+    packs_by_question: dict[str, dict[str, Any]],
+    synthesis_by_question: dict[str, dict[str, Any]],
+    source_text: str,
+    repair_feedback: str,
+) -> list[dict[str, Any]]:
+    concurrency = report_section_concurrency(len(target_questions))
+    if not target_questions:
+        return []
+    print(f"[report] repairing {len(target_questions)} topic section(s) with concurrency={concurrency}")
+
+    def repair_one(question: str) -> dict[str, Any]:
+        section, used_model, diagnostic = generate_topic_section_with_diagnostics(
+            client,
+            model,
+            objective,
+            question,
+            packs_by_question,
+            synthesis_by_question,
+            source_text,
+            repair_feedback=repair_feedback,
+        )
+        return {**diagnostic, "section": section, "model": used_model}
+
+    if concurrency <= 1 or len(target_questions) <= 1:
+        return [repair_one(question) for question in target_questions]
+
+    repaired_by_index: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = {
+            executor.submit(repair_one, question): index
+            for index, question in enumerate(target_questions)
+        }
+        for future in as_completed(futures):
+            repaired_by_index[futures[future]] = future.result()
+    return [repaired_by_index[index] for index in range(len(target_questions))]
 
 
 def report_framing_needs_repair(validation: dict[str, Any]) -> bool:
@@ -996,6 +1114,16 @@ def deterministic_report_frames(topics_digest: str) -> dict[str, str]:
 def report_frame_generation_mode() -> str:
     mode = clean_text(os.environ.get("REPORT_FRAME_GENERATION_MODE")).lower()
     return "llm" if mode in {"llm", "model", "generation"} else DEFAULT_REPORT_FRAME_GENERATION_MODE
+
+
+def report_section_concurrency(question_count: int | None = None) -> int:
+    raw = clean_text(os.environ.get("REPORT_SECTION_CONCURRENCY"))
+    try:
+        configured = int(raw) if raw else DEFAULT_REPORT_SECTION_CONCURRENCY
+    except ValueError:
+        configured = DEFAULT_REPORT_SECTION_CONCURRENCY
+    count = max(1, int(question_count or 1))
+    return max(1, min(configured, 8, count))
 
 
 def generate_frame_section(
