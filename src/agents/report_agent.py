@@ -84,7 +84,7 @@ Evidence and citation rules:
 - End with ## References, listing only sources actually cited."""
 
 EVIDENCE_SNIPPET_SIGNALS = ["definition", "equation", "formula", "benchmark", "score", "result", "complexity", "api", "limitation", "challenge"]
-CLIPPED_SENTENCE_FRAGMENT_WORDS = ("representat", "implemen", "computat", "matrix")
+CLIPPED_SENTENCE_FRAGMENT_WORDS = ("representat", "implemen", "computat", "compu", "matrix")
 
 STOPWORDS = {
     "a", "an", "and", "are", "as", "be", "by", "can", "do", "does", "for", "from",
@@ -1467,7 +1467,7 @@ def format_supporting_evidence(
         seen.add(key)
         marker = f"[{index}]" if isinstance(index, int) else "[uncited]"
         block = f"{marker} {clean_text(title) or clean_text(url)}\n{content}"
-        score = source_priority(url) * 20 + evidence_snippet_score(content, terms, EVIDENCE_SNIPPET_SIGNALS)
+        score = source_priority(url) * 28 + evidence_snippet_score(content, terms, EVIDENCE_SNIPPET_SIGNALS)
         blocks.append({"source_index": index, "url": clean_text(url), "block": block, "score": score})
 
     for chunk in chunks:
@@ -1574,7 +1574,7 @@ def question_chunk_score(question: str, chunk: dict[str, Any], planned_urls: set
     score += 8 if assigned else 0
     score += 6 if planned else 0
     score += 4 if chunk.get("is_primary_source") else 0
-    score += source_priority(source_url) * 2
+    score += source_priority(source_url) * 4
     score += canonical_source_score(question, source_url)
     score += evidence_snippet_score(text, list(terms), evidence_signals_for_question(question))
     return score
@@ -1678,7 +1678,11 @@ def evidence_backed_sources(sources: Sequence[dict[str, Any]], *evidence_texts: 
 
 def source_priority(url: Any) -> int:
     value = clean_text(url).lower()
-    if any(signal in value for signal in ("arxiv.org", "openreview.net", "doi.org", "pytorch.org", "tensorflow.org", "keras.io", "docs.")) or ".edu" in value:
+    if any(signal in value for signal in ("pytorch.org", "tensorflow.org", "keras.io")):
+        return 4
+    if any(signal in value for signal in ("arxiv.org", "openreview.net", "doi.org")) or ".edu" in value:
+        return 3
+    if "docs." in value:
         return 2
     return 1 if value else 0
 
@@ -1965,6 +1969,10 @@ def finalize_report_output(
             repairs.extend(f"applied final evidence repair: {question}" for question in evidence_repairs)
             report = repaired
             validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
+    limitation_repaired = apply_validation_limitations(report, validation, sources)
+    if limitation_repaired != report:
+        repairs.append("updated limitations from validation issues")
+        report = limitation_repaired
 
     status = "clean" if not report_needs_revision(validation) else "blocked"
     if repairs and status == "clean":
@@ -2002,6 +2010,38 @@ def source_backed_scaled_dot_product_equation(evidence_text: str) -> str:
     return r"\text{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V"
 
 
+def apply_validation_limitations(report: str, validation: dict[str, Any], sources: Sequence[dict[str, Any]]) -> str:
+    issues = validation_limitation_items(validation)
+    if not issues:
+        return report
+    current = named_report_section(report, "Limitations and Open Questions")
+    current_body = strip_leading_heading(current)
+    if issues and (
+        not current_body
+        or re.search(r"\bno unresolved evidence gaps\b|\bno unresolved gaps\b", current_body, flags=re.IGNORECASE)
+    ):
+        body = "\n".join(f"- {item}" for item in issues[:7])
+        return normalize_final_report(replace_named_report_section(report, "Limitations and Open Questions", body), sources)
+    return report
+
+
+def validation_limitation_items(validation: dict[str, Any]) -> list[str]:
+    items = []
+    for question in validation.get("coverage", {}).get("missing", []) or []:
+        items.append(f"Missing planner coverage: {question}.")
+    for question in validation.get("synthesis_gaps", []) or []:
+        items.append(f"Synthesis marked evidence as incomplete for: {question}.")
+    for issue in validation.get("report_issues", []) or []:
+        text = clean_text(issue)
+        if text:
+            items.append(text[0].upper() + text[1:] + ".")
+    for question in validation.get("false_gap_questions", []) or []:
+        items.append(f"Report contains a contradicted evidence gap for: {question}.")
+    for question in validation.get("pack_citation_gap_questions", []) or []:
+        items.append(f"Report section still needs evidence-pack citation support for: {question}.")
+    return dedupe_text(items)
+
+
 def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
     lines = strip_references(clean_markdown(report)).splitlines()
     cleaned: list[str] = []
@@ -2009,6 +2049,10 @@ def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
     index = 0
     while index < len(lines):
         line = lines[index]
+        if line_is_raw_planner_notes_label(line):
+            repairs.append("removed raw planner notes block")
+            index = skip_raw_planner_notes_block(lines, index)
+            continue
         if missing_details_stub_at(lines, index):
             repairs.append("removed empty missing-details stub")
             index = skip_empty_missing_details_stub(lines, index)
@@ -2051,6 +2095,22 @@ def cleanup_report_section_roles(report: str) -> tuple[str, list[str]]:
     text, frame_repairs = repair_weak_frame_sections(text)
     repairs.extend(frame_repairs)
     return text, repairs
+
+
+def line_is_raw_planner_notes_label(line: str) -> bool:
+    return bool(re.match(r"^\s*\*\*Planner notes\b", clean_text(line), flags=re.IGNORECASE))
+
+
+def skip_raw_planner_notes_block(lines: Sequence[str], index: int) -> int:
+    position = index + 1
+    while position < len(lines):
+        line = lines[position]
+        if re.match(r"^\s{0,3}#{1,6}\s+", line):
+            break
+        if line_is_raw_planner_notes_label(line):
+            break
+        position += 1
+    return position
 
 
 def remove_duplicate_section_labels(report: str) -> str:
