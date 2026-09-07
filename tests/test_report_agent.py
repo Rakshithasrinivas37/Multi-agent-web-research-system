@@ -59,6 +59,7 @@ from src.agents.report_agent import (
     report_synthesis_gap_contradictions,
     report_needs_revision,
     report_pack_citation_gaps,
+    report_section_concurrency,
     repair_report_by_sections,
     section_has_incomplete_equation,
     report_schema_issues,
@@ -1935,6 +1936,20 @@ Old conclusion.
 
     def test_report_generation_token_cap_stays_under_budget(self):
         self.assertLessEqual(report_generation_token_cap(), DEFAULT_REPORT_TOTAL_TOKEN_BUDGET)
+
+    def test_report_section_concurrency_is_bounded_and_configurable(self):
+        original = report_agent_module.os.environ.get("REPORT_SECTION_CONCURRENCY")
+        try:
+            report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = "12"
+            self.assertEqual(report_section_concurrency(20), 8)
+            self.assertEqual(report_section_concurrency(3), 3)
+            report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = "bad"
+            self.assertEqual(report_section_concurrency(6), 4)
+        finally:
+            if original is None:
+                report_agent_module.os.environ.pop("REPORT_SECTION_CONCURRENCY", None)
+            else:
+                report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = original
 
     def test_slugify_filename(self):
         self.assertEqual(slugify_filename("What is Attention Mechanism?"), "what-is-attention-mechanism")
