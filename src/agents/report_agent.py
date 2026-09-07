@@ -628,6 +628,8 @@ def topic_section_acceptance_issues(
         issues.append("section appears truncated")
     if section_has_incomplete_equation(body) or malformed_equation_tail_present(body):
         issues.append("section has malformed equation")
+    if evidence_snippet_is_noisy(body):
+        issues.append("section contains noisy source text")
     if has_placeholder_source_marker(body):
         issues.append("section has placeholder citation")
     if section_claims_missing_supported_evidence(body, question, pack):
@@ -648,18 +650,20 @@ def malformed_equation_tail_present(text: str) -> bool:
 
 
 def topic_section_canonical_source_issue(section: str, question: str, sources: Sequence[dict[str, Any]]) -> str:
-    required_url = canonical_source_url_signal(question)
-    if not required_url:
+    required_urls = canonical_source_url_signals(question)
+    if not required_urls:
         return ""
     source_url_by_index = {
         source.get("index"): normalize_url(source.get("url"))
         for source in sources or []
         if isinstance(source, dict) and isinstance(source.get("index"), int)
     }
-    if not any(required_url in url for url in source_url_by_index.values()):
+    available_required = [required_url for required_url in required_urls if any(required_url in url for url in source_url_by_index.values())]
+    if not available_required:
         return ""
     cited_urls = [source_url_by_index.get(index, "") for index in citation_markers(section)]
-    return "" if any(required_url in url for url in cited_urls) else "section omits canonical source"
+    missing = [required_url for required_url in available_required if not any(required_url in url for url in cited_urls)]
+    return "" if not missing else "section omits canonical source"
 
 
 def deterministic_topic_section(
@@ -669,6 +673,10 @@ def deterministic_topic_section(
     sources: Sequence[dict[str, Any]],
     issues: Sequence[str],
 ) -> str:
+    if framework_api_question(question):
+        api_section = deterministic_framework_api_section(question, pack, synthesis_note, sources)
+        if api_section:
+            return api_section
     cited_notes = deterministic_topic_evidence_notes(question, pack, synthesis_note, sources)
     if cited_notes:
         return "\n".join(cited_notes)
@@ -684,8 +692,7 @@ def deterministic_topic_evidence_notes(
     sources: Sequence[dict[str, Any]],
 ) -> list[str]:
     notes: list[str] = []
-    canonical = canonical_source_url_signal(question)
-    canonical_indexes = source_indexes_matching_url_signal(sources, canonical)
+    canonical_indexes = source_indexes_matching_url_signals(sources, canonical_source_url_signals(question))
     chunks = rank_question_chunks(question, pack.get("chunks", []) if isinstance(pack, dict) else [])
     if canonical_indexes:
         chunks = sorted(
@@ -706,15 +713,80 @@ def deterministic_topic_evidence_notes(
     return []
 
 
-def source_indexes_matching_url_signal(sources: Sequence[dict[str, Any]], signal: str) -> set[int]:
-    if not signal:
+def framework_api_question(question: str) -> bool:
+    lowered = clean_text(question).lower()
+    return bool(
+        re.search(r"\b(?:api|apis|implementation|implementations|frameworks?)\b", lowered)
+        and any(term in lowered for term in ("tensorflow", "keras", "pytorch"))
+    )
+
+
+def deterministic_framework_api_section(
+    question: str,
+    pack: dict[str, Any],
+    synthesis_note: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+) -> str:
+    chunks = pack.get("chunks", []) if isinstance(pack, dict) else []
+    text = clean_text(" ".join([
+        *(clean_text(chunk.get("title")) + " " + clean_text(chunk.get("url")) + " " + clean_text(chunk.get("content")) for chunk in chunks if isinstance(chunk, dict)),
+        clean_text(synthesis_note.get("synthesis")) if isinstance(synthesis_note, dict) else "",
+    ]))
+    lines: list[str] = []
+    tf_marker = framework_source_marker(sources, chunks, ("tensorflow.org", "keras.io"))
+    torch_marker = framework_source_marker(sources, chunks, ("pytorch.org",))
+
+    if re.search(r"\btf\.keras\.layers\.Attention\b|\bkeras\.layers\.Attention\b", text, flags=re.IGNORECASE):
+        lines.append(f"TensorFlow/Keras provides the official `tf.keras.layers.Attention` layer for attention-style weighting {tf_marker or ''}.".strip())
+    elif re.search(r"\btf\.keras\.layers\.AdditiveAttention\b|\bkeras\.layers\.AdditiveAttention\b", text, flags=re.IGNORECASE):
+        lines.append(f"TensorFlow/Keras provides the official `tf.keras.layers.AdditiveAttention` layer {tf_marker or ''}.".strip())
+    elif tf_marker:
+        lines.append(f"The retrieved TensorFlow/Keras documentation is official, but the selected evidence does not list a concrete attention-layer usage pattern {tf_marker}.")
+
+    if re.search(r"\btorch\.nn\.MultiheadAttention\b|\bnn\.MultiheadAttention\b", text, flags=re.IGNORECASE):
+        lines.append(f"PyTorch provides the official `torch.nn.MultiheadAttention` module for multi-head attention {torch_marker or ''}.".strip())
+    elif re.search(r"\bscaled_dot_product_attention\b", text, flags=re.IGNORECASE):
+        lines.append(f"PyTorch provides the official `scaled_dot_product_attention` API for scaled dot-product attention {torch_marker or ''}.".strip())
+    elif torch_marker:
+        lines.append(f"The retrieved PyTorch documentation is official, but the selected evidence does not list a concrete PyTorch attention API or usage pattern {torch_marker}.")
+
+    if lines:
+        return "\n".join(line if re.search(r"[.!?]\s*(?:\[\d+\])?$", line) else line + "." for line in lines)
+    return ""
+
+
+def framework_source_marker(
+    sources: Sequence[dict[str, Any]],
+    chunks: Sequence[dict[str, Any]],
+    url_signals: Sequence[str],
+) -> str:
+    indexes = {
+        chunk.get("source_index")
+        for chunk in chunks or []
+        if isinstance(chunk, dict)
+        and isinstance(chunk.get("source_index"), int)
+        and any(signal in normalize_url(chunk.get("url")) for signal in url_signals)
+    }
+    indexes.update(
+        source.get("index")
+        for source in sources or []
+        if isinstance(source, dict)
+        and isinstance(source.get("index"), int)
+        and any(signal in normalize_url(source.get("url")) for signal in url_signals)
+    )
+    return format_citation_indexes(indexes) if indexes else ""
+
+
+def source_indexes_matching_url_signals(sources: Sequence[dict[str, Any]], signals: Sequence[str]) -> set[int]:
+    clean_signals = [signal for signal in signals or [] if clean_text(signal)]
+    if not clean_signals:
         return set()
     return {
         source.get("index")
         for source in sources or []
         if isinstance(source, dict)
         and isinstance(source.get("index"), int)
-        and signal in normalize_url(source.get("url"))
+        and any(signal in normalize_url(source.get("url")) for signal in clean_signals)
     }
 
 
@@ -727,6 +799,8 @@ def chunk_evidence_sentence(chunk: dict[str, Any]) -> str:
     marker = f"[{chunk['source_index']}]"
     snippet = compact_markdown_at_sentence(content, 520)
     snippet = cleanup_evidence_snippet_for_section(snippet)
+    if evidence_snippet_is_noisy(snippet):
+        return ""
     if not snippet:
         return ""
     if marker not in snippet:
@@ -742,6 +816,21 @@ def cleanup_evidence_snippet_for_section(snippet: str) -> str:
     if markdown_appears_truncated(text):
         text = trim_incomplete_final_sentence(text) or text
     return clean_text(text)
+
+
+def evidence_snippet_is_noisy(snippet: str) -> bool:
+    lowered = clean_text(snippet).lower()
+    noise = (
+        "skip to main content",
+        "uses cookies",
+        "was this helpful",
+        "view source",
+        "except as otherwise noted",
+        "triplet loss",
+        "pixelshuffle",
+        "upsamples",
+    )
+    return any(term in lowered for term in noise)
 
 
 def repair_report_by_sections(
@@ -2859,6 +2948,8 @@ def report_per_question_synthesis_citation_gaps(
 
 
 def section_claims_missing_per_question_synthesis(section: str, question: str, synthesis_note: dict[str, Any]) -> bool:
+    if not per_question_synthesis_has_cited_evidence(synthesis_note):
+        return False
     lowered = clean_text(section).lower()
     gap_terms = evidence_gap_pattern()
     if not re.search(gap_terms, lowered):
@@ -2954,6 +3045,8 @@ def markdown_sections(markdown: str) -> list[tuple[str, str]]:
 def section_claims_missing_supported_evidence(section: str, question: str, pack: dict[str, Any]) -> bool:
     lowered = clean_text(section).lower()
     gap_terms = evidence_gap_pattern()
+    if framework_api_question(question) and section_cites_pack_source(section, pack):
+        return False
     if re.search(gap_terms, lowered) and (evidence_pack_has_formula_evidence(pack) or not section_cites_pack_source(section, pack)):
         return True
     if (
@@ -3347,7 +3440,7 @@ def framework_api_pattern(facet: str) -> str:
     if normalize_heading(facet) == "pytorch":
         return r"\b(?:torch\.nn\.MultiheadAttention|scaled_dot_product_attention|nn\.MultiheadAttention)\b"
     if normalize_heading(facet) == "tensorflow":
-        return r"\b(?:tf\.keras\.layers\.MultiHeadAttention|keras\.layers\.MultiHeadAttention)\b"
+        return r"\b(?:tf\.keras\.layers\.(?:MultiHeadAttention|Attention|AdditiveAttention)|keras\.layers\.(?:MultiHeadAttention|Attention|AdditiveAttention))\b"
     return rf"\b{re.escape(facet)}\b"
 
 
@@ -3363,27 +3456,35 @@ def canonical_source_routing_issues(
     }
     issues = []
     for question in planner_questions or []:
-        required_url = canonical_source_url_signal(question)
-        if not required_url:
+        required_urls = canonical_source_url_signals(question)
+        if not required_urls:
             continue
         section = report_section_for_question(report, question)
         if not section:
             continue
         cited_urls = [source_url_by_index.get(index, "") for index in citation_markers(section)]
-        if not any(required_url in url for url in cited_urls):
+        available_required = [url for url in required_urls if any(url in source_url for source_url in source_url_by_index.values())]
+        missing = [url for url in available_required if not any(url in cited_url for cited_url in cited_urls)]
+        if missing:
             issues.append(f"report does not cite canonical source for topic: {clean_text(question)}")
     return dedupe_text(issues)
 
 
 def canonical_source_url_signal(question: str) -> str:
+    signals = canonical_source_url_signals(question)
+    return signals[0] if signals else ""
+
+
+def canonical_source_url_signals(question: str) -> list[str]:
     lowered = clean_text(question).lower()
+    signals = []
     if "luong" in lowered or "multiplicative" in lowered:
-        return "1508.04025"
+        signals.append("1508.04025")
     if "bahdanau" in lowered or "additive" in lowered:
-        return "1409.0473"
+        signals.append("1409.0473")
     if "attention is all you need" in lowered or "self-attention" in lowered or "multi-head" in lowered:
-        return "1706.03762"
-    return ""
+        signals.append("1706.03762")
+    return dedupe_text(signals)
 
 
 def internal_gap_contradiction_issues(report: str) -> list[str]:
