@@ -438,6 +438,7 @@ def generate_report_by_sections(
         synthesis_by_question=synthesis_by_question,
         source_text=source_text,
         fallback_model=last_model,
+        sources=sources,
     )
 
     topics_digest = "\n\n".join(compact_text(section, DEFAULT_FRAME_SECTION_CHARS) for section in topic_sections)
@@ -477,6 +478,7 @@ def generate_topic_sections(
     synthesis_by_question: dict[str, dict[str, Any]],
     source_text: str,
     fallback_model: str,
+    sources: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], str]:
     concurrency = report_section_concurrency(len(coverage_questions))
     if concurrency <= 1 or len(coverage_questions) <= 1:
@@ -490,6 +492,7 @@ def generate_topic_sections(
                 packs_by_question,
                 synthesis_by_question,
                 source_text,
+                sources=sources,
             )
             sections.append(section)
             diagnostics.append(diagnostic)
@@ -511,6 +514,7 @@ def generate_topic_sections(
                 packs_by_question,
                 synthesis_by_question,
                 source_text,
+                sources=sources,
             ): index
             for index, question in enumerate(coverage_questions)
         }
@@ -536,6 +540,7 @@ def generate_topic_section_with_diagnostics(
     synthesis_by_question: dict[str, dict[str, Any]],
     source_text: str,
     repair_feedback: str = "",
+    sources: Sequence[dict[str, Any]] | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
     pack = packs_by_question.get(normalize_heading(question), {})
     synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
@@ -549,14 +554,194 @@ def generate_topic_section_with_diagnostics(
         synthesis_note=synthesis_note,
         repair_feedback=repair_feedback,
     )
-    return strip_topic_section_headings(section), used_model, {
+    accepted_section, acceptance_repairs, used_fallback = accept_topic_section(
+        question,
+        section,
+        pack,
+        synthesis_note,
+        sources or [],
+    )
+    return accepted_section, used_model, {
         "question": question,
         "retried": retried,
         "model_calls": 2 if retried else 1,
+        "accepted_with_fallback": used_fallback,
+        "acceptance_repairs": acceptance_repairs,
         "had_usable_evidence": evidence_pack_has_usable_cited_evidence(pack),
         "had_per_question_synthesis": per_question_synthesis_has_cited_evidence(synthesis_note),
-        "chars": len(section),
+        "chars": len(accepted_section),
     }
+
+
+def accept_topic_section(
+    question: str,
+    section: str,
+    pack: dict[str, Any],
+    synthesis_note: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+) -> tuple[str, list[str], bool]:
+    """Clean or replace a topic section before it can contaminate the report."""
+
+    cleaned, cleanup_repairs = cleanup_topic_section(section, question)
+    issues = topic_section_acceptance_issues(cleaned, question, pack, synthesis_note, sources)
+    if not issues:
+        return cleaned, cleanup_repairs, False
+
+    fallback = deterministic_topic_section(question, pack, synthesis_note, sources, issues)
+    fallback, fallback_repairs = cleanup_topic_section(fallback, question)
+    fallback_issues = topic_section_acceptance_issues(
+        fallback,
+        question,
+        pack,
+        synthesis_note,
+        sources,
+        allow_gap_fallback=True,
+    )
+    repairs = dedupe_text([*cleanup_repairs, *(f"section acceptance issue: {issue}" for issue in issues), *fallback_repairs])
+    if fallback_issues:
+        repairs.extend(f"fallback retained issue: {issue}" for issue in fallback_issues)
+    return fallback, repairs, True
+
+
+def cleanup_topic_section(section: str, question: str) -> tuple[str, list[str]]:
+    wrapped = f"### 3.1. {planner_question_heading(question)}\n{strip_topic_section_headings(section)}"
+    cleaned, repairs = cleanup_report_markdown_artifacts(wrapped)
+    return strip_topic_section_headings(cleaned), repairs
+
+
+def topic_section_acceptance_issues(
+    section: str,
+    question: str,
+    pack: dict[str, Any],
+    synthesis_note: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+    allow_gap_fallback: bool = False,
+) -> list[str]:
+    issues: list[str] = []
+    body = strip_topic_section_headings(section)
+    plain = strip_markdown(body)
+    if len(plain) < 45:
+        issues.append("section is too short")
+    if has_dangling_markdown_bullet(body):
+        issues.append("section has dangling bullet")
+    if markdown_appears_truncated(body):
+        issues.append("section appears truncated")
+    if section_has_incomplete_equation(body) or malformed_equation_tail_present(body):
+        issues.append("section has malformed equation")
+    if has_placeholder_source_marker(body):
+        issues.append("section has placeholder citation")
+    if section_claims_missing_supported_evidence(body, question, pack):
+        issues.append("section contradicts cited evidence")
+    if section_claims_missing_per_question_synthesis(body, question, synthesis_note):
+        issues.append("section contradicts cited synthesis")
+    available = set(pack_source_indexes(pack)) | set(per_question_synthesis_source_indexes(synthesis_note))
+    if available and not allow_gap_fallback and not (available & set(citation_markers(body))):
+        issues.append("section omits per-question citations")
+    canonical_issue = topic_section_canonical_source_issue(body, question, sources)
+    if canonical_issue and not allow_gap_fallback:
+        issues.append(canonical_issue)
+    return dedupe_text(issues)
+
+
+def malformed_equation_tail_present(text: str) -> bool:
+    return bool(re.search(r"^\s*\\\]\s*\\left", clean_markdown(text), flags=re.MULTILINE))
+
+
+def topic_section_canonical_source_issue(section: str, question: str, sources: Sequence[dict[str, Any]]) -> str:
+    required_url = canonical_source_url_signal(question)
+    if not required_url:
+        return ""
+    source_url_by_index = {
+        source.get("index"): normalize_url(source.get("url"))
+        for source in sources or []
+        if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+    if not any(required_url in url for url in source_url_by_index.values()):
+        return ""
+    cited_urls = [source_url_by_index.get(index, "") for index in citation_markers(section)]
+    return "" if any(required_url in url for url in cited_urls) else "section omits canonical source"
+
+
+def deterministic_topic_section(
+    question: str,
+    pack: dict[str, Any],
+    synthesis_note: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+    issues: Sequence[str],
+) -> str:
+    cited_notes = deterministic_topic_evidence_notes(question, pack, synthesis_note, sources)
+    if cited_notes:
+        return "\n".join(cited_notes)
+    issue_text = "; ".join(clean_text(issue) for issue in issues if clean_text(issue))
+    gap = f"The retrieved evidence was not sufficient to generate a reliable section for this sub-question"
+    return f"{gap}: {clean_text(question)}. Remaining quality issue: {issue_text or 'insufficient cited evidence'}."
+
+
+def deterministic_topic_evidence_notes(
+    question: str,
+    pack: dict[str, Any],
+    synthesis_note: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+) -> list[str]:
+    notes: list[str] = []
+    canonical = canonical_source_url_signal(question)
+    canonical_indexes = source_indexes_matching_url_signal(sources, canonical)
+    chunks = rank_question_chunks(question, pack.get("chunks", []) if isinstance(pack, dict) else [])
+    if canonical_indexes:
+        chunks = sorted(
+            chunks,
+            key=lambda chunk: 0 if chunk.get("source_index") in canonical_indexes else 1,
+        )
+    for chunk in chunks:
+        if len(notes) >= 3:
+            break
+        note = chunk_evidence_sentence(chunk)
+        if note:
+            notes.append(note)
+    if notes:
+        return notes
+    synthesis = clean_markdown(synthesis_note.get("synthesis")) if isinstance(synthesis_note, dict) else ""
+    if synthesis and citation_markers(synthesis) and not line_has_gap_claim(synthesis):
+        return [compact_markdown_at_sentence(synthesis, 520)]
+    return []
+
+
+def source_indexes_matching_url_signal(sources: Sequence[dict[str, Any]], signal: str) -> set[int]:
+    if not signal:
+        return set()
+    return {
+        source.get("index")
+        for source in sources or []
+        if isinstance(source, dict)
+        and isinstance(source.get("index"), int)
+        and signal in normalize_url(source.get("url"))
+    }
+
+
+def chunk_evidence_sentence(chunk: dict[str, Any]) -> str:
+    if not isinstance(chunk, dict) or not isinstance(chunk.get("source_index"), int):
+        return ""
+    content = sanitize_evidence_content(chunk.get("content"))
+    if not content:
+        return ""
+    marker = f"[{chunk['source_index']}]"
+    snippet = compact_markdown_at_sentence(content, 520)
+    snippet = cleanup_evidence_snippet_for_section(snippet)
+    if not snippet:
+        return ""
+    if marker not in snippet:
+        snippet = f"{snippet.rstrip('.')} {marker}."
+    return snippet
+
+
+def cleanup_evidence_snippet_for_section(snippet: str) -> str:
+    text = clean_markdown(snippet)
+    text = re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", text)
+    text = remove_orphan_citation_punctuation(text)
+    text = remove_clipped_sentence_fragments(text)
+    if markdown_appears_truncated(text):
+        text = trim_incomplete_final_sentence(text) or text
+    return clean_text(text)
 
 
 def repair_report_by_sections(
@@ -596,6 +781,7 @@ def repair_report_by_sections(
         synthesis_by_question=synthesis_by_question,
         source_text=source_text,
         repair_feedback=repair_feedback,
+        sources=sources,
     )
     for item in repairs:
         question = item["question"]
@@ -628,6 +814,7 @@ def generate_repair_topic_sections(
     synthesis_by_question: dict[str, dict[str, Any]],
     source_text: str,
     repair_feedback: str,
+    sources: Sequence[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     concurrency = report_section_concurrency(len(target_questions))
     if not target_questions:
@@ -644,6 +831,7 @@ def generate_repair_topic_sections(
             synthesis_by_question,
             source_text,
             repair_feedback=repair_feedback,
+            sources=sources,
         )
         return {**diagnostic, "section": section, "model": used_model}
 
@@ -2119,7 +2307,7 @@ def apply_incomplete_equation_repairs(
     if not equation:
         return report, []
     repaired = re.sub(
-        r"\\text\{Attention\}\(Q,\s*K,\s*V\)\s*=\s*\\operatorname\{softmax\}\\!\s*(?:\\\])?",
+        r"\\text\{Attention\}\(Q,\s*K,\s*V\)\s*=\s*\\operatorname\{softmax\}\\!\s*(?:\\\])?\s*(?=\n|$)",
         lambda _: f"{equation}\n\\]",
         clean_markdown(report),
         flags=re.MULTILINE,
@@ -2365,6 +2553,8 @@ def remove_raw_repair_prefix(line: str) -> str:
 def repair_truncated_markdown_line(line: str) -> tuple[str, list[str]]:
     if not clean_text(line) or line.lstrip().startswith(("#", "|", "```")):
         return line, []
+    if re.match(r"^\s*\\\]\s*\\left", line):
+        return "", ["removed malformed equation tail"]
     if list_item_appears_truncated(line):
         return "", ["removed truncated list item"]
     repaired = remove_clipped_sentence_fragments(line)
