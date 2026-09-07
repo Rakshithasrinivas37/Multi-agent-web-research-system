@@ -29,6 +29,7 @@ DEFAULT_FOCUSED_CHUNKS_PER_QUESTION = 4
 DEFAULT_FOCUSED_CHUNK_CHARS = 1500
 
 DEFAULT_REPORT_GENERATION_MODE = "sections"  # "single" or "sections"  
+DEFAULT_REPORT_FRAME_GENERATION_MODE = "deterministic"  # "deterministic" or "llm"
 DEFAULT_SECTION_MAX_TOKENS = 1500
 DEFAULT_SECTION_RETRY_ATTEMPTS = 2
 DEFAULT_SECTION_EVIDENCE_CHUNKS = 4
@@ -92,8 +93,8 @@ STOPWORDS = {
 }
 
 TRAILING_HEADING_WORDS = {
-    "and", "as", "be", "by", "can", "does", "for", "from", "how", "in", "including",
-    "of", "or", "sequence", "the", "their", "to", "what", "when", "where", "which", "with",
+    "and", "as", "be", "by", "can", "does", "especially", "for", "from", "how", "in", "including",
+    "of", "or", "regarding", "sequence", "the", "their", "to", "what", "when", "where", "which", "with",
 }
 
 
@@ -296,6 +297,7 @@ class ReportAgent:
                 "report_finalization_repairs": finalization["repairs"],
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
                 "report_generation_mode": self.generation_mode,
+                "report_frame_generation_mode": report_frame_generation_mode() if self.generation_mode == "sections" else None,
                 "report_section_diagnostics": section_diagnostics,
                 "report_prompt_chars": len(prompt) if self.generation_mode != "sections" else None,
                 "report_fallback_prompt_chars": len(fallback_prompt) if self.generation_mode != "sections" else None,
@@ -451,64 +453,25 @@ def generate_report_by_sections(
 
     topics_digest = "\n\n".join(compact_text(section, DEFAULT_FRAME_SECTION_CHARS) for section in topic_sections)
 
-    intro, last_model = generate_frame_section(
-        client, model, "Introduction and Context",
-        instructions=(
-            "Write a short introduction (3-5 sentences) that frames the research objective and previews the "
-            "topics covered below, using only claims already present in the topic sections. Cite using the "
-            "same source markers used in those sections; do not introduce a new fact without one."
-        ),
-        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
-    )
-    cross_cutting, last_model = generate_frame_section(
-        client, model, "Cross-cutting Analysis and Synthesis",
-        instructions=(
-            "Write a cross-cutting analysis that connects the topic sections below into a coherent narrative: "
-            "note relationships, tensions, or a progression across topics. Use only claims and citations already "
-            "present in the topic sections - do not add new facts."
-        ),
-        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
-    )
-    limitations, last_model = generate_frame_section(
-        client, model, "Limitations and Open Questions",
-        instructions=(
-            "List, as short bullet points, which sub-questions below have thin or missing evidence and what "
-            "specific detail is unresolved. Base this only on gaps already stated in the topic sections; do not "
-            "invent new limitations and do not repeat claims that were already supported with a citation."
-        ),
-        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
-    )
-    conclusion, last_model = generate_frame_section(
-        client, model, "Conclusion",
-        instructions=(
-            "Write a short conclusion (3-5 sentences) summarising what is well-supported across the topic "
-            "sections and what remains open, consistent with the limitations already identified. Do not add new "
-            "facts or citations that are not already present above."
-        ),
-        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
-    )
-    exec_summary, last_model = generate_frame_section(
-        client, model, "Executive Summary",
-        instructions=(
-            "Write a 3-4 sentence executive summary of the whole report below, naming the main topics covered "
-            "and, in one clause, the main limitation. Do not add new facts or citations that are not already "
-            "present above."
-        ),
-        objective=objective, source_text=source_text,
-        body_digest=f"{intro}\n\n{topics_digest}\n\n{cross_cutting}\n\n{limitations}\n\n{conclusion}",
+    frames, last_model, frame_diagnostics = generate_report_frames(
+        client,
+        model,
+        objective=objective,
+        source_text=source_text,
+        topics_digest=topics_digest,
         fallback_model=last_model,
     )
 
     report = "\n\n".join([
-        f"## 1. Executive Summary\n{strip_leading_heading(exec_summary)}",
-        f"## 2. Introduction and Context\n{strip_leading_heading(intro)}",
+        f"## 1. Executive Summary\n{strip_leading_heading(frames['exec_summary'])}",
+        f"## 2. Introduction and Context\n{strip_leading_heading(frames['intro'])}",
         "## 3. Topic Sections",
         *(f"### 3.{i}. {planner_question_heading(q)}\n{strip_topic_section_headings(section)}" for i, (q, section) in enumerate(zip(coverage_questions, topic_sections), 1)),
-        f"## 4. Cross-cutting Analysis and Synthesis\n{strip_leading_heading(cross_cutting)}",
-        f"## 5. Limitations and Open Questions\n{strip_leading_heading(limitations)}",
-        f"## 6. Conclusion\n{strip_leading_heading(conclusion)}",
+        f"## 4. Cross-cutting Analysis and Synthesis\n{strip_leading_heading(frames['cross_cutting'])}",
+        f"## 5. Limitations and Open Questions\n{strip_leading_heading(frames['limitations'])}",
+        f"## 6. Conclusion\n{strip_leading_heading(frames['conclusion'])}",
     ])
-    return report, last_model, {"topic_sections": section_diagnostics}
+    return report, last_model, {"topic_sections": section_diagnostics, "framing": frame_diagnostics}
 
 
 def repair_report_by_sections(
@@ -582,7 +545,7 @@ def repair_report_by_sections(
 
 def report_framing_needs_repair(validation: dict[str, Any]) -> bool:
     issues = [clean_text(issue).lower() for issue in validation.get("report_issues", []) or []]
-    return any("truncated or incomplete section text" in issue for issue in issues)
+    return any("truncated or incomplete section text" in issue or "report frame section" in issue for issue in issues)
 
 
 def report_section_repair_questions(validation: dict[str, Any], coverage_questions: Sequence[str]) -> list[str]:
@@ -592,6 +555,7 @@ def report_section_repair_questions(validation: dict[str, Any], coverage_questio
             *validation.get("false_gap_questions", []),
             *validation.get("pack_citation_gap_questions", []),
             *facet_gap_questions(validation.get("report_issues", []), coverage_questions),
+            *framework_api_issue_questions(validation.get("report_issues", []), coverage_questions),
             *canonical_source_issue_questions(validation.get("report_issues", []), coverage_questions),
             *schema_missing_topic_questions(validation.get("schema_issues", []), coverage_questions),
             *schema_malformed_topic_questions(validation.get("schema_issues", []), coverage_questions),
@@ -639,6 +603,16 @@ def truncated_topic_section_questions(report_issues: Sequence[str], coverage_que
 
 def facet_gap_questions(report_issues: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
     prefix = "report omits required topic facet:"
+    missing = [
+        clean_text(issue).removeprefix(prefix).strip()
+        for issue in report_issues or []
+        if clean_text(issue).startswith(prefix)
+    ]
+    return [question for question in coverage_questions if question in missing]
+
+
+def framework_api_issue_questions(report_issues: Sequence[str], coverage_questions: Sequence[str]) -> list[str]:
+    prefix = "report lacks concrete framework API detail:"
     missing = [
         clean_text(issue).removeprefix(prefix).strip()
         for issue in report_issues or []
@@ -734,58 +708,19 @@ def refresh_report_framing_sections(
     source_text = format_sources(sources)
     topic_sections = [report_section_for_question(report, question) for question in coverage_questions]
     topics_digest = "\n\n".join(compact_text(section, DEFAULT_FRAME_SECTION_CHARS) for section in topic_sections if section)
-    intro, last_model = generate_frame_section(
-        client, model, "Introduction and Context",
-        instructions=(
-            "Write a short introduction (3-5 sentences) that frames the research objective and previews the "
-            "topics covered below, using only claims already present in the topic sections. Cite using the "
-            "same source markers used in those sections; do not introduce a new fact without one."
-        ),
-        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=fallback_model,
+    frames, last_model, _ = generate_report_frames(
+        client,
+        model,
+        objective=objective,
+        source_text=source_text,
+        topics_digest=topics_digest,
+        fallback_model=fallback_model,
     )
-    cross_cutting, last_model = generate_frame_section(
-        client, model, "Cross-cutting Analysis and Synthesis",
-        instructions=(
-            "Write a cross-cutting analysis that connects the topic sections below into a coherent narrative: "
-            "note relationships, tensions, or a progression across topics. Use only claims and citations already "
-            "present in the topic sections - do not add new facts."
-        ),
-        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
-    )
-    limitations, last_model = generate_frame_section(
-        client, model, "Limitations and Open Questions",
-        instructions=(
-            "List, as short bullet points, which sub-questions below have thin or missing evidence and what "
-            "specific detail is unresolved. Base this only on gaps already stated in the topic sections; do not "
-            "invent new limitations and do not repeat claims that were already supported with a citation."
-        ),
-        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
-    )
-    conclusion, last_model = generate_frame_section(
-        client, model, "Conclusion",
-        instructions=(
-            "Write a short conclusion (3-5 sentences) summarising what is well-supported across the topic "
-            "sections and what remains open, consistent with the limitations already identified. Do not add new "
-            "facts or citations that are not already present above."
-        ),
-        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
-    )
-    exec_summary, last_model = generate_frame_section(
-        client, model, "Executive Summary",
-        instructions=(
-            "Write a 3-4 sentence executive summary of the whole report below, naming the main topics covered "
-            "and, in one clause, the main limitation. Do not add new facts or citations that are not already "
-            "present above."
-        ),
-        objective=objective, source_text=source_text,
-        body_digest=f"{intro}\n\n{topics_digest}\n\n{cross_cutting}\n\n{limitations}\n\n{conclusion}",
-        fallback_model=last_model,
-    )
-    refreshed = replace_named_report_section(report, "Executive Summary", strip_leading_heading(exec_summary))
-    refreshed = replace_named_report_section(refreshed, "Introduction and Context", strip_leading_heading(intro))
-    refreshed = replace_named_report_section(refreshed, "Cross-cutting Analysis and Synthesis", strip_leading_heading(cross_cutting))
-    refreshed = replace_named_report_section(refreshed, "Limitations and Open Questions", strip_leading_heading(limitations))
-    refreshed = replace_named_report_section(refreshed, "Conclusion", strip_leading_heading(conclusion))
+    refreshed = replace_named_report_section(report, "Executive Summary", strip_leading_heading(frames["exec_summary"]))
+    refreshed = replace_named_report_section(refreshed, "Introduction and Context", strip_leading_heading(frames["intro"]))
+    refreshed = replace_named_report_section(refreshed, "Cross-cutting Analysis and Synthesis", strip_leading_heading(frames["cross_cutting"]))
+    refreshed = replace_named_report_section(refreshed, "Limitations and Open Questions", strip_leading_heading(frames["limitations"]))
+    refreshed = replace_named_report_section(refreshed, "Conclusion", strip_leading_heading(frames["conclusion"]))
     return refreshed, last_model
 
 
@@ -912,6 +847,13 @@ Rules:
 
 
 def format_question_source_target_guidance(question: str) -> str:
+    if required_question_facets(question) and re.search(r"\b(?:api|apis|implementation|implementations)\b", question, flags=re.IGNORECASE):
+        return (
+            "- Prefer official framework documentation for concrete APIs. "
+            "Name PyTorch APIs such as torch.nn.MultiheadAttention only when cited evidence supports them, "
+            "and name TensorFlow/Keras APIs such as tf.keras.layers.MultiHeadAttention only when cited evidence supports them. "
+            "If a framework lacks cited API evidence, state that exact framework-specific gap."
+        )
     source_signal = canonical_source_url_signal(question)
     if not source_signal:
         return "- No canonical source target detected for this question."
@@ -962,6 +904,98 @@ def section_needs_retry(section_text: str, pack: dict[str, Any], synthesis_note:
     has_cited = bool(available & set(citation_markers(section_text)))
     has_gap_claim = bool(re.search(evidence_gap_pattern(), section_text.lower()))
     return (not has_cited) or has_gap_claim
+
+
+def generate_report_frames(
+    client: Any,
+    model: str,
+    objective: str,
+    source_text: str,
+    topics_digest: str,
+    fallback_model: str,
+) -> tuple[dict[str, str], str, dict[str, Any]]:
+    mode = report_frame_generation_mode()
+    if mode != "llm":
+        frames = deterministic_report_frames(topics_digest)
+        return frames, fallback_model, {"mode": mode, "model_calls": 0}
+
+    intro, last_model = generate_frame_section(
+        client, model, "Introduction and Context",
+        instructions=(
+            "Write a short introduction (3-5 sentences) that frames the research objective and previews the "
+            "topics covered below, using only claims already present in the topic sections. Cite using the "
+            "same source markers used in those sections; do not introduce a new fact without one."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=fallback_model,
+    )
+    cross_cutting, last_model = generate_frame_section(
+        client, model, "Cross-cutting Analysis and Synthesis",
+        instructions=(
+            "Write a cross-cutting analysis that connects the topic sections below into a coherent narrative: "
+            "note relationships, tensions, or a progression across topics. Use only claims and citations already "
+            "present in the topic sections - do not add new facts."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    limitations, last_model = generate_frame_section(
+        client, model, "Limitations and Open Questions",
+        instructions=(
+            "List, as short bullet points, which sub-questions below have thin or missing evidence and what "
+            "specific detail is unresolved. Base this only on gaps already stated in the topic sections; do not "
+            "invent new limitations and do not repeat claims that were already supported with a citation."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    conclusion, last_model = generate_frame_section(
+        client, model, "Conclusion",
+        instructions=(
+            "Write a short conclusion (3-5 sentences) summarising what is well-supported across the topic "
+            "sections and what remains open, consistent with the limitations already identified. Do not add new "
+            "facts or citations that are not already present above."
+        ),
+        objective=objective, source_text=source_text, body_digest=topics_digest, fallback_model=last_model,
+    )
+    exec_summary, last_model = generate_frame_section(
+        client, model, "Executive Summary",
+        instructions=(
+            "Write a 3-4 sentence executive summary of the whole report below, naming the main topics covered "
+            "and, in one clause, the main limitation. Do not add new facts or citations that are not already "
+            "present above."
+        ),
+        objective=objective, source_text=source_text,
+        body_digest=f"{intro}\n\n{topics_digest}\n\n{cross_cutting}\n\n{limitations}\n\n{conclusion}",
+        fallback_model=last_model,
+    )
+    return {
+        "exec_summary": exec_summary,
+        "intro": intro,
+        "cross_cutting": cross_cutting,
+        "limitations": limitations,
+        "conclusion": conclusion,
+    }, last_model, {"mode": mode, "model_calls": 5}
+
+
+def deterministic_report_frames(topics_digest: str) -> dict[str, str]:
+    intro = deterministic_frame_section("Introduction and Context", topics_digest)
+    cross_cutting = deterministic_frame_section("Cross-cutting Analysis and Synthesis", topics_digest)
+    limitations = deterministic_frame_section("Limitations and Open Questions", topics_digest)
+    conclusion = deterministic_frame_section("Conclusion", topics_digest)
+    exec_summary = deterministic_frame_section(
+        "Executive Summary",
+        f"{intro}\n\n{topics_digest}\n\n{cross_cutting}\n\n{limitations}\n\n{conclusion}",
+    )
+    return {
+        "exec_summary": exec_summary,
+        "intro": intro,
+        "cross_cutting": cross_cutting,
+        "limitations": limitations,
+        "conclusion": conclusion,
+    }
+
+
+def report_frame_generation_mode() -> str:
+    mode = clean_text(os.environ.get("REPORT_FRAME_GENERATION_MODE")).lower()
+    return "llm" if mode in {"llm", "model", "generation"} else DEFAULT_REPORT_FRAME_GENERATION_MODE
 
 
 def generate_frame_section(
@@ -1114,7 +1148,7 @@ def deterministic_frame_section(heading: str, body_digest: str) -> str:
     cited_lines = [
         clean_text(line)
         for line in digest.splitlines()
-        if citation_markers(line) and not line.lstrip().startswith("#")
+        if frame_source_line_usable(line)
     ]
     gap_lines = [
         clean_text(line)
@@ -1147,6 +1181,20 @@ def frame_lines_as_prose(lines: Sequence[str]) -> str:
         if text:
             sentences.append(text.rstrip(".") + ".")
     return " ".join(sentences)
+
+
+def frame_source_line_usable(line: str) -> bool:
+    value = clean_text(line)
+    if not citation_markers(value) or value.lstrip().startswith("#"):
+        return False
+    plain = strip_markdown(value)
+    if re.match(r"^(?:where|which|that|and|or|formally|because)\b", plain, flags=re.IGNORECASE):
+        return False
+    if re.search(r"^(?:\\\[|\\\]|\\text\{|=)", value):
+        return False
+    if frame_prose_has_broken_fragments(value):
+        return False
+    return len(plain.split()) >= 6
 
 
 def strip_leading_heading(section_text: str) -> str:
@@ -1630,7 +1678,7 @@ def evidence_backed_sources(sources: Sequence[dict[str, Any]], *evidence_texts: 
 
 def source_priority(url: Any) -> int:
     value = clean_text(url).lower()
-    if any(signal in value for signal in ("arxiv.org", "openreview.net", "doi.org", "pytorch.org", "tensorflow.org", "docs.")) or ".edu" in value:
+    if any(signal in value for signal in ("arxiv.org", "openreview.net", "doi.org", "pytorch.org", "tensorflow.org", "keras.io", "docs.")) or ".edu" in value:
         return 2
     return 1 if value else 0
 
@@ -1780,6 +1828,7 @@ def validate_report_output(
     )
     report_issues = report_quality_issues(report, sources, evidence_text=f"{evidence}\n{synthesis}\n{pack_text}")
     report_issues.extend(required_topic_facet_issues(report, planner_questions))
+    report_issues.extend(framework_api_detail_issues(report, planner_questions))
     report_issues.extend(canonical_source_routing_issues(report, planner_questions, sources))
     report_issues.extend(internal_gap_contradiction_issues(report))
     report_issues.extend(f"report marks covered evidence as a gap: {question}" for question in false_gaps)
@@ -1894,6 +1943,15 @@ def finalize_report_output(
     if cleanup_repairs:
         report = normalize_final_report(cleaned, sources)
         validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
+    repaired, formula_repairs = apply_incomplete_equation_repairs(
+        report,
+        sources,
+        evidence_text=f"{evidence}\n{synthesis}\n{pack_text}\n{format_per_question_synthesis(report_context.get('per_question_synthesis', []))}",
+    )
+    if formula_repairs:
+        repairs.extend(formula_repairs)
+        report = repaired
+        validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
     if validation.get("false_gap_questions") or validation.get("pack_citation_gap_questions"):
         repaired, evidence_repairs = apply_report_evidence_pack_repairs(
             report,
@@ -1912,6 +1970,36 @@ def finalize_report_output(
     if repairs and status == "clean":
         status = "repaired"
     return report, validation, {"status": status, "repairs": repairs}
+
+
+def apply_incomplete_equation_repairs(
+    report: str,
+    sources: Sequence[dict[str, Any]],
+    evidence_text: str,
+) -> tuple[str, list[str]]:
+    if not incomplete_equation_issues(report):
+        return report, []
+    equation = source_backed_scaled_dot_product_equation(evidence_text)
+    if not equation:
+        return report, []
+    repaired = re.sub(
+        r"\\text\{Attention\}\(Q,\s*K,\s*V\)\s*=\s*\\operatorname\{softmax\}\\!\s*(?:\\\])?",
+        lambda _: f"{equation}\n\\]",
+        clean_markdown(report),
+        flags=re.MULTILINE,
+    )
+    if repaired == clean_markdown(report):
+        return report, []
+    return normalize_final_report(repaired, sources), ["repaired incomplete scaled dot-product equation"]
+
+
+def source_backed_scaled_dot_product_equation(evidence_text: str) -> str:
+    text = clean_text(evidence_text)
+    if not re.search(r"Attention\}?\(Q,?\s*K,?\s*V\)", text, flags=re.IGNORECASE):
+        return ""
+    if not all(re.search(pattern, text, flags=re.IGNORECASE) for pattern in (r"softmax", r"QK", r"sqrt", r"d_?k", r"\bV\b")):
+        return ""
+    return r"\text{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V"
 
 
 def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
@@ -2845,6 +2933,44 @@ def required_topic_facet_issues(report: str, planner_questions: Sequence[str]) -
         if missing:
             issues.append(f"report omits required topic facet: {clean_text(question)}")
     return dedupe_text(issues)
+
+
+def framework_api_detail_issues(report: str, planner_questions: Sequence[str]) -> list[str]:
+    issues = []
+    for question in planner_questions or []:
+        lowered = clean_text(question).lower()
+        if "api" not in lowered and "implementation" not in lowered:
+            continue
+        facets = required_question_facets(question)
+        if not facets:
+            continue
+        section = report_section_for_question(report, question)
+        if not section:
+            continue
+        missing = [facet for facet in facets if not section_has_framework_api_detail(section, facet)]
+        if missing:
+            issues.append(f"report lacks concrete framework API detail: {clean_text(question)}")
+    return dedupe_text(issues)
+
+
+def section_has_framework_api_detail(section: str, facet: str) -> bool:
+    if not section_has_supported_or_gap_facet(section, facet):
+        return False
+    text = clean_text(section)
+    if re.search(framework_api_pattern(facet), text, flags=re.IGNORECASE):
+        return True
+    for line in clean_markdown(section).splitlines():
+        if re.search(rf"\b{re.escape(facet)}\b", line, flags=re.IGNORECASE) and line_has_gap_claim(line):
+            return True
+    return False
+
+
+def framework_api_pattern(facet: str) -> str:
+    if normalize_heading(facet) == "pytorch":
+        return r"\b(?:torch\.nn\.MultiheadAttention|scaled_dot_product_attention|nn\.MultiheadAttention)\b"
+    if normalize_heading(facet) == "tensorflow":
+        return r"\b(?:tf\.keras\.layers\.MultiHeadAttention|keras\.layers\.MultiHeadAttention)\b"
+    return rf"\b{re.escape(facet)}\b"
 
 
 def canonical_source_routing_issues(
