@@ -6,6 +6,7 @@ from src.agents.report_agent import (
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
     apply_incomplete_equation_repairs,
     apply_report_evidence_pack_repairs,
+    apply_validation_limitations,
     clean_markdown,
     build_report_prompt,
     canonical_source_routing_issues,
@@ -66,6 +67,7 @@ from src.agents.report_agent import (
     resolve_report_coverage,
     rewrite_missing_sub_question_queries,
     sources_with_browser_results,
+    source_priority,
     slugify_filename,
     strip_topic_section_headings,
     synthesis_coverage_gap_questions,
@@ -296,8 +298,12 @@ Topic fact is supported [1].
 ## 4. Cross-cutting Analysis and Synthesis
 Supported fact remains [1]. This sentence ends with representat. Next fact remains [2].
 Dot-product attention is faster due to optimized matrix-. where \\(d_k\\) is the dimension. Final fact remains [3].
+The conclusion should trim this clipped sentence before conditional compu. Preserved sentence remains [5].
 The citation marker was removed but punctuation should remain tidy .
 **Per-question synthesis support:** Debug labels should not appear [4].
+**Planner notes – Efficient attention variants**
+- Linformer repeats the same diagnostic note [5].
+- Reformer note should not leak into the report [5].
 """
 
         cleaned, repairs = cleanup_report_markdown_artifacts(report)
@@ -305,15 +311,20 @@ The citation marker was removed but punctuation should remain tidy .
         self.assertIn("removed clipped sentence fragment", repairs)
         self.assertIn("removed orphan citation punctuation", repairs)
         self.assertIn("removed raw repair label", repairs)
+        self.assertIn("removed raw planner notes block", repairs)
         self.assertIn("Supported fact remains [1].", cleaned)
         self.assertIn("Next fact remains [2].", cleaned)
         self.assertIn("Final fact remains [3].", cleaned)
+        self.assertIn("Preserved sentence remains [5].", cleaned)
         self.assertIn("tidy.", cleaned)
         self.assertIn("Debug labels should not appear [4].", cleaned)
         self.assertNotIn("representat", cleaned)
         self.assertNotIn("matrix-", cleaned)
+        self.assertNotIn("compu", cleaned)
         self.assertNotIn("where \\(d_k\\)", cleaned)
         self.assertNotIn("Per-question synthesis support", cleaned)
+        self.assertNotIn("Planner notes", cleaned)
+        self.assertNotIn("Reformer note", cleaned)
 
     def test_normalize_nested_markdown_bullet_removes_duplicate_marker(self):
         self.assertEqual(
@@ -384,6 +395,28 @@ Conclusion is complete [1].
         self.assertEqual(final_validation["report_issues"], [])
         self.assertNotIn("Exact missing details", finalized)
         self.assertNotIn("- -", finalized)
+
+    def test_apply_validation_limitations_replaces_false_no_gap_summary(self):
+        report = """
+## 5. Limitations and Open Questions
+- No unresolved evidence gaps were explicitly stated.
+
+## References
+[1] https://example.com
+"""
+        validation = {
+            "coverage": {"missing": []},
+            "synthesis_gaps": [],
+            "false_gap_questions": [],
+            "pack_citation_gap_questions": ["What APIs are provided?"],
+            "report_issues": ["report lacks concrete framework API detail: What APIs are provided?"],
+        }
+
+        repaired = apply_validation_limitations(report, validation, [{"index": 1, "url": "https://example.com"}])
+
+        self.assertNotIn("No unresolved evidence gaps", repaired)
+        self.assertIn("Report lacks concrete framework API detail: What APIs are provided?.", repaired)
+        self.assertIn("Report section still needs evidence-pack citation support for: What APIs are provided?.", repaired)
 
     def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
         markdown = "### ## 1. Definition\nText."
@@ -1773,6 +1806,10 @@ Self-attention computes relationships within the same sequence [2].
         )
 
         self.assertEqual(ranked[0]["source_index"], 5)
+
+    def test_source_priority_prefers_official_docs_and_primary_papers(self):
+        self.assertGreater(source_priority("https://docs.pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html"), source_priority("https://example-blog.com/attention"))
+        self.assertGreater(source_priority("https://arxiv.org/pdf/1706.03762"), source_priority("https://www.sotaaz.com/post/attention-mechanism-implementation-en"))
 
     def test_per_question_synthesis_repair_note_does_not_cut_mid_sentence(self):
         text = (
