@@ -272,6 +272,60 @@ Supported definition [1].
         self.assertIn("[3]", accepted)
         self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, {}, sources))
 
+    def test_topic_section_acceptance_uses_clean_framework_api_fallback(self):
+        question = "What are the official implementations and APIs for attention mechanisms in major deep-learning frameworks (TensorFlow/Keras, PyTorch) and how are they used?"
+        section = "Skip to main content. output Retrieves the output tensor(s) of a layer [6]."
+        pack = {
+            "question": question,
+            "coverage": "covered",
+            "chunks": [
+                {
+                    "source_index": 6,
+                    "url": "https://www.tensorflow.org/api_docs/python/tf/keras/layers/Attention",
+                    "title": "tf.keras.layers.Attention | TensorFlow v2.16.1",
+                    "content": "tf.keras.layers.Attention computes attention-style output tensors.",
+                },
+                {
+                    "source_index": 7,
+                    "url": "https://docs.pytorch.org/docs/2.14/nn.html",
+                    "title": "torch.nn - PyTorch documentation",
+                    "content": "TripletMarginWithDistanceLoss Creates a criterion. Vision Layers nn.PixelShuffle Rearrange elements.",
+                },
+            ],
+        }
+        sources = [
+            {"index": 6, "url": "https://www.tensorflow.org/api_docs/python/tf/keras/layers/Attention"},
+            {"index": 7, "url": "https://docs.pytorch.org/docs/2.14/nn.html"},
+        ]
+
+        accepted, repairs, used_fallback = accept_topic_section(question, section, pack, {}, sources)
+
+        self.assertTrue(used_fallback)
+        self.assertIn("tf.keras.layers.Attention", accepted)
+        self.assertIn("does not list a concrete PyTorch attention API", accepted)
+        self.assertNotIn("TripletMargin", accepted)
+        self.assertNotIn("Skip to main content", accepted)
+        self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, {}, sources))
+
+    def test_canonical_source_routing_requires_each_available_canonical_source(self):
+        question = "What are the main variants of attention mechanisms (additive/Bahdanau, multiplicative/Luong, self-attention, multi-head attention) and how do they differ?"
+        sources = [
+            {"index": 2, "url": "https://arxiv.org/pdf/1409.0473"},
+            {"index": 3, "url": "https://arxiv.org/pdf/1706.03762"},
+            {"index": 5, "url": "https://arxiv.org/pdf/1508.04025"},
+        ]
+        report = """
+## 3. Topic Sections
+
+### 3.1. Main Variants Of Attention Mechanisms Additive Bahdanau Multiplicative Luong Self-attention Multi-head Attention
+Variants are described with only one canonical citation [3].
+"""
+
+        self.assertEqual(canonical_source_routing_issues(report, [question], sources), [f"report does not cite canonical source for topic: {question}"])
+
+        fixed = report.replace("[3]", "[2] [3] [5]")
+        self.assertEqual(canonical_source_routing_issues(fixed, [question], sources), [])
+
     def test_cleanup_report_markdown_artifacts_repairs_section_role_polish(self):
         report = """
 ## 1. Executive Summary
