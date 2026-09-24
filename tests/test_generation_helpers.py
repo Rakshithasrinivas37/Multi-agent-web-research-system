@@ -6,6 +6,7 @@ from io import StringIO
 from unittest.mock import patch
 
 from src.rag.generation import (
+    DEFAULT_PER_QUESTION_SYNTHESIS_CHARS,
     audit_synthesis_citations,
     build_sub_question_evidence_packs,
     build_coverage_by_question,
@@ -60,6 +61,9 @@ from src.rag.retrieval import RetrievalResult
 
 
 class GenerationHelperTests(unittest.TestCase):
+    def test_per_question_synthesis_budget_constant_is_available(self):
+        self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_CHARS, 0)
+
     def test_audit_synthesis_citations_flags_invalid_markers(self):
         sources = [{"index": 1}, {"index": 2}, {"index": 4}]
 
