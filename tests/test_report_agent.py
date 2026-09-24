@@ -1,31 +1,83 @@
 import unittest
 
+import src.agents.report_agent as report_agent_module
 from src.agents.report_agent import (
+    DEFAULT_REPORT_PROMPT_CHARS,
     DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
+    accept_topic_section,
+    apply_incomplete_equation_repairs,
+    apply_report_evidence_pack_repairs,
+    apply_validation_limitations,
     clean_markdown,
     build_report_prompt,
+    canonical_source_routing_issues,
+    compact_markdown_at_sentence,
     dedupe_sources,
     evidence_pack_questions,
     format_evidence_packs,
     format_question_coverage,
+    format_question_focused_evidence,
+    format_single_question_synthesis,
+    format_report_revision_feedback,
     format_report_section_outline,
     format_supporting_evidence,
+    frame_lines_as_prose,
+    cleanup_report_markdown_artifacts,
+    frame_source_line_usable,
+    finalize_report_output,
+    frame_body_needs_role_repair,
+    generate_single_report,
+    frame_section_needs_retry,
+    has_dangling_markdown_bullet,
+    has_truncated_markdown_list_item,
+    heading_ends_with_connector,
+    list_item_appears_truncated,
     missing_evidence_constraints,
+    markdown_appears_truncated,
+    malformed_equation_tail_present,
+    malformed_frame_section_issues,
     missing_sub_question_coverage,
     normalize_final_report,
+    normalize_nested_markdown_bullet,
     normalize_markdown_headings,
+    planner_question_heading,
+    remove_clipped_sentence_fragments,
     remove_unavailable_citation_markers,
+    remove_duplicate_section_labels,
+    required_topic_facet_issues,
+    framework_api_detail_issues,
+    rank_question_chunks,
+    repair_topic_headings,
+    repair_weak_frame_sections,
+    repair_truncated_markdown_line,
     report_context_gap_items,
     report_context_gap_queries,
+    report_evidence_gap_contradictions,
+    internal_gap_contradiction_issues,
+    report_per_question_synthesis_citation_gaps,
     report_generation_token_cap,
     report_quality_issues,
+    report_section_repair_questions,
+    report_synthesis_gap_contradictions,
+    report_needs_revision,
+    report_pack_citation_gaps,
+    report_section_concurrency,
+    repair_report_by_sections,
+    section_has_incomplete_equation,
     report_schema_issues,
     report_self_critique,
     report_sub_question_coverage_check,
+    resolve_report_coverage,
     rewrite_missing_sub_question_queries,
     sources_with_browser_results,
+    source_priority,
     slugify_filename,
+    strip_topic_section_headings,
     synthesis_coverage_gap_questions,
+    trim_report_prompt,
+    topic_heading_sequence_issues,
+    topic_section_acceptance_issues,
+    truncated_report_sections,
     unsupported_benchmark_metrics,
 )
 
@@ -67,6 +119,405 @@ Supported [1]. Unsupported [9].
 
         self.assertIn("report contains placeholder or non-source citation markers", issues)
 
+    def test_report_quality_flags_dangling_bullet(self):
+        issues = report_quality_issues(
+            "## Limitations\n-\n\n## References\n[1] https://example.com",
+            [{"index": 1, "url": "https://example.com"}],
+        )
+
+        self.assertTrue(has_dangling_markdown_bullet("## Limitations\n-"))
+        self.assertIn("report contains empty or dangling bullet items", issues)
+
+    def test_report_quality_flags_truncated_middle_section(self):
+        report = """
+## Executive Summary
+Summary is complete [1].
+
+## Cross-cutting Analysis and Synthesis
+Despite the computational
+
+## Conclusion
+Conclusion is complete [1].
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_quality_issues(report, [{"index": 1, "url": "https://example.com"}])
+
+        self.assertIn("Cross-cutting Analysis and Synthesis", truncated_report_sections(report))
+        self.assertIn("report contains truncated or incomplete section text", "\n".join(issues))
+
+    def test_report_quality_flags_truncated_list_items_inside_sections(self):
+        report = """
+## Executive Summary
+Summary is complete [1].
+
+## Cross-cutting Analysis and Synthesis
+- This variant can be implemen
+
+## Limitations and Open Questions
+- The models exhibit limited ability to generalize to novel compositional structures [
+
+## Conclusion
+Conclusion is complete [1].
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_quality_issues(report, [{"index": 1, "url": "https://example.com"}])
+
+        self.assertTrue(list_item_appears_truncated("- This variant can be implemen"))
+        self.assertTrue(list_item_appears_truncated("- The models exhibit limited ability to generalize to novel compositional structures ["))
+        self.assertTrue(has_truncated_markdown_list_item(report))
+        self.assertIn("Cross-cutting Analysis and Synthesis", truncated_report_sections(report))
+        self.assertIn("Limitations and Open Questions", truncated_report_sections(report))
+        self.assertIn("report contains truncated or incomplete section text", "\n".join(issues))
+
+    def test_report_quality_accepts_complete_list_items(self):
+        report = """
+## Cross-cutting Analysis and Synthesis
+- Complete synthesis bullet with a citation [1].
+- Complete limitation bullet with final punctuation.
+"""
+
+        self.assertFalse(has_truncated_markdown_list_item(report))
+        self.assertFalse(list_item_appears_truncated("- Complete synthesis bullet with a citation [1]."))
+
+    def test_report_quality_accepts_list_item_that_introduces_formula(self):
+        report = """
+## Seminal Papers
+- The attention weight matrix is computed as
+
+  \\[
+  A = softmax(QK^T)
+  \\]
+"""
+
+        self.assertFalse(has_truncated_markdown_list_item(report))
+
+    def test_cleanup_report_markdown_artifacts_repairs_final_output_breakage(self):
+        report = """
+## 1. Executive Summary
+The core intuition is that the model learns where to look in the input sequence for ea.
+
+## 3. Topic Sections
+
+### 3.1. Definition
+Supported definition [1].
+
+**Exact missing details**
+-
+
+## 4. Cross-cutting Analysis and Synthesis
+- The model learns where to look in the input sequence for ea
+- - **Bahdanau attention** uses recurrent processing [1].
+
+## References
+[1] https://example.com
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed empty missing-details stub", repairs)
+        self.assertIn("removed truncated list item", repairs)
+        self.assertIn("normalized nested bullet marker", repairs)
+        self.assertIn("trimmed incomplete sentence fragment", repairs)
+        self.assertNotIn("Exact missing details", cleaned)
+        self.assertNotIn("\n-\n", cleaned)
+        self.assertNotIn("- -", cleaned)
+        self.assertNotIn("for ea", cleaned)
+        self.assertIn("- **Bahdanau attention** uses recurrent processing [1].", cleaned)
+
+    def test_cleanup_report_markdown_artifacts_removes_malformed_equation_tail(self):
+        report = r"""
+## 3. Topic Sections
+
+### 3.1. Definition
+\[
+\text{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V
+\]\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V
+\]
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed malformed equation tail", repairs)
+        self.assertFalse(malformed_equation_tail_present(cleaned))
+        self.assertNotIn(r"\]\left", cleaned)
+
+    def test_topic_section_acceptance_falls_back_for_truncated_model_output(self):
+        question = 'What is the self-attention and multi-head attention mechanism introduced in "Attention is All You Need" and its equations?'
+        section = "Multi-head attention extends self-attention by running several independent attention heads in"
+        pack = {
+            "question": question,
+            "coverage": "covered",
+            "chunks": [
+                {
+                    "source_index": 3,
+                    "url": "https://arxiv.org/pdf/1706.03762",
+                    "title": "Attention Is All You Need",
+                    "content": "Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions.",
+                }
+            ],
+        }
+        sources = [{"index": 3, "url": "https://arxiv.org/pdf/1706.03762"}]
+
+        accepted, repairs, used_fallback = accept_topic_section(question, section, pack, {}, sources)
+
+        self.assertTrue(used_fallback)
+        self.assertIn("section acceptance issue: section appears truncated", repairs)
+        self.assertIn("Multi-head attention allows the model", accepted)
+        self.assertIn("[3]", accepted)
+        self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, {}, sources))
+
+    def test_topic_section_acceptance_uses_clean_framework_api_fallback(self):
+        question = "What are the official implementations and APIs for attention mechanisms in major deep-learning frameworks (TensorFlow/Keras, PyTorch) and how are they used?"
+        section = "Skip to main content. output Retrieves the output tensor(s) of a layer [6]."
+        pack = {
+            "question": question,
+            "coverage": "covered",
+            "chunks": [
+                {
+                    "source_index": 6,
+                    "url": "https://www.tensorflow.org/api_docs/python/tf/keras/layers/Attention",
+                    "title": "tf.keras.layers.Attention | TensorFlow v2.16.1",
+                    "content": "tf.keras.layers.Attention computes attention-style output tensors.",
+                },
+                {
+                    "source_index": 7,
+                    "url": "https://docs.pytorch.org/docs/2.14/nn.html",
+                    "title": "torch.nn - PyTorch documentation",
+                    "content": "TripletMarginWithDistanceLoss Creates a criterion. Vision Layers nn.PixelShuffle Rearrange elements.",
+                },
+            ],
+        }
+        sources = [
+            {"index": 6, "url": "https://www.tensorflow.org/api_docs/python/tf/keras/layers/Attention"},
+            {"index": 7, "url": "https://docs.pytorch.org/docs/2.14/nn.html"},
+        ]
+
+        accepted, repairs, used_fallback = accept_topic_section(question, section, pack, {}, sources)
+
+        self.assertTrue(used_fallback)
+        self.assertIn("tf.keras.layers.Attention", accepted)
+        self.assertIn("does not list a concrete PyTorch attention API", accepted)
+        self.assertNotIn("TripletMargin", accepted)
+        self.assertNotIn("Skip to main content", accepted)
+        self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, {}, sources))
+
+    def test_canonical_source_routing_requires_each_available_canonical_source(self):
+        question = "What are the main variants of attention mechanisms (additive/Bahdanau, multiplicative/Luong, self-attention, multi-head attention) and how do they differ?"
+        sources = [
+            {"index": 2, "url": "https://arxiv.org/pdf/1409.0473"},
+            {"index": 3, "url": "https://arxiv.org/pdf/1706.03762"},
+            {"index": 5, "url": "https://arxiv.org/pdf/1508.04025"},
+        ]
+        report = """
+## 3. Topic Sections
+
+### 3.1. Main Variants Of Attention Mechanisms Additive Bahdanau Multiplicative Luong Self-attention Multi-head Attention
+Variants are described with only one canonical citation [3].
+"""
+
+        self.assertEqual(canonical_source_routing_issues(report, [question], sources), [f"report does not cite canonical source for topic: {question}"])
+
+        fixed = report.replace("[3]", "[2] [3] [5]")
+        self.assertEqual(canonical_source_routing_issues(fixed, [question], sources), [])
+
+    def test_cleanup_report_markdown_artifacts_repairs_section_role_polish(self):
+        report = """
+## 1. Executive Summary
+**Executive Summary**
+Summary is complete [1].
+
+## 3. Topic Sections
+
+### 3.1. The Mathematical Formulation As Introduced In "Attention Is All
+Topic fact is supported [1].
+
+## 4. Cross-cutting Analysis and Synthesis
+- Topic fact is supported [1].
+- Another topic fact is supported [1].
+
+## 6. Conclusion
+- Topic fact is supported [1]. - Another copied bullet is supported [1].
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed duplicate section label", repairs)
+        self.assertIn("trimmed incomplete topic heading", repairs)
+        self.assertIn("replaced weak cross-cutting analysis and synthesis section", repairs)
+        self.assertIn("replaced weak conclusion section", repairs)
+        self.assertNotIn("**Executive Summary**", cleaned)
+        self.assertNotIn('"Attention Is All', cleaned)
+        self.assertNotIn("\n- Topic fact", cleaned)
+
+    def test_section_role_helpers_detect_and_repair_weak_frames(self):
+        report = """
+## 3. Topic Sections
+### 3.1. Topic
+Topic fact is supported [1].
+
+## 4. Cross-cutting Analysis and Synthesis
+- Copied fact [1].
+- Copied fact two [1].
+
+## 6. Conclusion
+- Copied conclusion [1].
+"""
+
+        self.assertTrue(frame_body_needs_role_repair("Conclusion", "- Copied conclusion [1]."))
+        no_label = remove_duplicate_section_labels("## 1. Executive Summary\n**Executive Summary**\nText [1].")
+        self.assertNotIn("**Executive Summary**", no_label)
+        fixed_headings, _ = repair_topic_headings('### 3.1. Title As Introduced In "Attention Is All')
+        self.assertEqual(fixed_headings, "### 3.1. Title")
+        repaired, repairs = repair_weak_frame_sections(report)
+        self.assertIn("replaced weak conclusion section", repairs)
+        self.assertNotIn("\n- Copied conclusion", repaired)
+
+    def test_repair_truncated_markdown_line_trims_suspicious_short_fragment(self):
+        repaired, repairs = repair_truncated_markdown_line(
+            "The evidence supports the definition [1]. The model learns where to look for ea."
+        )
+
+        self.assertEqual(repaired, "The evidence supports the definition [1].")
+        self.assertEqual(repairs, ["trimmed incomplete sentence fragment"])
+
+    def test_remove_clipped_sentence_fragments_drops_known_word_fragments(self):
+        cleaned = remove_clipped_sentence_fragments(
+            "Supported fact remains [1]. This sentence ends with representat. Next fact remains [2]."
+        )
+
+        self.assertEqual(cleaned, "Supported fact remains [1]. Next fact remains [2].")
+
+    def test_cleanup_report_markdown_artifacts_removes_clipped_frame_fragments(self):
+        report = """
+## 4. Cross-cutting Analysis and Synthesis
+Supported fact remains [1]. This sentence ends with representat. Next fact remains [2].
+Dot-product attention is faster due to optimized matrix-. where \\(d_k\\) is the dimension. Final fact remains [3].
+The conclusion should trim this clipped sentence before conditional compu. Preserved sentence remains [5].
+The citation marker was removed but punctuation should remain tidy .
+**Per-question synthesis support:** Debug labels should not appear [4].
+**Planner notes – Efficient attention variants**
+- Linformer repeats the same diagnostic note [5].
+- Reformer note should not leak into the report [5].
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed clipped sentence fragment", repairs)
+        self.assertIn("removed orphan citation punctuation", repairs)
+        self.assertIn("removed raw repair label", repairs)
+        self.assertIn("removed raw planner notes block", repairs)
+        self.assertIn("Supported fact remains [1].", cleaned)
+        self.assertIn("Next fact remains [2].", cleaned)
+        self.assertIn("Final fact remains [3].", cleaned)
+        self.assertIn("Preserved sentence remains [5].", cleaned)
+        self.assertIn("tidy.", cleaned)
+        self.assertIn("Debug labels should not appear [4].", cleaned)
+        self.assertNotIn("representat", cleaned)
+        self.assertNotIn("matrix-", cleaned)
+        self.assertNotIn("compu", cleaned)
+        self.assertNotIn("where \\(d_k\\)", cleaned)
+        self.assertNotIn("Per-question synthesis support", cleaned)
+        self.assertNotIn("Planner notes", cleaned)
+        self.assertNotIn("Reformer note", cleaned)
+
+    def test_normalize_nested_markdown_bullet_removes_duplicate_marker(self):
+        self.assertEqual(
+            normalize_nested_markdown_bullet("- - **Bahdanau attention** uses recurrence [1]."),
+            "- **Bahdanau attention** uses recurrence [1].",
+        )
+
+    def test_finalize_report_output_reports_repaired_status_after_cleanup(self):
+        question = "What is the definition of attention?"
+        report = """
+## 1. Executive Summary
+Summary is complete [1].
+
+## 2. Introduction and Context
+The evidence supports the definition [1]. The model learns where to look for ea.
+
+## 3. Topic Sections
+
+### 3.1. Definition Of Attention
+Attention is defined with cited support [1].
+
+**Exact missing details**
+-
+
+## 4. Cross-cutting Analysis and Synthesis
+- The evidence supports the definition [1].
+- The model learns where to look for ea
+- - **Attention** focuses relevant input [1].
+The citation marker was removed but punctuation should remain tidy .
+
+## 5. Limitations and Open Questions
+- No unresolved evidence gaps were explicitly stated.
+
+## 6. Conclusion
+Conclusion is complete [1].
+
+## References
+[1] https://example.com
+"""
+        sources = [{"index": 1, "url": "https://example.com"}]
+        context = {
+            "coverage_by_question": [],
+            "evidence_packs": [],
+            "per_question_synthesis": [],
+        }
+        validation = {
+            "coverage": {"missing": []},
+            "schema_issues": [],
+            "synthesis_gaps": [],
+            "false_gap_questions": [],
+            "pack_citation_gap_questions": [],
+            "report_issues": ["report contains empty or dangling bullet items"],
+        }
+
+        finalized, final_validation, finalization = finalize_report_output(
+            report,
+            sources,
+            [question],
+            "Attention is defined with cited support [1].",
+            "Attention is defined with cited support [1].",
+            "",
+            [],
+            context,
+            validation,
+        )
+
+        self.assertEqual(finalization["status"], "repaired")
+        self.assertEqual(final_validation["report_issues"], [])
+        self.assertNotIn("Exact missing details", finalized)
+        self.assertNotIn("- -", finalized)
+
+    def test_apply_validation_limitations_replaces_false_no_gap_summary(self):
+        report = """
+## 5. Limitations and Open Questions
+- No unresolved evidence gaps were explicitly stated.
+
+## References
+[1] https://example.com
+"""
+        validation = {
+            "coverage": {"missing": []},
+            "synthesis_gaps": [],
+            "false_gap_questions": [],
+            "pack_citation_gap_questions": ["What APIs are provided?"],
+            "report_issues": ["report lacks concrete framework API detail: What APIs are provided?"],
+        }
+
+        repaired = apply_validation_limitations(report, validation, [{"index": 1, "url": "https://example.com"}])
+
+        self.assertNotIn("No unresolved evidence gaps", repaired)
+        self.assertIn("Report lacks concrete framework API detail: What APIs are provided?.", repaired)
+        self.assertIn("Report section still needs evidence-pack citation support for: What APIs are provided?.", repaired)
+
     def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
         markdown = "### ## 1. Definition\nText."
 
@@ -80,6 +531,71 @@ Supported [1]. Unsupported [9].
         )
 
         self.assertIn("report includes benchmark metrics not present in evidence: 77%", issues)
+
+    def test_report_quality_flags_incomplete_equation_blocks(self):
+        report = """
+## Definition
+The scaled dot-product equation is listed below [1].
+\\[
+\\text{Attention}(Q,K,V) = \\operatorname{softmax}\\!
+\\]
+
+## References
+[1] https://arxiv.org/pdf/1706.03762
+"""
+
+        issues = report_quality_issues(report, [{"index": 1, "url": "https://arxiv.org/pdf/1706.03762"}])
+
+        self.assertTrue(section_has_incomplete_equation(report))
+        self.assertIn("report contains incomplete equations: Definition", issues)
+
+    def test_apply_incomplete_equation_repairs_fills_source_backed_scaled_dot_product_formula(self):
+        report = """
+## Definition
+The scaled dot-product equation is listed below [1].
+\\[
+\\text{Attention}(Q,K,V) = \\operatorname{softmax}\\!
+\\]
+
+## References
+[1] https://arxiv.org/pdf/1706.03762
+"""
+        evidence = r"\text{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V [1]"
+
+        repaired, repairs = apply_incomplete_equation_repairs(
+            report,
+            [{"index": 1, "url": "https://arxiv.org/pdf/1706.03762"}],
+            evidence,
+        )
+
+        self.assertEqual(repairs, ["repaired incomplete scaled dot-product equation"])
+        self.assertNotIn("\\operatorname{softmax}\\!\n\\]", repaired)
+        self.assertIn(r"\frac{QK^{\top}}{\sqrt{d_k}}\right)V", repaired)
+        self.assertFalse(section_has_incomplete_equation(repaired))
+
+    def test_malformed_frame_section_issues_flags_uncited_broken_cross_cutting(self):
+        report = """
+## 4. Cross-cutting Analysis and Synthesis
+The matrix-based formulation is. In the implementation described in the later work of, projections are normalized.
+
+## References
+[1] https://example.com
+"""
+
+        issues = malformed_frame_section_issues(report)
+
+        self.assertIn("report frame section lacks citations: Cross-cutting Analysis and Synthesis", issues)
+        self.assertIn("report frame section contains broken prose: Cross-cutting Analysis and Synthesis", issues)
+
+    def test_frame_lines_as_prose_preserves_citations(self):
+        prose = frame_lines_as_prose(["- **Attention** weights encoder states [1]."])
+
+        self.assertEqual(prose, "Attention weights encoder states [1].")
+
+    def test_frame_source_line_usable_rejects_continuation_fragments(self):
+        self.assertFalse(frame_source_line_usable("where \\(d_k\\) is the key dimension [2]."))
+        self.assertFalse(frame_source_line_usable("Formally,."))
+        self.assertTrue(frame_source_line_usable("Scaled dot-product attention uses query-key products [2]."))
 
     def test_unsupported_benchmark_metrics_allows_evidence_numbers(self):
         report = "BLEU-4 improves from 0.386 to 0.482 [1]."
@@ -149,6 +665,44 @@ Supported [1]. Unsupported [9].
         self.assertIn("## 1. Benchmark Demonstrate GLUE And WMT Performance", outline)
         self.assertIn("## 2. PyTorch MultiheadAttention Used", outline)
 
+    def test_planner_question_heading_truncates_at_word_boundary(self):
+        heading = planner_question_heading(
+            "What are the main variants of attention mechanisms (additive, multiplicative, self-attention, multi-head) and how do they differ?"
+        )
+
+        self.assertLessEqual(len(heading), 110)
+        self.assertFalse(heading.endswith("Multi-hea"))
+        self.assertFalse(heading_ends_with_connector(heading))
+
+    def test_planner_question_heading_removes_common_dangling_question_tails(self):
+        variants = planner_question_heading(
+            "What are the main variants of attention mechanisms (e.g., additive, multiplicative, self-attention) and how do they differ?"
+        )
+        complexity = planner_question_heading(
+            "What is the computational complexity of attention mechanisms and how does it scale with sequence length?"
+        )
+        quadratic = planner_question_heading(
+            "What are the main limitations and computational challenges of attention mechanisms, especially regarding quadratic complexity?"
+        )
+        sequence_scaling = planner_question_heading(
+            "What are the known limitations and computational challenges of attention mechanisms, especially regarding sequence-length scaling?"
+        )
+        improve = planner_question_heading(
+            "How does attention improve performance on machine-translation benchmarks compared to non-attention models?"
+        )
+        api = planner_question_heading(
+            "Where can official implementations and API references for attention be found in major frameworks (TensorFlow, PyTorch)?"
+        )
+
+        self.assertEqual(variants, "The Main Variants Of Attention Mechanisms And Their Differences")
+        self.assertEqual(complexity, "The Computational Complexity Of Attention Mechanisms And Sequence-length Scaling")
+        self.assertEqual(quadratic, "The Main Limitations And Computational Challenges Of Attention Mechanisms Especially Regarding Quadratic Complexity")
+        self.assertEqual(sequence_scaling, "The Known Limitations And Computational Challenges Of Attention Mechanisms")
+        self.assertEqual(improve, "How Attention Improves Performance On Machine-translation Benchmarks Compared To Non-attention Models")
+        self.assertEqual(api, "Official Implementations And API References For Attention In Major Frameworks TensorFlow PyTorch")
+        self.assertFalse(heading_ends_with_connector(variants))
+        self.assertFalse(heading_ends_with_connector(complexity))
+
     def test_build_report_prompt_requires_core_equation_for_formula_questions(self):
         prompt = build_report_prompt(
             objective="Attention mechanism",
@@ -206,6 +760,60 @@ Supported [1]. Unsupported [9].
         self.assertIn("Per-question evidence packs", prompt)
         self.assertIn("covered: How is the API used?", prompt)
         self.assertIn("Covered packs must be explained", prompt)
+        self.assertIn("Never label a covered evidence pack as an evidence gap", prompt)
+
+    def test_build_report_prompt_keeps_full_evidence_and_synthesis(self):
+        evidence_tail = "retrieved evidence tail should remain"
+        synthesis_tail = "synthesis tail should remain"
+        prompt = build_report_prompt(
+            objective="Large research topic",
+            output_format="report",
+            planner_questions=["What evidence should be covered?"],
+            synthesis=("Synthesis sentence. " * 1000) + synthesis_tail,
+            evidence=("[1] Evidence sentence. " * 1000) + evidence_tail,
+            sources=[{"index": 1, "url": "https://example.com"}],
+            evidence_packs=[
+                {
+                    "question": "What evidence should be covered?",
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "title": "Source", "content": "Useful evidence. " * 200}],
+                }
+            ],
+        )
+
+        self.assertIn(evidence_tail, prompt)
+        self.assertIn(synthesis_tail, prompt)
+        self.assertIn("Grounding requirement (strict - read this first)", prompt)
+        self.assertLess(prompt.index("Grounding requirement"), prompt.index("Per-question evidence packs"))
+
+    def test_build_report_prompt_can_compact_for_retry(self):
+        prompt = build_report_prompt(
+            objective="Large research topic",
+            output_format="report",
+            planner_questions=["What evidence should be covered?"],
+            synthesis="Synthesis sentence. " * 1000,
+            evidence="[1] Evidence sentence. " * 1000,
+            sources=[{"index": 1, "url": "https://example.com"}],
+            evidence_packs=[
+                {
+                    "question": "What evidence should be covered?",
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "title": "Source", "content": "Useful evidence. " * 200}],
+                }
+            ],
+            compact=True,
+        )
+
+        self.assertLessEqual(len(prompt), DEFAULT_REPORT_PROMPT_CHARS)
+        self.assertIn("Grounding requirement (strict - read this first)", prompt)
+
+    def test_trim_report_prompt_limits_prompt_size(self):
+        prompt = "Rules first.\n\n" + ("long evidence " * 2000)
+
+        trimmed = trim_report_prompt(prompt, max_chars=1000)
+
+        self.assertLessEqual(len(trimmed), 1000)
+        self.assertTrue(trimmed.startswith("Rules first."))
 
     def test_format_question_coverage_lists_status_and_sources(self):
         coverage = format_question_coverage([
@@ -236,6 +844,26 @@ Supported [1]. Unsupported [9].
         self.assertIn("[2] Benchmark", formatted)
         self.assertEqual(evidence_pack_questions(packs), ["What benchmark result is reported?"])
 
+    def test_format_evidence_packs_marks_formula_evidence_as_usable(self):
+        formatted = format_evidence_packs(
+            [
+                {
+                    "question": "What are the equations of additive attention?",
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "title": "Bahdanau paper",
+                            "content": "The alignment model is a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                        }
+                    ],
+                }
+            ]
+        )
+
+        self.assertIn("Use cited evidence from [2]", formatted)
+        self.assertIn("Formula/equation evidence is present", formatted)
+
     def test_format_supporting_evidence_uses_chunks_once(self):
         context = {
             "supporting_chunks": [
@@ -258,6 +886,132 @@ Supported [1]. Unsupported [9].
 
         self.assertEqual(evidence.count("Attention evidence"), 1)
         self.assertIn("[1]", evidence)
+
+    def test_format_supporting_evidence_keeps_full_chunk_content(self):
+        tail = "important formula appears at the end"
+        context = {
+            "retrieved_chunks": [
+                {
+                    "source_index": 2,
+                    "title": "Long source",
+                    "url": "https://example.com/long",
+                    "content": f"{'context evidence ' * 700}{tail}",
+                }
+            ]
+        }
+
+        evidence = format_supporting_evidence(context)
+
+        self.assertIn(tail, evidence)
+
+    def test_format_evidence_packs_keeps_all_chunk_content(self):
+        first_tail = "first chunk tail"
+        second_tail = "second chunk tail"
+        formatted = format_evidence_packs(
+            [
+                {
+                    "question": "What evidence is available?",
+                    "coverage": "covered",
+                    "chunks": [
+                        {"source_index": 1, "title": "One", "content": f"{'alpha ' * 100}{first_tail}"},
+                        {"source_index": 2, "title": "Two", "content": f"{'beta ' * 100}{second_tail}"},
+                    ],
+                }
+            ]
+        )
+
+        self.assertIn(first_tail, formatted)
+        self.assertIn(second_tail, formatted)
+
+    def test_format_question_focused_evidence_keeps_per_question_details(self):
+        context = {
+            "planner_questions": [
+                "What is the equation?",
+                "What benchmark result is reported?",
+            ],
+            "retrieved_chunks": [
+                {
+                    "source_index": 1,
+                    "title": "Paper",
+                    "url": "https://paper.example",
+                    "content": "General background without the requested detail.",
+                },
+                {
+                    "source_index": 2,
+                    "title": "Equation paper",
+                    "url": "https://equation.example",
+                    "content": "The core formula is score(q,k)=exp(q k) and alpha=sum weights.",
+                },
+                {
+                    "source_index": 3,
+                    "title": "Benchmark paper",
+                    "url": "https://benchmark.example",
+                    "content": "The benchmark result improves BLEU from 20.1 to 24.3.",
+                },
+            ],
+        }
+
+        evidence = format_question_focused_evidence(context, context["planner_questions"])
+
+        self.assertIn("Question: What is the equation?", evidence)
+        self.assertIn("score(q,k)=exp(q k)", evidence)
+        self.assertIn("Question: What benchmark result is reported?", evidence)
+        self.assertIn("BLEU from 20.1 to 24.3", evidence)
+
+    def test_generate_single_report_sends_full_prompt(self):
+        captured = {}
+
+        class Message:
+            content = "## Executive Summary\nDone.\n\n## References\n"
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "test-model"
+
+        def fake_completion(client, **kwargs):
+            captured["prompt"] = kwargs["messages"][1]["content"]
+            return Response()
+
+        original = report_agent_module.create_chat_completion_with_retries
+        report_agent_module.create_chat_completion_with_retries = fake_completion
+        try:
+            tail = "prompt tail should remain"
+            generate_single_report(object(), "test-model", f"{'prompt content ' * 1200}{tail}")
+        finally:
+            report_agent_module.create_chat_completion_with_retries = original
+
+        self.assertIn(tail, captured["prompt"])
+
+    def test_generate_single_report_retries_with_compact_prompt_on_context_error(self):
+        calls = []
+
+        class Message:
+            content = "## Executive Summary\nDone.\n\n## References\n"
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+            model = "test-model"
+
+        def fake_completion(client, **kwargs):
+            calls.append(kwargs["messages"][1]["content"])
+            if len(calls) == 1:
+                raise RuntimeError("context_length_exceeded: Please reduce the length of the messages or completion.")
+            return Response()
+
+        original = report_agent_module.create_chat_completion_with_retries
+        report_agent_module.create_chat_completion_with_retries = fake_completion
+        try:
+            generate_single_report(object(), "test-model", "full prompt", fallback_prompt="compact prompt")
+        finally:
+            report_agent_module.create_chat_completion_with_retries = original
+
+        self.assertEqual(calls, ["full prompt", "compact prompt"])
 
     def test_missing_sub_question_coverage_flags_missing_topic(self):
         report = "The report defines attention and explains scoring."
@@ -320,7 +1074,7 @@ No cited source markers were used.
         self.assertIn("missing schema section: cross-cutting analysis/synthesis", issues)
         self.assertIn("missing planner topic section: Benchmark Demonstrate GLUE And WMT Performance", issues)
 
-    def test_report_schema_accepts_nested_markdown_headings(self):
+    def test_report_schema_accepts_sequential_topic_headings(self):
         report = """# Topic
 
 ### 1. Executive Summary
@@ -329,7 +1083,7 @@ Summary.
 ### 2. Introduction and Context
 Context.
 
-### 3. Benchmark Demonstrate GLUE And WMT Performance
+### 3.1. Benchmark Demonstrate GLUE And WMT Performance
 Benchmarks.
 
 ```python
@@ -353,6 +1107,75 @@ Done.
 
         self.assertEqual(issues, [])
 
+    def test_report_schema_flags_unnumbered_topic_heading(self):
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+## 3. Topic Sections
+
+### Scaled Dot-product Self-attention Work As Described In Attention Is All You Need
+Details.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = topic_heading_sequence_issues(
+            report,
+            ['How does scaled dot-product self-attention work as described in "Attention Is All You Need" (Vaswani et al., 2017)?'],
+        )
+
+        self.assertIn("planner topic heading must be numbered 3.1", "\n".join(issues))
+        self.assertIn("missing sequential planner topic heading: 3.1", issues)
+
+    def test_report_schema_flags_skipped_topic_number(self):
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+## 3. Topic Sections
+
+### 3.1. First Topic
+First.
+
+### 3.3. Second Topic
+Second.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = topic_heading_sequence_issues(report, ["What is the first topic?", "What is the second topic?"])
+
+        self.assertIn("missing sequential planner topic heading: 3.2", issues)
+
     def test_report_schema_accepts_concise_topic_heading_for_long_question(self):
         report = """# Topic
 
@@ -362,7 +1185,7 @@ Summary.
 ## Introduction and Context
 Context.
 
-### Benchmark Evidence of Performance Impact
+### 3.1. Benchmark Evidence of Performance Impact
 Benchmarks.
 
 ## Cross-cutting Analysis and Synthesis
@@ -384,6 +1207,107 @@ Done.
         )
 
         self.assertEqual(issues, [])
+
+    def test_strip_topic_section_headings_removes_model_emitted_headings(self):
+        section = """### Accidental Model Heading
+Supported topic prose [1].
+
+#### Extra Subheading
+More supported prose [1].
+"""
+
+        body = strip_topic_section_headings(section)
+
+        self.assertNotIn("###", body)
+        self.assertIn("Supported topic prose [1].", body)
+        self.assertIn("More supported prose [1].", body)
+
+    def test_report_schema_flags_mid_word_truncated_topic_heading(self):
+        question = "What are the main variants of attention mechanisms (additive, multiplicative, self-attention, multi-head) and how do they differ?"
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+### The Main Variants Of Attention Mechanisms Additive Multiplicative Self-attention Multi-hea
+Variants.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_schema_issues(report, [question])
+
+        self.assertIn("malformed planner topic heading appears truncated", "\n".join(issues))
+
+    def test_report_schema_flags_connector_truncated_topic_heading(self):
+        questions = [
+            "What are the main variants of attention mechanisms (e.g., additive, multiplicative, self-attention) and how do they differ?",
+            "What is the computational complexity of attention mechanisms and how does it scale with sequence length?",
+        ]
+        report = """# Topic
+
+## Executive Summary
+Summary.
+
+## Introduction and Context
+Context.
+
+### 3.3. The Main Variants Of Attention Mechanisms E.g Additive Multiplicative Self-attention And
+Variants.
+
+### 3.5. The Computational Complexity Of Attention Mechanisms And How Does It Scale With Sequence
+Complexity.
+
+## Cross-cutting Analysis and Synthesis
+Synthesis.
+
+## Limitations and Open Questions
+Limits.
+
+## Conclusion
+Done.
+
+## References
+[1] https://example.com
+"""
+
+        issues = report_schema_issues(report, questions)
+
+        self.assertGreaterEqual("\n".join(issues).count("malformed planner topic heading appears truncated"), 2)
+
+    def test_report_section_repair_questions_routes_malformed_and_truncated_topics(self):
+        questions = [
+            "What is the computational complexity of attention mechanisms and how does it scale with sequence length?",
+            "What are common limitations or challenges of attention mechanisms?",
+        ]
+        validation = {
+            "coverage": {"missing": []},
+            "false_gap_questions": [],
+            "pack_citation_gap_questions": [],
+            "schema_issues": [
+                "malformed planner topic heading appears truncated: The Computational Complexity Of Attention Mechanisms And How Does It Scale With Sequence"
+            ],
+            "report_issues": [
+                "report contains truncated or incomplete section text: Common Limitations Or Challenges Of Attention Mechanisms"
+            ],
+        }
+
+        repairs = report_section_repair_questions(validation, questions)
+
+        self.assertEqual(repairs, questions)
 
     def test_clean_markdown_strips_open_thinking_block(self):
         text = "Useful.\n<think>hidden reasoning that never closes"
@@ -430,6 +1354,671 @@ Done.
         self.assertEqual(synthesis_coverage_gap_questions(context, plan["sub_questions"]), [question])
         self.assertEqual(report_context_gap_items(context, plan), [question])
 
+    def test_synthesis_gap_ignores_stale_missing_when_pack_has_cited_evidence(self):
+        question = "What equation is used?"
+        context = {
+            "coverage_by_question": [{"question": question, "status": "missing", "source_indexes": []}],
+            "evidence_packs": [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "content": "The equation is present."}],
+                }
+            ],
+        }
+
+        self.assertEqual(synthesis_coverage_gap_questions(context, [question]), [])
+
+    def test_synthesis_gap_ignores_stale_partial_when_per_question_synthesis_has_citations(self):
+        question = "What are the major applications of attention mechanisms?"
+        context = {
+            "coverage_by_question": [{"question": question, "status": "partial", "source_indexes": []}],
+            "per_question_synthesis": [
+                {
+                    "question": question,
+                    "synthesis": "Attention is used in image captioning and speech recognition [5] [6].",
+                    "source_indexes": [5, 6],
+                }
+            ],
+        }
+
+        self.assertEqual(synthesis_coverage_gap_questions(context, [question]), [])
+
+    def test_resolve_report_coverage_prefers_cited_evidence_pack(self):
+        question = "How does the method work?"
+
+        resolved = resolve_report_coverage(
+            [{"question": question, "status": "missing", "source_indexes": [], "missing_reason": "No match."}],
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 2, "content": "The method is explained with source evidence."}],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(resolved[0]["status"], "covered")
+        self.assertEqual(resolved[0]["source_indexes"], [2])
+        self.assertEqual(resolved[0]["missing_reason"], "")
+
+    def test_report_evidence_gap_contradictions_flags_false_gap(self):
+        question = "What are the main variants such as Alpha and Beta?"
+        report = """
+## Main Variants Such As Alpha And Beta
+Alpha is covered by source evidence [1].
+Beta evidence not provided in the supplied sources.
+
+## References
+[1] https://example.com
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [{"source_index": 1, "content": "Beta is described as a supported variant."}],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_evidence_gap_contradictions_detects_covered_source_denial(self):
+        question = "What are the core equations governing the original Bahdanau additive attention mechanism?"
+        report = """
+## Core Equations Governing Bahdanau Additive Attention
+Evidence Gap: The provided sources mention Bahdanau attention but do not contain the explicit compatibility function.
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "covered",
+                    "chunks": [
+                        {
+                            "source_index": 7,
+                            "content": "The additive attention compatibility function is available in this source.",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_evidence_gap_contradictions_detects_partial_formula_denial(self):
+        question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Bahdanau Attention Mechanism
+The supplied evidence does not contain the explicit additive-attention formulas from the original Bahdanau paper [2].
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj), where Wa and Ua are matrices.",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_evidence_gap_contradictions_allows_cited_partial_pack_gap(self):
+        question = "What are the standard implementations and APIs for attention in PyTorch and TensorFlow?"
+        report = """
+## Standard Implementations And APIs For Attention In PyTorch And TensorFlow
+TensorFlow provides an online API reference for public functions, classes, and modules [4].
+Concrete PyTorch API references are missing from the supplied evidence [4].
+"""
+
+        false_gaps = report_evidence_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "missing_facets": ["PyTorch"],
+                    "chunks": [
+                        {
+                            "source_index": 4,
+                            "content": "TensorFlow provides API documentation, but the retrieved chunk does not list PyTorch APIs.",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [])
+
+    def test_report_pack_citation_gaps_flags_uncited_matching_section(self):
+        question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Bahdanau Attention Mechanism
+Bahdanau additive attention uses an alignment score with a tanh compatibility function.
+
+## References
+[3] https://example.com/other
+"""
+
+        gaps = report_pack_citation_gaps(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(gaps, [question])
+
+    def test_report_pack_citation_gaps_allows_pack_citation(self):
+        question = "What are the core equations of the original additive (Bahdanau) attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Bahdanau Attention Mechanism
+Bahdanau additive attention uses an alignment score with a tanh compatibility function [2].
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+
+        gaps = report_pack_citation_gaps(
+            report,
+            [
+                {
+                    "question": question,
+                    "coverage": "partial",
+                    "chunks": [
+                        {
+                            "source_index": 2,
+                            "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                        }
+                    ],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(gaps, [])
+
+    def test_report_synthesis_gap_contradictions_flags_false_application_gap(self):
+        question = "What are the major applications of attention mechanisms across NLP, vision, and speech?"
+        report = """
+## Major Applications Of Attention Mechanisms Across NLP Vision And Speech
+Attention is used in translation [1].
+Evidence for vision and speech applications is missing.
+"""
+
+        false_gaps = report_synthesis_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "synthesis": "Vision applications include image captioning [5]. Speech recognition is also supported [6].",
+                    "source_indexes": [5, 6],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [question])
+
+    def test_report_synthesis_gap_contradictions_allows_specific_missing_detail(self):
+        question = "What are the standard implementations and APIs for attention in PyTorch and TensorFlow?"
+        report = """
+## Standard Implementations And APIs For Attention In PyTorch And TensorFlow
+TensorFlow provides an online API reference for public functions, classes, and modules [4].
+Specific PyTorch API references are missing, and exact TensorFlow attention classes are not listed [4].
+"""
+
+        false_gaps = report_synthesis_gap_contradictions(
+            report,
+            [
+                {
+                    "question": question,
+                    "synthesis": (
+                        "TensorFlow provides an online API reference for public functions, classes, and modules [4]. "
+                        "The exact TensorFlow attention classes are not listed in the retrieved evidence. "
+                        "Any description of PyTorch attention APIs is absent."
+                    ),
+                    "source_indexes": [4],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(false_gaps, [])
+
+    def test_report_per_question_synthesis_citation_gaps_flags_dropped_synthesis_sources(self):
+        question = "What is the definition of attention?"
+        report = """
+## Definition Of Attention
+Attention lets a model focus on specific input elements.
+"""
+
+        gaps = report_per_question_synthesis_citation_gaps(
+            report,
+            [
+                {
+                    "question": question,
+                    "synthesis": "Attention lets a model focus on specific input elements [5].",
+                    "source_indexes": [5],
+                }
+            ],
+            [question],
+        )
+
+        self.assertEqual(gaps, [question])
+
+    def test_report_needs_revision_for_false_evidence_gap(self):
+        self.assertTrue(
+            report_needs_revision(
+                {
+                    "report_issues": ["report marks covered evidence as a gap: What is covered?"],
+                    "schema_issues": [],
+                    "synthesis_gaps": [],
+                    "false_gap_questions": ["What is covered?"],
+                    "coverage": {"missing": []},
+                }
+            )
+        )
+
+    def test_report_revision_feedback_includes_false_gap_questions(self):
+        question = "What are the core equations governing Bahdanau attention?"
+
+        feedback = format_report_revision_feedback(
+            {
+                "report_issues": [],
+                "schema_issues": [],
+                "coverage": {"missing": []},
+                "synthesis_gaps": [],
+                "false_gap_questions": [question],
+            }
+        )
+
+        self.assertIn("false evidence gap to remove", feedback)
+        self.assertIn(question, feedback)
+
+    def test_report_revision_feedback_includes_pack_citation_gaps(self):
+        question = "What source-backed topic needs a citation?"
+
+        feedback = format_report_revision_feedback(
+            {
+                "report_issues": [],
+                "schema_issues": [],
+                "coverage": {"missing": []},
+                "synthesis_gaps": [],
+                "false_gap_questions": [],
+                "pack_citation_gap_questions": [question],
+            }
+        )
+
+        self.assertIn("missing evidence-pack citation", feedback)
+        self.assertIn(question, feedback)
+
+    def test_apply_report_evidence_pack_repairs_removes_false_gap_and_adds_cited_note(self):
+        question = "What are the core equations of the original additive attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Attention Mechanism
+Evidence Gap: The supplied evidence does not contain the explicit formula.
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+        packs = [
+            {
+                "question": question,
+                "coverage": "partial",
+                "chunks": [
+                    {
+                        "source_index": 2,
+                        "title": "Original paper",
+                        "url": "https://arxiv.org/pdf/1409.0473",
+                        "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                    }
+                ],
+            }
+        ]
+
+        repaired, repairs = apply_report_evidence_pack_repairs(
+            report,
+            packs,
+            {"false_gap_questions": [question], "pack_citation_gap_questions": []},
+            [question],
+            [{"index": 2, "url": "https://arxiv.org/pdf/1409.0473"}],
+        )
+
+        self.assertEqual(repairs, [question])
+        self.assertNotIn("Evidence Gap", repaired)
+        self.assertNotIn("Core evidence", repaired)
+        self.assertIn("a(si-1,hj) = va^T tanh", repaired)
+        self.assertIn("[2]", repaired)
+        self.assertIn("1409.0473", repaired)
+
+    def test_apply_report_evidence_pack_repairs_adds_missing_pack_citation(self):
+        question = "What are the core equations of the original additive attention mechanism?"
+        report = """
+## Core Equations Of The Original Additive Attention Mechanism
+Additive attention uses a tanh compatibility function.
+
+## References
+No cited source markers were used.
+"""
+        packs = [
+            {
+                "question": question,
+                "coverage": "partial",
+                "chunks": [
+                    {
+                        "source_index": 2,
+                        "title": "Original paper",
+                        "url": "https://arxiv.org/pdf/1409.0473",
+                        "content": "The alignment model uses a(si-1,hj) = va^T tanh(Wa si-1 + Ua hj).",
+                    }
+                ],
+            }
+        ]
+
+        repaired, repairs = apply_report_evidence_pack_repairs(
+            report,
+            packs,
+            {"false_gap_questions": [], "pack_citation_gap_questions": [question]},
+            [question],
+            [{"index": 2, "url": "https://arxiv.org/pdf/1409.0473"}],
+        )
+
+        self.assertEqual(repairs, [question])
+        self.assertNotIn("Core evidence", repaired)
+        self.assertIn("a(si-1,hj) = va^T tanh", repaired)
+        self.assertIn("[2] https://arxiv.org/pdf/1409.0473", repaired)
+
+    def test_apply_report_repairs_prefer_per_question_synthesis_over_raw_pack_chunk(self):
+        question = "What are the major applications of attention mechanisms?"
+        report = """
+## Major Applications Of Attention Mechanisms
+Evidence for vision and speech applications is missing.
+
+## References
+No cited source markers were used.
+"""
+        packs = [
+            {
+                "question": question,
+                "coverage": "covered",
+                "chunks": [
+                    {
+                        "source_index": 2,
+                        "title": "PDF",
+                        "content": "ut. The quadratic dependence on n poses a challenge for very long input sequences.",
+                    }
+                ],
+            }
+        ]
+        synthesis = [
+            {
+                "question": question,
+                "synthesis": "Attention is used for image captioning [5] and speech recognition [6].",
+                "source_indexes": [5, 6],
+            }
+        ]
+
+        repaired, repairs = apply_report_evidence_pack_repairs(
+            report,
+            packs,
+            {"false_gap_questions": [question], "pack_citation_gap_questions": []},
+            [question],
+            [{"index": 5, "url": "https://vision.example"}, {"index": 6, "url": "https://speech.example"}],
+            per_question_synthesis=synthesis,
+        )
+
+        self.assertEqual(repairs, [question])
+        self.assertNotIn("Per-question synthesis support", repaired)
+        self.assertIn("image captioning [5]", repaired)
+        self.assertIn("speech recognition [6]", repaired)
+        self.assertNotIn("quadratic dependence", repaired)
+
+    def test_required_topic_facet_issues_flags_missing_compound_api_facet(self):
+        question = "What are the major open-source implementations and APIs for attention mechanisms in PyTorch and TensorFlow?"
+        report = """
+## 3. Topic Sections
+### 3.1. Major Open-source Implementations And APIs For Attention Mechanisms In PyTorch And TensorFlow
+**PyTorch**
+PyTorch provides `torch.nn.MultiheadAttention` [6].
+**TensorFlow**
+**Per-question synthesis support:** PyTorch provides `torch.nn.MultiheadAttention` [6].
+"""
+
+        issues = required_topic_facet_issues(report, [question])
+
+        self.assertEqual(issues, [f"report omits required topic facet: {question}"])
+
+    def test_required_topic_facet_issues_allows_explicit_facet_gap(self):
+        question = "What are the major open-source implementations and APIs for attention mechanisms in PyTorch and TensorFlow?"
+        report = """
+## 3. Topic Sections
+### 3.1. Major Open-source Implementations And APIs For Attention Mechanisms In PyTorch And TensorFlow
+PyTorch provides `torch.nn.MultiheadAttention` [6].
+The retrieved evidence does not list a concrete TensorFlow attention API.
+"""
+
+        self.assertEqual(required_topic_facet_issues(report, [question]), [])
+
+    def test_framework_api_detail_issues_flags_generic_framework_comparison(self):
+        question = "How do implementations of attention mechanisms differ across major deep-learning frameworks (TensorFlow, PyTorch) and what APIs are provided?"
+        report = """
+## 3. Topic Sections
+### 3.1. Implementations Of Attention Mechanisms Differ Across Major Deep-learning Frameworks TensorFlow PyTorch
+PyTorch provides `torch.nn.MultiheadAttention` for attention layers [7].
+TensorFlow uses a static graph programming model in the cited framework comparison [7].
+"""
+
+        issues = framework_api_detail_issues(report, [question])
+
+        self.assertEqual(issues, [f"report lacks concrete framework API detail: {question}"])
+
+    def test_framework_api_detail_issues_allows_concrete_api_or_explicit_gap(self):
+        question = "How do implementations of attention mechanisms differ across major deep-learning frameworks (TensorFlow, PyTorch) and what APIs are provided?"
+        report = """
+## 3. Topic Sections
+### 3.1. Implementations Of Attention Mechanisms Differ Across Major Deep-learning Frameworks TensorFlow PyTorch
+PyTorch provides `torch.nn.MultiheadAttention` for attention layers [6].
+The retrieved evidence does not list a concrete TensorFlow attention API.
+"""
+
+        self.assertEqual(framework_api_detail_issues(report, [question]), [])
+
+    def test_canonical_source_routing_issues_flags_wrong_luong_source(self):
+        question = "What is the original formulation of multiplicative (Luong) attention and its core equations?"
+        report = """
+## 3. Topic Sections
+### 3.1. The Original Formulation Of Multiplicative Luong Attention And Its Core Equations
+The section gives the additive Bahdanau equation instead [1].
+"""
+        sources = [
+            {"index": 1, "url": "https://arxiv.org/pdf/1409.0473"},
+            {"index": 5, "url": "https://arxiv.org/pdf/1508.04025"},
+        ]
+
+        issues = canonical_source_routing_issues(report, [question], sources)
+
+        self.assertEqual(issues, [f"report does not cite canonical source for topic: {question}"])
+
+    def test_internal_gap_contradiction_issues_flags_self_attention_gap(self):
+        report = """
+## 3. Topic Sections
+### 3.1. Variants
+Self-attention – The provided sources do not contain a description of self-attention.
+
+### 3.2. Transformer
+Self-attention computes relationships within the same sequence [2].
+"""
+
+        self.assertEqual(
+            internal_gap_contradiction_issues(report),
+            ["report contains contradicted evidence gap: self-attention"],
+        )
+
+    def test_rank_question_chunks_prefers_canonical_luong_source(self):
+        chunks = [
+            {
+                "source_index": 1,
+                "url": "https://arxiv.org/pdf/1409.0473",
+                "content": "The alignment model uses a tanh additive attention score.",
+            },
+            {
+                "source_index": 5,
+                "url": "https://arxiv.org/pdf/1508.04025",
+                "content": "Luong multiplicative attention defines dot, general, and concat score functions.",
+            },
+        ]
+
+        ranked = rank_question_chunks(
+            "What is the original formulation of multiplicative (Luong) attention and its core equations?",
+            chunks,
+        )
+
+        self.assertEqual(ranked[0]["source_index"], 5)
+
+    def test_source_priority_prefers_official_docs_and_primary_papers(self):
+        self.assertGreater(source_priority("https://docs.pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html"), source_priority("https://example-blog.com/attention"))
+        self.assertGreater(source_priority("https://arxiv.org/pdf/1706.03762"), source_priority("https://www.sotaaz.com/post/attention-mechanism-implementation-en"))
+
+    def test_per_question_synthesis_repair_note_does_not_cut_mid_sentence(self):
+        text = (
+            "Attention is used for image captioning [5]. "
+            "Speech recognition is supported by the retrieved evidence [6]. "
+            "This final sentence should be dropped rather than clipped in the middle of a word [6]."
+        )
+
+        snippet = compact_markdown_at_sentence(text, 95)
+
+        self.assertEqual(snippet, "Attention is used for image captioning [5].")
+
+    def test_format_single_question_synthesis_lists_source_markers(self):
+        text = format_single_question_synthesis(
+            "What is attention?",
+            {"synthesis": "Attention focuses input elements [5].", "source_indexes": [5]},
+        )
+
+        self.assertIn("Synthesis source markers: [5]", text)
+        self.assertIn("Attention focuses input elements [5].", text)
+
+    def test_markdown_appears_truncated_detects_dangling_final_phrase(self):
+        self.assertTrue(markdown_appears_truncated("The practical impact of"))
+        self.assertFalse(markdown_appears_truncated("The practical impact is supported [2]."))
+
+    def test_frame_section_needs_retry_flags_empty_or_uncited_framing(self):
+        digest = "The benchmark result is supported [2]."
+
+        self.assertTrue(frame_section_needs_retry("", "Limitations and Open Questions", digest))
+        self.assertTrue(frame_section_needs_retry("The practical impact of", "Cross-cutting Analysis and Synthesis", digest))
+        self.assertTrue(frame_section_needs_retry("This is complete but has no citation.", "Conclusion", digest))
+        self.assertFalse(frame_section_needs_retry("This complete conclusion summarizes the repaired benchmark evidence with a valid citation [2].", "Conclusion", digest))
+
+    def test_repair_report_by_sections_regenerates_only_target_topics_and_refreshes_framing_without_llm(self):
+        question = "What benchmark result is reported?"
+        calls = []
+
+        class Message:
+            def __init__(self, content):
+                self.content = content
+
+        class Choice:
+            def __init__(self, content):
+                self.message = Message(content)
+
+        class Response:
+            def __init__(self, content):
+                self.choices = [Choice(content)]
+                self.model = "test-model"
+
+        def fake_completion(client, **kwargs):
+            prompt = kwargs["messages"][1]["content"]
+            calls.append(prompt)
+            self.assertIn("Sub-question this section must answer:", prompt)
+            return Response("The benchmark result is 28.4 BLEU, which directly answers the planner question with cited evidence [2].")
+
+        original = report_agent_module.create_chat_completion_with_retries
+        original_single = report_agent_module.generate_single_report
+        report_agent_module.create_chat_completion_with_retries = fake_completion
+        report_agent_module.generate_single_report = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("single-shot repair should not run"))
+        try:
+            repaired, _, diagnostics = repair_report_by_sections(
+                object(),
+                "test-model",
+                report="""
+## 1. Executive Summary
+Old summary.
+
+## 2. Introduction and Context
+Old intro.
+
+## 3. Topic Sections
+
+### 3.1 Benchmark Result Is Reported
+The benchmark result is discussed without the expected citation.
+
+## 4. Cross-cutting Analysis and Synthesis
+Old synthesis.
+
+## 5. Limitations and Open Questions
+Old limitations.
+
+## 6. Conclusion
+Old conclusion.
+""",
+                objective="Attention mechanism",
+                coverage_questions=[question],
+                evidence_packs=[
+                    {
+                        "question": question,
+                        "coverage": "covered",
+                        "chunks": [{"source_index": 2, "title": "Paper", "content": "The benchmark result is 28.4 BLEU."}],
+                    }
+                ],
+                sources=[{"index": 2, "url": "https://example.com/paper"}],
+                validation={"pack_citation_gap_questions": [question], "false_gap_questions": [], "coverage": {"missing": []}, "schema_issues": []},
+                repair_feedback="- missing evidence-pack citation to add in matching section: What benchmark result is reported?",
+                per_question_synthesis=[],
+            )
+        finally:
+            report_agent_module.create_chat_completion_with_retries = original
+            report_agent_module.generate_single_report = original_single
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(diagnostics["section_repairs"][0]["question"], question)
+        self.assertTrue(diagnostics["framing_refreshed"])
+        self.assertIn("The benchmark result is 28.4 BLEU", repaired)
+        self.assertIn("The benchmark result is 28.4 BLEU, which directly answers the planner question with cited evidence [2].", repaired)
+
     def test_rewrite_missing_sub_question_queries_keeps_focus(self):
         queries = rewrite_missing_sub_question_queries(
             "Attention mechanism",
@@ -446,6 +2035,20 @@ Done.
 
     def test_report_generation_token_cap_stays_under_budget(self):
         self.assertLessEqual(report_generation_token_cap(), DEFAULT_REPORT_TOTAL_TOKEN_BUDGET)
+
+    def test_report_section_concurrency_is_bounded_and_configurable(self):
+        original = report_agent_module.os.environ.get("REPORT_SECTION_CONCURRENCY")
+        try:
+            report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = "12"
+            self.assertEqual(report_section_concurrency(20), 8)
+            self.assertEqual(report_section_concurrency(3), 3)
+            report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = "bad"
+            self.assertEqual(report_section_concurrency(6), 4)
+        finally:
+            if original is None:
+                report_agent_module.os.environ.pop("REPORT_SECTION_CONCURRENCY", None)
+            else:
+                report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = original
 
     def test_slugify_filename(self):
         self.assertEqual(slugify_filename("What is Attention Mechanism?"), "what-is-attention-mechanism")
