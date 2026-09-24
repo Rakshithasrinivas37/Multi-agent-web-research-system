@@ -19,6 +19,7 @@ from src.rag.generation import (
     DEFAULT_REPORT_SOURCE_URL_K,
     DEFAULT_REPORT_TOP_K,
     rag_generation_model,
+    synthesis_graphrag_enabled,
     synthesize_report_from_research_plan,
 )
 from src.rag.retrieval import (
@@ -164,6 +165,7 @@ class SynthesisAgent:
             "max_tokens": self.max_tokens,
             "supporting_chunk_count": self.supporting_chunk_count,
             "include_retrieved_chunks": self.include_retrieved_chunks,
+            "synthesis_graphrag": synthesis_graphrag_enabled(),
         }
 
     def write_to_memory(

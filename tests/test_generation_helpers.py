@@ -6,6 +6,9 @@ from io import StringIO
 from unittest.mock import patch
 
 from src.rag.generation import (
+    DEFAULT_PER_QUESTION_SYNTHESIS_CHARS,
+    DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS,
+    DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS,
     audit_synthesis_citations,
     build_sub_question_evidence_packs,
     build_coverage_by_question,
@@ -33,6 +36,7 @@ from src.rag.generation import (
     trim_synthesis_prompt,
 )
 from src.rag.evidence_spans import supporting_chunks_from_evidence_spans
+from src.rag.evidence_graph import build_evidence_graph, expand_chunks_for_question
 from src.rag.query_helpers import broad_query_hints, question_required_facets, retrieval_topic_phrase
 from src.rag.sub_question_context import (
     browser_question_context_retrieve,
@@ -59,6 +63,11 @@ from src.rag.retrieval import RetrievalResult
 
 
 class GenerationHelperTests(unittest.TestCase):
+    def test_per_question_synthesis_budget_constant_is_available(self):
+        self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_CHARS, 0)
+        self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS, 0)
+        self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS, 0)
+
     def test_audit_synthesis_citations_flags_invalid_markers(self):
         sources = [{"index": 1}, {"index": 2}, {"index": 4}]
 
@@ -206,6 +215,77 @@ class GenerationHelperTests(unittest.TestCase):
         )
 
         self.assertEqual(packs[0]["chunks"][0]["source_index"], 2)
+
+    def test_evidence_graph_expands_connected_question_chunks(self):
+        seed = {
+            "id": "seed",
+            "source_index": 1,
+            "title": "Attention overview",
+            "url": "https://example.com/overview",
+            "content": "Self-attention uses queries, keys, and values.",
+        }
+        neighbor = {
+            "id": "neighbor",
+            "source_index": 2,
+            "title": "Transformer equation",
+            "url": "https://arxiv.org/pdf/1706.03762",
+            "content": "Scaled dot-product self-attention computes softmax(QK^T / sqrt(d_k))V.",
+            "is_primary_source": True,
+            "has_formula_signal": True,
+        }
+
+        graph = build_evidence_graph([seed, neighbor])
+        expanded, diagnostics = expand_chunks_for_question(
+            "What is self-attention and its equation?",
+            [seed],
+            [seed, neighbor],
+            max_chunks=2,
+        )
+
+        self.assertIn("self_attention", graph.entity_chunks)
+        self.assertEqual([chunk["id"] for chunk in expanded], ["seed", "neighbor"])
+        self.assertEqual(diagnostics["added"], 1)
+
+    def test_build_sub_question_evidence_packs_adds_graph_neighbors_after_seed_chunks(self):
+        question = "What is self-attention and its equation?"
+        results = [
+            RetrievalResult(
+                id="seed",
+                document="Self-attention is an attention mechanism over one sequence. " * 3,
+                metadata={"title": "Overview", "url": "https://example.com/overview", "synthesis_question": question},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="equation",
+                document="Scaled dot-product self-attention uses the equation Attention(Q,K,V)=softmax(QK^T/sqrt(d_k))V. " * 3,
+                metadata={
+                    "title": "Attention Is All You Need",
+                    "url": "https://arxiv.org/pdf/1706.03762",
+                    "source_type": "arxiv",
+                    "has_formula_signal": True,
+                },
+                score=0.1,
+                semantic_score=0.1,
+                bm25_score=0.0,
+            ),
+        ]
+        sources = [
+            {"index": 1, "id": "seed", "url": "https://example.com/overview"},
+            {"index": 2, "id": "equation", "url": "https://arxiv.org/pdf/1706.03762"},
+        ]
+
+        packs = build_sub_question_evidence_packs(
+            [question],
+            results,
+            sources,
+            max_chunks_per_question=2,
+            use_graphrag=True,
+        )
+
+        self.assertCountEqual([chunk["id"] for chunk in packs[0]["chunks"]], ["seed", "equation"])
+        self.assertEqual(packs[0]["graph_expansion"]["added"], 1)
 
     def test_evidence_pack_prefers_planned_facet_source_over_generic_signal(self):
         question = "What are the key contributions and equations of the AlphaMethod paper?"

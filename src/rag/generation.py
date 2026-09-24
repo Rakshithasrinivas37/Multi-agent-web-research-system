@@ -17,6 +17,7 @@ from src.rag.evidence_spans import (
     merge_supporting_chunks,
     supporting_chunks_from_evidence_spans,
 )
+from src.rag.evidence_graph import evidence_graph_summary, expand_chunks_for_question
 from src.rag.indexing import get_collection
 from src.rag.query_helpers import (
     COVERAGE_EVIDENCE_TERMS,
@@ -97,11 +98,13 @@ DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
 DEFAULT_SYNTHESIS_CHUNK_PRINT_LIMIT = 30
 DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 3
 DEFAULT_SYNTHESIS_CANDIDATE_CHUNKS_PER_QUESTION = 20
-DEFAULT_SYNTHESIS_MAX_CHUNKS = 18
-DEFAULT_SYNTHESIS_MODE = "per_question"
+DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION = 6
+DEFAULT_SYNTHESIS_GRAPHRAG_ENABLED = True
+DEFAULT_SYNTHESIS_MAX_CHUNKS = 48
 DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS = 4
-DEFAULT_PER_QUESTION_SYNTHESIS_CHARS = 5200
-DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS = 650
+DEFAULT_PER_QUESTION_SYNTHESIS_CHARS = 2200
+DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS = 700
+DEFAULT_MIN_SYNTHESIS_CHARS = 900
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
 DEFAULT_OBJECTIVE_SCOPE_SIMILARITY = 0.40
@@ -154,6 +157,13 @@ def retrieve_full_collection_enabled() -> bool:
     """Default RAG retrieval to the full Chroma collection, not one run scope."""
 
     value = clean_text(os.environ.get("RAG_RETRIEVE_FULL_COLLECTION", "true")).lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def synthesis_graphrag_enabled() -> bool:
+    value = clean_text(os.environ.get("RAG_SYNTHESIS_GRAPHRAG", "true")).lower()
+    if not DEFAULT_SYNTHESIS_GRAPHRAG_ENABLED:
+        return value in {"1", "true", "yes", "on"}
     return value not in {"0", "false", "no", "off"}
 
 
@@ -2768,6 +2778,7 @@ def build_sub_question_evidence_packs(
     sources: Sequence[dict[str, Any]],
     question_source_urls: dict[str, list[str]] | None = None,
     max_chunks_per_question: int = DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION,
+    use_graphrag: bool | None = None,
 ) -> list[dict[str, Any]]:
     """Group source-numbered chunks under each planner sub-question."""
 
@@ -2809,6 +2820,8 @@ def build_sub_question_evidence_packs(
                         chunk,
                     )
                 )
+        graph_enabled = synthesis_graphrag_enabled() if use_graphrag is None else bool(use_graphrag)
+        seed_limit = max(1, max_chunks_per_question - 1) if graph_enabled and max_chunks_per_question > 1 else max_chunks_per_question
         selected = [
             chunk
             for *_score, chunk in sorted(
@@ -2826,14 +2839,23 @@ def build_sub_question_evidence_packs(
                     -item[9],
                 ),
             )
-            [:max_chunks_per_question]
+            [:seed_limit]
         ]
+        graph_expansion = {"added": 0, "matched_entities": [], "candidate_count": 0}
+        if graph_enabled:
+            selected, graph_expansion = expand_chunks_for_question(
+                question,
+                selected,
+                chunks,
+                max_chunks=max_chunks_per_question,
+            )
         evidence_spans = evidence_spans_for_question(question, selected, evidence_types)
         coverage_details = coverage_evidence_details(question, selected, evidence_types)
         packs.append(
             {
                 "question": question,
                 "coverage": coverage_details["status"],
+                "graph_expansion": graph_expansion,
                 "evidence_span_count": len(evidence_spans),
                 "evidence_span_coverage": "covered" if evidence_spans else ("partial" if selected else "missing"),
                 "planned_source_urls": question_source_urls_for(question, question_source_urls),
@@ -3027,6 +3049,8 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         if is_primary_source(result.metadata if isinstance(result.metadata, dict) else {})
     )
     evidence_chunk_count = count_meaningful_evidence_chunks(retrieved_context)
+    evidence_packs = payload.get("evidence_packs", [])
+    graph_summary = evidence_graph_summary(all_evidence_pack_chunks(evidence_packs))
     return {
         "retrieved_count": len(retrieved_context),
         "evidence_chunk_count": evidence_chunk_count,
@@ -3038,6 +3062,11 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "cited_source_count": len(payload.get("citation_audit", {}).get("valid_referenced_source_indexes", [])),
         "source_coverage_count": payload.get("source_coverage_count", 0),
         "question_source_coverage_count": payload.get("question_source_coverage_count", 0),
+        "graphrag_enabled": synthesis_graphrag_enabled(),
+        "graphrag_chunk_count": graph_summary["chunk_count"],
+        "graphrag_entity_count": graph_summary["entity_count"],
+        "graphrag_edge_count": graph_summary["edge_count"],
+        "graphrag_added_chunk_count": graph_added_chunk_count(evidence_packs),
         "sub_question_context_counts": payload.get("sub_question_context_counts", []),
         "llm_sub_question_query_provider": payload.get("llm_sub_question_query_provider", ""),
         "llm_sub_question_query_fallback_reason": payload.get("llm_sub_question_query_fallback_reason", ""),
@@ -3065,6 +3094,25 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
             else 0,
         ),
     }
+
+
+def all_evidence_pack_chunks(evidence_packs: Sequence[Any]) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for pack in evidence_packs or []:
+        if isinstance(pack, dict):
+            chunks.extend(chunk for chunk in pack.get("chunks", []) or [] if isinstance(chunk, dict))
+    return chunks
+
+
+def graph_added_chunk_count(evidence_packs: Sequence[Any]) -> int:
+    count = 0
+    for pack in evidence_packs or []:
+        if not isinstance(pack, dict):
+            continue
+        expansion = pack.get("graph_expansion")
+        if isinstance(expansion, dict):
+            count += int(expansion.get("added") or 0)
+    return count
 
 
 def is_primary_source(metadata: dict[str, Any]) -> bool:
