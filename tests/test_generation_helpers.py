@@ -28,6 +28,7 @@ from src.rag.generation import (
     planner_sub_question_specs,
     print_synthesis_chunks,
     report_supporting_chunks,
+    rag_generation_model,
     retrieve_full_collection_enabled,
     result_supports_question,
     select_synthesis_context,
@@ -774,6 +775,51 @@ Missing Evidence: exact benchmark values are not present.
 
         self.assertIn(tail, chunks[0]["content"])
 
+    def test_compact_retrieved_chunks_trims_at_sentence_boundary(self):
+        results = [
+            RetrievalResult(
+                id="chunk-sentence",
+                document=(
+                    "First complete attention evidence sentence with enough useful detail about queries, keys, values, weighted sums, citations, and model behavior. "
+                    "Second sentence should not be clipped into a dangling fragment about the fraction of training cost."
+                ),
+                metadata={"title": "Sentence Source", "url": "https://example.com/sentence"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 1, "url": "https://example.com/sentence", "ids": ["chunk-sentence"]}]
+
+        chunks = compact_retrieved_chunks(results, sources, max_chars=145)
+
+        self.assertEqual(
+            chunks[0]["content"],
+            "First complete attention evidence sentence with enough useful detail about queries, keys, values, weighted sums, citations, and model behavior.",
+        )
+
+    def test_compact_retrieved_chunks_filters_pdf_layout_artifacts(self):
+        results = [
+            RetrievalResult(
+                id="chunk-pdf-artifact",
+                document=(
+                    "A.1.2 A LIGNMENT MODEL The alignment model should be evaluatedTx×Ty times. "
+                    "Clean attention evidence remains available with enough detail for synthesis, including queries, keys, values, weighted sums, and source-backed explanations."
+                ),
+                metadata={"title": "PDF Source", "url": "https://arxiv.org/pdf/example"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            )
+        ]
+        sources = [{"index": 1, "url": "https://arxiv.org/pdf/example", "ids": ["chunk-pdf-artifact"]}]
+
+        chunks = compact_retrieved_chunks(results, sources, max_chars=300)
+
+        self.assertIn("Clean attention evidence remains", chunks[0]["content"])
+        self.assertNotIn("A.1.2", chunks[0]["content"])
+        self.assertNotIn("evaluatedTx", chunks[0]["content"])
+
     def test_build_coverage_by_question_uses_evidence_pack_when_synthesis_section_is_generic(self):
         specs = [{"question_id": "q001", "question": "What is the official API?", "required_evidence": ["api"]}]
         packs = [
@@ -1328,13 +1374,17 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(queries, ["scaled dot product attention equation softmax sqrt dk"])
 
     @patch.dict("os.environ", {"RAG_QUERY_REWRITE_PROVIDER": "groq"}, clear=True)
-    def test_llm_sub_question_retrieval_query_result_defaults_to_qwen(self):
+    def test_llm_sub_question_retrieval_query_result_defaults_to_safe_groq_model(self):
         result = llm_sub_question_retrieval_query_result(
             {"objective": "X research", "sub_questions": ["What is X?"]},
         )
 
-        self.assertEqual(result["model"], "qwen/qwen3.6-27b")
+        self.assertEqual(result["model"], "llama-3.1-8b-instant")
         self.assertEqual(result["error"], "GROQ_API_KEY is not set")
+
+    @patch.dict("os.environ", {"RESEARCH_PLANNER_MODEL": "qwen/qwen3.6-27b"}, clear=True)
+    def test_rag_generation_model_ignores_unavailable_qwen_alias(self):
+        self.assertEqual(rag_generation_model(), "llama-3.1-8b-instant")
 
     @patch.dict("os.environ", {}, clear=True)
     def test_hf_sub_question_query_model_defaults_to_llama(self):

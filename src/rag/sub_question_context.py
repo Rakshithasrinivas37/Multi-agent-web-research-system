@@ -31,7 +31,7 @@ from src.tools.groq_retry import create_chat_completion_with_retries
 from src.tools.text_utils import clean_text
 
 
-DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL = "qwen/qwen3.8-27b"
+DEFAULT_SUBQUESTION_QUERY_REWRITE_MODEL = "llama-3.1-8b-instant"
 DEFAULT_SUBQUESTION_HF_QUERY_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_SUBQUESTION_QUERY_VARIANTS = 3
 DEFAULT_SUBQUESTION_RETRIEVAL_MAX_WORKERS = 4
