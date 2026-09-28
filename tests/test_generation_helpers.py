@@ -32,6 +32,7 @@ from src.rag.generation import (
     result_supports_question,
     select_synthesis_context,
     synthesize_context_for_report,
+    synthesis_mode,
     synthesis_quality_issues,
     trim_synthesis_prompt,
 )
@@ -67,6 +68,10 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_CHARS, 0)
         self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS, 0)
         self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS, 0)
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_synthesis_mode_defaults_to_per_question(self):
+        self.assertEqual(synthesis_mode(), "per_question")
 
     def test_audit_synthesis_citations_flags_invalid_markers(self):
         sources = [{"index": 1}, {"index": 2}, {"index": 4}]
