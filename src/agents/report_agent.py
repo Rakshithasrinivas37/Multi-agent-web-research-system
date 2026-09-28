@@ -31,7 +31,7 @@ DEFAULT_FOCUSED_CHUNK_CHARS = 1500
 
 DEFAULT_REPORT_GENERATION_MODE = "sections"  # "single" or "sections"  
 DEFAULT_REPORT_FRAME_GENERATION_MODE = "deterministic"  # "deterministic" or "llm"
-DEFAULT_REPORT_SECTION_CONCURRENCY = 4
+DEFAULT_REPORT_SECTION_CONCURRENCY = 2
 DEFAULT_SECTION_MAX_TOKENS = 1000
 DEFAULT_SECTION_RETRY_ATTEMPTS = 2
 DEFAULT_SECTION_EVIDENCE_CHUNKS = 3
@@ -484,16 +484,26 @@ def generate_topic_sections(
     if concurrency <= 1 or len(coverage_questions) <= 1:
         sections, diagnostics, last_model = [], [], fallback_model
         for question in coverage_questions:
-            section, used_model, diagnostic = generate_topic_section_with_diagnostics(
-                client,
-                model,
-                objective,
-                question,
-                packs_by_question,
-                synthesis_by_question,
-                source_text,
-                sources=sources,
-            )
+            try:
+                section, used_model, diagnostic = generate_topic_section_with_diagnostics(
+                    client,
+                    model,
+                    objective,
+                    question,
+                    packs_by_question,
+                    synthesis_by_question,
+                    source_text,
+                    sources=sources,
+                )
+            except Exception as error:
+                section, used_model, diagnostic = deterministic_failed_topic_section(
+                    question,
+                    packs_by_question,
+                    synthesis_by_question,
+                    sources or [],
+                    error,
+                    fallback_model,
+                )
             sections.append(section)
             diagnostics.append(diagnostic)
             last_model = used_model or last_model
@@ -520,7 +530,18 @@ def generate_topic_sections(
         }
         for future in as_completed(futures):
             index = futures[future]
-            section, used_model, diagnostic = future.result()
+            question = coverage_questions[index]
+            try:
+                section, used_model, diagnostic = future.result()
+            except Exception as error:
+                section, used_model, diagnostic = deterministic_failed_topic_section(
+                    question,
+                    packs_by_question,
+                    synthesis_by_question,
+                    sources or [],
+                    error,
+                    fallback_model,
+                )
             sections_by_index[index] = section
             diagnostics_by_index[index] = diagnostic
             last_model = used_model or last_model
@@ -529,6 +550,42 @@ def generate_topic_sections(
         [diagnostics_by_index[index] for index in range(len(coverage_questions))],
         last_model,
     )
+
+
+def deterministic_failed_topic_section(
+    question: str,
+    packs_by_question: dict[str, dict[str, Any]],
+    synthesis_by_question: dict[str, dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+    error: Exception,
+    fallback_model: str,
+) -> tuple[str, str, dict[str, Any]]:
+    pack = packs_by_question.get(normalize_heading(question), {})
+    synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
+    error_text = clean_text(error)
+    print(f"[report] topic section fallback after generation error for '{question[:100]}': {error_text[:180]}")
+    section = deterministic_topic_section(
+        question,
+        pack,
+        synthesis_note,
+        sources,
+        [f"model generation failed: {type(error).__name__}: {error_text[:240]}"],
+    )
+    section, repairs = cleanup_topic_section(section, question)
+    diagnostic = {
+        "question": question,
+        "retried": False,
+        "model_calls": 0,
+        "accepted_with_fallback": True,
+        "acceptance_repairs": [
+            f"section generation failed: {type(error).__name__}",
+            *repairs,
+        ],
+        "had_usable_evidence": evidence_pack_has_usable_cited_evidence(pack),
+        "had_per_question_synthesis": per_question_synthesis_has_cited_evidence(synthesis_note),
+        "chars": len(section),
+    }
+    return section, fallback_model, diagnostic
 
 
 def generate_topic_section_with_diagnostics(
@@ -946,17 +1003,27 @@ def generate_repair_topic_sections(
     print(f"[report] repairing {len(target_questions)} topic section(s) with concurrency={concurrency}")
 
     def repair_one(question: str) -> dict[str, Any]:
-        section, used_model, diagnostic = generate_topic_section_with_diagnostics(
-            client,
-            model,
-            objective,
-            question,
-            packs_by_question,
-            synthesis_by_question,
-            source_text,
-            repair_feedback=repair_feedback,
-            sources=sources,
-        )
+        try:
+            section, used_model, diagnostic = generate_topic_section_with_diagnostics(
+                client,
+                model,
+                objective,
+                question,
+                packs_by_question,
+                synthesis_by_question,
+                source_text,
+                repair_feedback=repair_feedback,
+                sources=sources,
+            )
+        except Exception as error:
+            section, used_model, diagnostic = deterministic_failed_topic_section(
+                question,
+                packs_by_question,
+                synthesis_by_question,
+                sources or [],
+                error,
+                model,
+            )
         return {**diagnostic, "section": section, "model": used_model}
 
     if concurrency <= 1 or len(target_questions) <= 1:

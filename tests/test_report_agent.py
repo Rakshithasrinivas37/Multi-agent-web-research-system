@@ -2087,12 +2087,61 @@ Old conclusion.
             self.assertEqual(report_section_concurrency(20), 8)
             self.assertEqual(report_section_concurrency(3), 3)
             report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = "bad"
-            self.assertEqual(report_section_concurrency(6), 4)
+            self.assertEqual(report_section_concurrency(6), 2)
         finally:
             if original is None:
                 report_agent_module.os.environ.pop("REPORT_SECTION_CONCURRENCY", None)
             else:
                 report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = original
+
+    def test_generate_topic_sections_falls_back_after_section_exception(self):
+        question = "What is attention?"
+        packs_by_question = {
+            "what is attention": {
+                "question": question,
+                "coverage": "covered",
+                "chunks": [{"source_index": 1, "content": "Attention weights combine value vectors with enough cited evidence."}],
+            }
+        }
+        synthesis_by_question = {
+            "what is attention": {
+                "question": question,
+                "synthesis": "Attention uses weights to combine value vectors [1].",
+                "source_indexes": [1],
+            }
+        }
+        original = report_agent_module.generate_topic_section_with_diagnostics
+        original_concurrency = report_agent_module.os.environ.get("REPORT_SECTION_CONCURRENCY")
+
+        def fail_section(*args, **kwargs):
+            raise RuntimeError("rate_limit_exceeded: retry later")
+
+        try:
+            report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = "2"
+            report_agent_module.generate_topic_section_with_diagnostics = fail_section
+            sections, diagnostics, model = report_agent_module.generate_topic_sections(
+                client=object(),
+                model="openai/gpt-oss-120b",
+                objective="Attention mechanism",
+                coverage_questions=[question, question],
+                packs_by_question=packs_by_question,
+                synthesis_by_question=synthesis_by_question,
+                source_text="[1] Source - https://example.com",
+                fallback_model="openai/gpt-oss-120b",
+                sources=[{"index": 1, "url": "https://example.com"}],
+            )
+        finally:
+            report_agent_module.generate_topic_section_with_diagnostics = original
+            if original_concurrency is None:
+                report_agent_module.os.environ.pop("REPORT_SECTION_CONCURRENCY", None)
+            else:
+                report_agent_module.os.environ["REPORT_SECTION_CONCURRENCY"] = original_concurrency
+
+        self.assertEqual(model, "openai/gpt-oss-120b")
+        self.assertEqual(len(sections), 2)
+        self.assertIn("Attention uses weights", sections[0])
+        self.assertTrue(diagnostics[0]["accepted_with_fallback"])
+        self.assertIn("section generation failed: RuntimeError", diagnostics[0]["acceptance_repairs"])
 
     def test_slugify_filename(self):
         self.assertEqual(slugify_filename("What is Attention Mechanism?"), "what-is-attention-mechanism")
