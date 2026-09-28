@@ -272,6 +272,37 @@ Supported definition [1].
         self.assertIn("[3]", accepted)
         self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, {}, sources))
 
+    def test_topic_section_fallback_prefers_clean_synthesis_over_raw_pdf_chunks(self):
+        question = "How does the self-attention mechanism used in the Transformer model work?"
+        section = "Self-attention works by"
+        pack = {
+            "question": question,
+            "coverage": "covered",
+            "chunks": [
+                {
+                    "source_index": 3,
+                    "url": "https://arxiv.org/pdf/1706.03762",
+                    "title": "Attention Is All You Need",
+                    "content": "Linear SliceLinear Dot Product Concat Linear O K VQ Figure 1: Standard multi-head scaled dot product attention.",
+                }
+            ],
+        }
+        synthesis_note = {
+            "question": question,
+            "source_indexes": [3],
+            "synthesis": "**Supported answer**\nSelf-attention maps tokens to queries, keys, and values, then uses scaled dot-product weights to combine value vectors [3].\n**Missing details**\n- No implementation details are available.",
+        }
+        sources = [{"index": 3, "url": "https://arxiv.org/pdf/1706.03762"}]
+
+        accepted, repairs, used_fallback = accept_topic_section(question, section, pack, synthesis_note, sources)
+
+        self.assertTrue(used_fallback)
+        self.assertIn("queries, keys, and values", accepted)
+        self.assertIn("[3]", accepted)
+        self.assertNotIn("Linear SliceLinear", accepted)
+        self.assertNotIn("Missing details", accepted)
+        self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, synthesis_note, sources))
+
     def test_topic_section_acceptance_uses_clean_framework_api_fallback(self):
         question = "What are the official implementations and APIs for attention mechanisms in major deep-learning frameworks (TensorFlow/Keras, PyTorch) and how are they used?"
         section = "Skip to main content. output Retrieves the output tensor(s) of a layer [6]."
@@ -306,6 +337,19 @@ Supported definition [1].
         self.assertNotIn("TripletMargin", accepted)
         self.assertNotIn("Skip to main content", accepted)
         self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, {}, sources))
+
+    def test_report_quality_flags_raw_pdf_extraction_artifacts(self):
+        report = """
+## 1. Executive Summary
+A.1.2 A LIGNMENT MODEL The alignment model should be evaluatedTx×Ty times [2].
+
+## References
+[2] https://arxiv.org/pdf/1409.0473
+"""
+
+        issues = report_quality_issues(report, sources=[{"index": 2, "url": "https://arxiv.org/pdf/1409.0473"}])
+
+        self.assertIn("report contains raw PDF extraction artifacts: Executive Summary", issues)
 
     def test_canonical_source_routing_requires_each_available_canonical_source(self):
         question = "What are the main variants of attention mechanisms (additive/Bahdanau, multiplicative/Luong, self-attention, multi-head attention) and how do they differ?"
