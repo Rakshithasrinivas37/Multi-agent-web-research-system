@@ -692,6 +692,9 @@ def deterministic_topic_evidence_notes(
     sources: Sequence[dict[str, Any]],
 ) -> list[str]:
     notes: list[str] = []
+    synthesis = clean_section_synthesis_note(synthesis_note)
+    if synthesis:
+        return [synthesis]
     canonical_indexes = source_indexes_matching_url_signals(sources, canonical_source_url_signals(question))
     chunks = rank_question_chunks(question, pack.get("chunks", []) if isinstance(pack, dict) else [])
     if canonical_indexes:
@@ -707,10 +710,29 @@ def deterministic_topic_evidence_notes(
             notes.append(note)
     if notes:
         return notes
-    synthesis = clean_markdown(synthesis_note.get("synthesis")) if isinstance(synthesis_note, dict) else ""
-    if synthesis and citation_markers(synthesis) and not line_has_gap_claim(synthesis):
-        return [compact_markdown_at_sentence(synthesis, 520)]
     return []
+
+
+def clean_section_synthesis_note(synthesis_note: dict[str, Any]) -> str:
+    if not isinstance(synthesis_note, dict):
+        return ""
+    synthesis = clean_markdown(synthesis_note.get("synthesis"))
+    if not synthesis or not citation_markers(synthesis):
+        return ""
+    lines = []
+    for line in synthesis.splitlines():
+        if re.match(r"^\s*\*\*(?:Missing details|Limitations|Open questions)\b", line, flags=re.IGNORECASE):
+            break
+        if re.match(r"^\s*\*\*(?:Planner notes|Supported answer|Supported evidence|Supported definition)", line, flags=re.IGNORECASE):
+            continue
+        if line_has_gap_claim(line):
+            continue
+        if raw_pdf_extraction_artifact(line) or evidence_snippet_is_noisy(line):
+            continue
+        lines.append(line)
+    snippet = compact_markdown_at_sentence("\n".join(lines), 620)
+    snippet = cleanup_evidence_snippet_for_section(snippet)
+    return "" if raw_pdf_extraction_artifact(snippet) or evidence_snippet_is_noisy(snippet) else snippet
 
 
 def framework_api_question(question: str) -> bool:
@@ -830,7 +852,20 @@ def evidence_snippet_is_noisy(snippet: str) -> bool:
         "pixelshuffle",
         "upsamples",
     )
-    return any(term in lowered for term in noise)
+    return any(term in lowered for term in noise) or raw_pdf_extraction_artifact(snippet)
+
+
+def raw_pdf_extraction_artifact(text: Any) -> bool:
+    value = clean_text(text)
+    if not value:
+        return False
+    return bool(
+        re.search(r"\bA\.\d+(?:\.\d+)?\s+[A-Z](?:\s+[A-Z]){2,}\b", value)
+        or re.search(r"\bLinear\s+SliceLinear\b|\bSliceLinear\s+Dot\s+Product\b", value, flags=re.IGNORECASE)
+        or re.search(r"\bfunc-\s*tion\b|\bparallelisa-\s*tion\b", value, flags=re.IGNORECASE)
+        or re.search(r"\bTx\s*[×x]\s*Ty\b|\bevaluated\s*Tx\b", value)
+        or re.search(r"^\s*[a-z]{1,3}\s+models\s+to\s+focus\b", value, flags=re.IGNORECASE)
+    )
 
 
 def repair_report_by_sections(
@@ -1591,6 +1626,8 @@ def frame_lines_as_prose(lines: Sequence[str]) -> str:
 def frame_source_line_usable(line: str) -> bool:
     value = clean_text(line)
     if not citation_markers(value) or value.lstrip().startswith("#"):
+        return False
+    if raw_pdf_extraction_artifact(value) or evidence_snippet_is_noisy(value):
         return False
     plain = strip_markdown(value)
     if re.match(r"^(?:where|which|that|and|or|formally|because)\b", plain, flags=re.IGNORECASE):
@@ -3318,6 +3355,9 @@ def report_quality_issues(
         issues.append(f"report contains incomplete equations: {', '.join(equation_issues[:4])}")
     frame_issues = malformed_frame_section_issues(text)
     issues.extend(frame_issues)
+    raw_artifact_sections = raw_pdf_artifact_sections(text)
+    if raw_artifact_sections:
+        issues.append(f"report contains raw PDF extraction artifacts: {', '.join(raw_artifact_sections[:4])}")
     source_indexes = source_index_set(sources or [])
     invalid = unavailable_citation_markers(report, source_indexes)
     if invalid:
@@ -3559,6 +3599,18 @@ def truncated_report_sections(markdown: str) -> list[str]:
         if not clean_text(strip_markdown(body)):
             continue
         if markdown_appears_truncated(body):
+            issues.append(strip_heading_numbering(label) or label)
+    return dedupe_text(issues)
+
+
+def raw_pdf_artifact_sections(markdown: str) -> list[str]:
+    issues = []
+    for heading, section in markdown_sections(markdown):
+        label = clean_text(heading)
+        normalized = normalize_heading(label)
+        if not label or normalized in {"references", "reference", "sources", "topic sections", "topic specific sections"}:
+            continue
+        if any(raw_pdf_extraction_artifact(line) for line in section.splitlines()):
             issues.append(strip_heading_numbering(label) or label)
     return dedupe_text(issues)
 
