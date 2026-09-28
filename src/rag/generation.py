@@ -71,7 +71,8 @@ from src.tools.text_utils import clean_text
 
 
 DEFAULT_RAG_GENERATION_MODEL = "llama-3.1-8b-instant"
-DEFAULT_GAP_QUERY_MODEL = "qwen/qwen3.6-27b"
+DEFAULT_GAP_QUERY_MODEL = DEFAULT_RAG_GENERATION_MODEL
+UNAVAILABLE_GROQ_MODEL_ALIASES = {"qwen/qwen3.6-27b", "qwen/qwen3.8-27b"}
 DEFAULT_MAX_CONTEXT_CHARS = 12000
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_REPORT_MAX_TOKENS = 900
@@ -104,7 +105,7 @@ DEFAULT_SYNTHESIS_GRAPHRAG_ENABLED = True
 DEFAULT_SYNTHESIS_MAX_CHUNKS = 48
 DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS = 4
 DEFAULT_PER_QUESTION_SYNTHESIS_CHARS = 2200
-DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS = 700
+DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS = 1200
 DEFAULT_MIN_SYNTHESIS_CHARS = 900
 MIN_EVIDENCE_CHARS = 120
 MIN_EVIDENCE_TOKENS = 12
@@ -138,8 +139,8 @@ def rag_generation_model(model: str | None = None) -> str:
     """Use the same default model selection as the planner agent."""
 
     return (
-        clean_model_name(model)
-        or clean_model_name(os.environ.get("RESEARCH_PLANNER_MODEL"))
+        available_groq_model_name(model)
+        or available_groq_model_name(os.environ.get("RESEARCH_PLANNER_MODEL"))
         or DEFAULT_RAG_GENERATION_MODEL
     )
 
@@ -148,10 +149,15 @@ def gap_query_model(model: str | None = None) -> str:
     """Model used for rewriting synthesis evidence gaps into retrieval queries."""
 
     return (
-        clean_model_name(os.environ.get("RAG_GAP_QUERY_MODEL"))
+        available_groq_model_name(os.environ.get("RAG_GAP_QUERY_MODEL"))
         or DEFAULT_GAP_QUERY_MODEL
         or rag_generation_model(model)
     )
+
+
+def available_groq_model_name(value: Any) -> str:
+    model = clean_model_name(value)
+    return "" if model.lower() in UNAVAILABLE_GROQ_MODEL_ALIASES else model
 
 
 def retrieve_full_collection_enabled() -> bool:
@@ -1971,9 +1977,9 @@ def deterministic_pack_chunk_lines(pack: dict[str, Any], limit: int = DEFAULT_PE
         if not isinstance(source_index, int):
             continue
         title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Retrieved chunk"
-        content = clean_text(chunk.get("content"))
+        content = sentence_aligned_evidence_preview(chunk.get("content"), DEFAULT_CONTEXT_BLOCK_CHARS)
         if content:
-            lines.append(f"- [{source_index}] {title}: {content[:DEFAULT_CONTEXT_BLOCK_CHARS].rstrip()}")
+            lines.append(f"- [{source_index}] {title}: {content}")
     return lines
 
 
@@ -3141,8 +3147,53 @@ def retrieved_chunk_preview(document: str, metadata: dict[str, Any], max_chars: 
         body = clean_text(document) if max_chars is None else display_document_preview(document, max_chars=max_chars)
     if not body:
         body = clean_text(document)
-    preview = body.strip() if max_chars is None else body[: max(80, max_chars)].strip()
+    preview = clean_retrieved_evidence_text(body) if max_chars is None else sentence_aligned_evidence_preview(body, max(80, max_chars))
     return preview if is_meaningful_evidence(preview) else ""
+
+
+def sentence_aligned_evidence_preview(text: Any, max_chars: int | None) -> str:
+    """Trim evidence at sentence boundaries so downstream synthesis does not inherit clipped prose."""
+
+    value = clean_retrieved_evidence_text(text)
+    if not value or max_chars is None or len(value) <= max_chars:
+        return value
+    window = value[:max(80, max_chars)].rstrip()
+    boundaries = [match.end() for match in re.finditer(r"[.!?](?:\s+|$)|\]\s*(?:\s+|$)", window)]
+    if boundaries:
+        trimmed = window[:boundaries[-1]].strip()
+        if len(trimmed) >= min(160, max(60, max_chars // 4)):
+            return trimmed
+    return window.rsplit(" ", 1)[0].rstrip(" .,:;")
+
+
+def clean_retrieved_evidence_text(text: Any) -> str:
+    """Remove obvious PDF-layout fragments before they enter synthesis/report evidence."""
+
+    value = clean_text(text)
+    if not value:
+        return ""
+    value = re.sub(r"\b([A-Za-z]{3,})[-‑]\s+([a-z]{2,})\b", r"\1\2", value)
+    pieces = re.split(r"(?<=[.!?])\s+|\n+", value)
+    kept = []
+    for piece in pieces:
+        sentence = clean_text(piece)
+        if not sentence or raw_pdf_extraction_artifact(sentence):
+            continue
+        kept.append(sentence)
+    return clean_text(" ".join(kept)) if kept else ("" if raw_pdf_extraction_artifact(value) else value)
+
+
+def raw_pdf_extraction_artifact(text: Any) -> bool:
+    value = clean_text(text)
+    if not value:
+        return False
+    return bool(
+        re.search(r"\bA\.\d+(?:\.\d+)?\s+[A-Z](?:\s+[A-Z]){2,}\b", value)
+        or re.search(r"\bLinear\s+SliceLinear\b|\bSliceLinear\s+Dot\s+Product\b", value, flags=re.IGNORECASE)
+        or re.search(r"\bTx\s*[×x]\s*Ty\b|\bevaluated\s*Tx\b", value)
+        or re.search(r"^\s*[a-z]{1,3}\s+models\s+to\s+focus\b", value, flags=re.IGNORECASE)
+        or re.search(r"^\s*(?:educe|nsion|ich)\b", value, flags=re.IGNORECASE)
+    )
 
 
 def strip_stored_chunk_headers(document: str, metadata: dict[str, Any]) -> str:
