@@ -45,6 +45,10 @@ DEFAULT_HF_QUERY_MAX_NEW_TOKENS = 900
 DEFAULT_QUERY_MAX_WORDS = 10
 DEFAULT_EVIDENCE_TAIL_TERMS = 2
 DEFAULT_NEAR_DUPLICATE_SIMILARITY = 0.58
+DEFAULT_CHUNK_DUPLICATE_SIMILARITY = 0.82
+BENCHMARK_VALUE_PATTERN = re.compile(
+    r"(?i)\b\d+(?:\.\d+)?\s*(?:%|bleu|rouge|f1|auc|accuracy|precision|recall|score|ms|s|hours?)\b"
+)
 QUERY_FILLER_PHRASES = (
     r"\bhave\s+been\s+proposed\b",
     r"\bhave\s+proposed\b",
@@ -1000,6 +1004,10 @@ def rank_collection_scan_results(
             + helpers.retrieval_result_priority(result)
             + (1.0 / (position + 1))
         )
+        if "benchmark" in {clean_text(item).lower() for item in evidence_types} and BENCHMARK_VALUE_PATTERN.search(text):
+            score += 15.0
+        if chunk_starts_mid_word(chunk) and not chunk_has_exact_signal(text, signal_score, table_score):
+            score *= 0.55
         scored.append((score, result))
 
     ranked = [
@@ -1007,8 +1015,50 @@ def rank_collection_scan_results(
         for score, result in sorted(scored, key=lambda item: item[0], reverse=True)
     ]
     if ranked:
-        return helpers.unique_retrieval_results(ranked)
+        return dedupe_near_duplicate_chunks(helpers.unique_retrieval_results(ranked))
     return helpers.source_balanced_results(fallback)
+
+
+def chunk_starts_mid_word(text: str) -> bool:
+    value = clean_text(text)
+    if not value:
+        return False
+    first = value.split(maxsplit=1)[0].strip("([{")
+    return bool(re.match(r"^[a-z]{3,}(?:ed|er|ing|ion|ions|ive|al|ly|ment|s)$", first))
+
+
+def chunk_has_exact_signal(text: str, signal_score: float, table_score: float) -> bool:
+    return bool(signal_score >= 10 or table_score or BENCHMARK_VALUE_PATTERN.search(clean_text(text)) or re.search(r"=", clean_text(text)))
+
+
+def dedupe_near_duplicate_chunks(results: Sequence[RetrievalResult]) -> list[RetrievalResult]:
+    selected: list[RetrievalResult] = []
+    fingerprints: list[tuple[str, set[str]]] = []
+    for result in results:
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        url = clean_text(metadata.get("url") or metadata.get("source_url")).lower()
+        tokens = chunk_fingerprint_tokens(result.document)
+        if tokens and any(url and url == seen_url and chunk_token_similarity(tokens, seen_tokens) >= DEFAULT_CHUNK_DUPLICATE_SIMILARITY for seen_url, seen_tokens in fingerprints):
+            continue
+        selected.append(result)
+        if tokens:
+            fingerprints.append((url, tokens))
+    return selected
+
+
+def chunk_fingerprint_tokens(text: Any) -> set[str]:
+    tokens = {
+        token
+        for token in query_tokens(clean_text(text))
+        if token not in COVERAGE_GENERIC_TERMS and token not in OBJECTIVE_STOPWORDS and len(token) >= 4
+    }
+    return set(list(tokens)[:80])
+
+
+def chunk_token_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(1, min(len(left), len(right)))
 
 
 def metadata_table_signal_score(metadata: dict[str, Any], evidence_types: Sequence[str]) -> float:

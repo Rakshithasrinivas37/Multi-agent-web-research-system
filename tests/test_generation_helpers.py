@@ -33,6 +33,7 @@ from src.rag.generation import (
     result_supports_question,
     select_synthesis_context,
     synthesize_context_for_report,
+    synthesis_chunk_display_score,
     synthesis_mode,
     synthesis_quality_issues,
     trim_synthesis_prompt,
@@ -53,6 +54,7 @@ from src.rag.sub_question_context import (
     missing_facets_for_results,
     parse_llm_retrieval_queries,
     precision_retrieval_queries,
+    rank_collection_scan_results,
     retrieve_sub_question_context_groups,
     retrieve_sub_question_context,
     select_facet_covered_results,
@@ -1614,6 +1616,12 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("https://arxiv.org/pdf/1706.03762", output)
         self.assertIn("rerank=1.000", output)
 
+    def test_synthesis_chunk_display_score_normalizes_large_composite_scores(self):
+        score, raw_note = synthesis_chunk_display_score(149.833)
+
+        self.assertEqual(score, 1.0)
+        self.assertIn("raw_score=149.833", raw_note)
+
     def test_select_synthesis_context_balances_planner_questions(self):
         results = [
             RetrievalResult(
@@ -1716,6 +1724,56 @@ Missing Evidence: exact benchmark values are not present.
 
         self.assertEqual(selected[0].id, "question-alpha")
         self.assertIn("browser-signal", {result.id for result in selected})
+
+    def test_rank_collection_scan_results_dedupes_pdf_fragments_and_prefers_metrics(self):
+        question = "What benchmark results demonstrate the performance improvements of attention mechanisms?"
+        candidates = [
+            RetrievalResult(
+                id="fragment-a",
+                document=(
+                    "tion models are based on complex recurrent or convolutional neural networks that include an encoder "
+                    "and a decoder. The best performing models also connect the encoder and decoder through attention."
+                ),
+                metadata={"title": "Transformer", "url": "https://arxiv.org/pdf/1706.03762"},
+                score=0.0,
+                semantic_score=0.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="fragment-b",
+                document=(
+                    "ncoder and a decoder. The best performing models also connect the encoder and decoder through "
+                    "an attention mechanism. We propose a new simple network architecture, the Transformer."
+                ),
+                metadata={"title": "Transformer", "url": "https://arxiv.org/pdf/1706.03762"},
+                score=0.0,
+                semantic_score=0.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="metric",
+                document=(
+                    "Benchmark evidence reports that the model reaches 28.4 BLEU on WMT 2014 English-to-German "
+                    "and trains faster than recurrent baselines. This sentence adds surrounding context about "
+                    "performance improvements and machine translation evaluation results."
+                ),
+                metadata={"title": "Transformer", "url": "https://arxiv.org/pdf/1706.03762"},
+                score=0.0,
+                semantic_score=0.0,
+                bm25_score=0.0,
+            ),
+        ]
+
+        ranked = rank_collection_scan_results(
+            question=question,
+            queries=[question],
+            candidates=candidates,
+            required_evidence=["benchmark"],
+        )
+        ranked_ids = [result.id for result in ranked]
+
+        self.assertEqual(ranked_ids[0], "metric")
+        self.assertLessEqual(len([item for item in ranked_ids if item.startswith("fragment")]), 1)
 
     def test_retrieve_sub_question_context_reranks_candidates_and_keeps_six(self):
         calls = []

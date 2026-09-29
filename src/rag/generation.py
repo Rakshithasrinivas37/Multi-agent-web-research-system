@@ -502,13 +502,21 @@ def print_synthesis_chunks(retrieved_context: Sequence[RetrievalResult], label: 
         source_kind = "primary/paper" if primary_source_url_like(url) else "secondary"
         preview = clean_text(display_document_preview(result.document, max_chars=180))
         rerank_note = f", rerank={result.rerank_score:.3f}" if result.rerank_score else ""
+        score, raw_note = synthesis_chunk_display_score(result.score)
         question_note = f", question={clean_text(metadata.get('synthesis_question'))[:80]}" if metadata.get("synthesis_question") else ""
         print(
-            f"[synthesis] chunk {rank}: score={result.score:.3f}{rerank_note}, "
+            f"[synthesis] chunk {rank}: score={score:.3f}{raw_note}{rerank_note}, "
             f"{source_kind}{question_note}, url={url}, title={title}, preview={preview}"
         )
     if len(retrieved_context) > limit:
         print(f"[synthesis] ... {len(retrieved_context) - limit} more chunk(s) not printed")
+
+
+def synthesis_chunk_display_score(raw_score: float) -> tuple[float, str]:
+    score = float(raw_score or 0.0)
+    if score <= 1.0:
+        return score, ""
+    return min(1.0, score / 100.0), f", raw_score={score:.3f}"
 
 
 def planner_sub_questions(research_plan: dict[str, Any]) -> list[str]:
