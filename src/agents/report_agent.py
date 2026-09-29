@@ -103,15 +103,34 @@ TRAILING_HEADING_WORDS = {
     "of", "or", "regarding", "sequence", "the", "their", "to", "what", "when", "where", "which", "with",
 }
 
+REPORT_FRAME_SECTION_NAMES = {
+    "executive summary",
+    "introduction and context",
+    "introduction",
+    "context",
+    "topic sections",
+    "cross cutting analysis and synthesis",
+    "cross source synthesis",
+    "cross cutting analysis",
+    "limitations and open questions",
+    "limitations",
+    "open questions",
+    "conclusion",
+    "references",
+    "sources",
+}
+
 CANONICAL_SOURCE_TERMS = {
     "1409.0473": ("bahdanau", "additive"),
     "1508.04025": ("luong", "multiplicative"),
     "1706.03762": ("self-attention", "multi-head", "transformer"),
+    "2010.11929": ("vision transformer", "vit"),
 }
 CANONICAL_SOURCE_GAP_NOTES = {
     "1409.0473": "The selected evidence does not provide enough cited detail to compare Bahdanau/additive attention architecture, performance, or use cases.",
     "1508.04025": "The selected evidence does not provide enough cited detail to compare Luong/multiplicative attention architecture, performance, or use cases.",
     "1706.03762": "The selected evidence does not provide enough cited detail to compare Transformer self-attention or multi-head attention architecture, performance, or use cases.",
+    "2010.11929": "The selected evidence does not provide enough cited detail to compare Vision Transformer attention over image patches, architecture, performance, or use cases.",
 }
 
 
@@ -838,18 +857,28 @@ def clean_section_synthesis_note(synthesis_note: dict[str, Any]) -> str:
     if not synthesis or not citation_markers(synthesis):
         return ""
     lines = []
+    active_markers: list[int] = []
     for line in synthesis.splitlines():
         if re.match(r"^\s*(?:#{1,6}\s*)?\*\*(?:Missing details|Limitations|Open questions|What is missing)\b", line, flags=re.IGNORECASE):
             break
         if line_is_synthesis_scaffold_line(line) and not line_is_report_scaffold_label(line):
+            active_markers = citation_markers(line) or active_markers
+            continue
+        if line_is_synthesis_transition_label(line):
             continue
         if line_has_gap_claim(line):
             continue
         if raw_pdf_extraction_artifact(line) or evidence_snippet_is_noisy(line):
             continue
         cleaned_line = scrub_report_scaffold_text(line)
+        if line_is_report_scaffold_label(line):
+            active_markers = citation_markers(line) or active_markers
+            if not cleaned_line:
+                continue
         if citation_markers(cleaned_line):
             lines.append(cleaned_line)
+        elif active_markers and clean_text(strip_markdown(cleaned_line)):
+            lines.append(f"{cleaned_line} {format_citation_indexes(active_markers)}")
     snippet = compact_markdown_at_sentence("\n".join(lines), 620)
     snippet = cleanup_evidence_snippet_for_section(snippet)
     return "" if raw_pdf_extraction_artifact(snippet) or evidence_snippet_is_noisy(snippet) else snippet
@@ -2590,6 +2619,14 @@ def apply_report_evidence_pack_repairs(
     for question in target_questions:
         pack = packs_by_question.get(normalize_heading(question))
         synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
+        should_remove_gap_lines = question in validation.get("false_gap_questions", [])
+        if should_remove_gap_lines and pack:
+            gap_cleaned = remove_gap_lines_from_question_section(report_text, question)
+            current_section = report_section_for_question(gap_cleaned, question)
+            if section_cites_pack_source(current_section, pack):
+                report_text = gap_cleaned
+                repairs.append(question)
+                continue
         note = per_question_synthesis_repair_note(question, synthesis_note)
         if not note and pack:
             note = evidence_pack_repair_note(question, pack)
@@ -2599,12 +2636,22 @@ def apply_report_evidence_pack_repairs(
             report_text,
             question,
             note,
-            remove_gap_lines=question in validation.get("false_gap_questions", []),
+            remove_gap_lines=should_remove_gap_lines,
         )
         repairs.append(question)
     if not repairs:
         return report, []
     return normalize_final_report(report_text, sources), repairs
+
+
+def remove_gap_lines_from_question_section(report: str, question: str) -> str:
+    lines = clean_markdown(report).splitlines()
+    bounds = section_bounds_for_question(lines, question)
+    if not bounds:
+        return report
+    start, end = bounds
+    section_lines = [line for line in lines[start:end] if not line_has_gap_claim(line)]
+    return clean_markdown("\n".join([*lines[:start], *section_lines, *lines[end:]]))
 
 
 def finalize_report_output(
@@ -2657,6 +2704,7 @@ def finalize_report_output(
     if limitation_repaired != report:
         repairs.append("updated limitations from validation issues")
         report = limitation_repaired
+        validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
 
     status = "clean" if not report_needs_revision(validation) else "blocked"
     if repairs and status == "clean":
@@ -2774,19 +2822,30 @@ def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
     cleaned: list[str] = []
     repairs: list[str] = []
     index = 0
+    pending_scaffold_markers: list[int] = []
     while index < len(lines):
         line = lines[index]
+        if re.match(r"^\s{0,3}#{1,6}\s+", line) or not clean_text(line):
+            pending_scaffold_markers = []
         if line_is_raw_planner_notes_label(line):
             repairs.append("removed raw planner notes block")
             index = skip_raw_planner_notes_block(lines, index)
             continue
+        if line_is_standalone_question_echo(line):
+            repairs.append("removed raw question echo")
+            index += 1
+            continue
         if line_is_report_scaffold_label(line):
+            pending_scaffold_markers = citation_markers(line) or pending_scaffold_markers
             scrubbed = scrub_report_scaffold_text(line)
             repairs.append("removed raw report scaffold label")
             if not citation_markers(scrubbed):
                 index += 1
                 continue
             line = scrubbed
+        elif pending_scaffold_markers and re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line) and not citation_markers(line):
+            line = f"{line.rstrip()} {format_citation_indexes(pending_scaffold_markers)}"
+            repairs.append("applied scaffold source marker to evidence item")
         if missing_details_stub_at(lines, index):
             repairs.append("removed empty missing-details stub")
             index = skip_empty_missing_details_stub(lines, index)
@@ -2880,6 +2939,14 @@ def line_is_report_scaffold_label(line: str) -> bool:
     )
 
 
+def line_is_standalone_question_echo(line: str) -> bool:
+    value = clean_text(line).strip("*_ ")
+    return bool(
+        re.match(r"^(?:what|how|why|when|where|which)\b.+\?$", value, flags=re.IGNORECASE)
+        and len(value.split()) >= 5
+    )
+
+
 def line_is_synthesis_scaffold_line(line: str) -> bool:
     value = clean_text(line)
     return bool(
@@ -2892,6 +2959,17 @@ def line_is_synthesis_scaffold_line(line: str) -> bool:
     )
 
 
+def line_is_synthesis_transition_label(line: str) -> bool:
+    value = clean_text(strip_markdown(line)).strip(":- ")
+    return bool(
+        re.match(
+            r"^(?:key differences highlighted by the evidence|key differences|supported evidence|missing details|next steps for report generation)$",
+            value,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def scrub_report_scaffold_text(text: Any) -> str:
     value = clean_markdown(text)
     value = re.sub(r"\*\*Planner[\s‑-]*sub[\s‑-]*question:\*\*.*?(?:---|\s+-\s+)", "", value, flags=re.IGNORECASE)
@@ -2899,7 +2977,8 @@ def scrub_report_scaffold_text(text: Any) -> str:
     value = re.sub(r"\s*\*\*Planner[\s‑-]*sub[\s‑-]*question:\*\*.*$", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s*Planner[\s‑-]*sub[\s‑-]*question:\s*.*$", "", value, flags=re.IGNORECASE)
     value = re.sub(r"(?:---\s*)?#{1,6}\s*\d+[.)]?\s*Supported evidence\s*(?:\(.*?\))?\s*-?\s*", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\*\*(?:Supported evidence|Supported definition|Supported answer|Supported details)(?:\s*\([^)]*\))?\*\*\s*-?\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\*\*(?:Supported evidence|Supported definition|Supported answer|Supported details)(?:\s*\([^)]*\))?:?\*\*\s*-?\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^(?:Supported evidence|Supported definition|Supported answer|Supported details)(?:\s*\([^)]*\))?:?\s*-?\s*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\*\*Key points to include in the final report\*\*\s*", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\*?All statements above are directly supported.*?(?:$|\n)", "", value, flags=re.IGNORECASE)
     return clean_markdown(value)
@@ -2980,7 +3059,7 @@ def repair_weak_frame_sections(report: str) -> tuple[str, list[str]]:
         [heading for heading, _ in topic_pairs],
         [section for _, section in topic_pairs],
     )
-    for heading in ("Cross-cutting Analysis and Synthesis", "Conclusion"):
+    for heading in ("Executive Summary", "Introduction and Context", "Cross-cutting Analysis and Synthesis", "Conclusion"):
         section = named_report_section(report, heading)
         if not section:
             continue
@@ -3005,11 +3084,23 @@ def frame_body_needs_role_repair(heading_name: str, body: str) -> bool:
         return True
     bullet_lines = [line for line in lines if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line)]
     normalized = normalize_heading(heading_name)
+    plain = strip_markdown(body)
+    sentence_count = len(split_sentences(plain))
     if report_contains_raw_scaffold(body):
+        return True
+    if frame_prose_has_broken_fragments(body):
+        return True
+    if normalized == "executive summary" and (len(plain) > 900 or sentence_count > 4):
+        return True
+    if normalized == "introduction and context" and (len(plain) > 700 or sentence_count > 5):
         return True
     if normalized == "conclusion" and bullet_lines:
         return True
+    if normalized == "conclusion" and (len(plain) > 900 or sentence_count > 4):
+        return True
     if normalized == "cross cutting analysis and synthesis" and len(bullet_lines) >= max(2, len(lines) // 2):
+        return True
+    if normalized == "cross cutting analysis and synthesis" and len(plain) > 1600:
         return True
     return False
 
@@ -3133,7 +3224,7 @@ def trim_incomplete_final_sentence(line: str) -> str:
 def per_question_synthesis_repair_note(question: str, synthesis_note: dict[str, Any]) -> str:
     if not per_question_synthesis_has_cited_evidence(synthesis_note):
         return ""
-    synthesis = clean_markdown(synthesis_note.get("synthesis"))
+    synthesis = clean_section_synthesis_note(synthesis_note)
     if not synthesis:
         return ""
     snippet = compact_markdown_at_sentence(synthesis, 620)
@@ -3165,15 +3256,9 @@ def compact_markdown_at_sentence(value: Any, max_chars: int) -> str:
 def evidence_pack_repair_note(question: str, pack: dict[str, Any]) -> str:
     ranked_chunks = rank_question_chunks(question, pack.get("chunks", []) or [], planned_urls=pack.get("planned_source_urls", []))
     for chunk in ranked_chunks:
-        if not isinstance(chunk, dict) or not isinstance(chunk.get("source_index"), int):
+        snippet = chunk_evidence_sentence(chunk)
+        if not snippet:
             continue
-        content = sanitize_evidence_content(chunk.get("content"))
-        if not content:
-            continue
-        marker = f"[{chunk['source_index']}]"
-        snippet = compact_text(content, 420)
-        if marker not in snippet:
-            snippet = f"{snippet} {marker}"
         return snippet
     return ""
 
@@ -3227,7 +3312,7 @@ def evidence_gap_pattern() -> str:
         r"(?:is|are)\s+missing|"
         r"no\s+source-backed|cannot\s+be\s+(?:given|reproduced|answered|provided)|"
         r"do\s+not\s+(?:contain|provide|include|list)|does\s+not\s+(?:contain|provide|include|list)|"
-        r"none\s+.*\s+provide|not\s+available|not\s+listed|\babsent\b|absent\s+from\s+.*\s+evidence|"
+        r"none\s+.*\s+provide|not\s+available|not\s+listed|not\s+reliable\s+enough|\babsent\b|absent\s+from\s+.*\s+evidence|"
         r"not\s+present\s+in\s+.*\s+(?:evidence|sources|material))"
     )
 
@@ -3299,6 +3384,9 @@ def report_evidence_gap_contradictions(
             continue
         question = clean_text(pack.get("question"))
         section = report_section_for_question(report, question)
+        gap_lines = [line for line in clean_markdown(section).splitlines() if line_has_gap_claim(line)]
+        if gap_lines and section_cites_pack_source(section, pack) and all(line_is_canonical_gap_note(line) for line in gap_lines):
+            continue
         if section and section_claims_missing_supported_evidence(section, question, pack):
             contradictions.append(canonical.get(normalize_heading(question), question))
     return dedupe_text(contradictions)
@@ -3370,6 +3458,9 @@ def section_claims_missing_per_question_synthesis(section: str, question: str, s
         return False
     lowered = clean_text(section).lower()
     gap_terms = evidence_gap_pattern()
+    gap_lines = [line for line in clean_markdown(section).splitlines() if line_has_gap_claim(line)]
+    if gap_lines and section_cites_per_question_synthesis(section, synthesis_note) and all(line_is_canonical_gap_note(line) for line in gap_lines):
+        return False
     if not re.search(gap_terms, lowered):
         return False
     synthesis = clean_text(synthesis_note.get("synthesis")).lower()
@@ -3428,16 +3519,31 @@ def report_section_for_question(report: str, question: str) -> str:
     question_terms = detail_terms(question)
     best = ""
     best_score = 0
-    for heading, section in markdown_sections(report):
+    sections = markdown_sections(report)
+    topic_sections = [(heading, section) for heading, section in sections if re.match(r"^3\.\d+", clean_text(heading))]
+    candidates = topic_sections or [
+        (heading, section)
+        for heading, section in sections
+        if normalize_heading(strip_heading_numbering(heading)) not in REPORT_FRAME_SECTION_NAMES
+    ]
+    strong_best = ""
+    strong_score = 0
+    for heading, section in candidates:
         actual = normalize_heading(heading)
         score = 0
         if expected and headings_match(expected, actual):
             score += 5
         score += len(question_terms & detail_terms(heading))
+        if score >= 5 and score > strong_score:
+            strong_score = score
+            strong_best = section
         if score > best_score:
             best_score = score
             best = section
-    return best if best_score else ""
+    if strong_best:
+        return strong_best
+    fuzzy_threshold = min(4, max(3, len(question_terms) // 2))
+    return best if best_score >= fuzzy_threshold else ""
 
 
 def markdown_sections(markdown: str) -> list[tuple[str, str]]:
@@ -3463,7 +3569,10 @@ def markdown_sections(markdown: str) -> list[tuple[str, str]]:
 def section_claims_missing_supported_evidence(section: str, question: str, pack: dict[str, Any]) -> bool:
     lowered = clean_text(section).lower()
     gap_terms = evidence_gap_pattern()
+    gap_lines = [line for line in clean_markdown(section).splitlines() if line_has_gap_claim(line)]
     if framework_api_question(question) and section_cites_pack_source(section, pack):
+        return False
+    if gap_lines and section_cites_pack_source(section, pack) and all(line_is_canonical_gap_note(line) for line in gap_lines):
         return False
     if re.search(gap_terms, lowered) and (evidence_pack_has_formula_evidence(pack) or not section_cites_pack_source(section, pack)):
         return True
@@ -3477,6 +3586,14 @@ def section_claims_missing_supported_evidence(section: str, question: str, pack:
         if term in lowered and re.search(rf"\b{re.escape(term)}\b.{{0,140}}{gap_terms}|{gap_terms}.{{0,140}}\b{re.escape(term)}\b", lowered):
             return True
     return False
+
+
+def line_is_canonical_gap_note(line: str) -> bool:
+    value = clean_text(line)
+    return bool(
+        value in CANONICAL_SOURCE_GAP_NOTES.values()
+        or re.match(r"^The selected evidence does not provide enough cited detail to compare\b", value)
+    )
 
 
 def section_cites_pack_source(section: str, pack: dict[str, Any]) -> bool:
@@ -3905,12 +4022,20 @@ def canonical_source_routing_issues(
 def canonical_source_url_signals(question: str) -> list[str]:
     lowered = clean_text(question).lower()
     signals = []
+    variant_or_evolution_question = (
+        "attention" in lowered
+        and any(term in lowered for term in ("variant", "variants", "evolved", "evolution", "major models", "key differences"))
+    )
+    if variant_or_evolution_question or "seq2seq" in lowered:
+        signals.append("1409.0473")
     if "luong" in lowered or "multiplicative" in lowered:
         signals.append("1508.04025")
     if "bahdanau" in lowered or "additive" in lowered:
         signals.append("1409.0473")
-    if "attention is all you need" in lowered or "self-attention" in lowered or "multi-head" in lowered:
+    if "attention is all you need" in lowered or "self-attention" in lowered or "multi-head" in lowered or variant_or_evolution_question:
         signals.append("1706.03762")
+    if "vision transformer" in lowered or re.search(r"\bvit\b", lowered):
+        signals.append("2010.11929")
     return dedupe_text(signals)
 
 
