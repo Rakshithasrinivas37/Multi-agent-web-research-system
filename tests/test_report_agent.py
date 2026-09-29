@@ -43,6 +43,7 @@ from src.agents.report_agent import (
     normalize_nested_markdown_bullet,
     normalize_markdown_headings,
     planner_question_heading,
+    per_question_synthesis_repair_note,
     remove_clipped_sentence_fragments,
     remove_unavailable_citation_markers,
     remove_duplicate_section_labels,
@@ -444,8 +445,29 @@ Definition sentence is supported [1]. **Planner Sub-question:** What is attentio
         self.assertIn("The alignment score is supported [1].", cleaned)
         self.assertIn("Transformer self-attention is supported [2].", cleaned)
 
+    def test_cleanup_report_markdown_artifacts_removes_scaffold_label_with_source_marker(self):
+        report = """
+## 3. Topic Sections
+### 3.1. Variants
+*How have attention mechanisms evolved across major models?*
+**Supported evidence (from source [2]):**
+1. **Transformer architecture** removes recurrence and convolution.
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed raw question echo", repairs)
+        self.assertIn("removed raw report scaffold label", repairs)
+        self.assertIn("applied scaffold source marker to evidence item", repairs)
+        self.assertNotIn("Supported evidence", cleaned)
+        self.assertNotIn("How have attention mechanisms evolved", cleaned)
+        self.assertIn("Transformer architecture** removes recurrence and convolution. [2]", cleaned)
+
     def test_section_role_helpers_detect_and_repair_weak_frames(self):
         report = """
+## 1. Executive Summary
+Topic fact is supported [1]. Topic fact two is supported [1]. Topic fact three is supported [1]. Topic fact four is supported [1]. Topic fact five is supported [1].
+
 ## 3. Topic Sections
 ### 3.1. Topic
 Topic fact is supported [1].
@@ -459,11 +481,13 @@ Topic fact is supported [1].
 """
 
         self.assertTrue(frame_body_needs_role_repair("Conclusion", "- Copied conclusion [1]."))
+        self.assertTrue(frame_body_needs_role_repair("Executive Summary", "One [1]. Two [1]. Three [1]. Four [1]. Five [1]."))
         no_label = remove_duplicate_section_labels("## 1. Executive Summary\n**Executive Summary**\nText [1].")
         self.assertNotIn("**Executive Summary**", no_label)
         fixed_headings, _ = repair_topic_headings('### 3.1. Title As Introduced In "Attention Is All')
         self.assertEqual(fixed_headings, "### 3.1. Title")
         repaired, repairs = repair_weak_frame_sections(report)
+        self.assertIn("replaced weak executive summary section", repairs)
         self.assertIn("replaced weak conclusion section", repairs)
         self.assertNotIn("\n- Copied conclusion", repaired)
 
@@ -499,6 +523,21 @@ Topic fact is supported [1].
         self.assertIn("[3]", cleaned)
         self.assertNotIn("Planner Sub-question", cleaned)
         self.assertNotIn("Missing details", cleaned)
+
+    def test_per_question_synthesis_repair_note_uses_clean_synthesis(self):
+        note = {
+            "source_indexes": [2],
+            "synthesis": (
+                "**Planner Sub-question:** How do variants compare? --- ### 1. Supported evidence "
+                "(from source [2]): - Transformer attention removes recurrence and convolution [2]."
+            ),
+        }
+
+        repaired = per_question_synthesis_repair_note("How do variants compare?", note)
+
+        self.assertIn("Transformer attention", repaired)
+        self.assertNotIn("Planner Sub-question", repaired)
+        self.assertNotIn("Supported evidence", repaired)
 
     def test_repair_truncated_markdown_line_trims_suspicious_short_fragment(self):
         repaired, repairs = repair_truncated_markdown_line(
