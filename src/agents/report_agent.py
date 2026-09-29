@@ -14,6 +14,10 @@ from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
+# ---------------------------------------------------------------------------
+# Constants and prompts
+# ---------------------------------------------------------------------------
+
 DEFAULT_REPORT_AGENT_MODEL = "llama-3.1-8b-instant"
 DEFAULT_REPORT_MAX_TOKENS = 4000
 DEFAULT_REPORT_PROMPT_CHARS = 12000
@@ -99,6 +103,21 @@ TRAILING_HEADING_WORDS = {
     "of", "or", "regarding", "sequence", "the", "their", "to", "what", "when", "where", "which", "with",
 }
 
+CANONICAL_SOURCE_TERMS = {
+    "1409.0473": ("bahdanau", "additive"),
+    "1508.04025": ("luong", "multiplicative"),
+    "1706.03762": ("self-attention", "multi-head", "transformer"),
+}
+CANONICAL_SOURCE_GAP_NOTES = {
+    "1409.0473": "The selected evidence does not provide enough cited detail to compare Bahdanau/additive attention architecture, performance, or use cases.",
+    "1508.04025": "The selected evidence does not provide enough cited detail to compare Luong/multiplicative attention architecture, performance, or use cases.",
+    "1706.03762": "The selected evidence does not provide enough cited detail to compare Transformer self-attention or multi-head attention architecture, performance, or use cases.",
+}
+
+
+# ---------------------------------------------------------------------------
+# Public agent orchestration
+# ---------------------------------------------------------------------------
 
 class ReportAgent:
     """Generate a final report from synthesis-agent context."""
@@ -319,6 +338,10 @@ class ReportAgent:
         SharedMemory(memory_path).write_agent_output("report", {"final_report": {**report_payload, "report_path": saved_path}})
 
 
+# ---------------------------------------------------------------------------
+# Whole-report prompt construction
+# ---------------------------------------------------------------------------
+
 def build_report_prompt(
     objective: str,
     output_format: str,
@@ -399,6 +422,10 @@ Write the final Markdown report. Explain each supported topic in clear prose bef
     return trim_report_prompt(prompt) if compact else prompt
 
 
+# ---------------------------------------------------------------------------
+# Section-mode report assembly
+# ---------------------------------------------------------------------------
+
 def generate_report_by_sections(
     client: Any,
     model: str,
@@ -441,7 +468,7 @@ def generate_report_by_sections(
         sources=sources,
     )
 
-    topics_digest = "\n\n".join(compact_text(section, DEFAULT_FRAME_SECTION_CHARS) for section in topic_sections)
+    topics_digest = clean_topic_digest_for_frames(coverage_questions, topic_sections)
 
     frames, last_model, frame_diagnostics = generate_report_frames(
         client,
@@ -630,6 +657,10 @@ def generate_topic_section_with_diagnostics(
     }
 
 
+# ---------------------------------------------------------------------------
+# Topic section acceptance and deterministic fallbacks
+# ---------------------------------------------------------------------------
+
 def accept_topic_section(
     question: str,
     section: str,
@@ -784,8 +815,20 @@ def deterministic_topic_evidence_notes(
         if note:
             notes.append(note)
     if notes:
+        notes.extend(canonical_gap_notes(question, notes))
         return notes
     return []
+
+
+def canonical_gap_notes(question: str, notes: Sequence[str]) -> list[str]:
+    text = clean_text(" ".join(notes)).lower().replace("‑", "-").replace("–", "-").replace("—", "-")
+    lowered_question = clean_text(question).lower().replace("‑", "-").replace("–", "-").replace("—", "-")
+    return [
+        note
+        for signal, note in CANONICAL_SOURCE_GAP_NOTES.items()
+        if any(term in lowered_question for term in CANONICAL_SOURCE_TERMS[signal])
+        and not any(term in text for term in CANONICAL_SOURCE_TERMS[signal])
+    ]
 
 
 def clean_section_synthesis_note(synthesis_note: dict[str, Any]) -> str:
@@ -796,15 +839,17 @@ def clean_section_synthesis_note(synthesis_note: dict[str, Any]) -> str:
         return ""
     lines = []
     for line in synthesis.splitlines():
-        if re.match(r"^\s*\*\*(?:Missing details|Limitations|Open questions)\b", line, flags=re.IGNORECASE):
+        if re.match(r"^\s*(?:#{1,6}\s*)?\*\*(?:Missing details|Limitations|Open questions|What is missing)\b", line, flags=re.IGNORECASE):
             break
-        if re.match(r"^\s*\*\*(?:Planner notes|Supported answer|Supported evidence|Supported definition)", line, flags=re.IGNORECASE):
+        if line_is_synthesis_scaffold_line(line) and not line_is_report_scaffold_label(line):
             continue
         if line_has_gap_claim(line):
             continue
         if raw_pdf_extraction_artifact(line) or evidence_snippet_is_noisy(line):
             continue
-        lines.append(line)
+        cleaned_line = scrub_report_scaffold_text(line)
+        if citation_markers(cleaned_line):
+            lines.append(cleaned_line)
     snippet = compact_markdown_at_sentence("\n".join(lines), 620)
     snippet = cleanup_evidence_snippet_for_section(snippet)
     return "" if raw_pdf_extraction_artifact(snippet) or evidence_snippet_is_noisy(snippet) else snippet
@@ -896,6 +941,9 @@ def chunk_evidence_sentence(chunk: dict[str, Any]) -> str:
     marker = f"[{chunk['source_index']}]"
     snippet = compact_markdown_at_sentence(content, 520)
     snippet = cleanup_evidence_snippet_for_section(snippet)
+    first_word = clean_text(snippet).split(maxsplit=1)[0].strip("([{")
+    if re.match(r"^[a-z]{3,}(?:ed|er|ing|ion|ions|ive|al|ly|ment|s)$", first_word):
+        return ""
     if evidence_snippet_is_noisy(snippet):
         return ""
     if not snippet:
@@ -942,6 +990,10 @@ def raw_pdf_extraction_artifact(text: Any) -> bool:
         or re.search(r"^\s*[a-z]{1,3}\s+models\s+to\s+focus\b", value, flags=re.IGNORECASE)
     )
 
+
+# ---------------------------------------------------------------------------
+# Section repair workflow
+# ---------------------------------------------------------------------------
 
 def repair_report_by_sections(
     client: Any,
@@ -1256,6 +1308,10 @@ def replace_named_report_section(report: str, heading_name: str, body: str) -> s
     return clean_markdown(f"{report}\n\n## {heading_name}\n{body}")
 
 
+# ---------------------------------------------------------------------------
+# Topic section LLM generation
+# ---------------------------------------------------------------------------
+
 def generate_topic_section(
     client: Any,
     model: str,
@@ -1369,7 +1425,8 @@ def format_question_source_target_guidance(question: str) -> str:
             "and name TensorFlow/Keras APIs such as tf.keras.layers.MultiHeadAttention only when cited evidence supports them. "
             "If a framework lacks cited API evidence, state that exact framework-specific gap."
         )
-    source_signal = canonical_source_url_signal(question)
+    source_signals = canonical_source_url_signals(question)
+    source_signal = source_signals[0] if source_signals else ""
     if not source_signal:
         return "- No canonical source target detected for this question."
     return f"- Use source URLs containing {source_signal} for the named formulation when such chunks are available."
@@ -1420,6 +1477,10 @@ def section_needs_retry(section_text: str, pack: dict[str, Any], synthesis_note:
     has_gap_claim = bool(re.search(evidence_gap_pattern(), section_text.lower()))
     return (not has_cited) or has_gap_claim
 
+
+# ---------------------------------------------------------------------------
+# Frame section generation
+# ---------------------------------------------------------------------------
 
 def generate_report_frames(
     client: Any,
@@ -1670,11 +1731,11 @@ def list_item_appears_truncated(line: str) -> bool:
 
 def deterministic_frame_section(heading: str, body_digest: str) -> str:
     digest = clean_markdown(body_digest)
-    cited_lines = [
+    cited_lines = unique_frame_lines([
         clean_text(line)
         for line in digest.splitlines()
         if frame_source_line_usable(line)
-    ]
+    ])
     gap_lines = [
         clean_text(line)
         for line in digest.splitlines()
@@ -1686,15 +1747,84 @@ def deterministic_frame_section(heading: str, body_digest: str) -> str:
         return "\n".join(f"- {strip_markdown(item)}" for item in items)
     if normalized == "executive summary":
         items = cited_lines[:3] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
-        return " ".join(item.rstrip(".") + "." for item in items if item)
+        return frame_lines_as_prose(items)
     if normalized == "introduction and context":
         first = cited_lines[0] if cited_lines else compact_text(digest, DEFAULT_FRAME_SECTION_CHARS)
-        return first.rstrip(".") + "." if first else "The topic sections below summarize the available cited evidence."
+        return frame_lines_as_prose([first]) if first else "The topic sections below summarize the available cited evidence."
     if normalized == "conclusion":
-        items = cited_lines[-3:] or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
+        items = balanced_frame_lines(cited_lines, limit=3) or [compact_text(strip_markdown(digest), DEFAULT_FRAME_SECTION_CHARS)]
         return frame_lines_as_prose(items)
     items = cited_lines[:4] or [compact_text(digest, DEFAULT_FRAME_SECTION_CHARS)]
     return frame_lines_as_prose(items)
+
+
+def unique_frame_lines(lines: Sequence[str]) -> list[str]:
+    selected = []
+    seen = set()
+    for line in lines:
+        cleaned = scrub_report_scaffold_text(line)
+        key = normalize_heading(strip_markdown(first_complete_cited_sentence(cleaned) or cleaned))
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        selected.append(cleaned)
+    return selected
+
+
+def balanced_frame_lines(lines: Sequence[str], limit: int) -> list[str]:
+    clean_lines = unique_frame_lines(lines)
+    if len(clean_lines) <= limit:
+        return clean_lines
+    return dedupe_text(clean_lines[index] for index in (0, len(clean_lines) // 2, len(clean_lines) - 1))[:limit]
+
+
+def clean_topic_digest_for_frames(questions: Sequence[str], topic_sections: Sequence[str]) -> str:
+    lines = []
+    seen = set()
+    for question, section in zip(questions, topic_sections):
+        summary = topic_section_summary_for_frame(question, section)
+        key = normalize_heading(strip_markdown(summary))
+        if not summary or key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"- {summary}")
+    return "\n".join(lines)
+
+
+def topic_section_summary_for_frame(question: str, section: str) -> str:
+    body = scrub_report_scaffold_text(strip_topic_section_headings(section))
+    for line in clean_markdown(body).splitlines():
+        line = scrub_report_scaffold_text(normalize_nested_markdown_bullet(line))
+        if not frame_source_line_usable(line):
+            continue
+        sentence = first_complete_cited_sentence(line)
+        if sentence:
+            return sentence
+    gap = first_gap_sentence(body)
+    if gap:
+        return f"{planner_question_heading(question)} remains partially unresolved: {gap}"
+    return ""
+
+
+def first_complete_cited_sentence(text: Any) -> str:
+    for sentence in split_sentences(clean_text(text)):
+        if citation_markers(sentence) and not markdown_appears_truncated(sentence) and not line_is_synthesis_scaffold_line(sentence):
+            return sentence.rstrip(".") + "."
+    return ""
+
+
+def first_gap_sentence(text: Any) -> str:
+    for sentence in split_sentences(strip_markdown(text)):
+        if re.search(evidence_gap_pattern(), sentence.lower()):
+            return sentence.rstrip(".") + "."
+    return ""
+
+
+def split_sentences(text: Any) -> list[str]:
+    value = clean_text(text)
+    if not value:
+        return []
+    return [clean_text(part) for part in re.split(r"(?<=[.!?])\s+", value) if clean_text(part)]
 
 
 def frame_lines_as_prose(lines: Sequence[str]) -> str:
@@ -1709,8 +1839,10 @@ def frame_lines_as_prose(lines: Sequence[str]) -> str:
 
 
 def frame_source_line_usable(line: str) -> bool:
-    value = clean_text(line)
+    value = scrub_report_scaffold_text(line)
     if not citation_markers(value) or value.lstrip().startswith("#"):
+        return False
+    if report_contains_raw_scaffold(value):
         return False
     if raw_pdf_extraction_artifact(value) or evidence_snippet_is_noisy(value):
         return False
@@ -1747,6 +1879,10 @@ def strip_topic_section_headings(section_text: str) -> str:
         lines.append(line)
     return clean_markdown("\n".join(lines))
 
+
+# ---------------------------------------------------------------------------
+# Single-shot report generation
+# ---------------------------------------------------------------------------
 
 def generate_single_report(
     client: Any,
@@ -1795,6 +1931,10 @@ def report_generation_token_cap(prompt_chars: int | None = None) -> int:
         return DEFAULT_REPORT_TOTAL_TOKEN_BUDGET
     return (max(0, prompt_chars) + 3) // 4 + DEFAULT_REPORT_MAX_TOKENS
 
+
+# ---------------------------------------------------------------------------
+# Evidence and prompt formatting helpers
+# ---------------------------------------------------------------------------
 
 def format_planner_questions(questions: Sequence[str]) -> str:
     items = [clean_text(q) for q in questions if clean_text(q)]
@@ -2181,6 +2321,10 @@ def compact_evidence_blocks(blocks: Sequence[dict[str, Any]], max_chars: int | N
     return "\n\n".join(selected)
 
 
+# ---------------------------------------------------------------------------
+# Sources, references, and citation normalization
+# ---------------------------------------------------------------------------
+
 def format_sources(sources: Sequence[dict[str, Any]]) -> str:
     lines = []
     for fallback, source in enumerate(sources, 1):
@@ -2306,6 +2450,10 @@ def strip_references(report: str) -> str:
     return clean_markdown("\n".join(lines))
 
 
+# ---------------------------------------------------------------------------
+# Validation and finalization
+# ---------------------------------------------------------------------------
+
 def report_sub_question_coverage_check(
     report: str,
     planner_questions: Sequence[str],
@@ -2409,6 +2557,10 @@ def format_repair_feedback(repair_feedback: str) -> str:
 Revise the report to fix every item above. If a topic has covered cited evidence, do not write it as an evidence gap."""
 
 
+# ---------------------------------------------------------------------------
+# Final deterministic repairs
+# ---------------------------------------------------------------------------
+
 def apply_report_evidence_pack_repairs(
     report: str,
     evidence_packs: Sequence[dict[str, Any]],
@@ -2496,6 +2648,11 @@ def finalize_report_output(
             repairs.extend(f"applied final evidence repair: {question}" for question in evidence_repairs)
             report = repaired
             validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
+    canonical_repaired, canonical_repairs = apply_canonical_gap_repairs(report, planner_questions, sources)
+    if canonical_repairs:
+        repairs.extend(canonical_repairs)
+        report = canonical_repaired
+        validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
     limitation_repaired = apply_validation_limitations(report, validation, sources)
     if limitation_repaired != report:
         repairs.append("updated limitations from validation issues")
@@ -2505,6 +2662,49 @@ def finalize_report_output(
     if repairs and status == "clean":
         status = "repaired"
     return report, validation, {"status": status, "repairs": repairs}
+
+
+def apply_canonical_gap_repairs(
+    report: str,
+    planner_questions: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    source_url_by_index = {
+        source.get("index"): normalize_url(source.get("url"))
+        for source in sources or []
+        if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+    lines = clean_markdown(strip_references(report)).splitlines()
+    repairs = []
+    for question in planner_questions or []:
+        section = report_section_for_question("\n".join(lines), question)
+        if not section:
+            continue
+        cited_urls = [source_url_by_index.get(index, "") for index in citation_markers(section)]
+        notes = [
+            CANONICAL_SOURCE_GAP_NOTES.get(signal, "The selected evidence does not provide enough cited detail for one required canonical source.")
+            for signal in canonical_source_url_signals(question)
+            if not any(signal in cited_url for cited_url in cited_urls)
+            and not section_has_gap_for_canonical_signal(section, signal)
+        ]
+        if not notes:
+            continue
+        lines = append_notes_to_question_section(lines, question, notes)
+        repairs.append(f"added canonical-source gap note: {question}")
+    if not repairs:
+        return report, []
+    return normalize_final_report("\n".join(lines), sources), dedupe_text(repairs)
+
+
+def append_notes_to_question_section(lines: Sequence[str], question: str, notes: Sequence[str]) -> list[str]:
+    bounds = section_bounds_for_question(lines, question)
+    if not bounds:
+        return [*lines, "", f"### {planner_question_heading(question)}", *notes]
+    start, end = bounds
+    additions = [note for note in notes if note and note not in "\n".join(lines[start:end])]
+    if not additions:
+        return list(lines)
+    return [*lines[:end], "", *additions, *lines[end:]]
 
 
 def apply_incomplete_equation_repairs(
@@ -2565,6 +2765,10 @@ def validation_limitation_items(validation: dict[str, Any]) -> list[str]:
     return dedupe_text(items)
 
 
+# ---------------------------------------------------------------------------
+# Markdown cleanup and frame polishing
+# ---------------------------------------------------------------------------
+
 def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
     lines = strip_references(clean_markdown(report)).splitlines()
     cleaned: list[str] = []
@@ -2577,9 +2781,12 @@ def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
             index = skip_raw_planner_notes_block(lines, index)
             continue
         if line_is_report_scaffold_label(line):
+            scrubbed = scrub_report_scaffold_text(line)
             repairs.append("removed raw report scaffold label")
-            index += 1
-            continue
+            if not citation_markers(scrubbed):
+                index += 1
+                continue
+            line = scrubbed
         if missing_details_stub_at(lines, index):
             repairs.append("removed empty missing-details stub")
             index = skip_empty_missing_details_stub(lines, index)
@@ -2617,11 +2824,46 @@ def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
 def cleanup_report_section_roles(report: str) -> tuple[str, list[str]]:
     text = remove_duplicate_section_labels(report)
     repairs = ["removed duplicate section label"] if text != clean_markdown(report) else []
+    deduped = dedupe_frame_section_sentences(text)
+    if deduped != text:
+        repairs.append("deduped frame section sentences")
+        text = deduped
     text, heading_repairs = repair_topic_headings(text)
     repairs.extend(heading_repairs)
     text, frame_repairs = repair_weak_frame_sections(text)
     repairs.extend(frame_repairs)
     return text, repairs
+
+
+def dedupe_frame_section_sentences(report: str) -> str:
+    text = clean_markdown(report)
+    for heading in ("Executive Summary", "Introduction and Context", "Cross-cutting Analysis and Synthesis", "Conclusion"):
+        section = named_report_section(text, heading)
+        if not section:
+            continue
+        body = strip_leading_heading(section)
+        deduped = dedupe_sentences_preserving_order(body)
+        if deduped != clean_markdown(body):
+            text = replace_named_report_section(text, heading, deduped)
+    return clean_markdown(text)
+
+
+def dedupe_sentences_preserving_order(text: Any) -> str:
+    value = clean_markdown(text)
+    if "\n" in value:
+        return "\n".join(dedupe_sentences_preserving_order(line) for line in value.splitlines())
+    sentences = split_sentences(value)
+    if len(sentences) <= 1:
+        return value
+    selected = []
+    seen = set()
+    for sentence in sentences:
+        key = normalize_heading(strip_markdown(sentence))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        selected.append(sentence)
+    return clean_text(" ".join(selected))
 
 
 def line_is_raw_planner_notes_label(line: str) -> bool:
@@ -2631,8 +2873,44 @@ def line_is_raw_planner_notes_label(line: str) -> bool:
 def line_is_report_scaffold_label(line: str) -> bool:
     return bool(
         re.match(
-            r"^\s*\*\*(?:Planner Sub-question|Key points to include in the final report|Supported (?:information|answer|definition|details|evidence))\b",
+            r"^\s*\*\*(?:Planner[\s‑-]*sub[\s‑-]*question|Key points to include in the final report|Supported (?:information|answer|definition|details|evidence))\b",
             clean_text(line),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def line_is_synthesis_scaffold_line(line: str) -> bool:
+    value = clean_text(line)
+    return bool(
+        re.match(
+            r"^\s*(?:---\s*)?(?:#{1,6}\s*)?(?:\d+[.)]\s*)?(?:Supported evidence|Missing details|Next steps|All statements above|Planner[\s‑-]*sub[\s‑-]*question)\b",
+            value,
+            flags=re.IGNORECASE,
+        )
+        or re.match(r"^\s*\|", value)
+    )
+
+
+def scrub_report_scaffold_text(text: Any) -> str:
+    value = clean_markdown(text)
+    value = re.sub(r"\*\*Planner[\s‑-]*sub[\s‑-]*question:\*\*.*?(?:---|\s+-\s+)", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"Planner[\s‑-]*sub[\s‑-]*question:\s*.*?(?:---|\s+-\s+)", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s*\*\*Planner[\s‑-]*sub[\s‑-]*question:\*\*.*$", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s*Planner[\s‑-]*sub[\s‑-]*question:\s*.*$", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"(?:---\s*)?#{1,6}\s*\d+[.)]?\s*Supported evidence\s*(?:\(.*?\))?\s*-?\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\*\*(?:Supported evidence|Supported definition|Supported answer|Supported details)(?:\s*\([^)]*\))?\*\*\s*-?\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\*\*Key points to include in the final report\*\*\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\*?All statements above are directly supported.*?(?:$|\n)", "", value, flags=re.IGNORECASE)
+    return clean_markdown(value)
+
+
+def report_contains_raw_scaffold(text: Any) -> bool:
+    value = clean_text(text)
+    return bool(
+        re.search(
+            r"Planner[\s‑-]*sub[\s‑-]*question|Supported evidence|Key points to include in the final report|---\s*###",
+            value,
             flags=re.IGNORECASE,
         )
     )
@@ -2693,7 +2971,15 @@ def trim_incomplete_heading(heading: str) -> str:
 
 def repair_weak_frame_sections(report: str) -> tuple[str, list[str]]:
     repairs: list[str] = []
-    topic_digest = "\n\n".join(section for heading, section in markdown_sections(report) if re.match(r"^3\.\d+", clean_text(heading)))
+    topic_pairs = [
+        (strip_heading_numbering(heading), section)
+        for heading, section in markdown_sections(report)
+        if re.match(r"^3\.\d+", clean_text(heading))
+    ]
+    topic_digest = clean_topic_digest_for_frames(
+        [heading for heading, _ in topic_pairs],
+        [section for _, section in topic_pairs],
+    )
     for heading in ("Cross-cutting Analysis and Synthesis", "Conclusion"):
         section = named_report_section(report, heading)
         if not section:
@@ -2719,6 +3005,8 @@ def frame_body_needs_role_repair(heading_name: str, body: str) -> bool:
         return True
     bullet_lines = [line for line in lines if re.match(r"^\s*(?:[-*+]|\d+[.)])\s+", line)]
     normalized = normalize_heading(heading_name)
+    if report_contains_raw_scaffold(body):
+        return True
     if normalized == "conclusion" and bullet_lines:
         return True
     if normalized == "cross cutting analysis and synthesis" and len(bullet_lines) >= max(2, len(lines) // 2):
@@ -2774,19 +3062,24 @@ def remove_raw_repair_prefix(line: str) -> str:
 def repair_truncated_markdown_line(line: str) -> tuple[str, list[str]]:
     if not clean_text(line) or line.lstrip().startswith(("#", "|", "```")):
         return line, []
+    repairs: list[str] = []
+    scrubbed = scrub_report_scaffold_text(line)
+    if scrubbed != clean_markdown(line):
+        line = scrubbed
+        repairs.append("removed inline report scaffold text")
     if re.match(r"^\s*\\\]\s*\\left", line):
         return "", ["removed malformed equation tail"]
     if list_item_appears_truncated(line):
         return "", ["removed truncated list item"]
     repaired = remove_clipped_sentence_fragments(line)
     if repaired != clean_text(line):
-        return repaired, ["removed clipped sentence fragment"]
+        return repaired, [*repairs, "removed clipped sentence fragment"]
     if line_has_suspicious_terminal_fragment(line):
         repaired = trim_incomplete_final_sentence(line)
         if repaired != clean_text(line):
-            return repaired, ["trimmed incomplete sentence fragment"]
-        return "", ["removed incomplete sentence fragment"]
-    return line, []
+            return repaired, [*repairs, "trimmed incomplete sentence fragment"]
+        return "", [*repairs, "removed incomplete sentence fragment"]
+    return line, repairs
 
 
 def remove_clipped_sentence_fragments(line: str) -> str:
@@ -2815,17 +3108,6 @@ def sentence_fragment_start(text: str, fragment_start: int) -> int:
         return boundary + 2
     bullet_match = re.match(r"^(\s*(?:[-*+]|\d+[.)])\s+)", text)
     return len(bullet_match.group(1)) if bullet_match else 0
-
-
-def remove_internal_clipped_sentence_fragments(line: str) -> str:
-    return remove_clipped_sentence_fragments(line)
-
-
-def clipped_word_fragment(word: str) -> bool:
-    lowered = clean_text(word).lower().rstrip("-")
-    if len(lowered) <= 2:
-        return lowered not in {"a", "i"}
-    return lowered.endswith("-") or lowered in CLIPPED_SENTENCE_FRAGMENT_WORDS
 
 
 def line_has_suspicious_terminal_fragment(line: str) -> bool:
@@ -2909,6 +3191,10 @@ def upsert_section_repair_note(report: str, question: str, note: str, remove_gap
         section_lines.extend(["", note])
     return clean_markdown("\n".join([*lines[:start], *section_lines, *lines[end:]]))
 
+
+# ---------------------------------------------------------------------------
+# Coverage reconciliation and section matching
+# ---------------------------------------------------------------------------
 
 def section_bounds_for_question(lines: Sequence[str], question: str) -> tuple[int, int] | None:
     expected = normalize_heading(planner_question_heading(question))
@@ -3284,6 +3570,10 @@ def synthesis_coverage_status_is_gap(status: Any) -> bool:
     return bool(lowered and any(term in lowered for term in ("missing", "partial", "weak", "insufficient", "unsupported", "failed", "error")))
 
 
+# ---------------------------------------------------------------------------
+# Report schema and quality checks
+# ---------------------------------------------------------------------------
+
 def missing_sub_question_coverage(report: str, planner_questions: Sequence[str]) -> list[str]:
     report_terms = set(technical_question_terms(report))
     missing = []
@@ -3440,6 +3730,8 @@ def report_quality_issues(
         issues.append("report must include a References section")
     if has_placeholder_source_marker(text):
         issues.append("report contains placeholder or non-source citation markers")
+    if report_contains_raw_scaffold(text):
+        issues.append("report contains raw synthesis scaffold text")
     if has_dangling_markdown_bullet(text):
         issues.append("report contains empty or dangling bullet items")
     truncated_sections = truncated_report_sections(text)
@@ -3599,15 +3891,15 @@ def canonical_source_routing_issues(
             continue
         cited_urls = [source_url_by_index.get(index, "") for index in citation_markers(section)]
         available_required = [url for url in required_urls if any(url in source_url for source_url in source_url_by_index.values())]
-        missing = [url for url in available_required if not any(url in cited_url for cited_url in cited_urls)]
+        missing = [
+            url
+            for url in available_required
+            if not any(url in cited_url for cited_url in cited_urls)
+            and not section_has_gap_for_canonical_signal(section, url)
+        ]
         if missing:
             issues.append(f"report does not cite canonical source for topic: {clean_text(question)}")
     return dedupe_text(issues)
-
-
-def canonical_source_url_signal(question: str) -> str:
-    signals = canonical_source_url_signals(question)
-    return signals[0] if signals else ""
 
 
 def canonical_source_url_signals(question: str) -> list[str]:
@@ -3620,6 +3912,15 @@ def canonical_source_url_signals(question: str) -> list[str]:
     if "attention is all you need" in lowered or "self-attention" in lowered or "multi-head" in lowered:
         signals.append("1706.03762")
     return dedupe_text(signals)
+
+
+def section_has_gap_for_canonical_signal(section: str, url_signal: str) -> bool:
+    terms = CANONICAL_SOURCE_TERMS.get(clean_text(url_signal), ())
+    return bool(terms and any(
+        any(term in clean_text(line).lower().replace("‑", "-").replace("–", "-").replace("—", "-") for term in terms)
+        and line_has_gap_claim(line)
+        for line in clean_markdown(section).splitlines()
+    ))
 
 
 def internal_gap_contradiction_issues(report: str) -> list[str]:
@@ -3793,6 +4094,10 @@ def format_missing_evidence_constraints(synthesis: Any) -> str:
     return "\n".join(f"- {item}" for item in items) if items else "- No explicit missing-evidence constraints."
 
 
+# ---------------------------------------------------------------------------
+# Persistence and generic text utilities
+# ---------------------------------------------------------------------------
+
 def write_report_file(report_payload: dict[str, Any], memory_path: str = "data/shared_memory.json", report_path: str | None = None) -> str:
     report = clean_markdown(report_payload.get("report"))
     if not report:
@@ -3958,16 +4263,3 @@ def normalize_url(value: Any) -> str:
 
 def format_citation_indexes(indexes: Sequence[int]) -> str:
     return ", ".join(f"[{index}]" for index in sorted(set(indexes)))
-
-
-# Compatibility aliases used by older tests/scripts.
-normalize_report_for_validation = normalize_final_report
-hard_report_issues = lambda issues: [issue for issue in issues if clean_text(issue)]
-markdown_completion_issues = lambda markdown: [] if clean_text(markdown) else ["section is empty"]
-format_evidence_coverage_brief = lambda **kwargs: ""
-format_memory_signal_evidence = lambda *args, **kwargs: ""
-format_planner_evidence_packet = lambda *args, **kwargs: ""
-format_source_priority_guidance = lambda sources: ""
-remove_conflicting_missing_evidence_statements = lambda report, evidence_text="": report
-remove_placeholder_citations = lambda text: re.sub(r"\[(?:uncited|citation needed|source needed)\]", "", str(text), flags=re.IGNORECASE)
-ensure_planner_question_sections = lambda report, *args, **kwargs: report

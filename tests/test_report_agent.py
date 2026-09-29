@@ -11,6 +11,8 @@ from src.agents.report_agent import (
     clean_markdown,
     build_report_prompt,
     canonical_source_routing_issues,
+    clean_section_synthesis_note,
+    clean_topic_digest_for_frames,
     compact_markdown_at_sentence,
     dedupe_sources,
     evidence_pack_questions,
@@ -379,6 +381,22 @@ Variants are described with only one canonical citation [3].
         fixed = report.replace("[3]", "[2] [3] [5]")
         self.assertEqual(canonical_source_routing_issues(fixed, [question], sources), [])
 
+    def test_canonical_source_routing_allows_explicit_missing_variant_gap(self):
+        question = "How do different attention variants (Bahdanau, Luong, self-attention, multi-head) compare?"
+        sources = [
+            {"index": 1, "url": "https://arxiv.org/pdf/1409.0473"},
+            {"index": 3, "url": "https://arxiv.org/pdf/1706.03762"},
+        ]
+        report = """
+## 3. Topic Sections
+
+### 3.1. Different Attention Variants
+Self-attention and multi-head attention are supported by the Transformer evidence [3].
+The selected evidence for this comparison does not provide enough cited detail to compare Bahdanau/additive attention architecture, performance, or use cases.
+"""
+
+        self.assertEqual(canonical_source_routing_issues(report, [question], sources), [])
+
     def test_cleanup_report_markdown_artifacts_repairs_section_role_polish(self):
         report = """
 ## 1. Executive Summary
@@ -408,6 +426,24 @@ Topic fact is supported [1].
         self.assertNotIn('"Attention Is All', cleaned)
         self.assertNotIn("\n- Topic fact", cleaned)
 
+    def test_cleanup_report_markdown_artifacts_removes_inline_scaffold_text(self):
+        report = """
+## 1. Executive Summary
+Definition sentence is supported [1]. **Planner Sub-question:** What is attention? - The alignment score is supported [1].
+
+## 3. Topic Sections
+### 3.1. Variants
+**Planner Sub-question:** How do variants compare? --- ### 1. Supported evidence (from retrieved source) - Transformer self-attention is supported [2].
+"""
+
+        cleaned, repairs = cleanup_report_markdown_artifacts(report)
+
+        self.assertIn("removed inline report scaffold text", repairs)
+        self.assertNotIn("Planner Sub-question", cleaned)
+        self.assertNotIn("Supported evidence", cleaned)
+        self.assertIn("The alignment score is supported [1].", cleaned)
+        self.assertIn("Transformer self-attention is supported [2].", cleaned)
+
     def test_section_role_helpers_detect_and_repair_weak_frames(self):
         report = """
 ## 3. Topic Sections
@@ -430,6 +466,39 @@ Topic fact is supported [1].
         repaired, repairs = repair_weak_frame_sections(report)
         self.assertIn("replaced weak conclusion section", repairs)
         self.assertNotIn("\n- Copied conclusion", repaired)
+
+    def test_clean_topic_digest_for_frames_uses_one_clean_summary_per_topic(self):
+        digest = clean_topic_digest_for_frames(
+            ["What is attention?", "What benchmark result is reported?"],
+            [
+                "Attention focuses relevant input elements [1]. Attention focuses relevant input elements [1]. **Planner Sub-question:** bad",
+                "The Transformer reaches 28.4 BLEU on WMT 2014 English-to-German [3].",
+            ],
+        )
+        summary = report_agent_module.deterministic_frame_section("Executive Summary", digest)
+        conclusion = report_agent_module.deterministic_frame_section("Conclusion", digest)
+
+        self.assertNotIn("Planner Sub-question", digest)
+        self.assertEqual(summary.count("Attention focuses relevant input elements"), 1)
+        self.assertIn("28.4 BLEU", conclusion)
+
+    def test_clean_section_synthesis_note_keeps_evidence_after_scaffold_prefix(self):
+        note = {
+            "synthesis": (
+                "**Planner Sub-question:** How do variants compare? --- ### 1. Supported evidence "
+                "(from retrieved source) - **Transformer architecture** removes recurrence and convolution [3].\n"
+                "### 2. Missing details\n"
+                "| Aspect | Missing information |\n"
+                "| Luong | Missing equations |"
+            )
+        }
+
+        cleaned = clean_section_synthesis_note(note)
+
+        self.assertIn("Transformer architecture", cleaned)
+        self.assertIn("[3]", cleaned)
+        self.assertNotIn("Planner Sub-question", cleaned)
+        self.assertNotIn("Missing details", cleaned)
 
     def test_repair_truncated_markdown_line_trims_suspicious_short_fragment(self):
         repaired, repairs = repair_truncated_markdown_line(
