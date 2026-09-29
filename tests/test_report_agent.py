@@ -207,6 +207,11 @@ The core intuition is that the model learns where to look in the input sequence 
 ### 3.1. Definition
 Supported definition [1].
 
+**Planner Sub-question:** What is attention?
+**Supported definition (from retrieved evidence)**
+Attention is supported by cited evidence [1].
+**Key points to include in the final report**
+
 **Exact missing details**
 -
 
@@ -221,9 +226,13 @@ Supported definition [1].
         cleaned, repairs = cleanup_report_markdown_artifacts(report)
 
         self.assertIn("removed empty missing-details stub", repairs)
+        self.assertIn("removed raw report scaffold label", repairs)
         self.assertIn("removed truncated list item", repairs)
         self.assertIn("normalized nested bullet marker", repairs)
         self.assertIn("trimmed incomplete sentence fragment", repairs)
+        self.assertNotIn("Planner Sub-question", cleaned)
+        self.assertNotIn("**Supported definition", cleaned)
+        self.assertNotIn("Key points to include", cleaned)
         self.assertNotIn("Exact missing details", cleaned)
         self.assertNotIn("\n-\n", cleaned)
         self.assertNotIn("- -", cleaned)
@@ -559,8 +568,8 @@ Conclusion is complete [1].
         repaired = apply_validation_limitations(report, validation, [{"index": 1, "url": "https://example.com"}])
 
         self.assertNotIn("No unresolved evidence gaps", repaired)
-        self.assertIn("Report lacks concrete framework API detail: What APIs are provided?.", repaired)
-        self.assertIn("Report section still needs evidence-pack citation support for: What APIs are provided?.", repaired)
+        self.assertNotIn("report lacks concrete framework API detail", repaired.lower())
+        self.assertIn("Citation support remains incomplete for: What APIs are provided?.", repaired)
 
     def test_normalize_markdown_headings_removes_duplicate_heading_markers(self):
         markdown = "### ## 1. Definition\nText."

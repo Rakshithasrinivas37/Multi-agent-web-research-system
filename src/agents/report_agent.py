@@ -657,7 +657,25 @@ def accept_topic_section(
     repairs = dedupe_text([*cleanup_repairs, *(f"section acceptance issue: {issue}" for issue in issues), *fallback_repairs])
     if fallback_issues:
         repairs.extend(f"fallback retained issue: {issue}" for issue in fallback_issues)
+        if fallback_is_unusable(fallback_issues):
+            fallback = reliable_gap_topic_section(question, fallback_issues)
+            repairs.append("replaced unreliable fallback with evidence-gap note")
     return fallback, repairs, True
+
+
+def fallback_is_unusable(issues: Sequence[str]) -> bool:
+    return any(
+        clean_text(issue) in {"section appears truncated", "section has dangling bullet", "section has malformed equation"}
+        for issue in issues or []
+    )
+
+
+def reliable_gap_topic_section(question: str, issues: Sequence[str]) -> str:
+    issue_text = "; ".join(clean_text(issue) for issue in issues if clean_text(issue))
+    return (
+        "The retrieved evidence selected for this sub-question was not reliable enough to produce a complete "
+        f"cited section: {clean_text(question)}. Remaining quality issue: {issue_text or 'incomplete cited evidence'}."
+    )
 
 
 def cleanup_topic_section(section: str, question: str) -> tuple[str, list[str]]:
@@ -2540,14 +2558,10 @@ def validation_limitation_items(validation: dict[str, Any]) -> list[str]:
         items.append(f"Missing planner coverage: {question}.")
     for question in validation.get("synthesis_gaps", []) or []:
         items.append(f"Synthesis marked evidence as incomplete for: {question}.")
-    for issue in validation.get("report_issues", []) or []:
-        text = clean_text(issue)
-        if text:
-            items.append(text[0].upper() + text[1:] + ".")
     for question in validation.get("false_gap_questions", []) or []:
-        items.append(f"Report contains a contradicted evidence gap for: {question}.")
+        items.append(f"Evidence-gap wording needs review for: {question}.")
     for question in validation.get("pack_citation_gap_questions", []) or []:
-        items.append(f"Report section still needs evidence-pack citation support for: {question}.")
+        items.append(f"Citation support remains incomplete for: {question}.")
     return dedupe_text(items)
 
 
@@ -2561,6 +2575,10 @@ def cleanup_report_markdown_artifacts(report: str) -> tuple[str, list[str]]:
         if line_is_raw_planner_notes_label(line):
             repairs.append("removed raw planner notes block")
             index = skip_raw_planner_notes_block(lines, index)
+            continue
+        if line_is_report_scaffold_label(line):
+            repairs.append("removed raw report scaffold label")
+            index += 1
             continue
         if missing_details_stub_at(lines, index):
             repairs.append("removed empty missing-details stub")
@@ -2608,6 +2626,16 @@ def cleanup_report_section_roles(report: str) -> tuple[str, list[str]]:
 
 def line_is_raw_planner_notes_label(line: str) -> bool:
     return bool(re.match(r"^\s*\*\*Planner notes\b", clean_text(line), flags=re.IGNORECASE))
+
+
+def line_is_report_scaffold_label(line: str) -> bool:
+    return bool(
+        re.match(
+            r"^\s*\*\*(?:Planner Sub-question|Key points to include in the final report|Supported (?:information|answer|definition|details|evidence))\b",
+            clean_text(line),
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def skip_raw_planner_notes_block(lines: Sequence[str], index: int) -> int:
