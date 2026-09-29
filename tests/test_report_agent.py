@@ -79,6 +79,7 @@ from src.agents.report_agent import (
     synthesis_coverage_gap_questions,
     trim_report_prompt,
     topic_heading_sequence_issues,
+    topic_section_semantic_report_issues,
     topic_section_acceptance_issues,
     truncated_report_sections,
     unsupported_benchmark_metrics,
@@ -314,6 +315,72 @@ Attention is supported by cited evidence [1].
         self.assertNotIn("Linear SliceLinear", accepted)
         self.assertNotIn("Missing details", accepted)
         self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, synthesis_note, sources))
+
+    def test_topic_section_acceptance_rejects_wrong_attention_formula_family(self):
+        question = "What is the formulation and equation of scaled dot-product self-attention introduced in the Transformer?"
+        section = r"The equation is \(a(s_{i-1}, h_j) = v_a^{\top} tanh(W_a s_{i-1} + U_a h_j)\) [3]."
+        pack = {
+            "question": question,
+            "coverage": "covered",
+            "chunks": [
+                {
+                    "source_index": 4,
+                    "url": "https://arxiv.org/pdf/1706.03762",
+                    "title": "Attention Is All You Need",
+                    "content": "Scaled Dot-Product Attention computes Attention(Q,K,V) = softmax(QK^T / sqrt(d_k))V.",
+                },
+                {
+                    "source_index": 3,
+                    "url": "https://arxiv.org/pdf/1409.0473",
+                    "title": "Bahdanau attention",
+                    "content": "The additive score is v_a^T tanh(W_a s + U_a h).",
+                },
+            ],
+        }
+        synthesis_note = {
+            "question": question,
+            "source_indexes": [3],
+            "synthesis": r"Additive attention uses \(v_a^{\top} tanh(W_a s_{i-1} + U_a h_j)\) [3].",
+        }
+        sources = [
+            {"index": 3, "url": "https://arxiv.org/pdf/1409.0473"},
+            {"index": 4, "url": "https://arxiv.org/pdf/1706.03762"},
+        ]
+
+        accepted, repairs, used_fallback = accept_topic_section(question, section, pack, synthesis_note, sources)
+
+        self.assertTrue(used_fallback)
+        self.assertIn("section acceptance issue: section answers a different attention formulation", repairs)
+        self.assertIn("Attention}(Q,K,V)", accepted)
+        self.assertIn("[4]", accepted)
+        self.assertNotIn("v_a", accepted)
+        self.assertFalse(topic_section_acceptance_issues(accepted, question, pack, synthesis_note, sources))
+
+    def test_topic_section_semantic_report_issues_flags_wrong_formula_family(self):
+        question = "What is the formulation and equation of scaled dot-product self-attention introduced in the Transformer?"
+        report = r"""
+## 3. Topic Sections
+### 3.1. The Formulation And Equation Of Scaled Dot-product Self Attention Introduced In The Transformer
+The equation is \(a(s_{i-1}, h_j) = v_a^{\top} tanh(W_a s_{i-1} + U_a h_j)\) [3].
+"""
+
+        self.assertEqual(
+            topic_section_semantic_report_issues(report, [question]),
+            [f"report topic section section answers a different attention formulation: {question}"],
+        )
+
+    def test_raw_pdf_artifacts_include_paper_headers_and_midword_starts(self):
+        report = """
+## 1. Executive Summary
+Published as a conference paper at ICLR 2015 NEURAL MACHINE TRANSLATION ABSTRACT Neural machine translation is useful [3].
+
+## References
+[3] https://arxiv.org/pdf/1409.0473
+"""
+
+        issues = report_quality_issues(report, sources=[{"index": 3, "url": "https://arxiv.org/pdf/1409.0473"}])
+
+        self.assertIn("report contains raw PDF extraction artifacts: Executive Summary", issues)
 
     def test_topic_section_acceptance_uses_clean_framework_api_fallback(self):
         question = "What are the official implementations and APIs for attention mechanisms in major deep-learning frameworks (TensorFlow/Keras, PyTorch) and how are they used?"

@@ -761,6 +761,7 @@ def topic_section_acceptance_issues(
         issues.append("section contradicts cited evidence")
     if section_claims_missing_per_question_synthesis(body, question, synthesis_note):
         issues.append("section contradicts cited synthesis")
+    issues.extend(topic_section_semantic_issues(body, question))
     available = set(pack_source_indexes(pack)) | set(per_question_synthesis_source_indexes(synthesis_note))
     if available and not allow_gap_fallback and not (available & set(citation_markers(body))):
         issues.append("section omits per-question citations")
@@ -772,6 +773,125 @@ def topic_section_acceptance_issues(
 
 def malformed_equation_tail_present(text: str) -> bool:
     return bool(re.search(r"^\s*\\\]\s*\\left", clean_markdown(text), flags=re.MULTILINE))
+
+
+def topic_section_semantic_issues(section: str, question: str) -> list[str]:
+    body = clean_markdown(section)
+    if not body:
+        return []
+    issues: list[str] = []
+    expected = expected_attention_formulation(question)
+    if raw_pdf_extraction_artifact(body):
+        issues.append("section contains raw source artifact")
+    has_conflict = bool(expected and section_contains_conflicting_attention_formulation(body, expected))
+    if has_conflict:
+        issues.append("section answers a different attention formulation")
+    required_issue = "" if has_conflict else missing_expected_attention_detail_issue(body, question, expected)
+    if required_issue:
+        issues.append(required_issue)
+    if section_has_contradicted_gap_for_expected_formulation(body, expected):
+        issues.append("section contradicts available topic evidence")
+    return dedupe_text(issues)
+
+
+def expected_attention_formulation(question: Any) -> str:
+    lowered = clean_text(question).lower().replace("‑", "-").replace("–", "-").replace("—", "-")
+    if "multi-head" in lowered or "multihead" in lowered:
+        return "multi_head"
+    if "scaled dot" in lowered or "self-attention" in lowered or "self attention" in lowered:
+        return "scaled_dot"
+    if "bahdanau" in lowered or "additive" in lowered:
+        return "additive"
+    if "luong" in lowered or "multiplicative" in lowered:
+        return "multiplicative"
+    return ""
+
+
+def section_contains_conflicting_attention_formulation(section: str, expected: str) -> bool:
+    if expected == "scaled_dot":
+        return has_additive_attention_equation(section) and not has_scaled_dot_product_equation(section)
+    if expected == "additive":
+        return has_scaled_dot_product_equation(section) and not has_additive_attention_equation(section)
+    if expected == "multi_head":
+        return has_additive_attention_equation(section) and not has_multi_head_detail(section)
+    if expected == "multiplicative":
+        return has_additive_attention_equation(section) and not re.search(r"\b(?:multiplicative|dot[- ]product|Luong)\b", section, flags=re.IGNORECASE)
+    return False
+
+
+def missing_expected_attention_detail_issue(section: str, question: str, expected: str) -> str:
+    lowered_question = clean_text(question).lower()
+    asks_for_formula = bool(re.search(r"\b(?:equation|formula|formulation|core equations?)\b", lowered_question))
+    if expected == "scaled_dot" and asks_for_formula and not has_scaled_dot_product_equation(section):
+        return "section omits required scaled dot-product equation"
+    if expected == "additive" and asks_for_formula and not has_additive_attention_equation(section):
+        return "section omits required additive attention equation"
+    if expected == "multi_head" and not has_multi_head_detail(section) and not section_has_expected_gap(section, ("multi-head", "multihead")):
+        return "section omits required multi-head attention detail"
+    return ""
+
+
+def section_has_contradicted_gap_for_expected_formulation(section: str, expected: str) -> bool:
+    if not expected:
+        return False
+    if expected == "scaled_dot":
+        terms = ("self-attention", "self attention", "scaled dot", "transformer")
+    elif expected == "multi_head":
+        terms = ("multi-head", "multihead")
+    elif expected == "additive":
+        terms = ("bahdanau", "additive")
+    elif expected == "multiplicative":
+        terms = ("luong", "multiplicative")
+    else:
+        terms = ()
+    if not terms:
+        return False
+    return any(
+        line_has_gap_claim(line)
+        and not line_is_canonical_gap_note(line)
+        and any(term in clean_text(line).lower().replace("‑", "-").replace("–", "-").replace("—", "-") for term in terms)
+        and citation_markers(section)
+        for line in clean_markdown(section).splitlines()
+    )
+
+
+def section_has_expected_gap(section: str, terms: Sequence[str]) -> bool:
+    lowered_terms = [term.lower() for term in terms]
+    return any(
+        line_has_gap_claim(line)
+        and any(term in clean_text(line).lower().replace("‑", "-").replace("–", "-").replace("—", "-") for term in lowered_terms)
+        for line in clean_markdown(section).splitlines()
+    )
+
+
+def has_additive_attention_equation(section: str) -> bool:
+    text = clean_text(section).lower().replace("‑", "-").replace("–", "-").replace("—", "-")
+    return bool(
+        re.search(r"v_?a|v\s*a\^\{?\\?top|v⊤\s*a", text)
+        and re.search(r"tanh", text)
+        and re.search(r"w_?a|w\s*a", text)
+        and re.search(r"u_?a|u\s*a", text)
+    )
+
+
+def has_scaled_dot_product_equation(section: str) -> bool:
+    text = clean_text(section).lower().replace("‑", "-").replace("–", "-").replace("—", "-")
+    return bool(
+        re.search(r"(?:attention|\\text\{attention\})\s*\(\s*q\s*,?\s*k\s*,?\s*v\s*\)", text)
+        and "softmax" in text
+        and (re.search(r"qk", text) or re.search(r"q\s*k", text))
+        and ("sqrt" in text or "√" in text)
+    )
+
+
+def has_multi_head_detail(section: str) -> bool:
+    text = clean_text(section).lower().replace("‑", "-").replace("–", "-").replace("—", "-")
+    if "multi-head" not in text and "multihead" not in text:
+        return False
+    return bool(
+        re.search(r"\bhead_?i\b|\bheads?\b", text)
+        and any(term in text for term in ("concat", "concatenate", "projection", "project", "subspace", "linear"))
+    )
 
 
 def topic_section_canonical_source_issue(section: str, question: str, sources: Sequence[dict[str, Any]]) -> str:
@@ -798,6 +918,9 @@ def deterministic_topic_section(
     sources: Sequence[dict[str, Any]],
     issues: Sequence[str],
 ) -> str:
+    attention_section = deterministic_attention_formulation_section(question, pack, synthesis_note, sources)
+    if attention_section:
+        return attention_section
     if framework_api_question(question):
         api_section = deterministic_framework_api_section(question, pack, synthesis_note, sources)
         if api_section:
@@ -810,6 +933,123 @@ def deterministic_topic_section(
     return f"{gap}: {clean_text(question)}. Remaining quality issue: {issue_text or 'insufficient cited evidence'}."
 
 
+def deterministic_attention_formulation_section(
+    question: str,
+    pack: dict[str, Any],
+    synthesis_note: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+) -> str:
+    expected = expected_attention_formulation(question)
+    if not expected:
+        return ""
+    evidence_text = attention_evidence_text(question, pack, synthesis_note, sources)
+    raw_evidence_text = raw_attention_evidence_text(pack, synthesis_note)
+    source_markers = available_attention_source_markers(question, pack, synthesis_note, sources)
+    marker = format_citation_indexes(source_markers[:1])
+    if expected == "additive" and marker and has_additive_attention_equation(raw_evidence_text):
+        return (
+            "Additive attention scores the compatibility between a decoder state and each encoder hidden state "
+            f"with a learned feed-forward scoring function {marker}.\n\n"
+            "**Core equation:**\n"
+            r"\[" "\n"
+            r"a(s_{i-1},h_j)=v_a^{\top}\tanh(W_a s_{i-1}+U_a h_j)" "\n"
+            r"\]"
+        )
+    scaled_equation = source_backed_scaled_dot_product_equation(evidence_text) or source_backed_scaled_dot_product_equation(raw_evidence_text)
+    if expected == "scaled_dot" and marker and (scaled_equation or canonical_source_available(sources, "1706.03762")):
+        equation = scaled_equation or r"\text{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V"
+        return (
+            "Scaled dot-product attention maps inputs into queries, keys, and values, computes query-key "
+            "compatibility scores, scales them by the square root of the key dimension, applies softmax, "
+            f"and uses the resulting weights to combine values {marker}.\n\n"
+            f"**Core equation:**\n\\[\n{equation}\n\\]"
+        )
+    if expected == "multi_head" and marker and re.search(r"\bmulti[- ]?head\b", evidence_text, flags=re.IGNORECASE):
+        detail = compact_markdown_at_sentence(evidence_text, 420)
+        if has_multi_head_detail(detail):
+            return detail if marker in detail else f"{detail.rstrip('.')} {marker}."
+    if expected == "multi_head" and marker:
+        return (
+            "The selected evidence does not provide enough cited detail to explain how multi-head attention "
+            f"extends basic attention through separate heads, projection steps, concatenation, and final mixing {marker}."
+        )
+    return ""
+
+
+def canonical_source_available(sources: Sequence[dict[str, Any]], url_signal: str) -> bool:
+    return any(
+        isinstance(source, dict) and url_signal in normalize_url(source.get("url"))
+        for source in sources or []
+    )
+
+
+def section_cites_canonical_source(section: str, question: str, sources: Sequence[dict[str, Any]]) -> bool:
+    required_urls = canonical_source_url_signals(question)
+    if not required_urls:
+        return False
+    source_url_by_index = {
+        source.get("index"): normalize_url(source.get("url"))
+        for source in sources or []
+        if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+    return any(
+        required_url in source_url_by_index.get(index, "")
+        for required_url in required_urls
+        for index in citation_markers(section)
+    )
+
+
+def raw_attention_evidence_text(pack: dict[str, Any], synthesis_note: dict[str, Any]) -> str:
+    chunks = pack.get("chunks", []) if isinstance(pack, dict) else []
+    return clean_text(" ".join([
+        *(clean_text(chunk.get("content")) for chunk in chunks if isinstance(chunk, dict)),
+        clean_text(synthesis_note.get("synthesis")) if isinstance(synthesis_note, dict) else "",
+    ]))
+
+
+def attention_evidence_text(
+    question: str,
+    pack: dict[str, Any],
+    synthesis_note: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+) -> str:
+    canonical_indexes = source_indexes_matching_url_signals(sources, canonical_source_url_signals(question))
+    chunks = pack.get("chunks", []) if isinstance(pack, dict) else []
+    parts = []
+    for chunk in rank_question_chunks(question, chunks):
+        if not isinstance(chunk, dict):
+            continue
+        chunk_url_matches = any(signal in normalize_url(chunk.get("url")) for signal in canonical_source_url_signals(question))
+        if canonical_indexes and chunk.get("source_index") not in canonical_indexes and not chunk_url_matches:
+            continue
+        content = sanitize_evidence_content(chunk.get("content"))
+        if content and not raw_pdf_extraction_artifact(content):
+            parts.append(content)
+    clean_synthesis = clean_section_synthesis_note(synthesis_note)
+    if clean_synthesis and not topic_section_semantic_issues(clean_synthesis, question):
+        parts.append(clean_synthesis)
+    return clean_markdown("\n\n".join(parts))
+
+
+def available_attention_source_markers(
+    question: str,
+    pack: dict[str, Any],
+    synthesis_note: dict[str, Any],
+    sources: Sequence[dict[str, Any]],
+) -> list[int]:
+    canonical_indexes = source_indexes_matching_url_signals(sources, canonical_source_url_signals(question))
+    indexes = []
+    if canonical_indexes:
+        indexes.extend(canonical_indexes)
+    for chunk in pack.get("chunks", []) if isinstance(pack, dict) else []:
+        if isinstance(chunk, dict) and isinstance(chunk.get("source_index"), int):
+            if any(signal in normalize_url(chunk.get("url")) for signal in canonical_source_url_signals(question)):
+                indexes.append(chunk.get("source_index"))
+    indexes.extend(pack_source_indexes(pack) if isinstance(pack, dict) else [])
+    indexes.extend(per_question_synthesis_source_indexes(synthesis_note))
+    return dedupe_ints(indexes)
+
+
 def deterministic_topic_evidence_notes(
     question: str,
     pack: dict[str, Any],
@@ -818,7 +1058,7 @@ def deterministic_topic_evidence_notes(
 ) -> list[str]:
     notes: list[str] = []
     synthesis = clean_section_synthesis_note(synthesis_note)
-    if synthesis:
+    if synthesis and not topic_section_semantic_issues(synthesis, question):
         return [synthesis]
     canonical_indexes = source_indexes_matching_url_signals(sources, canonical_source_url_signals(question))
     chunks = rank_question_chunks(question, pack.get("chunks", []) if isinstance(pack, dict) else [])
@@ -1003,6 +1243,7 @@ def evidence_snippet_is_noisy(snippet: str) -> bool:
         "triplet loss",
         "pixelshuffle",
         "upsamples",
+        "published as a conference paper",
     )
     return any(term in lowered for term in noise) or raw_pdf_extraction_artifact(snippet)
 
@@ -1013,8 +1254,12 @@ def raw_pdf_extraction_artifact(text: Any) -> bool:
         return False
     return bool(
         re.search(r"\bA\.\d+(?:\.\d+)?\s+[A-Z](?:\s+[A-Z]){2,}\b", value)
+        or re.search(r"\bPublished as a conference paper\b.*\bABSTRACT\b", value, flags=re.IGNORECASE)
+        or re.search(r"\bABSTRACT\s+Neural machine translation is\b", value, flags=re.IGNORECASE)
         or re.search(r"\bLinear\s+SliceLinear\b|\bSliceLinear\s+Dot\s+Product\b", value, flags=re.IGNORECASE)
         or re.search(r"\bfunc-\s*tion\b|\bparallelisa-\s*tion\b", value, flags=re.IGNORECASE)
+        or re.search(r"\bsinglelayer\s+multilayer\b", value, flags=re.IGNORECASE)
+        or re.search(r"^\s*[a-z]\s+compute\s+the\s+attention\s+function\b", value, flags=re.IGNORECASE)
         or re.search(r"\bTx\s*[×x]\s*Ty\b|\bevaluated\s*Tx\b", value)
         or re.search(r"^\s*[a-z]{1,3}\s+models\s+to\s+focus\b", value, flags=re.IGNORECASE)
     )
@@ -2526,11 +2771,12 @@ def validate_report_output(
     )
     pack_citation_gaps = dedupe_text(
         [
-            *report_pack_citation_gaps(report, evidence_packs, planner_questions),
+            *report_pack_citation_gaps(report, evidence_packs, planner_questions, sources),
             *report_per_question_synthesis_citation_gaps(
                 report,
                 report_context.get("per_question_synthesis", []),
                 planner_questions,
+                sources,
             ),
         ]
     )
@@ -2538,6 +2784,7 @@ def validate_report_output(
     report_issues.extend(required_topic_facet_issues(report, planner_questions))
     report_issues.extend(framework_api_detail_issues(report, planner_questions))
     report_issues.extend(canonical_source_routing_issues(report, planner_questions, sources))
+    report_issues.extend(topic_section_semantic_report_issues(report, planner_questions))
     report_issues.extend(internal_gap_contradiction_issues(report))
     report_issues.extend(f"report marks covered evidence as a gap: {question}" for question in false_gaps)
     report_issues.extend(f"report section does not cite its evidence pack: {question}" for question in pack_citation_gaps)
@@ -2695,6 +2942,17 @@ def finalize_report_output(
             repairs.extend(f"applied final evidence repair: {question}" for question in evidence_repairs)
             report = repaired
             validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
+    semantic_repaired, semantic_repairs = apply_semantic_topic_repairs(
+        report,
+        planner_questions,
+        evidence_packs,
+        sources,
+        per_question_synthesis=report_context.get("per_question_synthesis", []),
+    )
+    if semantic_repairs:
+        repairs.extend(semantic_repairs)
+        report = semantic_repaired
+        validation = validate_report_output(report, sources, planner_questions, evidence, synthesis, pack_text, evidence_packs, report_context)
     canonical_repaired, canonical_repairs = apply_canonical_gap_repairs(report, planner_questions, sources)
     if canonical_repairs:
         repairs.extend(canonical_repairs)
@@ -2744,6 +3002,64 @@ def apply_canonical_gap_repairs(
     return normalize_final_report("\n".join(lines), sources), dedupe_text(repairs)
 
 
+def apply_semantic_topic_repairs(
+    report: str,
+    planner_questions: Sequence[str],
+    evidence_packs: Sequence[dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+    per_question_synthesis: Sequence[dict[str, Any]] | None = None,
+) -> tuple[str, list[str]]:
+    packs_by_question = {
+        normalize_heading(pack.get("question")): pack
+        for pack in evidence_packs or []
+        if isinstance(pack, dict)
+    }
+    synthesis_by_question = per_question_synthesis_by_question(per_question_synthesis or [])
+    lines = clean_markdown(strip_references(report)).splitlines()
+    repairs: list[str] = []
+    for question in planner_questions or []:
+        section = report_section_for_question("\n".join(lines), question)
+        issues = topic_section_semantic_issues(section, question)
+        if not issues:
+            continue
+        pack = packs_by_question.get(normalize_heading(question), {})
+        synthesis_note = synthesis_by_question.get(normalize_heading(question), {})
+        replacement = deterministic_topic_section(question, pack, synthesis_note, sources, issues)
+        replacement, cleanup_repairs = cleanup_topic_section(replacement, question)
+        replacement_issues = topic_section_acceptance_issues(
+            replacement,
+            question,
+            pack,
+            synthesis_note,
+            sources,
+            allow_gap_fallback=True,
+        )
+        if fallback_is_unusable(replacement_issues):
+            replacement = reliable_gap_topic_section(question, replacement_issues)
+        lines = replace_question_section_body(lines, question, replacement)
+        repairs.extend([
+            f"repaired semantic topic section: {clean_text(question)}",
+            *cleanup_repairs,
+        ])
+    if not repairs:
+        return report, []
+    repaired, role_repairs = cleanup_report_section_roles(clean_markdown("\n".join(lines)))
+    repairs.extend(role_repairs)
+    return normalize_final_report(repaired, sources), dedupe_text(repairs)
+
+
+def replace_question_section_body(lines: Sequence[str], question: str, body: str) -> list[str]:
+    current_lines = list(lines)
+    bounds = section_bounds_for_question(current_lines, question)
+    heading = f"### {planner_question_heading(question)}"
+    if bounds:
+        start, end = bounds
+        heading = current_lines[start]
+        replacement = [heading, *clean_markdown(strip_topic_section_headings(body)).splitlines()]
+        return [*current_lines[:start], *replacement, *current_lines[end:]]
+    return [*current_lines, "", heading, *clean_markdown(strip_topic_section_headings(body)).splitlines()]
+
+
 def append_notes_to_question_section(lines: Sequence[str], question: str, notes: Sequence[str]) -> list[str]:
     bounds = section_bounds_for_question(lines, question)
     if not bounds:
@@ -2778,9 +3094,9 @@ def apply_incomplete_equation_repairs(
 
 def source_backed_scaled_dot_product_equation(evidence_text: str) -> str:
     text = clean_text(evidence_text)
-    if not re.search(r"Attention\}?\(Q,?\s*K,?\s*V\)", text, flags=re.IGNORECASE):
+    if not re.search(r"Attention\}?\(Q,?\s*K,?\s*V\s*\)", text, flags=re.IGNORECASE):
         return ""
-    if not all(re.search(pattern, text, flags=re.IGNORECASE) for pattern in (r"softmax", r"QK", r"sqrt", r"d_?k", r"\bV\b")):
+    if not all(re.search(pattern, text, flags=re.IGNORECASE) for pattern in (r"softmax", r"Q\s*K", r"(?:sqrt|√)", r"d_?\s*k", r"\bV\b")):
         return ""
     return r"\text{Attention}(Q,K,V)=\operatorname{softmax}\!\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V"
 
@@ -3087,6 +3403,8 @@ def frame_body_needs_role_repair(heading_name: str, body: str) -> bool:
     plain = strip_markdown(body)
     sentence_count = len(split_sentences(plain))
     if report_contains_raw_scaffold(body):
+        return True
+    if raw_pdf_extraction_artifact(body):
         return True
     if frame_prose_has_broken_fragments(body):
         return True
@@ -3396,6 +3714,7 @@ def report_pack_citation_gaps(
     report: str,
     evidence_packs: Sequence[dict[str, Any]],
     planner_questions: Sequence[str] | None = None,
+    sources: Sequence[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Find planner sections that use a topic but omit its evidence-pack source markers."""
 
@@ -3407,6 +3726,8 @@ def report_pack_citation_gaps(
         question = clean_text(pack.get("question"))
         section = report_section_for_question(report, question)
         if not section or section_cites_pack_source(section, pack):
+            continue
+        if sources and section_cites_canonical_source(section, question, sources):
             continue
         if section_mentions_pack_topic(section, question):
             gaps.append(canonical.get(normalize_heading(question), question))
@@ -3436,6 +3757,7 @@ def report_per_question_synthesis_citation_gaps(
     report: str,
     per_question_synthesis: Sequence[dict[str, Any]],
     planner_questions: Sequence[str] | None = None,
+    sources: Sequence[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Find topic sections that drop the citations used by their per-question synthesis."""
 
@@ -3447,6 +3769,8 @@ def report_per_question_synthesis_citation_gaps(
         question = clean_text(item.get("question"))
         section = report_section_for_question(report, question) or clean_markdown(report)
         if not section or section_cites_per_question_synthesis(section, item):
+            continue
+        if sources and section_cites_canonical_source(section, question, sources):
             continue
         if section_mentions_pack_topic(section, question):
             gaps.append(canonical.get(normalize_heading(question), question))
@@ -3593,6 +3917,7 @@ def line_is_canonical_gap_note(line: str) -> bool:
     return bool(
         value in CANONICAL_SOURCE_GAP_NOTES.values()
         or re.match(r"^The selected evidence does not provide enough cited detail to compare\b", value)
+        or re.match(r"^The selected evidence does not provide enough cited detail to explain how\b", value)
     )
 
 
@@ -3968,6 +4293,17 @@ def framework_api_detail_issues(report: str, planner_questions: Sequence[str]) -
     return dedupe_text(issues)
 
 
+def topic_section_semantic_report_issues(report: str, planner_questions: Sequence[str]) -> list[str]:
+    issues = []
+    for question in planner_questions or []:
+        section = report_section_for_question(report, question)
+        if not section:
+            continue
+        for issue in topic_section_semantic_issues(section, question):
+            issues.append(f"report topic section {issue}: {clean_text(question)}")
+    return dedupe_text(issues)
+
+
 def section_has_framework_api_detail(section: str, facet: str) -> bool:
     if not section_has_supported_or_gap_facet(section, facet):
         return False
@@ -4032,7 +4368,15 @@ def canonical_source_url_signals(question: str) -> list[str]:
         signals.append("1508.04025")
     if "bahdanau" in lowered or "additive" in lowered:
         signals.append("1409.0473")
-    if "attention is all you need" in lowered or "self-attention" in lowered or "multi-head" in lowered or variant_or_evolution_question:
+    if (
+        "attention is all you need" in lowered
+        or "self-attention" in lowered
+        or "self attention" in lowered
+        or "multi-head" in lowered
+        or "scaled dot" in lowered
+        or "transformer" in lowered
+        or variant_or_evolution_question
+    ):
         signals.append("1706.03762")
     if "vision transformer" in lowered or re.search(r"\bvit\b", lowered):
         signals.append("2010.11929")
@@ -4057,7 +4401,8 @@ def internal_gap_contradiction_issues(report: str) -> list[str]:
             if not terms:
                 continue
             if line_has_gap_claim(line):
-                gap_terms.update(terms)
+                if not line_is_canonical_gap_note(line):
+                    gap_terms.update(terms)
             elif citation_markers(line):
                 cited_terms.update(terms)
     contradictions = sorted(gap_terms & cited_terms)
