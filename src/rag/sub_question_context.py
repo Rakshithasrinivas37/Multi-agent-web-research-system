@@ -26,6 +26,7 @@ from src.rag.query_helpers import (
     retrieval_topic_phrase,
     source_query_terms,
 )
+from src.rag.graphrag import graph_expand_question_results, graphrag_enabled
 from src.rag.retrieval import RetrievalResult, expand_parent_context_results, multi_query_hybrid_retrieve, source_url_coverage_retrieve
 from src.tools.groq_retry import create_chat_completion_with_retries
 from src.tools.text_utils import clean_text
@@ -618,6 +619,15 @@ def retrieve_sub_question_context_groups(
         )
         selected = helpers.meaningful_retrieval_results(ranked_candidates) or ranked_candidates or list(candidates)
         selected = select_facet_covered_results(question, selected, final_chunks)
+        graph_result = graph_expand_question_results(
+            question=question,
+            candidates=ranked_candidates or candidates,
+            seed_results=selected,
+            final_chunks=final_chunks,
+        )
+        selected = graph_result["results"]
+        if graph_result.get("graph_added_count"):
+            fallback_sources.append("graphrag")
         tagged = [tag_result_for_question(result, question) for result in selected[:final_chunks]]
         return sub_question_context_group(
             question,
@@ -625,6 +635,7 @@ def retrieve_sub_question_context_groups(
             candidates,
             tagged,
             fallback_sources=fallback_sources,
+            graph_context=graph_result,
         )
 
     max_workers = sub_question_retrieval_max_workers(len(clean_questions), rerank=rerank)
@@ -641,8 +652,10 @@ def sub_question_context_group(
     chunks: Sequence[RetrievalResult],
     fallback_used: bool = False,
     fallback_sources: Sequence[str] | None = None,
+    graph_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean_fallback_sources = [clean_text(source) for source in fallback_sources or [] if clean_text(source)]
+    graph_context = graph_context or {}
     return {
         "question": clean_text(question),
         "queries": list(queries),
@@ -650,6 +663,11 @@ def sub_question_context_group(
         "chunk_count": len(chunks),
         "fallback_used": bool(fallback_used or clean_fallback_sources),
         "fallback_sources": clean_fallback_sources,
+        "retrieval_mode": graph_context.get("mode") or ("graphrag_vector" if graphrag_enabled() else "vector"),
+        "graph_enabled": bool(graph_context.get("enabled", graphrag_enabled())),
+        "graph_added_count": int(graph_context.get("graph_added_count") or 0),
+        "graph_entity_count": int(graph_context.get("entity_count") or 0),
+        "graph_entities": list(graph_context.get("entities") or []),
         "chunks": list(chunks),
     }
 
@@ -1103,6 +1121,11 @@ def sub_question_context_counts(groups: Sequence[dict[str, Any]]) -> list[dict[s
             "chunk_count": int(group.get("chunk_count") or 0),
             "fallback_used": bool(group.get("fallback_used")),
             "fallback_sources": list(group.get("fallback_sources", [])),
+            "retrieval_mode": clean_text(group.get("retrieval_mode")) or "vector",
+            "graph_enabled": bool(group.get("graph_enabled")),
+            "graph_added_count": int(group.get("graph_added_count") or 0),
+            "graph_entity_count": int(group.get("graph_entity_count") or 0),
+            "graph_entities": list(group.get("graph_entities", [])),
         }
         for group in groups
         if isinstance(group, dict)
