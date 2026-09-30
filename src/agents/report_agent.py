@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 from src.memory.shared_memory import SharedMemory
 from src.tools.groq_retry import create_chat_completion_with_retries
@@ -70,7 +70,7 @@ NOISE_RE = re.compile(
 )
 
 BAD_SENTENCE_START_RE = re.compile(
-    r"^(?:[a-z)]|(?:and|or|but|where|which|that|it also|this version|another is|the third is|head h|ncoder|resses|"
+    r"^(?:(?:where|which|that|it also|this version|another is|the third is|head h|ncoder|resses|"
     r"hematical|ng with|corresponding key|only limited|instead of all)\b)",
 )
 
@@ -216,7 +216,7 @@ def build_report_prompt(
     excerpts = []
     for index, question in enumerate(questions, 1):
         note = per_question_synthesis.get(normalize_heading(question), {})
-        excerpt = compact_at_sentence(
+        excerpt = compact_synthesis_excerpt(
             clean_markdown(note.get("synthesis")) if isinstance(note, dict) else "",
             DEFAULT_REPORT_EXCERPT_CHARS,
         )
@@ -256,10 +256,13 @@ Grounding and writing rules:
 - Use each question's excerpt as the primary evidence for its own section. Do not move claims between questions unless the same support appears in both excerpts.
 - Write concise, original prose that answers the question. Explain the result in context; do not copy the synthesis wording, labels, or bullet structure.
 - Preserve meaning, attribution, uncertainty, units, dates, and metric/task pairings. Do not complete partial equations from memory; include equations only when the full expression is present in that excerpt.
+- For attention topics, distinguish scoring functions (such as additive or multiplicative) from configurations (such as self-attention or multi-head attention); do not present them as mutually exclusive variants unless the evidence does so.
+- Do not claim that multi-head attention removes or solves quadratic sequence-length complexity. State a relationship between designs only when the supplied excerpts explicitly support it.
+- Include framework/API names only when they appear in the question-specific excerpt with a citation to relevant framework documentation. A source being listed is not evidence that it supports a particular API.
 - Cite every factual sentence with the real source marker attached to the claim in the excerpt. Use only markers in the citation map. Never invent or renumber citations, and never cite a source simply because it is listed.
 - Respect explicit missing, partial, uncertain, and conflicting-evidence notes. State supported findings first, then name the specific unresolved detail. If there is no answer, state the evidence gap briefly.
 - Exclude paper-title fragments, abstract boilerplate, web navigation, API boilerplate, and claims that do not answer the question.
-- The executive summary reports the key supported findings and most important gaps. The introduction frames scope. Cross-cutting analysis compares findings across sections without repeating them. Limitations lists only actual evidence gaps or conflicts. The conclusion synthesizes supported answers and uncertainty; it must not repeat a benchmark result or copy another section.
+- The executive summary reports key supported findings and important gaps. The introduction frames scope. Cross-cutting analysis compares findings only where evidence supports the relationship and cites each factual claim. Limitations lists actual gaps or conflicts. The conclusion synthesizes supported answers and uncertainty with citations; it must not repeat benchmark figures or copy another section.
 - Use clear paragraph prose. Use a comparison table only when at least two compared items are supported. Avoid filler and duplicated claims.
 - Output only the final Markdown report, with no drafting notes."""
 
@@ -476,10 +479,6 @@ def enforce_topic_requirements(question: str, body: str, pack: dict[str, Any], s
         equation = extract_source_backed_equation(pack, synthesis_note)
         if equation:
             additions.append(f"**Core equation:**\n\\[\n{equation}\n\\]\nSource: {format_citation_indexes(source_indexes[:2])}.")
-    if "variant" in lowered and "attention" in lowered:
-        table = attention_variant_table(body, source_indexes)
-        if table:
-            additions.append(table)
     if any(term in lowered for term in ("benchmark", "wmt", "bleu", "performance")) and not section_satisfies_required_evidence(question, body):
         benchmark = benchmark_note_from_evidence(pack, synthesis_note)
         if benchmark:
@@ -492,7 +491,8 @@ def enforce_topic_requirements(question: str, body: str, pack: dict[str, Any], s
         api_note = framework_api_note(body, source_indexes, sources)
         if api_note:
             additions.append(api_note)
-        if "tensorflow" in lowered and not re.search(r"\b(?:tf\.keras|keras\.layers)\b", body, flags=re.I):
+        supplied = evidence_text_for_requirement(pack, synthesis_note)
+        if "tensorflow" in lowered and not re.search(r"\b(?:tf\.keras|keras\.layers)\b", supplied, flags=re.I):
             additions.append("The supplied sources do not identify a TensorFlow/Keras attention API.")
     return clean_markdown("\n\n".join([body, *additions]))
 
@@ -569,20 +569,30 @@ def attention_variant_table(body: str, source_indexes: Sequence[int]) -> str:
 
 def framework_api_note(body: str, source_indexes: Sequence[int], sources: Sequence[dict[str, Any]] | None = None) -> str:
     lowered = body.lower()
-    api_indexes = [
-        source.get("index")
+    cited = set(citation_markers(body)) & set(source_indexes)
+    source_text = {
+        source.get("index"): clean_text(f"{source.get('title')} {source.get('url')}").lower()
         for source in sources or []
-        if isinstance(source, dict)
-        and source.get("index") in source_indexes
-        and re.search(r"(pytorch|tensorflow|keras|multiheadattention|docs\.)", clean_text(f"{source.get('title')} {source.get('url')}"), flags=re.I)
-    ]
-    preferred = dedupe_ints(api_indexes) or list(source_indexes[:2])
-    marker = format_citation_indexes(preferred)
+        if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+    api_names = (
+        ("torch.nn.MultiheadAttention", "pytorch"),
+        ("torch.nn.functional.scaled_dot_product_attention", "pytorch"),
+        ("tf.keras.layers.MultiHeadAttention", "tensorflow"),
+        ("keras.layers.MultiHeadAttention", "keras"),
+    )
     notes = []
-    if marker and (api_indexes or "multiheadattention" in lowered or "torch.nn" in lowered or not citation_markers(body)):
-        notes.append(f"**API evidence:** PyTorch exposes `torch.nn.MultiheadAttention` and related scaled dot-product attention support {marker}.")
-    if "tf.keras" in lowered or "keras.layers" in lowered:
-        notes.append(f"**API evidence:** TensorFlow/Keras evidence identifies attention layers in the framework API {marker}.")
+    for api, framework in api_names:
+        if api.lower() not in lowered:
+            continue
+        matches = [
+            index for index in cited
+            if framework in source_text.get(index, "")
+            or (framework == "tensorflow" and "keras" in source_text.get(index, ""))
+        ]
+        marker = format_citation_indexes(matches)
+        if marker:
+            notes.append(f"**API evidence:** `{api}` is identified in the supplied {framework} documentation {marker}.")
     return "\n".join(notes)
 
 
@@ -1033,10 +1043,37 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
     weak = weak_topic_headings(text)
     if weak:
         issues.append(f"report contains weak topic headings: {', '.join(weak[:4])}")
+    uncited_frames = uncited_factual_frame_sections(text)
+    if uncited_frames:
+        issues.append(f"report contains uncited factual prose in frame sections: {', '.join(uncited_frames)}")
     invalid = unavailable_citation_markers(text, source_index_set(sources or []))
     if invalid:
         issues.append(f"report uses unavailable citations: {format_citation_indexes(invalid)}")
     return dedupe_text(issues)
+
+
+def uncited_factual_frame_sections(report: str) -> list[str]:
+    frame_sections = {
+        "executive summary",
+        "introduction and context",
+        "cross cutting analysis and synthesis",
+        "conclusion",
+    }
+    missing = []
+    for heading, section in markdown_sections(report):
+        normalized = normalize_heading(heading)
+        if normalized not in frame_sections:
+            continue
+        body = strip_leading_heading(section)
+        factual_uncited = any(
+            len(strip_markdown(sentence).split()) >= 7
+            and not citation_markers(sentence)
+            and not line_has_gap_claim(sentence)
+            for sentence in split_sentences(body)
+        )
+        if factual_uncited:
+            missing.append(heading)
+    return dedupe_text(missing)
 
 
 def weak_report_phrases(report: str) -> list[str]:
@@ -1342,7 +1379,7 @@ def per_question_synthesis_source_indexes(synthesis_note: dict[str, Any]) -> lis
 
 
 def pack_source_indexes(pack: dict[str, Any]) -> list[int]:
-    return dedupe_ints(chunk.get("source_index") for chunk in sequence_items(pack.get("chunks")) if isinstance(chunk, dict))
+    return dedupe_ints([chunk.get("source_index") for chunk in sequence_items(pack.get("chunks")) if isinstance(chunk, dict)])
 
 
 def evidence_pack_has_usable_cited_evidence(pack: dict[str, Any]) -> bool:
@@ -1529,6 +1566,33 @@ def compact_at_sentence(text: Any, max_chars: int) -> str:
     return window.rsplit(" ", 1)[0].strip(" .,:;")
 
 
+def compact_synthesis_excerpt(text: Any, max_chars: int) -> str:
+    """Retain supported findings and explicit caveats within the excerpt budget."""
+    value = clean_text(text)
+    if len(value) <= max_chars:
+        return value
+    gap = re.search(
+        r"(?im)(?:\*\*|__)?(?:exact\s+)?(?:missing\s+details|evidence\s+gaps?|limitations)(?:\*\*|__)?\s*:?[ \t]*",
+        value,
+    )
+    if not gap or gap.start() < max_chars // 3:
+        return compact_at_sentence(value, max_chars)
+
+    marker = "\n[... middle omitted ...]\n"
+    gap_text = value[gap.start():]
+    tail_budget = min(len(gap_text), max_chars // 2)
+    head_budget = max(0, max_chars - tail_budget - len(marker))
+    head = compact_at_sentence(value[:gap.start()], head_budget)
+    tail = gap_text
+    if len(tail) > tail_budget:
+        tail_marker = " [...] "
+        start_budget = max(0, (tail_budget - len(tail_marker)) * 2 // 3)
+        end_budget = max(0, tail_budget - len(tail_marker) - start_budget)
+        tail = f"{tail[:start_budget].rstrip()}{tail_marker}{tail[-end_budget:].lstrip()}" if end_budget else tail[:tail_budget]
+    result = f"{head}{marker}{tail}"
+    return result if len(result) <= max_chars else result[:max_chars].rstrip()
+
+
 def split_sentences(text: Any) -> list[str]:
     value = clean_text(text)
     if not value:
@@ -1660,7 +1724,8 @@ def dedupe_text(items: Sequence[Any]) -> list[str]:
 
 def dedupe_ints(values: Sequence[Any]) -> list[int]:
     deduped, seen = [], set()
-    for value in sequence_items(values):
+    items = values if isinstance(values, Iterable) and not isinstance(values, (str, bytes, bytearray, dict)) else ()
+    for value in items:
         try:
             number = int(value)
         except (TypeError, ValueError):
