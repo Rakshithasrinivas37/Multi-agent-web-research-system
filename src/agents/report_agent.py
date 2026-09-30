@@ -32,15 +32,38 @@ TRAILING_HEADING_WORDS = {
 RAW_LABEL_RE = re.compile(
     r"\b(?:Planner Sub-?question|Report-?agent-?ready notes|Planner notes|"
     r"Supported information|Supported formulation|Supported evidence|"
-    r"Supported evidence-based synthesis|Missing details)\b",
+    r"Supported evidence-based synthesis|Supported answer|Supported definition|"
+    r"Self-?attention variant|Missing details)\b",
     flags=re.IGNORECASE,
 )
 
 NOISE_RE = re.compile(
     r"(?:skip to main content|section navigation|rate this page|manage preferences|"
     r"was this helpful|uses cookies|source code for|install pytorch|api developer notes|"
+    r"given the fast pace of innovation|higher level libraries from the pytorch ecosystem|"
+    r"privacy policy|learn community projects docs|"
+    r"we begin by establishing|presented with complete mathematical derivations|"
+    r"dimensiondk|dimensiondv|operation then computes:|"
+    r"another is the amount of computation|"
+    r"\.{6,}\s*\d+|"
+    r"\b\d+\.\d+\.\d+\s+[A-Z][A-Za-z -]+\.{3,}|"
+    r"\b(?:corresponding key|only limited features relative|instead of all encoder outputs)\b|"
+    r"[\)\]]\s*Instead of all encoder outputs|"
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|"
-    r"\b(?:translatio|classificatio|representatio|computatio|informatio|long-r)\b)",
+    r"\b(?:translatio|classificatio|representatio|computatio|informatio|long-r)\b|"
+    r"\b(?:ncoder|resses|hematical|aceVto|head h|ng with)\b|"
+    r"(?:Q=XW|K=XW|V=XW|T\(v\)\s*=|dX\s+i=1|MultiHead\(Q,K,V\)=Concat))",
+    flags=re.IGNORECASE,
+)
+
+BAD_SENTENCE_START_RE = re.compile(
+    r"^(?:[a-z)]|(?:and|or|but|where|which|that|it also|this version|another is|the third is|head h|ncoder|resses|"
+    r"hematical|ng with|corresponding key|only limited|instead of all)\b)",
+)
+
+FORMULA_FRAGMENT_RE = re.compile(
+    r"(?:[\U0001D400-\U0001D7FF]\s+[\U0001D400-\U0001D7FF]|[A-Z]=XW|dX\s+i=1|"
+    r"\b(?:head|MultiHead)\s+\d|\u200b|\\qquad|\\operatorname|\\text\{)",
     flags=re.IGNORECASE,
 )
 
@@ -142,7 +165,7 @@ def build_topic_section(
 ) -> tuple[str, dict[str, Any]]:
     heading = planner_question_heading(question)
     source_indexes = [idx for idx in sorted(set(pack_source_indexes(pack)) | set(per_question_synthesis_source_indexes(synthesis_note))) if idx in source_index_set(sources)]
-    body_parts = topic_body_from_synthesis(synthesis_note)
+    body_parts = topic_body_from_synthesis(question, synthesis_note)
     body_parts.extend(topic_body_from_chunks(question, pack, existing_text=" ".join(body_parts)))
     if not body_parts:
         body_parts = [evidence_gap_sentence(question, pack, synthesis_note)]
@@ -150,7 +173,7 @@ def build_topic_section(
     body = cleanup_section_text("\n\n".join(body_parts))
     if source_indexes and not (set(source_indexes) & set(citation_markers(body))):
         body = f"{body.rstrip('.')} {format_citation_indexes(source_indexes[:2])}."
-    body = enforce_topic_requirements(question, cleanup_section_text(body), pack, synthesis_note, source_indexes)
+    body = enforce_topic_requirements(question, cleanup_section_text(body), pack, synthesis_note, source_indexes, sources)
     return (
         f"### 3.{index}. {heading}\n{cleanup_section_text(body)}",
         {
@@ -158,32 +181,32 @@ def build_topic_section(
             "heading": heading,
             "source_indexes": source_indexes,
             "coverage": clean_text(pack.get("coverage")) or "unknown",
-            "source": "per_question_synthesis" if topic_body_from_synthesis(synthesis_note) else "evidence_pack",
+            "source": "per_question_synthesis" if topic_body_from_synthesis(question, synthesis_note) else "evidence_pack",
             "chars": len(body),
         },
     )
 
 
-def topic_body_from_synthesis(synthesis_note: dict[str, Any]) -> list[str]:
+def topic_body_from_synthesis(question: str, synthesis_note: dict[str, Any]) -> list[str]:
     synthesis = clean_text(synthesis_note.get("synthesis")) if isinstance(synthesis_note, dict) else ""
     if not synthesis or not citation_markers(synthesis):
         return []
-    lines = []
-    for line in clean_markdown(synthesis).splitlines():
-        line = cleanup_section_text(line)
-        if line and not line_has_gap_claim(line) and not RAW_LABEL_RE.search(line) and not is_noisy_text(line):
-            lines.append(line)
-    text = compact_at_sentence(" ".join(lines), DEFAULT_TOPIC_TEXT_CHARS)
-    return [text] if text and citation_markers(text) else []
+    sentences = clean_report_sentences(synthesis, max_sentences=4, require_citation=True, question=question)
+    if not sentences:
+        return []
+    text = compact_at_sentence(" ".join(sentences), DEFAULT_TOPIC_TEXT_CHARS)
+    return [text] if text and citation_markers(text) and report_sentence_quality(text, require_citation=True, allow_long=True) else []
 
 
 def topic_body_from_chunks(question: str, pack: dict[str, Any], existing_text: str = "") -> list[str]:
+    if citation_markers(existing_text):
+        return []
     chunks = rank_question_chunks(question, pack.get("chunks", []) if isinstance(pack, dict) else [])
     notes, seen = [], detail_terms(existing_text)
     for chunk in chunks:
-        if len(notes) >= 3:
+        if len(notes) >= 2:
             break
-        note = chunk_to_evidence_sentence(chunk)
+        note = chunk_to_evidence_sentence(question, chunk)
         if not note:
             continue
         terms = detail_terms(note)
@@ -194,18 +217,19 @@ def topic_body_from_chunks(question: str, pack: dict[str, Any], existing_text: s
     return notes
 
 
-def chunk_to_evidence_sentence(chunk: dict[str, Any]) -> str:
+def chunk_to_evidence_sentence(question: str, chunk: dict[str, Any]) -> str:
     if not isinstance(chunk, dict) or not isinstance(chunk.get("source_index"), int):
         return ""
-    sentence = compact_at_sentence(sanitize_evidence_content(chunk.get("content")), DEFAULT_EVIDENCE_CHUNK_CHARS)
-    sentence = cleanup_section_text(sentence)
-    if not sentence or is_noisy_text(sentence):
-        return ""
     marker = f"[{chunk['source_index']}]"
+    content = sanitize_evidence_content(chunk.get("content"))
+    sentences = clean_report_sentences(content, max_sentences=1, require_citation=False, question=question)
+    sentence = sentences[0] if sentences else ""
+    if not sentence:
+        return ""
     return sentence if marker in sentence else f"{sentence.rstrip('.')} {marker}."
 
 
-def enforce_topic_requirements(question: str, body: str, pack: dict[str, Any], synthesis_note: dict[str, Any], source_indexes: Sequence[int]) -> str:
+def enforce_topic_requirements(question: str, body: str, pack: dict[str, Any], synthesis_note: dict[str, Any], source_indexes: Sequence[int], sources: Sequence[dict[str, Any]]) -> str:
     lowered = clean_text(question).lower()
     additions = []
     if any(term in lowered for term in ("equation", "formula", "mathematical")) and "Core equation" not in body:
@@ -217,7 +241,7 @@ def enforce_topic_requirements(question: str, body: str, pack: dict[str, Any], s
         if table:
             additions.append(table)
     if any(term in lowered for term in ("api", "framework", "pytorch", "tensorflow", "keras")):
-        api_note = framework_api_note(body, source_indexes)
+        api_note = framework_api_note(body, source_indexes, sources)
         if api_note:
             additions.append(api_note)
     return clean_markdown("\n\n".join([body, *additions]))
@@ -250,10 +274,19 @@ def attention_variant_table(body: str, source_indexes: Sequence[int]) -> str:
     return "\n".join(["| Variant | Distinction |", "|---|---|", *(f"| {name} | {distinction} {marker}. |" for name, distinction in variants[:6])])
 
 
-def framework_api_note(body: str, source_indexes: Sequence[int]) -> str:
-    lowered, marker = body.lower(), format_citation_indexes(source_indexes[:2])
+def framework_api_note(body: str, source_indexes: Sequence[int], sources: Sequence[dict[str, Any]] | None = None) -> str:
+    lowered = body.lower()
+    api_indexes = [
+        source.get("index")
+        for source in sources or []
+        if isinstance(source, dict)
+        and source.get("index") in source_indexes
+        and re.search(r"(pytorch|tensorflow|keras|multiheadattention|docs\.)", clean_text(f"{source.get('title')} {source.get('url')}"), flags=re.I)
+    ]
+    preferred = dedupe_ints(api_indexes) or list(source_indexes[:2])
+    marker = format_citation_indexes(preferred)
     notes = []
-    if "multiheadattention" in lowered or "torch.nn" in lowered:
+    if marker and (api_indexes or "multiheadattention" in lowered or "torch.nn" in lowered or not citation_markers(body)):
         notes.append(f"**API evidence:** PyTorch exposes `torch.nn.MultiheadAttention` and related scaled dot-product attention support {marker}.")
     if "tf.keras" in lowered or "keras.layers" in lowered:
         notes.append(f"**API evidence:** TensorFlow/Keras evidence identifies attention layers in the framework API {marker}.")
@@ -289,24 +322,46 @@ def assemble_report(objective: str, topic_sections: Sequence[str], evidence_pack
 
 
 def frame_section(topic_digest: str, role: str) -> str:
-    takeaways = frame_takeaways(topic_digest)
-    if not takeaways:
+    topics = frame_topics(topic_digest)
+    if not topics:
         return "The retrieved evidence did not provide enough clean cited detail for this frame section."
+    topic_names = readable_topic_list([topic["heading"] for topic in topics[:4]])
+    markers = format_citation_indexes([index for topic in topics[:4] for index in topic["citations"]][:4])
     if role == "summary":
-        return " ".join(takeaways[:3])
+        return f"The report covers {topic_names} using the cited evidence selected for each planner question {markers}."
     if role == "intro":
-        return takeaways[0]
+        return f"The report is organized around {len(topics)} planner topic sections so the retrieved evidence can be evaluated question by question {markers}."
     if role == "conclusion":
-        return " ".join(takeaways[-3:])
-    return " ".join(takeaways[:4])
+        return f"The strongest report findings are the sections with direct source markers; any topic without clean cited support is preserved as a limitation rather than filled from outside knowledge {markers}."
+    return f"Across the topic sections, the evidence links {topic_names} while keeping each claim tied to the source markers available for that section {markers}."
+
+
+def frame_topics(markdown: str) -> list[dict[str, Any]]:
+    topics = []
+    for heading, section in markdown_sections(markdown):
+        match = re.match(r"^3\.\d+\.?\s+(.+)$", clean_text(heading))
+        if not match:
+            continue
+        citations = citation_markers(section)
+        if citations:
+            topics.append({"heading": strip_heading_numbering(match.group(1)), "citations": citations})
+    return topics
+
+
+def readable_topic_list(topics: Sequence[str]) -> str:
+    cleaned = [clean_text(topic).lower() for topic in topics if clean_text(topic)]
+    if not cleaned:
+        return "the requested topics"
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
 
 
 def frame_takeaways(markdown: str) -> list[str]:
     items = []
     for _, section in markdown_sections(markdown):
-        for sentence in split_sentences(strip_leading_heading(section)):
-            sentence = cleanup_section_text(sentence)
-            if frame_sentence_usable(sentence):
+        for sentence in clean_report_sentences(strip_leading_heading(section), max_sentences=3, require_citation=True):
+            if frame_sentence_usable(sentence) and sentence not in items:
                 items.append(sentence.rstrip(".") + ".")
                 break
     return dedupe_text(items)
@@ -317,7 +372,7 @@ def frame_sentence_usable(sentence: str) -> bool:
         return False
     if re.search(r"\b(?:Variant|Distinction|API evidence|Core equation|Core formula)\b", sentence, re.I):
         return False
-    return bool(citation_markers(sentence)) and not is_noisy_text(sentence) and not RAW_LABEL_RE.search(sentence) and "```" not in sentence and not re.search(r"\\\[[\s\S]*?\\\]", sentence) and len(strip_markdown(sentence).split()) >= 8
+    return report_sentence_quality(sentence, require_citation=True, allow_long=False)
 
 
 def limitations_section(evidence_packs: Sequence[dict[str, Any]], report_context: dict[str, Any]) -> str:
@@ -353,6 +408,12 @@ def cleanup_section_text(text: Any) -> str:
     value = remove_authoring_labels(value)
     value = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "", value)
     value = re.sub(r"\[\s*(?:uncited|citation needed|source needed)\s*\]", "", value, flags=re.I)
+    value = re.sub(r"\b(tasks|evidence|results)\s+(On|The)\b", r"\1. \2", value)
+    value = re.sub(r"\b(representations|architecture|formulation)\s+(This|The)\b", r"\1. \2", value)
+    value = re.sub(r"([A-Za-z)])(\[\d+\])", r"\1 \2", value)
+    value = re.sub(r"\.\s*,", ",", value)
+    value = re.sub(r"\bby√", "by √", value)
+    value = re.sub(r"\b(attention|comparison)\.\s+[–-]\s+", r"\1: ", value, flags=re.I)
     value = re.sub(r"\s+([.,;:])", r"\1", value)
     value = re.sub(r"([.!?])\s+([.!?])", r"\1", value)
     value = re.sub(r"([A-Za-z])-\s+([a-z])", r"\1\2", value)
@@ -363,11 +424,11 @@ def cleanup_section_text(text: Any) -> str:
 
 
 def remove_authoring_labels(text: Any) -> str:
-    value = clean_text(text)
-    value = re.sub(r"\*\*(?:Planner Sub-?question|Report-?agent-?ready notes|Planner notes|Supported information|Supported formulation|Supported evidence|Supported evidence-based synthesis|Missing details)\s*:?\*\*\s*", "", value, flags=re.I)
+    value = clean_markdown(text)
+    value = re.sub(r"\*\*(?:Planner Sub-?question|Report-?agent-?ready notes|Planner notes|Supported information|Supported formulation|Supported evidence|Supported evidence-based synthesis|Supported answer|Supported definition|Self-?attention variant|Missing details)(?:\s*\([^)]*\))?\s*:?\*\*\s*", "", value, flags=re.I)
     value = re.sub(r"\b(?:Planner Sub-?question|Report-?agent-?ready notes|Planner notes)\s*:?\s*", "", value, flags=re.I)
-    value = re.sub(r"\b(?:Supported information|Supported formulation|Supported evidence|Supported evidence-based synthesis)(?:\s*\([^)]*\))?\s*:?\s*", "", value, flags=re.I)
-    return clean_text(value)
+    value = re.sub(r"\b(?:Supported information|Supported formulation|Supported evidence|Supported evidence-based synthesis|Supported answer|Supported definition|Self-?attention variant)(?:\s*\([^)]*\))?\s*:?\s*", "", value, flags=re.I)
+    return clean_markdown(value)
 
 
 def sanitize_evidence_content(text: Any) -> str:
@@ -375,6 +436,107 @@ def sanitize_evidence_content(text: Any) -> str:
     value = re.sub(r"\[\s*\d+(?:\s*,\s*\d+)*\s*\]", "", value)
     value = re.sub(r"\b(?:Skip to main content|Section Navigation|Rate this Page|Manage Preferences)\b.*", "", value, flags=re.I)
     return cleanup_section_text(value)
+
+
+def clean_report_sentences(text: Any, max_sentences: int = 4, require_citation: bool = True, question: str = "") -> list[str]:
+    """Return complete cited sentences that are suitable for final report prose."""
+
+    value = prepare_report_sentence_text(text)
+    selected, pending = [], ""
+    for raw_sentence in split_sentences(value):
+        sentence = cleanup_section_text(raw_sentence)
+        if require_citation and pending and citation_markers(sentence):
+            joined = cleanup_section_text(f"{pending.rstrip('.')} {sentence}")
+            if report_sentence_quality(joined, require_citation=True, allow_long=True) and sentence_matches_question(joined, question):
+                selected.append(joined.rstrip(".") + ".")
+                pending = ""
+                if len(selected) >= max_sentences:
+                    break
+                continue
+        if require_citation and not citation_markers(sentence) and report_sentence_quality(sentence, require_citation=False) and sentence_matches_question(sentence, question):
+            pending = sentence
+            continue
+        if report_sentence_quality(sentence, require_citation=require_citation) and sentence_matches_question(sentence, question):
+            selected.append(sentence.rstrip(".") + ".")
+            pending = ""
+        if len(selected) >= max_sentences:
+            break
+    return dedupe_text(selected)
+
+
+def prepare_report_sentence_text(text: Any) -> str:
+    value = clean_markdown(text)
+    value = re.sub(r"\\\[[\s\S]*?\\\]", " ", value)
+    value = re.sub(r"\$\$[\s\S]*?\$\$", " ", value)
+    value = re.sub(r"`{1,3}[^`]*`{1,3}", " ", value)
+    value = remove_authoring_labels(value)
+    value = re.sub(r"\*\*([^*]{3,90})\*\*", r"\1. ", value)
+    value = re.sub(r"\s+-\s+", ". ", value)
+    value = re.sub(r"\s+", " ", value)
+    return clean_text(value)
+
+
+def report_sentence_quality(sentence: Any, require_citation: bool = True, allow_long: bool = False) -> bool:
+    value = cleanup_section_text(sentence)
+    words = strip_markdown(value).split()
+    if not value or len(words) < 8:
+        return False
+    if len(words) > (80 if allow_long else 45):
+        return False
+    if require_citation and not citation_markers(value):
+        return False
+    if RAW_LABEL_RE.search(value) or is_noisy_text(value):
+        return False
+    if BAD_SENTENCE_START_RE.search(strip_markdown(value)):
+        return False
+    if formula_fragment_score(value) >= 2:
+        return False
+    if value.count("[") != value.count("]"):
+        return False
+    if re.search(r"\b\d+\.\d+\.\d+\b|\bFigure\s+\d+\b", value, flags=re.I):
+        return False
+    return True
+
+
+def sentence_matches_question(sentence: Any, question: str = "") -> bool:
+    if not clean_text(question):
+        return True
+    text = clean_text(sentence).lower()
+    q = clean_text(question).lower()
+    asks_api = any(term in q for term in ("api", "framework", "pytorch", "tensorflow", "keras"))
+    asks_benchmark = any(term in q for term in ("benchmark", "application", "nlp", "vision", "imagenet", "glue", "translation"))
+    asks_complexity = any(term in q for term in ("complexity", "recurrent", "linear-time", "linear time", "cost"))
+    asks_limitation = any(term in q for term in ("limitation", "drawback", "quadratic", "locality"))
+    asks_variant = "variant" in q or "differ" in q or any(term in q for term in ("additive", "luong", "multi-head"))
+    api_terms = ("scaled_dot_product_attention", "multiheadattention", "nested tensor", "fastpath", "torch.", "pytorch", "keras", "tensorflow")
+    benchmark_terms = ("wmt", "bleu", "imagenet", "glue", "benchmark", "translation task")
+    if any(term in text for term in api_terms) and not asks_api:
+        return False
+    if any(term in text for term in benchmark_terms) and not asks_benchmark:
+        return False
+    if any(term in text for term in ("computational cost", "memory requirement", "o(n", "quadratic scaling")) and not (asks_complexity or asks_limitation):
+        return False
+    if "permutation equivariance" in text and not asks_complexity:
+        return False
+    if text.startswith("the third is"):
+        return False
+    if any(term in text for term in ("trace of a square matrix", "frobenius norm", "inner product induces", "cosine similarity")):
+        return False
+    if text.startswith("it also") or any(term in text for term in ("located at the class", "implementation of it also", "page is located at", "the class it also", "class it also")):
+        return False
+    if text.startswith("this monograph") or "comprehensive and rigorous mathematical treatment" in text:
+        return False
+    if any(term in text for term in ("additive", "luong", "multiplicative")) and not asks_variant:
+        return False
+    return True
+
+
+def formula_fragment_score(text: Any) -> int:
+    value = clean_text(text)
+    score = len(FORMULA_FRAGMENT_RE.findall(value))
+    score += 1 if len(re.findall(r"[=∑√⊤]", value)) >= 3 else 0
+    score += 1 if len(re.findall(r"\b[A-Z]\s*[=∈]\s*", value)) >= 2 else 0
+    return score
 
 
 def cleanup_code_and_math_citations(markdown: str) -> tuple[str, list[str]]:
@@ -422,6 +584,12 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
         issues.append("report contains raw planner or synthesis labels")
     if NOISE_RE.search(text):
         issues.append("report contains raw extraction or web-navigation artifacts")
+    noisy_lines = report_artifact_lines(text)
+    if noisy_lines:
+        issues.append(f"report contains noisy copied evidence lines: {len(noisy_lines)}")
+    copied_frames = repeated_frame_sentences(text)
+    if copied_frames:
+        issues.append(f"report repeats topic prose in frame sections: {len(copied_frames)}")
     if code_or_math_contains_citations(text):
         issues.append("report contains citations inside code or equation blocks")
     weak = weak_topic_headings(text)
@@ -431,6 +599,53 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
     if invalid:
         issues.append(f"report uses unavailable citations: {format_citation_indexes(invalid)}")
     return dedupe_text(issues)
+
+
+def report_artifact_lines(report: str) -> list[str]:
+    bad = []
+    for line in clean_markdown(report).splitlines():
+        value = clean_text(line)
+        if not value or value.startswith("#") or is_references_heading(value):
+            continue
+        if structured_report_line(value):
+            continue
+        if is_noisy_text(value) or BAD_SENTENCE_START_RE.search(strip_markdown(value)) or formula_fragment_score(value) >= 2:
+            bad.append(value[:140])
+    return bad
+
+
+def structured_report_line(line: str) -> bool:
+    value = clean_text(line)
+    return (
+        value.startswith("|")
+        or value.startswith(r"\[")
+        or value.startswith("- ")
+        or value.startswith("**Core equation:**")
+        or value.startswith("Source:")
+        or bool(re.fullmatch(r"\[?\d+\]?\s+https?://\S+", value))
+        or bool(re.fullmatch(r"\\operatorname\{Attention\}.*", value))
+    )
+
+
+def repeated_frame_sentences(report: str) -> list[str]:
+    sections = {normalize_heading(heading): section for heading, section in markdown_sections(report)}
+    frame_names = {
+        "executive summary",
+        "introduction and context",
+        "cross cutting analysis and synthesis",
+        "conclusion",
+    }
+    topic_text = sections.get("topic sections", "")
+    topic_sentences = {normalize_heading(sentence) for sentence in split_sentences(topic_text) if len(strip_markdown(sentence).split()) >= 10}
+    repeats = []
+    for heading, section in sections.items():
+        if heading not in frame_names:
+            continue
+        for sentence in split_sentences(section):
+            key = normalize_heading(sentence)
+            if key and key in topic_sentences:
+                repeats.append(sentence)
+    return repeats
 
 
 def report_schema_issues(report: str, questions: Sequence[str]) -> list[str]:
@@ -681,8 +896,11 @@ def planner_question_heading(question: str, max_length: int | None = DEFAULT_HEA
 def repair_common_heading_fragments(heading: str) -> str:
     value = clean_text(heading).strip(" .,:;")
     value = re.sub(r"\bThe Primary Applications Of (.+?) And What Benchmark(?:s)?(?: E\.?g\.?.*)?$", r"\1 Applications And Benchmark Evidence", value, flags=re.I)
+    value = re.sub(r"\bThe Computational Complexity Of (.+?) Compared To Recurrent Networks And What Are.*$", r"\1 Complexity Compared With Recurrent Networks", value, flags=re.I)
+    value = re.sub(r"\bThe Main Variants Of Attention Mechanisms.*$", "Attention Mechanism Variants And Differences", value, flags=re.I)
     value = re.sub(r"\bAttention Implemented In (.+?) Such As .*$", r"Attention Implementations In \1", value, flags=re.I)
     value = re.sub(r"\bAnd What Benchmark(?:s)?(?: E\.?g\.?.*)?$", "And Benchmark Evidence", value, flags=re.I)
+    value = re.sub(r"\bAnd What Are.*$", "", value, flags=re.I)
     value = re.sub(r"\bSuch As .*$", "", value, flags=re.I)
     value = re.sub(r"\bE\.?g\.?\s*$", "", value, flags=re.I)
     return clean_text(value).strip(" .,:;")
@@ -831,15 +1049,25 @@ def compact_at_sentence(text: Any, max_chars: int) -> str:
 
 def split_sentences(text: Any) -> list[str]:
     value = clean_text(text)
-    return [part.strip() for part in re.split(r"(?:(?<=[.!?])|(?<=\]))\s+(?=[A-Z`*_(])", value) if clean_text(part)] if value else []
+    if not value:
+        return []
+    value = re.sub(r"(\[\d+\])\s+(?=[A-Za-z(*`])", r"\1\n", value)
+    value = re.sub(r"(?<=[.!?])\s+(?=[A-Za-z(*`])", "\n", value)
+    value = re.sub(r"\s+(?=\*\*(?:Supported|Self|Planner|Missing)\b)", "\n", value, flags=re.I)
+    return [part.strip(" -") for part in value.splitlines() if clean_text(part)]
 
 
 def trim_clipped_fragments(text: str) -> str:
-    return clean_text(re.sub(r"\s*[^.!?]*\b(?:translatio|classificatio|representatio|computatio|informatio|long-r)\b[^.!?]*(?:[.!?]|$)", " ", clean_text(text), flags=re.I))
+    value = clean_markdown(text)
+    cleaned_lines = [
+        re.sub(r"\s*[^.!?]*\b(?:translatio|classificatio|representatio|computatio|informatio|long-r)\b[^.!?]*(?:[.!?]|$)", " ", line, flags=re.I)
+        for line in value.splitlines()
+    ]
+    return clean_markdown("\n".join(cleaned_lines))
 
 
 def drop_noisy_sentences(text: Any) -> str:
-    return clean_text(" ".join(sentence for sentence in split_sentences(text) if not is_noisy_text(sentence)))
+    return clean_text(" ".join(sentence for sentence in split_sentences(text) if not is_noisy_text(sentence) and not BAD_SENTENCE_START_RE.search(strip_markdown(sentence))))
 
 
 def is_noisy_text(text: Any) -> bool:
