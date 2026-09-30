@@ -407,10 +407,18 @@ def synthesize_report_from_research_plan(
     payload["queries"] = queries
     payload["rewritten_query"] = rewritten_query
     payload["retrieval_queries"] = retrieval_queries
+    context_counts = sub_question_context_counts(question_context_groups)
+    graph_added_count = sum(int(item.get("graph_added_count") or 0) for item in context_counts)
+    graph_entity_count = sum(int(item.get("graph_entity_count") or 0) for item in context_counts)
     payload["sub_question_context_count"] = len(question_context_results)
-    payload["sub_question_context_counts"] = sub_question_context_counts(question_context_groups)
+    payload["sub_question_context_counts"] = context_counts
     payload["sub_question_candidate_chunks_per_question"] = candidate_chunks_per_question
     payload["sub_question_final_chunks_per_question"] = DEFAULT_SYNTHESIS_CHUNKS_PER_QUESTION
+    payload["retrieval_mode"] = "graphrag_vector" if any(item.get("graph_enabled") for item in context_counts) else "vector"
+    payload["graphrag_enabled"] = any(item.get("graph_enabled") for item in context_counts)
+    payload["graphrag_added_count"] = graph_added_count
+    payload["graphrag_entity_count"] = graph_entity_count
+    payload["graphrag_question_count"] = sum(1 for item in context_counts if item.get("graph_enabled"))
     payload["llm_sub_question_retrieval_queries"] = llm_sub_question_queries
     payload["llm_sub_question_query_model"] = llm_query_result["model"]
     payload["llm_sub_question_query_provider"] = llm_query_result.get("provider", "")
@@ -3083,6 +3091,11 @@ def synthesis_diagnostics(payload: dict[str, Any], retrieved_context: Sequence[R
         "graphrag_edge_count": graph_summary["edge_count"],
         "graphrag_added_chunk_count": graph_added_chunk_count(evidence_packs),
         "sub_question_context_counts": payload.get("sub_question_context_counts", []),
+        "retrieval_mode": payload.get("retrieval_mode", ""),
+        "graphrag_enabled": bool(payload.get("graphrag_enabled")),
+        "graphrag_added_count": payload.get("graphrag_added_count", 0),
+        "graphrag_entity_count": payload.get("graphrag_entity_count", 0),
+        "graphrag_question_count": payload.get("graphrag_question_count", 0),
         "llm_sub_question_query_provider": payload.get("llm_sub_question_query_provider", ""),
         "llm_sub_question_query_fallback_reason": payload.get("llm_sub_question_query_fallback_reason", ""),
         "browser_signal_count": payload.get("browser_signal_count", 0),

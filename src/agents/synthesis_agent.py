@@ -166,6 +166,7 @@ class SynthesisAgent:
             "supporting_chunk_count": self.supporting_chunk_count,
             "include_retrieved_chunks": self.include_retrieved_chunks,
             "synthesis_graphrag": synthesis_graphrag_enabled(),
+            "graphrag_enabled": synthesis_graphrag_enabled(),
         }
 
     def write_to_memory(
