@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import re
+import time
 from typing import Any
 
 from src.tools.text_utils import clean_text
@@ -35,6 +37,9 @@ def create_chat_completion_with_retries(
             last_error = error
             if attempt + 1 >= retry_attempts or not is_groq_request_too_large_error(error):
                 raise
+            delay = groq_retry_delay_seconds(error)
+            if delay:
+                time.sleep(delay)
             request = shrink_groq_chat_request(request, shrink_factor=shrink_factor)
 
     if last_error:
@@ -51,6 +56,19 @@ def is_groq_request_too_large_error(error: Exception) -> bool:
         or "tpm" in message
         or "please reduce your message size" in message
     )
+
+
+def groq_retry_delay_seconds(error: Exception) -> float:
+    message = clean_text(error).lower()
+    if not any(term in message for term in ("rate_limit", "rate limit", "tokens per minute", "tpm")):
+        return 0.0
+    match = re.search(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", message)
+    if not match:
+        return 2.0
+    try:
+        return min(30.0, max(0.5, float(match.group(1)) + 0.5))
+    except ValueError:
+        return 2.0
 
 
 def shrink_groq_chat_request(request: dict[str, Any], shrink_factor: float) -> dict[str, Any]:
