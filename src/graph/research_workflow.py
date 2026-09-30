@@ -410,6 +410,8 @@ def report_missing_question_errors(report: dict[str, Any]) -> list[str]:
     missing_questions = report_missing_sub_questions(report)
     if not missing_questions:
         return []
+    if isinstance(report, dict) and clean_text(report.get("report")):
+        return []
     missing_text = "; ".join(missing_questions[:3])
     return [f"report_node report does not answer planner sub-questions: {missing_text}"]
 

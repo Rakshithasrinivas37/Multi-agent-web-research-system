@@ -106,11 +106,15 @@ class ReportAgent:
         if not objective:
             raise ValueError("report_context.objective is required")
 
-        evidence_packs = [p for p in report_context.get("evidence_packs", []) or [] if isinstance(p, dict)]
-        planner_questions = [clean_text(q) for q in report_context.get("planner_questions", []) if clean_text(q)]
+        evidence_packs = [p for p in sequence_items(report_context.get("evidence_packs")) if isinstance(p, dict)]
+        planner_questions = [clean_text(q) for q in sequence_items(report_context.get("planner_questions")) if clean_text(q)]
         questions = dedupe_text([*planner_questions, *evidence_pack_questions(evidence_packs)]) or [objective]
-        sources = sources_with_browser_results(report_context.get("sources", []), report_context.get("browser_results", []))
-        synthesis_by_question = per_question_synthesis_by_question(report_context.get("per_question_synthesis", []))
+        sources = sources_with_browser_results(
+            sequence_items(report_context.get("sources")),
+            sequence_items(report_context.get("browser_results")),
+        )
+        synthesis_items = sequence_items(report_context.get("per_question_synthesis"))
+        synthesis_by_question = per_question_synthesis_by_question(synthesis_items)
         packs_by_question = {normalize_heading(pack.get("question")): pack for pack in evidence_packs}
 
         prompt = build_report_prompt(
@@ -119,28 +123,33 @@ class ReportAgent:
             questions=questions,
             per_question_synthesis=synthesis_by_question,
             sources=sources,
-            coverage_by_question=report_context.get("coverage_by_question", []),
+            coverage_by_question=sequence_items(report_context.get("coverage_by_question")),
         )
         report, generation_mode, generation_error = generate_report_with_llm(
-            self.model, prompt, report_context
+            self.model, prompt
         )
         diagnostics = []
         if report is None:
-            topic_sections = []
-            for index, question in enumerate(questions, 1):
-                section, diagnostic = build_topic_section(
-                    index=index,
-                    question=question,
-                    pack=packs_by_question.get(normalize_heading(question), {}),
-                    synthesis_note=synthesis_by_question.get(normalize_heading(question), {}),
-                    sources=sources,
-                )
-                topic_sections.append(section)
-                diagnostics.append(diagnostic)
-            report = assemble_report(objective, topic_sections, evidence_packs, report_context)
+            report, diagnostics = build_deterministic_report(
+                objective, questions, packs_by_question, synthesis_by_question, sources, evidence_packs, report_context
+            )
+        else:
+            report, diagnostics = repair_report_topic_sections(
+                report, questions, packs_by_question, synthesis_by_question, sources
+            )
         report = normalize_final_report(report, sources)
         report, repairs = cleanup_report(report, sources)
-        validation = validate_report(report, sources, questions, evidence_packs, report_context.get("per_question_synthesis", []))
+        schema_issues = report_schema_issues(report, questions)
+        if schema_issues:
+            report, diagnostics = build_deterministic_report(
+                objective, questions, packs_by_question, synthesis_by_question, sources, evidence_packs, report_context
+            )
+            generation_mode = f"{generation_mode}_schema_fallback"
+            repairs.append("rebuilt report after incomplete LLM schema")
+            report = normalize_final_report(report, sources)
+            report, schema_repairs = cleanup_report(report, sources)
+            repairs.extend(schema_repairs)
+        validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
 
         coverage = report_sub_question_coverage_check(report, questions)
         synthesis_gaps = synthesis_coverage_gap_questions(report_context, questions)
@@ -155,8 +164,8 @@ class ReportAgent:
             "diagnostics": {
                 "source_count": len(sources),
                 "evidence_pack_count": len(evidence_packs),
-                "supporting_chunk_count": len(report_context.get("supporting_chunks", []) or []),
-                "retrieved_chunk_count": len(report_context.get("retrieved_chunks", []) or []),
+                "supporting_chunk_count": len(sequence_items(report_context.get("supporting_chunks"))),
+                "retrieved_chunk_count": len(sequence_items(report_context.get("retrieved_chunks"))),
                 "report_length": len(report),
                 "report_generation_mode": generation_mode,
                 "report_generation_error": generation_error,
@@ -172,7 +181,7 @@ class ReportAgent:
                 "report_revision_attempts": 0,
                 "report_deterministic_repairs": repairs,
                 "report_finalization_status": (
-                    "needs_review" if validation["issues"] else "clean_with_evidence_gaps" if synthesis_gaps else "clean"
+                    "needs_review" if validation["issues"] or coverage["missing"] else "clean_with_evidence_gaps" if synthesis_gaps else "clean"
                 ),
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
                 "report_section_diagnostics": {"topic_sections": diagnostics},
@@ -201,7 +210,7 @@ def build_report_prompt(
     """Build an excerpt-grounded report prompt with explicit source boundaries."""
     coverage = {
         normalize_heading(item.get("question")): clean_text(item.get("status"))
-        for item in coverage_by_question or []
+        for item in sequence_items(coverage_by_question)
         if isinstance(item, dict) and clean_text(item.get("question"))
     }
     excerpts = []
@@ -278,13 +287,103 @@ def generate_report_with_llm(
                 {"role": "user", "content": prompt},
             ],
         )
-        report = clean_markdown(response.choices[0].message.content)
+        choice = response.choices[0]
+        report = clean_markdown(choice.message.content)
         if not report:
             return None, "deterministic_fallback_empty_llm_response", "LLM returned an empty report"
+        if clean_text(getattr(choice, "finish_reason", "")).lower() in {"length", "max_tokens"}:
+            return None, "deterministic_fallback_truncated_llm_response", "LLM response reached its token limit"
         return report, "llm_from_per_question_synthesis", ""
     except Exception as error:
         print(f"[report] LLM generation failed; using deterministic synthesis fallback ({clean_text(error)[:180]})")
         return None, "deterministic_fallback_llm_error", clean_text(error)
+
+
+def build_deterministic_report(
+    objective: str,
+    questions: Sequence[str],
+    packs_by_question: dict[str, dict[str, Any]],
+    synthesis_by_question: dict[str, dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+    evidence_packs: Sequence[dict[str, Any]],
+    report_context: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    sections, diagnostics = [], []
+    for index, question in enumerate(questions, 1):
+        section, diagnostic = build_topic_section(
+            index,
+            question,
+            packs_by_question.get(normalize_heading(question), {}),
+            synthesis_by_question.get(normalize_heading(question), {}),
+            sources,
+        )
+        sections.append(section)
+        diagnostics.append(diagnostic)
+    return assemble_report(objective, sections, evidence_packs, report_context), diagnostics
+
+
+def repair_report_topic_sections(
+    report: str,
+    questions: Sequence[str],
+    packs_by_question: dict[str, dict[str, Any]],
+    synthesis_by_question: dict[str, dict[str, Any]],
+    sources: Sequence[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Replace missing or inadequate LLM topic sections with cited synthesis-based sections."""
+    text = strip_references(clean_markdown(report))
+    repairs = []
+    for index, question in enumerate(questions, 1):
+        pack = packs_by_question.get(normalize_heading(question), {})
+        note = synthesis_by_question.get(normalize_heading(question), {})
+        expected = f"3.{index}"
+        section = numbered_topic_section(text, expected)
+        if section and section_satisfies_required_evidence(question, section):
+            continue
+        fallback, diagnostic = build_topic_section(index, question, pack, note, sources)
+        text = replace_numbered_topic_section(text, expected, fallback)
+        diagnostic["repair"] = "missing_or_inadequate_llm_topic_section"
+        repairs.append(diagnostic)
+    return text, repairs
+
+
+def numbered_topic_section(report: str, number: str) -> str:
+    for heading, section in markdown_sections(report):
+        if re.match(rf"^{re.escape(number)}(?:[.)]|\s)", clean_text(heading)):
+            return section
+    return ""
+
+
+def replace_numbered_topic_section(report: str, number: str, replacement: str) -> str:
+    lines = clean_markdown(report).splitlines()
+    match = re.compile(rf"^\s{{0,3}}#{{3,6}}\s+{re.escape(number)}(?:[.)]|\s).*$")
+    starts = [index for index, line in enumerate(lines) if match.match(line)]
+    replacement_lines = clean_markdown(replacement).splitlines()
+    if starts:
+        start = starts[0]
+        end = next(
+            (i for i in range(start + 1, len(lines)) if re.match(r"^\s{0,3}#{1,3}\s+", lines[i])),
+            len(lines),
+        )
+        return clean_markdown("\n".join([*lines[:start], *replacement_lines, *lines[end:]]))
+    topics_heading = next(
+        (i for i, line in enumerate(lines) if normalize_heading(line) == "topic sections"),
+        None,
+    )
+    if topics_heading is not None:
+        topic_heading = re.compile(r"^\s{0,3}#{3,6}\s+3\.(\d+)(?:[.)]|\s)")
+        insert_at = len(lines)
+        expected_index = int(number.split(".")[-1])
+        for i in range(topics_heading + 1, len(lines)):
+            topic_match = topic_heading.match(lines[i])
+            if topic_match and int(topic_match.group(1)) > expected_index:
+                insert_at = i
+                break
+            if re.match(r"^\s{0,3}##\s+", lines[i]):
+                insert_at = i
+                break
+        lines[insert_at:insert_at] = ["", *replacement_lines, ""]
+        return clean_markdown("\n".join(lines))
+    return clean_markdown("\n\n".join([report, "## 3. Topic Sections", replacement]))
 
 
 def build_topic_section(
@@ -338,7 +437,7 @@ def topic_body_from_synthesis(question: str, synthesis_note: dict[str, Any]) -> 
 def topic_body_from_chunks(question: str, pack: dict[str, Any], existing_text: str = "") -> list[str]:
     if citation_markers(existing_text):
         return []
-    chunks = rank_question_chunks(question, pack.get("chunks", []) if isinstance(pack, dict) else [])
+    chunks = rank_question_chunks(question, sequence_items(pack.get("chunks")) if isinstance(pack, dict) else [])
     notes, seen = [], detail_terms(existing_text)
     for chunk in chunks:
         if len(notes) >= 2:
@@ -447,7 +546,7 @@ def extract_source_backed_equation(pack: dict[str, Any], synthesis_note: dict[st
 def evidence_text_for_requirement(pack: dict[str, Any], synthesis_note: dict[str, Any]) -> str:
     return clean_text(" ".join([
         clean_text(synthesis_note.get("synthesis")) if isinstance(synthesis_note, dict) else "",
-        *(clean_text(chunk.get("content")) for chunk in pack.get("chunks", []) or [] if isinstance(chunk, dict)),
+        *(clean_text(chunk.get("content")) for chunk in sequence_items(pack.get("chunks")) if isinstance(chunk, dict)),
     ]))
 
 
@@ -595,12 +694,12 @@ def frame_sentence_usable(sentence: str) -> bool:
 
 def limitations_section(evidence_packs: Sequence[dict[str, Any]], report_context: dict[str, Any]) -> str:
     items_by_question = {}
-    for pack in evidence_packs or []:
+    for pack in sequence_items(evidence_packs):
         if isinstance(pack, dict) and synthesis_coverage_status_is_gap(pack.get("coverage")):
             question = clean_text(pack.get("question"))
             if question:
                 items_by_question[normalize_heading(question)] = f"- Evidence is {clean_text(pack.get('coverage')) or 'incomplete'} for: {question}."
-    for item in report_context.get("coverage_by_question", []) or []:
+    for item in sequence_items(report_context.get("coverage_by_question")):
         if isinstance(item, dict) and synthesis_coverage_status_is_gap(item.get("status")):
             question = clean_text(item.get("question"))
             if question and normalize_heading(question) not in items_by_question:
@@ -815,7 +914,10 @@ def section_satisfies_required_evidence(question: str, section: str) -> bool:
     if kind == "bahdanau_equation":
         return has_bahdanau_equation(text)
     if kind == "scaled_attention":
-        return has_scaled_attention_equation(text) and ("multi-head" in text or "multihead" in text or line_has_gap_claim(text))
+        asks_multihead = "multi-head" in clean_text(question).lower() or "multihead" in clean_text(question).lower()
+        return has_scaled_attention_equation(text) and (
+            not asks_multihead or "multi-head" in text or "multihead" in text or line_has_gap_claim(text)
+        )
     if kind == "benchmark":
         return bool(re.search(r"\b(?:wmt|bleu|glue|imagenet)\b", text) and re.search(r"\b\d+(?:\.\d+)?\b", text) and citation_markers(text))
     if kind == "api":
@@ -837,11 +939,11 @@ def section_satisfies_required_evidence(question: str, section: str) -> bool:
 
 
 def has_scaled_attention_equation(text: str) -> bool:
-    return (
-        ("attention(q,k,v)" in text or "attention}(q,k,v)" in text or "softmax" in text)
-        and ("sqrt" in text or "√" in text or "d_k" in text)
-        and ("qk" in text or "dot product" in text or "queries" in text)
-    )
+    normalized = clean_text(text).lower()
+    softmax = "softmax" in normalized
+    scale = any(token in normalized for token in ("sqrt", "√", "d_k", "d_{k}"))
+    dot_product = any(token in normalized for token in ("qk", "q k", "query-key", "query key"))
+    return softmax and scale and dot_product and "attention" in normalized
 
 
 def has_bahdanau_equation(text: str) -> bool:
@@ -1014,7 +1116,13 @@ def report_schema_issues(report: str, questions: Sequence[str]) -> list[str]:
     for label, aliases in required.items():
         if not any(normalize_heading(alias) in headings for alias in aliases):
             issues.append(f"missing schema section: {label}")
-    numbered = {entry["number"] for entry in topic_section_heading_entries(report)}
+    topic_numbers = [entry["number"] for entry in topic_section_heading_entries(report)]
+    numbered = set(topic_numbers)
+    if len(topic_numbers) != len(numbered):
+        issues.append("duplicate planner topic sections")
+    expected_numbers = [f"3.{index}" for index in range(1, len(questions) + 1)]
+    if topic_numbers and topic_numbers != expected_numbers:
+        issues.append("planner topic sections are not in question order")
     for index, _ in enumerate(questions, 1):
         if f"3.{index}" not in numbered:
             issues.append(f"missing sequential planner topic heading: 3.{index}")
@@ -1028,9 +1136,9 @@ def ensure_limitations(report: str, issues: Sequence[str], sources: Sequence[dic
 
 
 def report_pack_citation_gaps(report: str, evidence_packs: Sequence[dict[str, Any]], questions: Sequence[str] | None = None, per_question_synthesis: Sequence[dict[str, Any]] = ()) -> list[str]:
-    canonical = {normalize_heading(q): q for q in questions or [] if clean_text(q)}
+    canonical = {normalize_heading(q): q for q in sequence_items(questions) if clean_text(q)}
     gaps = []
-    for pack in evidence_packs or []:
+    for pack in sequence_items(evidence_packs):
         if not isinstance(pack, dict) or not evidence_pack_has_usable_cited_evidence(pack):
             continue
         question = clean_text(pack.get("question"))
@@ -1039,7 +1147,7 @@ def report_pack_citation_gaps(report: str, evidence_packs: Sequence[dict[str, An
             continue
         synthesis_indexes = {
             index
-            for item in per_question_synthesis or []
+            for item in sequence_items(per_question_synthesis)
             if isinstance(item, dict) and normalize_heading(item.get("question")) == normalize_heading(question)
             for index in [*dedupe_ints(item.get("source_indexes", [])), *citation_markers(item.get("synthesis"))]
         }
@@ -1068,14 +1176,14 @@ def rewrite_missing_sub_question_queries(objective: str, questions: Sequence[str
 def synthesis_coverage_gap_questions(report_context: dict[str, Any], planner_questions: Sequence[str] | None = None) -> list[str]:
     if not isinstance(report_context, dict):
         return []
-    canonical = {normalize_heading(q): q for q in planner_questions or [] if clean_text(q)}
+    canonical = {normalize_heading(q): q for q in sequence_items(planner_questions) if clean_text(q)}
     gaps = []
-    for pack in report_context.get("evidence_packs", []) or []:
+    for pack in sequence_items(report_context.get("evidence_packs")):
         if isinstance(pack, dict) and synthesis_coverage_status_is_gap(pack.get("coverage")):
             question = clean_text(pack.get("question"))
             if question:
                 gaps.append(canonical.get(normalize_heading(question), question))
-    for item in report_context.get("coverage_by_question", []) or []:
+    for item in sequence_items(report_context.get("coverage_by_question")):
         if isinstance(item, dict) and synthesis_coverage_status_is_gap(item.get("status")):
             question = clean_text(item.get("question"))
             if question:
@@ -1105,6 +1213,8 @@ def missing_sub_question_coverage(report: str, planner_questions: Sequence[str])
     report_terms, missing = set(technical_question_terms(report)), []
     for question in planner_questions:
         section = report_section_for_question(report, question)
+        if section and line_has_gap_claim(section):
+            continue
         if specialized_question_covered(question, section):
             continue
         terms = [term for term in technical_question_terms(question) if term not in STOPWORDS]
@@ -1119,12 +1229,21 @@ def specialized_question_covered(question: str, section: str) -> bool:
     lowered = clean_text(question).lower()
     body = clean_text(section).lower()
     if any(term in lowered for term in ("equation", "formula", "mathematical")):
-        return "core equation" in body or ("attention(q,k,v)" in body or "attention}(q,k,v)" in body)
+        if line_has_gap_claim(body):
+            return True
+        has_equation = "core equation" in body or has_scaled_attention_equation(body) or has_bahdanau_equation(body)
+        return has_equation and bool(citation_markers(section))
     if any(term in lowered for term in ("api", "framework", "pytorch", "tensorflow", "keras")):
         return "api evidence" in body or "multiheadattention" in body or "keras.layers" in body
     if "benchmark" in lowered:
         return "benchmark" in body or line_has_gap_claim(body)
     return False
+
+
+def sequence_items(value: Any) -> list[Any]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return list(value)
+    return []
 
 
 def report_self_critique(report_issues: Sequence[str], coverage_check: dict[str, Any], schema_issues: Sequence[str]) -> dict[str, Any]:
@@ -1176,7 +1295,7 @@ def slugify_filename(text: Any, max_length: int = 80) -> str:
 
 def sources_with_browser_results(sources: Sequence[Any], browser_results: Sequence[Any]) -> list[dict[str, Any]]:
     merged, existing, used_indexes = [], set(), set()
-    for source in sources or []:
+    for source in sequence_items(sources):
         if not isinstance(source, dict):
             continue
         item = dict(source)
@@ -1186,10 +1305,10 @@ def sources_with_browser_results(sources: Sequence[Any], browser_results: Sequen
         used_indexes.add(item["index"])
         if normalize_url(item.get("url")):
             existing.add(normalize_url(item.get("url")))
-    for result in browser_results or []:
+    for result in sequence_items(browser_results):
         if not isinstance(result, dict):
             continue
-        for source in result.get("sources", []) or []:
+        for source in sequence_items(result.get("sources")):
             if not isinstance(source, dict):
                 continue
             url = normalize_url(source.get("url"))
@@ -1209,25 +1328,25 @@ def next_available_index(used: set[int]) -> int:
 
 
 def evidence_pack_questions(evidence_packs: Sequence[Any]) -> list[str]:
-    return dedupe_text(clean_text(pack.get("question")) for pack in evidence_packs or [] if isinstance(pack, dict) and clean_text(pack.get("question")))
+    return dedupe_text(clean_text(pack.get("question")) for pack in sequence_items(evidence_packs) if isinstance(pack, dict) and clean_text(pack.get("question")))
 
 
 def per_question_synthesis_by_question(per_question_synthesis: Sequence[Any]) -> dict[str, dict[str, Any]]:
-    return {normalize_heading(item.get("question")): item for item in per_question_synthesis or [] if isinstance(item, dict) and clean_text(item.get("question"))}
+    return {normalize_heading(item.get("question")): item for item in sequence_items(per_question_synthesis) if isinstance(item, dict) and clean_text(item.get("question"))}
 
 
 def per_question_synthesis_source_indexes(synthesis_note: dict[str, Any]) -> list[int]:
     if not isinstance(synthesis_note, dict):
         return []
-    return dedupe_ints([*synthesis_note.get("source_indexes", []), *citation_markers(synthesis_note.get("synthesis"))])
+    return dedupe_ints([*sequence_items(synthesis_note.get("source_indexes")), *citation_markers(synthesis_note.get("synthesis"))])
 
 
 def pack_source_indexes(pack: dict[str, Any]) -> list[int]:
-    return dedupe_ints(chunk.get("source_index") for chunk in pack.get("chunks", []) or [] if isinstance(chunk, dict))
+    return dedupe_ints(chunk.get("source_index") for chunk in sequence_items(pack.get("chunks")) if isinstance(chunk, dict))
 
 
 def evidence_pack_has_usable_cited_evidence(pack: dict[str, Any]) -> bool:
-    return any(isinstance(chunk, dict) and isinstance(chunk.get("source_index"), int) and clean_text(chunk.get("content")) for chunk in pack.get("chunks", []) or [])
+    return any(isinstance(chunk, dict) and isinstance(chunk.get("source_index"), int) and clean_text(chunk.get("content")) for chunk in sequence_items(pack.get("chunks")))
 
 
 def source_index_set(sources: Sequence[dict[str, Any]]) -> set[int]:
@@ -1236,7 +1355,7 @@ def source_index_set(sources: Sequence[dict[str, Any]]) -> set[int]:
 
 def rank_question_chunks(question: str, chunks: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     terms = detail_terms(question)
-    return sorted([chunk for chunk in chunks or [] if isinstance(chunk, dict)], key=lambda chunk: -len(terms & detail_terms(" ".join([clean_text(chunk.get("title")), clean_text(chunk.get("url")), clean_text(chunk.get("content"))]))))
+    return sorted([chunk for chunk in sequence_items(chunks) if isinstance(chunk, dict)], key=lambda chunk: -len(terms & detail_terms(" ".join([clean_text(chunk.get("title")), clean_text(chunk.get("url")), clean_text(chunk.get("content"))]))))
 
 
 def planner_question_heading(question: str, max_length: int | None = DEFAULT_HEADING_CHARS) -> str:
@@ -1541,7 +1660,7 @@ def dedupe_text(items: Sequence[Any]) -> list[str]:
 
 def dedupe_ints(values: Sequence[Any]) -> list[int]:
     deduped, seen = [], set()
-    for value in values or []:
+    for value in sequence_items(values):
         try:
             number = int(value)
         except (TypeError, ValueError):
