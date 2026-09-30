@@ -2330,6 +2330,88 @@ Old conclusion.
     def test_slugify_filename(self):
         self.assertEqual(slugify_filename("What is Attention Mechanism?"), "what-is-attention-mechanism")
 
+    def test_report_excerpt_preserves_missing_details_tail(self):
+        note = "Supported finding [1]. " + ("Detailed evidence text. " * 100)
+        note += "\n\n**Exact missing details**\n- API signatures are absent.\n- Multi-head derivation is absent."
+
+        excerpt = report_agent_module.compact_synthesis_excerpt(note, 1200)
+
+        self.assertLessEqual(len(excerpt), 1200)
+        self.assertIn("Supported finding [1]", excerpt)
+        self.assertIn("Exact missing details", excerpt)
+        self.assertIn("Multi-head derivation is absent", excerpt)
+
+    def test_prompt_separates_attention_scoring_and_architecture_categories(self):
+        prompt = build_report_prompt(
+            "Attention mechanisms",
+            "report",
+            ["What are the variants?"],
+            {"what are the variants": {"question": "What are the variants?", "synthesis": "Additive attention [1]."}},
+            [{"index": 1, "url": "https://example.org"}],
+        )
+
+        self.assertIn("distinguish scoring functions", prompt)
+        self.assertIn("Do not claim that multi-head attention removes", prompt)
+        self.assertIn("relevant framework documentation", prompt)
+
+    def test_pack_source_indexes_accepts_generator(self):
+        indexes = report_agent_module.pack_source_indexes({
+            "chunks": [
+                {"source_index": 2},
+                {"source_index": 1},
+                {"source_index": 2},
+            ]
+        })
+
+        self.assertEqual(indexes, [2, 1])
+
+    def test_framework_api_repair_never_uses_unrelated_fallback_sources(self):
+        body = "PyTorch exposes `torch.nn.MultiheadAttention` [1]."
+        sources = [
+            {"index": 1, "title": "Attention paper", "url": "https://arxiv.org/abs/1706.03762"},
+            {"index": 2, "title": "PyTorch API", "url": "https://docs.pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html"},
+        ]
+
+        self.assertEqual(report_agent_module.framework_api_note(body, [1], sources), "")
+        self.assertIn("[2]", report_agent_module.framework_api_note(
+            "PyTorch exposes `torch.nn.MultiheadAttention` [2].", [2], sources
+        ))
+
+    def test_artifact_detector_accepts_lowercase_sentence_continuations(self):
+        report = "The equation is defined here [1].\nand instantiated in self-attention via projections [2]."
+
+        self.assertEqual(report_agent_module.report_artifact_lines(report), [])
+
+    def test_variant_repair_does_not_invent_table_or_citations(self):
+        result = report_agent_module.enforce_topic_requirements(
+            "What are the main variants of attention?",
+            "Additive and multi-head attention differ [1].",
+            {}, {}, [1], [{"index": 1, "title": "General paper", "url": "https://example.org/paper"}],
+        )
+
+        self.assertNotIn("| Variant |", result)
+
+    def test_quality_check_requires_citations_for_factual_frame_prose(self):
+        report = """## Introduction and Context
+Attention is used across neural network architectures for sequence processing.
+
+## Limitations and Open Questions
+Evidence is incomplete for broader applications.
+
+## References
+No cited source markers were used.
+"""
+
+        issues = report_quality_issues(report, [{"index": 1, "url": "https://example.org"}])
+
+        self.assertTrue(any("uncited factual prose in frame sections" in issue for issue in issues))
+        self.assertEqual(
+            report_agent_module.uncited_factual_frame_sections(
+                "## Introduction and Context\nEvidence is incomplete for broader applications."
+            ),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
