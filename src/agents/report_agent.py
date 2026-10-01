@@ -72,7 +72,7 @@ NOISE_RE = re.compile(
 )
 
 BAD_SENTENCE_START_RE = re.compile(
-    r"^(?:(?:where|which|that|it also|this version|another is|the third is|head h|ncoder|resses|"
+    r"^(?:(?:[a-z],\s|where|which|that|it also|this version|another is|the third is|head h|ncoder|resses|"
     r"hematical|ng with|corresponding key|only limited|instead of all)\b)",
 )
 
@@ -132,61 +132,32 @@ class ReportAgent:
             coverage_by_question=sequence_items(report_context.get("coverage_by_question")),
             evidence_contracts=evidence_contracts,
         )
-        report, generation_mode, generation_error = generate_report_with_llm(
-            self.model, prompt
-        )
-        diagnostics = []
+        report, generation_mode, generation_error = generate_report_with_llm(self.model, prompt)
         llm_generated = report is not None
-        if report is None:
+        diagnostics = []
+        if not llm_generated:
             report, diagnostics = build_deterministic_report(
                 objective, questions, packs_by_question, synthesis_by_question, sources, evidence_packs, report_context,
                 evidence_contracts,
-            )
-        else:
-            report, diagnostics = repair_report_topic_sections(
-                report, questions, packs_by_question, synthesis_by_question, sources
             )
         report = normalize_final_report(report, sources)
         report, repairs = cleanup_report(report, sources)
-        schema_issues = report_schema_issues(report, questions)
-        if schema_issues:
-            report, diagnostics = build_deterministic_report(
-                objective, questions, packs_by_question, synthesis_by_question, sources, evidence_packs, report_context,
-                evidence_contracts,
-            )
-            generation_mode = f"{generation_mode}_schema_fallback"
-            repairs.append("rebuilt report after incomplete LLM schema")
-            report = normalize_final_report(report, sources)
-            report, schema_repairs = cleanup_report(report, sources)
-            repairs.extend(schema_repairs)
         validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
-        quality_fallback = {"attempted": False, "accepted": False, "candidate_issue_count": None}
+        revision_diagnostics = {"attempted": False, "accepted": False, "error": ""}
         if llm_generated and (validation["issues"] or validation["schema_issues"]):
-            quality_fallback["attempted"] = True
-            candidate, candidate_diagnostics = build_deterministic_report(
-                objective, questions, packs_by_question, synthesis_by_question, sources, evidence_packs, report_context,
-                evidence_contracts,
-            )
-            candidate = normalize_final_report(candidate, sources)
-            candidate, candidate_repairs = cleanup_report(candidate, sources)
-            candidate_validation = validate_report(candidate, sources, questions, evidence_packs, synthesis_items)
-            candidate_coverage = report_sub_question_coverage_check(candidate, questions)
-            current_coverage = report_sub_question_coverage_check(report, questions)
-            quality_fallback["candidate_issue_count"] = (
-                len(candidate_validation["issues"])
-                + len(candidate_validation["schema_issues"])
-                + candidate_coverage["missing_count"]
-            )
-            current_issue_count = (
-                len(validation["issues"])
-                + len(validation["schema_issues"])
-                + current_coverage["missing_count"]
-            )
-            if quality_fallback["candidate_issue_count"] < current_issue_count:
-                report, diagnostics, repairs = candidate, candidate_diagnostics, [*repairs, *candidate_repairs]
-                validation = candidate_validation
-                generation_mode = f"{generation_mode}_validated_fallback"
-                quality_fallback["accepted"] = True
+            revision_diagnostics["attempted"] = True
+            revision_prompt = build_report_revision_prompt(prompt, validation)
+            revised, _, revision_error = generate_report_with_llm(self.model, revision_prompt)
+            revision_diagnostics["error"] = revision_error
+            if revised:
+                revised = normalize_final_report(revised, sources)
+                revised, revision_repairs = cleanup_report(revised, sources)
+                revised_validation = validate_report(revised, sources, questions, evidence_packs, synthesis_items)
+                if report_validation_score(revised_validation, revised, questions) < report_validation_score(validation, report, questions):
+                    report, validation = revised, revised_validation
+                    repairs.extend(revision_repairs)
+                    generation_mode = "llm_revised_from_question_evidence"
+                    revision_diagnostics["accepted"] = True
 
         coverage = report_sub_question_coverage_check(report, questions)
         synthesis_gaps = synthesis_coverage_gap_questions(report_context, questions)
@@ -205,21 +176,24 @@ class ReportAgent:
                 "retrieved_chunk_count": len(sequence_items(report_context.get("retrieved_chunks"))),
                 "report_length": len(report),
                 "report_generation_mode": generation_mode,
+                "report_llm_used": llm_generated,
+                "report_deterministic_fallback_used": not llm_generated,
                 "report_generation_error": generation_error,
                 "report_issues": validation["issues"],
                 "report_schema_issues": validation["schema_issues"],
                 "report_missing_sub_questions": coverage["missing"],
                 "report_evidence_gap_questions": synthesis_gaps,
-                "report_false_gap_questions": [],
+                "report_false_gap_questions": validation["false_gap_questions"],
                 "report_pack_citation_gap_questions": validation["citation_gap_questions"],
                 "report_coverage_check": coverage,
                 "report_retry_queries": rewrite_missing_sub_question_queries(objective, retry_questions),
                 "report_review_trace": [report_self_critique(validation["issues"], coverage, validation["schema_issues"])],
-                "report_revision_attempts": 0,
-                "report_quality_fallback": quality_fallback,
+                "report_revision_attempts": int(revision_diagnostics["attempted"]),
+                "report_llm_revision": revision_diagnostics,
+                "report_quality_fallback": {"attempted": False, "accepted": False, "candidate_issue_count": None},
                 "report_deterministic_repairs": repairs,
                 "report_finalization_status": (
-                    "needs_review" if validation["issues"] or coverage["missing"] else "clean_with_evidence_gaps" if synthesis_gaps else "clean"
+                    "needs_review" if validation["issues"] or coverage["missing"] or validation["false_gap_questions"] or not llm_generated else "clean_with_evidence_gaps" if synthesis_gaps else "clean"
                 ),
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
                 "report_section_diagnostics": {"topic_sections": diagnostics},
@@ -318,6 +292,30 @@ Grounding and writing rules:
 - The executive summary reports key supported findings and important gaps. The introduction frames scope. Cross-cutting analysis compares findings only where evidence supports the relationship and cites each factual claim. Limitations lists actual gaps or conflicts. The conclusion synthesizes supported answers and uncertainty with citations; it must not repeat benchmark figures or copy another section.
 - Use clear paragraph prose. Use a comparison table only when at least two compared items are supported. Avoid filler and duplicated claims.
 - Output only the final Markdown report, with no drafting notes."""
+
+
+def build_report_revision_prompt(prompt: str, validation: dict[str, Any]) -> str:
+    issues = dedupe_text([
+        *sequence_items(validation.get("issues")),
+        *sequence_items(validation.get("schema_issues")),
+        *(f"Do not call this a total evidence gap; supported findings exist for: {q}" for q in sequence_items(validation.get("false_gap_questions"))),
+    ])
+    return (
+        f"{prompt}\n\nYour previous report failed these checks:\n"
+        + "\n".join(f"- {issue}" for issue in issues)
+        + "\nRewrite the complete report from the same question-specific evidence. Preserve supported partial findings, "
+        "state only the exact missing detail, remove extraction fragments, and do not add unsupported claims."
+    )
+
+
+def report_validation_score(validation: dict[str, Any], report: str, questions: Sequence[str]) -> int:
+    coverage = report_sub_question_coverage_check(report, questions)
+    return (
+        len(validation.get("issues", []))
+        + len(validation.get("schema_issues", []))
+        + len(validation.get("false_gap_questions", [])) * 2
+        + coverage["missing_count"]
+    )
 
 
 def build_question_evidence_contracts(
@@ -638,7 +636,7 @@ def chunk_to_evidence_sentence(question: str, chunk: dict[str, Any]) -> str:
     content = sanitize_evidence_content(chunk.get("content"))
     sentences = clean_report_sentences(content, max_sentences=1, require_citation=False, question=question)
     sentence = sentences[0] if sentences else ""
-    if not sentence:
+    if not sentence or detail_terms(sentence).isdisjoint(detail_terms(question)):
         return ""
     return sentence if marker in sentence else f"{sentence.rstrip('.')} {marker}."
 
@@ -1068,6 +1066,7 @@ def required_evidence_label(question: str) -> str:
         "bahdanau_equation": "the Bahdanau additive-attention equations or an explicit equation gap",
         "scaled_attention": "scaled dot-product and multi-head attention equations",
         "benchmark": "benchmark names and metric values",
+        "equation": "a source-backed equation or a specific explanation of the missing expression",
         "api": "actual framework API names and documentation sources",
         "complexity": "complexity or memory-cost evidence",
         "application": "application evidence tied to the requested domain",
@@ -1087,6 +1086,8 @@ def question_kind(question: Any) -> str:
         return "benchmark"
     if any(term in q for term in ("complexity", "memory", "recurrent", "quadratic", "cost")):
         return "complexity"
+    if any(term in q for term in ("equation", "formula", "mathematical", "score function", "softmax weighting")):
+        return "equation"
     if any(term in q for term in ("application", "vision", "beyond nlp", "computer vision", "vit")):
         return "application"
     if "variant" in q or "differ" in q:
@@ -1105,6 +1106,8 @@ def section_satisfies_required_evidence(question: str, section: str) -> bool:
         return any(term in text for term in ("maps a query", "weighted aggregation", "weighted sum", "combine values", "weights on the values")) and not any(term in text for term in ("key_padding_mask", "need_weights", "vdim", "fastpath"))
     if kind == "bahdanau_equation":
         return has_bahdanau_equation(text)
+    if kind == "equation":
+        return bool(re.search(r"=|\bsoftmax\b", text) and citation_markers(text))
     if kind == "scaled_attention":
         asks_multihead = "multi-head" in clean_text(question).lower() or "multihead" in clean_text(question).lower()
         return has_scaled_attention_equation(text) and (
@@ -1185,8 +1188,18 @@ def validate_report(report: str, sources: Sequence[dict[str, Any]], questions: S
     schema_issues = report_schema_issues(report, questions)
     citation_gap_questions = report_pack_citation_gaps(report, evidence_packs, questions, per_question_synthesis)
     issues.extend(required_evidence_issues(report, questions))
+    relevance_issues = report_topic_relevance_issues(report, questions)
+    false_gaps = report_evidence_gap_contradictions(report, questions, per_question_synthesis, evidence_packs)
+    issues.extend(relevance_issues)
+    issues.extend(f"report discards cited supported findings and labels the topic a gap: {q}" for q in false_gaps)
     issues.extend(f"report section does not cite supplied evidence: {q}" for q in citation_gap_questions)
-    return {"issues": dedupe_text(issues), "schema_issues": schema_issues, "citation_gap_questions": citation_gap_questions}
+    return {
+        "issues": dedupe_text(issues),
+        "schema_issues": schema_issues,
+        "citation_gap_questions": citation_gap_questions,
+        "false_gap_questions": false_gaps,
+        "topic_relevance_issues": relevance_issues,
+    }
 
 
 def required_evidence_issues(report: str, questions: Sequence[str]) -> list[str]:
@@ -1200,6 +1213,67 @@ def required_evidence_issues(report: str, questions: Sequence[str]) -> list[str]
         if not section_satisfies_required_evidence(question, section):
             issues.append(f"section lacks required evidence ({required_evidence_label(question)}): {question}")
     return issues
+
+
+def report_topic_relevance_issues(report: str, questions: Sequence[str]) -> list[str]:
+    """Reject cited topic sentences that share no meaningful terms with their question."""
+    issues = []
+    for question in questions:
+        section = report_section_for_question(report, question)
+        if not section:
+            continue
+        question_terms = detail_terms(question)
+        for sentence in split_sentences(strip_leading_heading(section)):
+            sentence = clean_text(sentence)
+            if not sentence or line_has_gap_claim(sentence) or not citation_markers(sentence):
+                continue
+            if sentence.startswith(("|", "- ", "**Core equation:**")):
+                continue
+            if detail_terms(sentence).isdisjoint(question_terms):
+                issues.append(f"report includes an irrelevant cited sentence under: {question}")
+                break
+    return dedupe_text(issues)
+
+
+def report_evidence_gap_contradictions(
+    report: str,
+    questions: Sequence[str],
+    per_question_synthesis: Sequence[dict[str, Any]],
+    evidence_packs: Sequence[dict[str, Any]] = (),
+) -> list[str]:
+    """Find all-gap topic sections despite clean cited synthesis or pack evidence."""
+    synthesis_by_question = per_question_synthesis_by_question(per_question_synthesis)
+    packs_by_question = {
+        normalize_heading(pack.get("question")): pack
+        for pack in sequence_items(evidence_packs)
+        if isinstance(pack, dict) and clean_text(pack.get("question"))
+    }
+    contradictions = []
+    for question in questions:
+        section = report_section_for_question(report, question)
+        if not section or not line_has_gap_claim(section):
+            continue
+        note = synthesis_by_question.get(normalize_heading(question), {})
+        synthesis = clean_text(note.get("synthesis")) if isinstance(note, dict) else ""
+        supported_text, _ = split_synthesis_gaps(synthesis)
+        synthesis_support = (
+            bool(citation_markers(supported_text))
+            and len(strip_markdown(supported_text).split()) >= 8
+            and not is_noisy_text(supported_text)
+        )
+        pack = packs_by_question.get(normalize_heading(question), {})
+        pack_support = bool(topic_body_from_chunks(question, pack)) if isinstance(pack, dict) else False
+        if not synthesis_support and not pack_support:
+            continue
+        reported_findings = [
+            sentence for sentence in clean_report_sentences(
+                strip_leading_heading(section), max_sentences=8, require_citation=True, question=question
+            )
+            if not line_has_gap_claim(sentence)
+        ]
+        if not reported_findings:
+            contradictions.append(question)
+    return dedupe_text(contradictions)
 
 
 def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None = None, evidence_text: str = "") -> list[str]:
@@ -1984,7 +2058,6 @@ framework_api_detail_issues = lambda report, planner_questions: []
 repair_topic_headings = lambda report: (repair_headings(report), [])
 repair_weak_frame_sections = lambda report: (report, [])
 repair_truncated_markdown_line = lambda line: (cleanup_section_text(line), ["cleaned line"] if cleanup_section_text(line) != clean_text(line) else [])
-report_evidence_gap_contradictions = lambda *args, **kwargs: []
 internal_gap_contradiction_issues = lambda report: []
 report_per_question_synthesis_citation_gaps = lambda *args, **kwargs: []
 report_needs_revision = lambda validation: bool(validation.get("issues") or validation.get("report_issues") or validation.get("schema_issues") or validation.get("coverage", {}).get("missing"))
