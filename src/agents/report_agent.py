@@ -145,7 +145,10 @@ class ReportAgent:
         report, repairs = cleanup_report(report, sources)
         validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
         revision_diagnostics = {"attempted": False, "accepted": False, "error": "", "rejection_reason": ""}
-        if llm_generated and (validation["issues"] or validation["schema_issues"]):
+        if llm_generated and (
+            validation["issues"] or validation["schema_issues"]
+            or generation_mode == "llm_truncated_partial"
+        ):
             revision_diagnostics["attempted"] = True
             revision_prompt = build_report_revision_prompt(
                 validation, report, questions, evidence_contracts
@@ -173,6 +176,35 @@ class ReportAgent:
                     revision_diagnostics["rejection_reason"] = "revision did not reduce validated report issues"
             elif revision_error:
                 revision_diagnostics["rejection_reason"] = "LLM revision failed; original draft retained"
+
+        # A truncated or weak draft can still have a valid frame but broken
+        # topic sections. Rebuild only sections that fail their evidence
+        # contract, using the same merged synthesis/evidence contract as the
+        # initial deterministic path.
+        if validation["issues"] or validation["schema_issues"]:
+            repair_notes = {}
+            for key, note in synthesis_by_question.items():
+                contract = evidence_contracts.get(key, {})
+                if contract:
+                    note = dict(note)
+                    note["synthesis"] = clean_markdown("\n\n".join(filter(None, [
+                        clean_markdown(contract.get("supported")),
+                        f"**Exact missing details**\n{clean_markdown(contract.get('missing_details'))}" if clean_text(contract.get("missing_details")) else "",
+                    ])))
+                    note["source_indexes"] = sequence_items(contract.get("synthesis_source_indexes"))
+                repair_notes[key] = note
+            repaired, topic_repairs = repair_report_topic_sections(
+                report, questions, packs_by_question, repair_notes, sources
+            )
+            if topic_repairs:
+                repaired = normalize_final_report(repaired, sources)
+                repaired, topic_cleanup = cleanup_report(repaired, sources)
+                repaired_validation = validate_report(repaired, sources, questions, evidence_packs, synthesis_items)
+                if report_validation_score(repaired_validation, repaired, questions) <= report_validation_score(validation, report, questions):
+                    report, validation = repaired, repaired_validation
+                    repairs.extend(topic_cleanup)
+                    repairs.extend(topic_repairs)
+                    generation_mode = f"{generation_mode}+targeted_topic_repair"
 
         report, frame_repairs = repair_uncited_frame_sections(report, sources)
         if frame_repairs:
@@ -216,7 +248,7 @@ class ReportAgent:
                 "needs_review" if (
                     validation["issues"] or validation["schema_issues"] or coverage["missing"]
                     or validation["false_gap_questions"] or validation["citation_gap_questions"]
-                    or not llm_generated
+                    or not llm_generated or generation_mode == "llm_truncated_partial"
                 ) else "clean_with_evidence_gaps" if synthesis_gaps else "clean"
                 ),
                 "report_token_budget": DEFAULT_REPORT_TOTAL_TOKEN_BUDGET,
@@ -586,7 +618,9 @@ def generate_report_with_llm(
         if not report:
             return None, "deterministic_fallback_empty_llm_response", "LLM returned an empty report"
         if clean_text(getattr(choice, "finish_reason", "")).lower() in {"length", "max_tokens"}:
-            return None, "deterministic_fallback_truncated_llm_response", "LLM response reached its token limit"
+            # A partial draft is still useful: validation can target a repair
+            # call at the missing sections instead of discarding good content.
+            return report, "llm_truncated_partial", "LLM response reached its token limit"
         return report, "llm_from_per_question_synthesis", ""
     except Exception as error:
         print(f"[report] LLM generation failed; using deterministic synthesis fallback ({clean_text(error)[:180]})")
@@ -610,8 +644,8 @@ def build_deterministic_report(
         contract = (evidence_contracts or {}).get(key, {})
         if contract:
             note["synthesis"] = clean_markdown("\n\n".join(filter(None, [
-                clean_text(contract.get("supported")),
-                f"**Exact missing details**\n{clean_text(contract.get('missing_details'))}" if clean_text(contract.get("missing_details")) else "",
+                clean_markdown(contract.get("supported")),
+                f"**Exact missing details**\n{clean_markdown(contract.get('missing_details'))}" if clean_text(contract.get("missing_details")) else "",
             ])))
             note["source_indexes"] = sequence_items(contract.get("synthesis_source_indexes"))
         section, diagnostic = build_topic_section(
@@ -641,7 +675,18 @@ def repair_report_topic_sections(
         note = synthesis_by_question.get(normalize_heading(question), {})
         expected = f"3.{index}"
         section = numbered_topic_section(text, expected)
-        if section and section_satisfies_required_evidence(question, section):
+        note_text = clean_text(note.get("synthesis")) if isinstance(note, dict) else ""
+        supported_note, _ = split_synthesis_gaps(note_text)
+        has_question_evidence = (
+            bool(citation_markers(supported_note))
+            and len(strip_markdown(supported_note).split()) >= 8
+        ) or evidence_pack_has_usable_cited_evidence(pack)
+        gap_only_despite_evidence = bool(
+            section and line_has_gap_claim(section)
+            and not section_has_supported_cited_content(section)
+            and has_question_evidence
+        )
+        if section and section_satisfies_required_evidence(question, section) and not gap_only_despite_evidence:
             continue
         fallback, diagnostic = build_topic_section(index, question, pack, note, sources)
         text = replace_numbered_topic_section(text, expected, fallback)
@@ -699,18 +744,19 @@ def build_topic_section(
 ) -> tuple[str, dict[str, Any]]:
     heading = planner_question_heading(question)
     source_indexes = [idx for idx in sorted(set(pack_source_indexes(pack)) | set(per_question_synthesis_source_indexes(synthesis_note))) if idx in source_index_set(sources)]
-    body_parts = topic_body_from_synthesis(question, synthesis_note)
+    body_parts = topic_body_from_synthesis(question, synthesis_note, pack)
     body_parts.extend(topic_body_from_chunks(question, pack, existing_text=" ".join(body_parts)))
-    if not body_parts:
-        body_parts = [evidence_gap_sentence(question, pack, synthesis_note)]
-
     body = cleanup_section_text("\n\n".join(body_parts))
-    if source_indexes and not (set(source_indexes) & set(citation_markers(body))):
+    if body and source_indexes and not (set(source_indexes) & set(citation_markers(body))):
         body = f"{body.rstrip('.')} {format_citation_indexes(source_indexes[:2])}."
     body = enforce_topic_requirements(question, cleanup_section_text(body), pack, synthesis_note, source_indexes, sources)
     if not section_satisfies_required_evidence(question, body):
-        body = evidence_gap_sentence(question, pack, synthesis_note, required_evidence_label(question))
+        gap = evidence_gap_sentence(question, pack, synthesis_note, required_evidence_label(question))
+        # Preserve supported findings when only a requested detail is missing.
+        body = f"{body.rstrip()}\n\n{gap}" if section_has_supported_cited_content(body) else gap
         body = enforce_topic_requirements(question, cleanup_section_text(body), pack, synthesis_note, source_indexes, sources)
+    if not clean_text(body):
+        body = evidence_gap_sentence(question, pack, synthesis_note)
     satisfied = section_satisfies_required_evidence(question, body)
     return (
         f"### 3.{index}. {heading}\n{cleanup_section_text(body)}",
@@ -719,7 +765,7 @@ def build_topic_section(
             "heading": heading,
             "source_indexes": source_indexes,
             "coverage": clean_text(pack.get("coverage")) or "unknown",
-            "source": "per_question_synthesis" if topic_body_from_synthesis(question, synthesis_note) else "evidence_pack",
+            "source": "per_question_synthesis" if topic_body_from_synthesis(question, synthesis_note, pack) else "evidence_pack",
             "required_evidence": required_evidence_label(question),
             "required_evidence_satisfied": satisfied,
             "chars": len(body),
@@ -727,15 +773,145 @@ def build_topic_section(
     )
 
 
-def topic_body_from_synthesis(question: str, synthesis_note: dict[str, Any]) -> list[str]:
-    synthesis = clean_text(synthesis_note.get("synthesis")) if isinstance(synthesis_note, dict) else ""
+def topic_body_from_synthesis(question: str, synthesis_note: dict[str, Any], pack: dict[str, Any] | None = None) -> list[str]:
+    synthesis = clean_markdown(synthesis_note.get("synthesis")) if isinstance(synthesis_note, dict) else ""
     if not synthesis or not citation_markers(synthesis):
         return []
-    sentences = clean_report_sentences(synthesis, max_sentences=4, require_citation=True, question=question)
-    if not sentences:
+    synthesis = attach_standalone_citations(synthesis)
+    supported, _ = split_synthesis_gaps(synthesis)
+    clean_sentences = clean_report_sentences(supported, max_sentences=8, require_citation=True, question=question)
+    candidates = [
+        *(sentence for sentence in clean_sentences if report_sentence_quality(sentence, require_citation=True, allow_long=True)),
+        *cited_synthesis_bullets(supported, question),
+    ]
+    selected, seen_claims = [], set()
+    for sentence in candidates:
+        if not topic_claim_relevant(sentence, question):
+            continue
+        key = normalize_heading(re.sub(r"\[\d+\]", "", sentence))
+        if key and key not in seen_claims:
+            selected.append(sentence)
+            seen_claims.add(key)
+        if len(selected) >= 8:
+            break
+    equations = source_backed_equation_lines(question, synthesis_note, pack or {})
+    parts, used = [], 0
+    # Reserve space for formulas before prose so long synthesis notes cannot
+    # truncate the exact technical details the planner explicitly requested.
+    for part in [*equations, *selected]:
+        if used + len(part) > DEFAULT_TOPIC_TEXT_CHARS:
+            continue
+        parts.append(part)
+        used += len(part)
+    return parts
+
+
+def topic_claim_relevant(sentence: str, question: str) -> bool:
+    terms = report_relevance_terms(question)
+    terms.difference_update({"attention", "mechanism", "mechanisms", "model", "models", "evidence", "source", "sources"})
+    lowered = clean_text(question).lower()
+    if any(term in lowered for term in ("definition", "what is attention", "purpose of attention")):
+        terms.update({"attention", "mechanism", "query", "key", "value", "weight"})
+    if any(term in lowered for term in ("limitation", "challenge", "drawback", "cost", "complexity")):
+        terms.update({"quadratic", "linear", "complexity", "scalability", "memory", "efficient", "efficiency", "x-former"})
+    if any(term in lowered for term in ("benchmark", "bleu", "wmt", "performance")):
+        terms.update({"benchmark", "bleu", "wmt", "glue", "translation", "score", "result"})
+    if any(term in lowered for term in ("api", "framework", "pytorch", "tensorflow", "keras")):
+        terms.update({"api", "pytorch", "tensorflow", "keras", "torch", "multiheadattention", "attention"})
+    if "variant" in lowered or "differ" in lowered:
+        terms.update({"additive", "multiplicative", "dot-product", "self-attention", "multi-head", "cross-attention", "bahdanau", "luong"})
+    return bool(terms & report_relevance_terms(sentence))
+
+
+def cited_synthesis_bullets(text: str, question: str) -> list[str]:
+    """Extract supported list claims when synthesis puts citations on their own line."""
+    claims, current, standalone_markers = [], [], []
+    def flush() -> None:
+        if not current:
+            return
+        claim = clean_text(" ".join(current))
+        markers = dedupe_ints([*citation_markers(claim), *standalone_markers])
+        if markers:
+            claim = re.sub(r"\*?_?Citation:?_?\*?\s*:?", " ", claim, flags=re.I)
+            claim = clean_text(re.sub(r"\[\d+\]", "", claim))
+            for sentence in split_sentences(prepare_report_sentence_text(claim)):
+                value = cleanup_section_text(sentence)
+                cited = f"{value.rstrip('.')} {format_citation_indexes(markers[:2])}."
+                words = strip_markdown(cited).split()
+                usable = (
+                    len(words) >= 5 and bool(citation_markers(cited))
+                    and not is_noisy_text(cited) and not BAD_SENTENCE_START_RE.search(strip_markdown(cited))
+                    and formula_fragment_score(cited) < 2
+                )
+                plain = strip_markdown(cited).lstrip()
+                usable = usable and bool(plain) and (not plain[0].islower() or is_equation_definition_clause(plain))
+                if usable and sentence_matches_question(cited, question):
+                    claims.append(cited)
+        current.clear()
+        standalone_markers.clear()
+
+    for line in clean_markdown(text).splitlines():
+        value = clean_text(line)
+        if value.startswith("-"):
+            flush()
+            current.append(value.lstrip("- "))
+        elif current and re.fullmatch(r"(?:\[\d+\]\s*)+", value):
+            standalone_markers.extend(citation_markers(value))
+        elif current and re.search(r"\bCitation\b", value, re.I):
+            standalone_markers.extend(citation_markers(value))
+        elif current and value and not value.startswith("#"):
+            current.append(value)
+    flush()
+    return dedupe_text(claims)
+
+
+def attach_standalone_citations(text: str) -> str:
+    """Attach synthesis citation-label lines to the claim immediately above."""
+    return re.sub(
+        r"(?im)[ \t]*(?:\*Citation:\*|\*Citation\*:|_Citation:_|Citation:)[ \t]*((?:\[\d+\][ \t]*)+)",
+        lambda match: f" {clean_text(match.group(1))}",
+        clean_markdown(text),
+    )
+
+
+def source_backed_equation_lines(question: str, synthesis_note: dict[str, Any], pack: dict[str, Any]) -> list[str]:
+    """Retain equations verbatim, but only with a citation present in their evidence block."""
+    if not asks_for_mathematics(question):
         return []
-    text = compact_at_sentence(" ".join(sentences), DEFAULT_TOPIC_TEXT_CHARS)
-    return [text] if text and citation_markers(text) and report_sentence_quality(text, require_citation=True, allow_long=True) else []
+    blocks = []
+    synthesis = clean_markdown(synthesis_note.get("synthesis")) if isinstance(synthesis_note, dict) else ""
+    supported, _ = split_synthesis_gaps(synthesis)
+    note_markers = citation_markers(supported)
+    if supported and note_markers:
+        blocks.append((supported, format_citation_indexes(note_markers[:2])))
+    for chunk in sequence_items(pack.get("chunks")) if isinstance(pack, dict) else []:
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("source_index"), int):
+            continue
+        content = clean_text(chunk.get("content"))
+        if content:
+            blocks.append((content, f"[{chunk['source_index']}]"))
+    found: list[tuple[str, str]] = []
+    patterns = (
+        r"\\\[[\s\S]*?\\\]", r"\\\([\s\S]*?\\\)",
+        r"\$\$[\s\S]*?\$\$", r"\$(?:[^$\n]{3,240})\$",
+    )
+    for text, marker in blocks:
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                equation = clean_text(match.group(0))
+                if "=" not in equation or any(equation == existing for existing, _ in found):
+                    continue
+                local_citations = citation_markers(text[max(0, match.start() - 100):match.end() + 160])
+                found.append((equation, format_citation_indexes(local_citations[:2]) or marker))
+                if len(found) == 5:
+                    break
+            if len(found) == 5:
+                break
+        if len(found) == 5:
+            break
+    if not found:
+        return []
+    return [f"**Core equation:** {equation} {citation}" for equation, citation in found]
 
 
 def topic_body_from_chunks(question: str, pack: dict[str, Any], existing_text: str = "") -> list[str]:
@@ -764,6 +940,8 @@ def chunk_to_evidence_sentence(question: str, chunk: dict[str, Any]) -> str:
     content = sanitize_evidence_content(chunk.get("content"))
     sentences = clean_report_sentences(content, max_sentences=1, require_citation=False, question=question)
     sentence = sentences[0] if sentences else ""
+    if re.match(r"^(?:keywords?|index terms?|subject terms?|table of contents)\s*:", strip_markdown(sentence), re.I):
+        return ""
     if not sentence or detail_terms(sentence).isdisjoint(detail_terms(question)):
         return ""
     return sentence if marker in sentence else f"{sentence.rstrip('.')} {marker}."
@@ -780,16 +958,24 @@ def enforce_topic_requirements(question: str, body: str, pack: dict[str, Any], s
         equation = extract_source_backed_equation(pack, synthesis_note)
         if equation:
             additions.append(f"**Core equation:**\n\\[\n{equation}\n\\]\nSource: {format_citation_indexes(source_indexes[:2])}.")
-    if any(term in lowered for term in ("benchmark", "wmt", "bleu", "performance")) and not section_satisfies_required_evidence(question, body):
+    if any(term in lowered for term in ("benchmark", "wmt", "bleu", "performance")):
         benchmark = benchmark_note_from_evidence(pack, synthesis_note)
-        if benchmark:
-            additions.append(benchmark)
+        additions.extend(
+            line for line in benchmark.splitlines()
+            if line and normalize_heading(line) not in normalize_heading(body)
+        )
     if any(term in lowered for term in ("complexity", "memory", "recurrent", "quadratic", "cost")) and not section_satisfies_required_evidence(question, body):
         complexity = complexity_note_from_evidence(pack, synthesis_note)
         if complexity:
             additions.append(complexity)
     if any(term in lowered for term in ("api", "framework", "pytorch", "tensorflow", "keras")):
-        api_note = framework_api_note(body, source_indexes, sources)
+        api_note = framework_api_note(
+            f"{body}\n{evidence_text_for_requirement(pack, synthesis_note)}",
+            source_indexes,
+            sources,
+        )
+        chunk_api_note = framework_api_note_from_chunks(pack, sources)
+        api_note = clean_markdown("\n".join(filter(None, [api_note, chunk_api_note])))
         if api_note:
             additions.append(api_note)
         supplied = evidence_text_for_requirement(pack, synthesis_note)
@@ -812,7 +998,8 @@ def definition_note_from_evidence(pack: dict[str, Any], synthesis_note: dict[str
 
 
 def benchmark_note_from_evidence(pack: dict[str, Any], synthesis_note: dict[str, Any]) -> str:
-    text = evidence_text_for_requirement(pack, synthesis_note)
+    text = re.sub(r"[\u00a0\u202f\u2009]", " ", evidence_text_for_requirement(pack, synthesis_note))
+    text = text.replace("‑", "-").replace("–", "-").replace("—", "-")
     marker = format_citation_indexes(dedupe_ints([*pack_source_indexes(pack), *per_question_synthesis_source_indexes(synthesis_note)])[:2])
     if not marker:
         return ""
@@ -880,7 +1067,9 @@ def framework_api_note(body: str, source_indexes: Sequence[int], sources: Sequen
         ("torch.nn.MultiheadAttention", "pytorch"),
         ("torch.nn.functional.scaled_dot_product_attention", "pytorch"),
         ("tf.keras.layers.MultiHeadAttention", "tensorflow"),
+        ("tf.keras.layers.Attention", "tensorflow"),
         ("keras.layers.MultiHeadAttention", "keras"),
+        ("keras.layers.Attention", "keras"),
     )
     notes = []
     for api, framework in api_names:
@@ -895,6 +1084,35 @@ def framework_api_note(body: str, source_indexes: Sequence[int], sources: Sequen
         if marker:
             notes.append(f"**API evidence:** `{api}` is identified in the supplied {framework} documentation {marker}.")
     return "\n".join(notes)
+
+
+def framework_api_note_from_chunks(pack: dict[str, Any], sources: Sequence[dict[str, Any]]) -> str:
+    """Cite framework APIs using the source index attached to each retrieved chunk."""
+    source_text = {
+        source.get("index"): clean_text(f"{source.get('title')} {source.get('url')}").lower()
+        for source in sources or [] if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+    api_names = (
+        (r"tf\.keras\.layers\.(?:MultiHeadAttention|Attention)", "tensorflow"),
+        (r"keras\.layers\.(?:MultiHeadAttention|Attention)", "keras"),
+        (r"torch\.nn\.MultiheadAttention", "pytorch"),
+        (r"torch\.nn\.functional\.scaled_dot_product_attention", "pytorch"),
+        (r"nn\.MultiheadAttention", "pytorch"),
+    )
+    notes = []
+    for chunk in sequence_items(pack.get("chunks")) if isinstance(pack, dict) else []:
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("source_index"), int):
+            continue
+        index = chunk["source_index"]
+        source = source_text.get(index, "")
+        content = clean_text(chunk.get("content"))
+        for pattern, framework in api_names:
+            match = re.search(pattern, content, re.I)
+            framework_matches = framework in source or (framework == "tensorflow" and "keras" in source)
+            if match and framework_matches:
+                api = match.group(0)
+                notes.append(f"**API evidence:** `{api}` is identified in the supplied {framework} documentation [{index}].")
+    return "\n".join(dedupe_text(notes))
 
 
 def evidence_gap_sentence(question: str, pack: dict[str, Any], synthesis_note: dict[str, Any], required_detail: str = "") -> str:
@@ -1145,6 +1363,7 @@ def clean_report_sentences(text: Any, max_sentences: int = 4, require_citation: 
 
 def prepare_report_sentence_text(text: Any) -> str:
     value = clean_markdown(text)
+    value = re.sub(r"[\u00a0\u202f\u2009]", " ", value)
     value = re.sub(r"\\\[[\s\S]*?\\\]", " ", value)
     value = re.sub(r"\$\$[\s\S]*?\$\$", " ", value)
     value = re.sub(r"`{1,3}[^`]*`{1,3}", " ", value)
@@ -1167,6 +1386,9 @@ def report_sentence_quality(sentence: Any, require_citation: bool = True, allow_
     if RAW_LABEL_RE.search(value) or is_noisy_text(value):
         return False
     if BAD_SENTENCE_START_RE.search(strip_markdown(value)):
+        return False
+    plain = strip_markdown(value).lstrip()
+    if plain and plain[0].islower() and not is_equation_definition_clause(plain):
         return False
     if formula_fragment_score(value) >= 2:
         return False
@@ -1231,6 +1453,7 @@ def required_evidence_label(question: str) -> str:
         "bahdanau_equation": "the Bahdanau additive-attention equations or an explicit equation gap",
         "scaled_attention": "scaled dot-product and multi-head attention equations",
         "benchmark": "benchmark names and metric values",
+        "limitations": "a cited limitation and any evidence-backed response or a specific gap",
         "equation": "a source-backed equation or a specific explanation of the missing expression",
         "api": "actual framework API names and documentation sources",
         "complexity": "complexity or memory-cost evidence",
@@ -1254,6 +1477,8 @@ def question_kind(question: Any) -> str:
         return "complexity"
     if "efficient" in q and any(term in q for term in ("variant", "approach", "method")):
         return "efficient_variants"
+    if any(term in q for term in ("limitation", "challenge", "drawback", "risk")):
+        return "limitations"
     if "type" in q or "variant" in q or "differ" in q:
         return "variant"
     if any(term in q for term in ("equation", "formula", "mathematical", "score function", "softmax weighting")):
@@ -1286,6 +1511,10 @@ def section_satisfies_required_evidence(question: str, section: str) -> bool:
         )
     if kind == "benchmark":
         return bool(re.search(r"\b(?:wmt|bleu|glue|imagenet)\b", text) and re.search(r"\b\d+(?:\.\d+)?\b", text) and citation_markers(text))
+    if kind == "limitations":
+        limitation = any(term in text for term in ("limitation", "challenge", "quadratic", "scalability", "memory complexity"))
+        response = any(term in text for term in ("efficient", "efficiency", "x-former", "reformer", "linformer", "performer", "solution"))
+        return limitation and response and bool(citation_markers(text))
     if kind == "api":
         api_present = bool(re.search(r"\b(?:torch\.nn\.multiheadattention|scaled_dot_product_attention|tf\.keras\.layers\.(?:attention|multiheadattention)|keras\.layers\.(?:attention|multiheadattention))\b", text))
         tensorflow_asked = "tensorflow" in clean_text(question).lower() or "keras" in clean_text(question).lower()
@@ -1435,7 +1664,7 @@ def report_topic_relevance_issues(report: str, questions: Sequence[str]) -> list
                     continue
                 if sentence.startswith("**Core equation:**"):
                     continue
-                if report_relevance_terms(sentence).isdisjoint(question_terms | context_terms):
+                if report_relevance_terms(sentence).isdisjoint(context_terms) and not topic_claim_relevant(sentence, question):
                     issues.append(f"report includes an irrelevant cited sentence under: {question}")
                     break
             if issues and issues[-1].endswith(question):
@@ -1779,18 +2008,33 @@ def supported_equation_omissions(
     questions: Sequence[str],
     per_question_synthesis: Sequence[dict[str, Any]],
 ) -> list[str]:
-    """Catch omission of a complete, explicitly supported Bahdanau scoring equation."""
+    """Catch omitted source-backed equations in math questions."""
     notes = per_question_synthesis_by_question(per_question_synthesis)
     omissions = []
     for question in questions:
         note = notes.get(normalize_heading(question), {})
         synthesis, _ = split_synthesis_gaps(note.get("synthesis"))
-        if not asks_for_mathematics(question) or not has_complete_bahdanau_score(synthesis):
+        if not asks_for_mathematics(question):
             continue
         section = report_section_for_question(report, question, questions)
-        if section and not has_complete_bahdanau_score(section):
+        if not section:
+            continue
+        if has_complete_bahdanau_score(synthesis) and not has_complete_bahdanau_score(section):
             omissions.append(f"report omits the complete source-backed Bahdanau scoring equation for: {question}")
+            continue
+        if has_complete_bahdanau_score(synthesis):
+            continue
+        expected = source_backed_equation_lines(question, note, {})
+        section_signature = equation_signature(section)
+        if expected and not any(equation_signature(line) and equation_signature(line) in section_signature for line in expected):
+            omissions.append(f"report omits the source-backed equation for: {question}")
     return omissions
+
+
+def equation_signature(text: Any) -> str:
+    value = re.sub(r"\\(?:\[|\]|\(|\))", "", clean_text(text).lower())
+    value = re.sub(r"\\(?:operatorname|mathrm|text|left|right|frac|sqrt|tanh)\b", " ", value)
+    return re.sub(r"[^a-z0-9α-ω=+*/^_-]+", "", value)
 
 
 def asks_for_mathematics(question: str) -> bool:
@@ -1827,14 +2071,12 @@ def specialized_question_covered(question: str, section: str) -> bool:
     lowered = clean_text(question).lower()
     body = clean_text(section).lower()
     if any(term in lowered for term in ("equation", "formula", "mathematical")):
-        if line_has_gap_claim(body):
-            return True
         has_equation = "core equation" in body or has_scaled_attention_equation(body) or has_bahdanau_equation(body)
         return has_equation and bool(citation_markers(section))
     if any(term in lowered for term in ("api", "framework", "pytorch", "tensorflow", "keras")):
         return "api evidence" in body or "multiheadattention" in body or "keras.layers" in body
     if "benchmark" in lowered:
-        return "benchmark" in body or line_has_gap_claim(body)
+        return "benchmark" in body and bool(re.search(r"\b\d+(?:\.\d+)?\b", body)) and bool(citation_markers(section))
     return False
 
 
@@ -1973,6 +2215,8 @@ def planner_question_heading(question: str, max_length: int | None = DEFAULT_HEA
 
 def repair_common_heading_fragments(heading: str) -> str:
     value = clean_text(heading).strip(" .,:;")
+    value = re.sub(r"\s+And What Recent Solutions Have(?: Been)? Proposed.*$", " And Recent Solutions", value, flags=re.I)
+    value = re.sub(r",?\s+And Where (?:Can )?Reference Code.*$", " And Reference Code", value, flags=re.I)
     value = re.sub(r"\bThe Primary Applications Of (.+?) And What Benchmark(?:s)?(?: E\.?g\.?.*)?$", r"\1 Applications And Benchmark Evidence", value, flags=re.I)
     value = re.sub(r"\bThe Computational Complexity Of (.+?) Compared To Recurrent Networks And What Are.*$", r"\1 Complexity Compared With Recurrent Networks", value, flags=re.I)
     value = re.sub(r"\bThe Main Variants Of Attention Mechanisms.*$", "Attention Mechanism Variants And Differences", value, flags=re.I)

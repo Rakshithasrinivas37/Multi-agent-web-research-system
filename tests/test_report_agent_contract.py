@@ -2,6 +2,8 @@
 
 import json
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -285,6 +287,97 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertEqual(len(report_agent.supported_equation_omissions(incomplete, [question], synthesis)), 1)
         self.assertEqual(report_agent.supported_equation_omissions(complete, [question], synthesis), [])
 
+    def test_supported_display_equations_survive_topic_extraction(self):
+        question = "What equations define additive attention, including the score and context vector?"
+        note = {
+            "source_indexes": [1],
+            "synthesis": (
+                r"The score is defined as \(e_{ij}=v_a^T\tanh(W_a s_{i-1}+U_a h_j)\) [1]. "
+                r"Weights are normalized as \(\alpha_{ij}=\operatorname{softmax}(e_{ij})\) [1]. "
+                r"The context is \(c_i=\sum_j\alpha_{ij}h_j\) [1]."
+            ),
+        }
+
+        parts = report_agent.topic_body_from_synthesis(question, note)
+        body = "\n".join(parts)
+
+        self.assertGreaterEqual(body.count("Core equation"), 3)
+        self.assertIn(r"e_{ij}=v_a^T", body)
+        self.assertIn(r"\alpha_{ij}=", body)
+        self.assertIn(r"c_i=", body)
+        self.assertEqual(report_agent.supported_equation_omissions(
+            f"## 3. Topic Sections\n### 3.1. Additive Attention Equations\n{body}", [question], [note]
+        ), [])
+
+    def test_supported_prose_is_not_replaced_by_gap_when_detail_check_fails(self):
+        question = "What are the benchmark results for attention on WMT and GLUE?"
+        pack = {"coverage": "partial", "chunks": []}
+        note = {
+            "source_indexes": [1],
+            "synthesis": "The Transformer reported 28.4 BLEU on WMT 2014 English-to-German [1]. Exact missing details: GLUE results are not reported.",
+        }
+
+        section, _ = report_agent.build_topic_section(
+            1, question, pack, note, [{"index": 1, "url": "https://example.org/paper"}]
+        )
+
+        self.assertIn("28.4 BLEU", section)
+        self.assertIn("GLUE", section)
+        self.assertNotIn("did not provide enough benchmark", section)
+
+    def test_gap_only_draft_does_not_satisfy_equation_or_benchmark_coverage(self):
+        for question in (
+            "What is the mathematical equation for attention?",
+            "What benchmark results demonstrate its performance?",
+        ):
+            self.assertFalse(report_agent.specialized_question_covered(
+                question, "Evidence is incomplete; the requested detail is missing."
+            ))
+
+    def test_standalone_synthesis_citations_attach_to_supported_claims(self):
+        question = "What are the limitations and recent solutions for attention?"
+        note = {
+            "source_indexes": [1],
+            "synthesis": "**Supported statements**\n- Self-attention has quadratic time and memory complexity.\n  *Citation:* [1]\n- Efficient X-former models address scalability.\n  *Citation:* [1]\n\n**Missing details**\n- Specific architecture comparisons are not available.",
+        }
+
+        body = "\n".join(report_agent.topic_body_from_synthesis(question, note))
+
+        self.assertIn("quadratic time and memory complexity. [1]", body)
+        self.assertIn("X-former models address scalability [1].", body)
+        self.assertTrue(report_agent.section_satisfies_required_evidence(question, body))
+
+    def test_token_truncated_llm_draft_is_retained_for_revision(self):
+        choice = type("Choice", (), {
+            "message": type("Message", (), {"content": GOOD_REPORT[:250]})(),
+            "finish_reason": "length",
+        })()
+        response = type("Response", (), {"choices": [choice], "model": "mock"})()
+        fake_sdk = SimpleNamespace(Groq=lambda: object())
+        with patch.dict("os.environ", {"GROQ_API_KEY": "test"}), \
+             patch.dict(sys.modules, {"groq": fake_sdk}), \
+             patch.object(report_agent, "create_chat_completion_with_retries", return_value=response):
+            draft, mode, error = report_agent.generate_report_with_llm("mock", "prompt")
+
+        self.assertEqual(draft, GOOD_REPORT[:250])
+        self.assertEqual(mode, "llm_truncated_partial")
+        self.assertIn("token limit", error)
+
+    def test_truncated_report_triggers_revision_instead_of_deterministic_fallback(self):
+        with patch.object(
+            report_agent, "generate_report_with_llm",
+            side_effect=[
+                (GOOD_REPORT[:250], "llm_truncated_partial", "LLM response reached its token limit"),
+                (GOOD_REPORT, "mocked_llm", ""),
+            ],
+        ):
+            payload = report_agent.ReportAgent(model="mocked-model").generate(fixture_context())
+
+        self.assertTrue(payload["diagnostics"]["report_llm_revision"]["attempted"])
+        self.assertTrue(payload["diagnostics"]["report_llm_revision"]["accepted"])
+        self.assertFalse(payload["diagnostics"]["report_deterministic_fallback_used"])
+        self.assertEqual(payload["diagnostics"]["report_generation_mode"], "llm_revised_from_question_evidence")
+
     def test_placeholder_citation_is_removed_during_cleanup(self):
         cleaned, repairs = report_agent.cleanup_report(
             "## 3.1. Attention Types\nSelf-attention's equation is not supplied [—].",
@@ -422,6 +515,25 @@ class ReportEvidenceContractTests(unittest.TestCase):
 
         self.assertEqual(validation["false_gap_questions"], [QUESTION])
 
+    def test_targeted_topic_repair_replaces_gap_only_section_when_question_has_evidence(self):
+        context = fixture_context()
+        gap_report = (
+            "## 3. Topic Sections\n"
+            "### 3.1. Mathematical Formulation Of Scaled Dot-product Attention Including Equation\n"
+            "The retrieved evidence is incomplete for this sub-question."
+        )
+        notes = report_agent.per_question_synthesis_by_question(context["per_question_synthesis"])
+        packs = {report_agent.normalize_heading(item["question"]): item for item in context["evidence_packs"]}
+
+        repaired, diagnostics = report_agent.repair_report_topic_sections(
+            gap_report, [QUESTION], packs, notes, context["sources"]
+        )
+
+        self.assertTrue(diagnostics)
+        self.assertIn("Core equation", repaired)
+        self.assertIn("softmax", repaired)
+        self.assertNotIn("evidence is incomplete", repaired.lower())
+
     def test_all_gap_topic_fails_when_only_question_pack_has_clean_evidence(self):
         gap_report = (
             "## 3. Topic Sections\n"
@@ -459,6 +571,14 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertNotIn("Semantic plausibility", section)
         self.assertNotIn("g, attention", section)
         self.assertIn("evidence", section.lower())
+
+    def test_deterministic_fallback_drops_keyword_metadata_chunks(self):
+        sentence = report_agent.chunk_to_evidence_sentence(
+            "What is the definition of the attention mechanism in neural networks?",
+            {"source_index": 1, "content": "Keywords: Deep Learning, Natural Language Processing, Transformer Models, Attention Models, Neural Networks."},
+        )
+
+        self.assertEqual(sentence, "")
 
     def test_llm_failure_returns_deterministic_report_instead_of_raising(self):
         with patch.object(
