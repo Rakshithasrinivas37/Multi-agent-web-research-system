@@ -241,6 +241,66 @@ class ReportEvidenceContractTests(unittest.TestCase):
             report_agent.report_evidence_gap_contradictions(report, [question], synthesis), []
         )
 
+    def test_question_section_rejects_foreign_citation_even_with_valid_marker(self):
+        second = "What are the benchmark results for attention?"
+        report = GOOD_REPORT.replace(
+            "## 4. Cross-cutting Analysis and Synthesis",
+            "### 3.2. Benchmark Results\nThe paper reports benchmark performance [3].\n\n## 4. Cross-cutting Analysis and Synthesis",
+        )
+        context = fixture_context()
+        context["planner_questions"] = [QUESTION, second]
+        context["evidence_packs"].append({
+            "question": second,
+            "coverage": "covered",
+            "chunks": [{"source_index": 2, "content": "Benchmark evidence is reported."}],
+        })
+        notes = [*context["per_question_synthesis"], {"question": second, "source_indexes": [2], "synthesis": "Benchmark evidence [2]."}]
+
+        gaps = report_agent.report_pack_citation_gaps(
+            report, context["evidence_packs"], context["planner_questions"], notes
+        )
+
+        self.assertEqual(gaps, [second])
+
+    def test_gap_only_section_does_not_need_citation(self):
+        question = "What are the benchmark results for attention?"
+        report = (
+            "## 3. Topic Sections\n### 3.1. Benchmark Results\n"
+            "The supplied evidence does not report benchmark results."
+        )
+        pack = {"question": question, "coverage": "missing", "chunks": []}
+
+        self.assertEqual(report_agent.report_pack_citation_gaps(report, [pack], [question]), [])
+
+    def test_limitations_are_rebuilt_only_from_recorded_question_gaps(self):
+        context = fixture_context()
+        notes = report_agent.per_question_synthesis_by_question(context["per_question_synthesis"])
+        packs = {report_agent.normalize_heading(item["question"]): item for item in context["evidence_packs"]}
+        contracts = report_agent.build_question_evidence_contracts(
+            [QUESTION], notes, packs, context["sources"]
+        )
+        report, changed = report_agent.enforce_evidence_limitations(
+            GOOD_REPORT.replace(
+                "The supplied evidence does not provide masking variants or runtime measurements.",
+                "The supplied evidence does not provide masking variants or runtime measurements.\n- Hardware accelerator comparisons remain an open question.",
+            ),
+            [QUESTION], contracts,
+        )
+
+        self.assertTrue(changed)
+        self.assertIn("runtime measurements", report)
+        self.assertNotIn("Hardware accelerator comparisons", report)
+
+    def test_quality_validator_flags_executive_summary_copied_into_conclusion(self):
+        duplicated = GOOD_REPORT.replace(
+            "The equation is supported, while masking variants and runtime measurements remain unresolved [1].",
+            "The evidence provides the scaled dot-product attention formulation [1]. Details on masking variants and runtime remain unavailable [1].",
+        ) + "\n\n## References\n[1] https://example.org/attention"
+
+        issues = report_agent.report_quality_issues(duplicated, fixture_context()["sources"])
+
+        self.assertIn("conclusion repeats executive-summary prose", issues)
+
     def test_context_labels_keep_application_bullets_on_topic(self):
         question = "What are the primary applications of attention mechanisms in NLP and computer vision?"
         report = (
@@ -377,6 +437,7 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertTrue(payload["diagnostics"]["report_llm_revision"]["accepted"])
         self.assertFalse(payload["diagnostics"]["report_deterministic_fallback_used"])
         self.assertEqual(payload["diagnostics"]["report_generation_mode"], "llm_revised_from_question_evidence")
+        self.assertTrue(payload["diagnostics"]["report_llm_revision"]["resolved_all_issues"])
 
     def test_placeholder_citation_is_removed_during_cleanup(self):
         cleaned, repairs = report_agent.cleanup_report(
