@@ -77,6 +77,36 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertIn("runtime measurements", contract["missing_details"])
         self.assertEqual(contract["synthesis_source_indexes"], [1])
         self.assertEqual(contract["pack_source_indexes"], [2])
+        self.assertEqual(contract["retrieved_chunks"][0]["source_index"], 2)
+        self.assertIn("scaled dot-product formulation", contract["retrieved_chunks"][0]["content"])
+
+    def test_prompt_chunks_are_bounded_source_diverse_and_citable(self):
+        context = fixture_context()
+        pack = context["evidence_packs"][0]
+        pack["chunks"] = [
+            {"source_index": 2, "title": "Primary", "content": "Primary evidence on scaled attention."},
+            {"source_index": 2, "title": "Primary", "content": "Additional primary evidence on scaled attention."},
+            {"source_index": 1, "title": "Paper", "content": "Independent evidence on the equation [77]."},
+            {"source_index": 2, "title": "Primary", "content": "Third primary detail."},
+            {"source_index": 1, "title": "Paper", "content": "Second independent detail."},
+            {"source_index": 2, "title": "Primary", "content": "Fourth primary detail."},
+            {"source_index": 999, "title": "Unknown", "content": "Must not appear."},
+            {"title": "Uncited", "content": "Must also not appear."},
+        ]
+        contracts = report_agent.build_question_evidence_contracts(
+            [QUESTION],
+            report_agent.per_question_synthesis_by_question(context["per_question_synthesis"]),
+            {report_agent.normalize_heading(QUESTION): pack},
+            context["sources"],
+        )
+        chunks = contracts[report_agent.normalize_heading(QUESTION)]["retrieved_chunks"]
+
+        self.assertEqual(len(chunks), 5)
+        self.assertEqual(chunks[0]["source_index"], 2)
+        self.assertEqual(chunks[1]["source_index"], 1)
+        self.assertNotIn(999, [chunk["source_index"] for chunk in chunks])
+        self.assertNotIn("Must not appear", report_agent.format_contract_chunks(chunks))
+        self.assertNotIn("[77]", report_agent.format_contract_chunks(chunks))
 
     def test_cited_covered_pack_overrides_stale_missing_coverage_row(self):
         context = fixture_context()
@@ -106,6 +136,8 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertIn("Markers cited by this question's synthesis: [1]", captured["prompt"])
         self.assertIn("Markers available in its evidence pack (cite only for claims directly supported there): [2]", captured["prompt"])
         self.assertIn("runtime measurements", captured["prompt"])
+        self.assertIn("Retrieved evidence for this question", captured["prompt"])
+        self.assertIn("[2] Source 2: Attention(Q,K,V)", captured["prompt"])
         self.assertNotIn("[999]", captured["prompt"])
         self.assertIn("[1] https://arxiv.org/abs/1706.03762", payload["report"])
         self.assertEqual(payload["diagnostics"]["report_schema_issues"], [])
