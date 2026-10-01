@@ -211,7 +211,18 @@ class ReportAgent:
             repairs.extend(frame_repairs)
             validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
 
-        coverage = report_sub_question_coverage_check(report, questions)
+        report, limitations_repaired = enforce_evidence_limitations(report, questions, evidence_contracts)
+        if limitations_repaired:
+            repairs.append("rebuilt limitations from question evidence contracts")
+            validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
+
+        final_coverage = report_sub_question_coverage_check(report, questions)
+        revision_diagnostics["remaining_issue_count"] = (
+            len(validation["issues"]) + len(validation["schema_issues"]) + final_coverage["missing_count"]
+        )
+        revision_diagnostics["resolved_all_issues"] = revision_diagnostics["attempted"] and revision_diagnostics["remaining_issue_count"] == 0
+
+        coverage = final_coverage
         synthesis_gaps = synthesis_coverage_gap_questions(report_context, questions)
         retry_questions = dedupe_text([*coverage["missing"], *synthesis_gaps])
 
@@ -344,6 +355,7 @@ Grounding and writing rules:
 - Include framework/API names only when they appear in the question-specific excerpt with a citation to relevant framework documentation. A source being listed is not evidence that it supports a particular API.
 - Cite every factual sentence with the real source marker attached to the claim in the excerpt. Use only markers in the citation map. Never invent or renumber citations, and never cite a source simply because it is listed.
 - Respect explicit missing, partial, uncertain, and conflicting-evidence notes. State supported findings first, then name the specific unresolved detail. If there is no answer, state the evidence gap briefly.
+- The Limitations and Open Questions section may contain only gaps, uncertainties, and conflicts explicitly recorded in the question-specific evidence blocks. Do not add generic research questions or plausible-sounding limitations.
 - Exclude paper-title fragments, abstract boilerplate, web navigation, API boilerplate, and claims that do not answer the question.
 - The executive summary reports key supported findings and important gaps. The introduction frames scope. Cross-cutting analysis compares findings only where evidence supports the relationship and cites each factual claim. Limitations lists actual gaps or conflicts. The conclusion synthesizes supported answers and uncertainty with citations; it must not repeat benchmark figures or copy another section.
 - Use clear paragraph prose. Use a comparison table only when at least two compared items are supported. Avoid filler and duplicated claims.
@@ -391,7 +403,7 @@ def build_report_revision_prompt(
         "Do not turn a partial answer into a total evidence gap. Preserve every complete, directly relevant equation present "
         "in its question's supported excerpt; do not substitute an equation from another attention family. Keep citations attached to their supported claims; cite every "
         "factual sentence, including framing sections. Preserve equations only when supplied. Keep the conclusion concise and "
-        "do not repeat benchmark values. Output Markdown only.\n\n"
+        "do not repeat benchmark values or reuse executive-summary sentences. Do not invent open questions: list only gaps explicitly stated in the matching evidence block. Output Markdown only.\n\n"
         f"Validation failures:\n{issue_text}\n\n"
         f"Question evidence:\n{evidence_text}\n\n"
         f"Draft to repair:\n{draft}"
@@ -1251,6 +1263,28 @@ def limitations_section(evidence_packs: Sequence[dict[str, Any]], report_context
     return "\n".join(dedupe_text(items)) or "- No explicit evidence gaps were identified in the supplied synthesis context."
 
 
+def enforce_evidence_limitations(
+    report: str,
+    questions: Sequence[str],
+    evidence_contracts: dict[str, dict[str, Any]],
+) -> tuple[str, bool]:
+    """Keep the limitations section restricted to gaps actually recorded in evidence."""
+    items = []
+    for question in questions:
+        contract = evidence_contracts.get(normalize_heading(question), {})
+        gaps = clean_text(contract.get("missing_details"))
+        if gaps:
+            items.append(f"- **{planner_question_heading(question)}:** {gaps}")
+    body = "\n".join(items) or "- No specific unresolved details are recorded in the supplied question evidence."
+    existing = next(
+        (section for heading, section in markdown_sections(report) if normalize_heading(heading).endswith("limitations and open questions")),
+        "",
+    )
+    if clean_text(strip_leading_heading(existing)) == clean_text(body):
+        return report, False
+    return replace_named_report_section(report, "Limitations and Open Questions", body), True
+
+
 def cleanup_report(report: str, sources: Sequence[dict[str, Any]]) -> tuple[str, list[str]]:
     repairs, cleaned_lines = [], []
     for line in strip_references(clean_markdown(report)).splitlines():
@@ -1764,6 +1798,9 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
     copied_frames = repeated_frame_sentences(text)
     if copied_frames:
         issues.append(f"report repeats topic prose in frame sections: {len(copied_frames)}")
+    duplicated_summary = executive_conclusion_overlap(text)
+    if duplicated_summary:
+        issues.append("conclusion repeats executive-summary prose")
     if code_or_math_contains_citations(text):
         issues.append("report contains citations inside code or equation blocks")
     weak = weak_topic_headings(text)
@@ -1776,6 +1813,24 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
     if invalid:
         issues.append(f"report uses unavailable citations: {format_citation_indexes(invalid)}")
     return dedupe_text(issues)
+
+
+def executive_conclusion_overlap(report: str) -> list[str]:
+    sections = {normalize_heading(heading): strip_leading_heading(body) for heading, body in markdown_sections(report)}
+    summary = next((body for heading, body in sections.items() if "executive summary" in heading), "")
+    conclusion = next((body for heading, body in sections.items() if "conclusion" in heading), "")
+    if not summary or not conclusion:
+        return []
+
+    def substantial_sentences(text: str) -> set[str]:
+        return {
+            re.sub(r"\s+", " ", strip_markdown(re.sub(r"\[\d+\]", "", sentence))).lower().strip(" .")
+            for sentence in split_sentences(text)
+            if len(detail_terms(sentence)) >= 5
+        }
+
+    repeated = substantial_sentences(summary) & substantial_sentences(conclusion)
+    return sorted(repeated)
 
 
 def has_placeholder_source_marker(text: Any) -> bool:
@@ -1924,21 +1979,36 @@ def ensure_limitations(report: str, issues: Sequence[str], sources: Sequence[dic
 
 def report_pack_citation_gaps(report: str, evidence_packs: Sequence[dict[str, Any]], questions: Sequence[str] | None = None, per_question_synthesis: Sequence[dict[str, Any]] = ()) -> list[str]:
     canonical = {normalize_heading(q): q for q in sequence_items(questions) if clean_text(q)}
+    packs_by_question = {
+        normalize_heading(pack.get("question")): pack
+        for pack in sequence_items(evidence_packs)
+        if isinstance(pack, dict) and clean_text(pack.get("question"))
+    }
+    synthesis_by_question = {
+        normalize_heading(item.get("question")): item
+        for item in sequence_items(per_question_synthesis)
+        if isinstance(item, dict) and clean_text(item.get("question"))
+    }
+    topic_questions = dedupe_text([
+        *sequence_items(questions),
+        *(clean_text(pack.get("question")) for pack in sequence_items(evidence_packs) if isinstance(pack, dict)),
+        *(clean_text(item.get("question")) for item in sequence_items(per_question_synthesis) if isinstance(item, dict)),
+    ])
     gaps = []
-    for pack in sequence_items(evidence_packs):
-        if not isinstance(pack, dict) or not evidence_pack_has_usable_cited_evidence(pack):
-            continue
-        question = clean_text(pack.get("question"))
+    for question in topic_questions:
+        key = normalize_heading(question)
+        pack = packs_by_question.get(key, {})
+        note = synthesis_by_question.get(key, {})
         section = report_section_for_question(report, question, questions)
-        if section and line_has_gap_claim(section):
+        if not section:
             continue
-        synthesis_indexes = {
-            index
-            for item in sequence_items(per_question_synthesis)
-            if isinstance(item, dict) and normalize_heading(item.get("question")) == normalize_heading(question)
-            for index in [*dedupe_ints(item.get("source_indexes", [])), *citation_markers(item.get("synthesis"))]
-        }
-        if section and not (set(citation_markers(section)) & (set(pack_source_indexes(pack)) | synthesis_indexes)):
+        allowed = set(pack_source_indexes(pack)) | set(dedupe_ints(note.get("source_indexes", [])))
+        allowed.update(citation_markers(note.get("synthesis")))
+        cited = set(citation_markers(section))
+        has_supported_claim = section_has_supported_cited_content(section)
+        # A gap-only section need not cite a source; supported claims must cite
+        # this question's evidence, and no foreign question marker may appear.
+        if (cited - allowed) or (has_supported_claim and not (cited & allowed)):
             gaps.append(canonical.get(normalize_heading(question), question))
     return dedupe_text(gaps)
 
