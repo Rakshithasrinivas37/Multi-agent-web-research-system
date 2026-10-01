@@ -1,5 +1,7 @@
 """Contract tests for the report pipeline, using fixed evidence and mocked LLM output."""
 
+import json
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -291,6 +293,62 @@ class ReportEvidenceContractTests(unittest.TestCase):
 
         self.assertNotIn("[—]", cleaned)
         self.assertIn("removed placeholder citation marker", repairs)
+
+    def test_saved_quality_regression_fixture_flags_known_report_defects(self):
+        fixture_path = Path(__file__).parent / "fixtures" / "report_quality_regression.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        validation = report_agent.validate_report(
+            fixture["draft"], fixture["sources"], fixture["questions"],
+            fixture["evidence_packs"], fixture["per_question_synthesis"],
+        )
+
+        self.assertEqual(validation["schema_issues"], [])
+        self.assertEqual(validation["false_gap_questions"], [])
+        self.assertTrue(any("Bahdanau scoring equation" in issue for issue in validation["issues"]))
+        self.assertTrue(any("efficient attention approaches" in issue for issue in validation["issues"]))
+
+    def test_revision_gate_rejects_changes_to_unaffected_topic_sections(self):
+        second_question = "What are the primary applications of attention mechanisms?"
+        original = GOOD_REPORT.replace(
+            "## 4. Cross-cutting Analysis and Synthesis",
+            "### 3.2. Primary Applications\nAttention is applied to image classification [2].\n\n## 4. Cross-cutting Analysis and Synthesis",
+        )
+        unrelated_change = original.replace(
+            "Attention is applied to image classification [2].",
+            "Applications include image classification and detection [2].",
+        )
+        targeted_change = original.replace(
+            "Scaled dot-product attention normalizes query-key scores",
+            "The scaled dot-product equation normalizes query-key scores",
+        )
+        validation = {"issues": [f"missing formulation: {QUESTION}"], "schema_issues": []}
+
+        self.assertFalse(report_agent.revision_preserves_unaffected_topics(
+            original, unrelated_change, [QUESTION, second_question], validation
+        ))
+        self.assertTrue(report_agent.revision_preserves_unaffected_topics(
+            original, targeted_change, [QUESTION, second_question], validation
+        ))
+
+    def test_generate_rejects_revision_that_improves_score_but_rewrites_unaffected_topic(self):
+        bad = GOOD_REPORT.replace(
+            "This report examines the formula and its documented limitations [1].",
+            "This report examines the supplied material without a citation.",
+        )
+        revised = GOOD_REPORT.replace(
+            "Scaled dot-product attention normalizes query-key scores",
+            "The equation rescales query-key scores",
+        )
+        with patch.object(
+            report_agent, "generate_report_with_llm",
+            side_effect=[(bad, "mocked_llm", ""), (revised, "mocked_llm", "")],
+        ):
+            payload = report_agent.ReportAgent(model="mocked-model").generate(fixture_context())
+
+        revision = payload["diagnostics"]["report_llm_revision"]
+        self.assertFalse(revision["accepted"])
+        self.assertIn("unrelated", revision["rejection_reason"])
+        self.assertIn("Scaled dot-product attention normalizes", payload["report"])
 
     def test_end_to_end_report_keeps_contract_boundaries_and_validates(self):
         captured = {}

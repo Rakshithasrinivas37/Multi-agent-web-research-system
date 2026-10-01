@@ -144,7 +144,7 @@ class ReportAgent:
         report = normalize_final_report(report, sources)
         report, repairs = cleanup_report(report, sources)
         validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
-        revision_diagnostics = {"attempted": False, "accepted": False, "error": ""}
+        revision_diagnostics = {"attempted": False, "accepted": False, "error": "", "rejection_reason": ""}
         if llm_generated and (validation["issues"] or validation["schema_issues"]):
             revision_diagnostics["attempted"] = True
             revision_prompt = build_report_revision_prompt(
@@ -159,11 +159,20 @@ class ReportAgent:
                 revised = normalize_final_report(revised, sources)
                 revised, revision_repairs = cleanup_report(revised, sources)
                 revised_validation = validate_report(revised, sources, questions, evidence_packs, synthesis_items)
-                if report_validation_score(revised_validation, revised, questions) < report_validation_score(validation, report, questions):
+                preserves_unaffected = revision_preserves_unaffected_topics(
+                    report, revised, questions, validation
+                )
+                if preserves_unaffected and report_validation_score(revised_validation, revised, questions) < report_validation_score(validation, report, questions):
                     report, validation = revised, revised_validation
                     repairs.extend(revision_repairs)
                     generation_mode = "llm_revised_from_question_evidence"
                     revision_diagnostics["accepted"] = True
+                elif not preserves_unaffected:
+                    revision_diagnostics["rejection_reason"] = "revision changed a topic section unrelated to the reported issues"
+                else:
+                    revision_diagnostics["rejection_reason"] = "revision did not reduce validated report issues"
+            elif revision_error:
+                revision_diagnostics["rejection_reason"] = "LLM revision failed; original draft retained"
 
         report, frame_repairs = repair_uncited_frame_sections(report, sources)
         if frame_repairs:
@@ -346,6 +355,7 @@ def build_report_revision_prompt(
         "Return this fixed schema: Executive Summary, Introduction and Context, Topic Sections, Cross-cutting Analysis "
         "and Synthesis, Limitations and Open Questions, Conclusion, References. Include exactly one topic section per question, "
         "numbered 3.1 onward in the supplied question order. Do not omit supported benchmark results or supported methods. "
+        "Preserve every topic section that is not named by a validation failure verbatim; make no unrelated wording changes. "
         "Do not turn a partial answer into a total evidence gap. Preserve every complete, directly relevant equation present "
         "in its question's supported excerpt; do not substitute an equation from another attention family. Keep citations attached to their supported claims; cite every "
         "factual sentence, including framing sections. Preserve equations only when supplied. Keep the conclusion concise and "
@@ -388,6 +398,38 @@ def report_validation_score(validation: dict[str, Any], report: str, questions: 
         + len(validation.get("false_gap_questions", [])) * 2
         + coverage["missing_count"]
     )
+
+
+def revision_preserves_unaffected_topics(
+    original: str,
+    revised: str,
+    questions: Sequence[str],
+    validation: dict[str, Any],
+) -> bool:
+    """Reject a repair that changes topic sections unrelated to reported failures."""
+    issues = [clean_text(item).casefold() for item in [
+        *sequence_items(validation.get("issues")),
+        *sequence_items(validation.get("schema_issues")),
+    ]]
+    affected = {
+        normalize_heading(question)
+        for question in questions
+        if any(clean_text(question).casefold() in issue for issue in issues)
+    }
+    for question in questions:
+        if normalize_heading(question) in affected:
+            continue
+        before = report_section_for_question(original, question, questions)
+        if not before:
+            continue
+        after = report_section_for_question(revised, question, questions)
+        if not after:
+            return False
+        before_body = clean_markdown(strip_leading_heading(before))
+        after_body = clean_markdown(strip_leading_heading(after))
+        if before_body != after_body:
+            return False
+    return True
 
 
 def build_question_evidence_contracts(
