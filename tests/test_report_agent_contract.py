@@ -123,6 +123,77 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertEqual(contracts[report_agent.normalize_heading(QUESTION)]["coverage"], "covered")
         self.assertEqual(report_agent.synthesis_coverage_gap_questions(context, [QUESTION]), [])
 
+    def test_explicit_synthesis_caveat_prevents_false_fully_covered_status(self):
+        context = fixture_context()
+        question = "Where is the official TensorFlow attention API documented?"
+        context["planner_questions"] = [question]
+        context["per_question_synthesis"][0].update({
+            "question": question,
+            "coverage": "covered",
+            "synthesis": "PyTorch documents MultiheadAttention [1]. Exact missing details: The TensorFlow API location is not provided.",
+        })
+        context["evidence_packs"][0]["coverage"] = "covered"
+        context["evidence_packs"][0]["question"] = question
+        contracts = report_agent.build_question_evidence_contracts(
+            [question],
+            report_agent.per_question_synthesis_by_question(context["per_question_synthesis"]),
+            {report_agent.normalize_heading(question): context["evidence_packs"][0]},
+            context["sources"],
+        )
+
+        self.assertEqual(contracts[report_agent.normalize_heading(question)]["coverage"], "partial")
+
+    def test_unrelated_caveat_does_not_downgrade_question_pack_coverage(self):
+        context = fixture_context()
+        context["per_question_synthesis"][0]["coverage"] = "partial"
+        context["evidence_packs"][0]["coverage"] = "covered"
+        contracts = report_agent.build_question_evidence_contracts(
+            [QUESTION],
+            report_agent.per_question_synthesis_by_question(context["per_question_synthesis"]),
+            {report_agent.normalize_heading(QUESTION): context["evidence_packs"][0]},
+            context["sources"],
+        )
+
+        self.assertEqual(contracts[report_agent.normalize_heading(QUESTION)]["coverage"], "covered")
+
+    def test_revision_prompt_is_compact_and_keeps_every_question_contract(self):
+        context = fixture_context()
+        contracts = report_agent.build_question_evidence_contracts(
+            [QUESTION],
+            report_agent.per_question_synthesis_by_question(context["per_question_synthesis"]),
+            {report_agent.normalize_heading(QUESTION): context["evidence_packs"][0]},
+            context["sources"],
+        )
+        prompt = report_agent.build_report_revision_prompt(
+            {"issues": ["missing benchmark evidence"], "schema_issues": []},
+            GOOD_REPORT * 8,
+            [QUESTION],
+            contracts,
+        )
+
+        self.assertLess(len(prompt), 9000)
+        self.assertIn(QUESTION, prompt)
+        self.assertIn("runtime measurements", prompt)
+        self.assertIn("Draft to repair", prompt)
+
+    def test_schema_validator_rejects_topic_number_assigned_to_wrong_question(self):
+        questions = [
+            "What is the definition of attention?",
+            "What are the benchmark results for attention?",
+        ]
+        report = GOOD_REPORT.replace(
+            "### 3.1. Mathematical Formulation Of Scaled Dot-product Attention Including Equation",
+            "### 3.1. Benchmark Results",
+        ).replace(
+            "## 4. Cross-cutting Analysis and Synthesis",
+            "### 3.2. Definition Of Attention\nAttention assigns weights to input information [1].\n\n## 4. Cross-cutting Analysis and Synthesis",
+        )
+
+        issues = report_agent.report_schema_issues(report, questions)
+
+        self.assertTrue(any("3.1" in issue and "definition" in issue.lower() for issue in issues))
+        self.assertTrue(any("3.2" in issue and "benchmark" in issue.lower() for issue in issues))
+
     def test_end_to_end_report_keeps_contract_boundaries_and_validates(self):
         captured = {}
 
