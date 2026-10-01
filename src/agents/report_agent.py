@@ -17,7 +17,7 @@ DEFAULT_REPORT_OUTPUT_DIR = "data/reports"
 DEFAULT_REPORT_TOTAL_TOKEN_BUDGET = 7000
 DEFAULT_REPORT_PROMPT_CHARS = 12000
 DEFAULT_REPORT_MAX_TOKENS = 3200
-DEFAULT_REPORT_REVISION_MAX_TOKENS = 2400
+DEFAULT_REPORT_REVISION_MAX_TOKENS = 4200
 DEFAULT_REPORT_EXCERPT_CHARS = 1200
 DEFAULT_TOPIC_TEXT_CHARS = 1100
 DEFAULT_EVIDENCE_CHUNK_CHARS = 480
@@ -164,6 +164,11 @@ class ReportAgent:
                     repairs.extend(revision_repairs)
                     generation_mode = "llm_revised_from_question_evidence"
                     revision_diagnostics["accepted"] = True
+
+        report, frame_repairs = repair_uncited_frame_sections(report, sources)
+        if frame_repairs:
+            repairs.extend(frame_repairs)
+            validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
 
         coverage = report_sub_question_coverage_check(report, questions)
         synthesis_gaps = synthesis_coverage_gap_questions(report_context, questions)
@@ -319,19 +324,21 @@ def build_report_revision_prompt(
     evidence_blocks = []
     for index, question in enumerate(questions, 1):
         contract = evidence_contracts.get(normalize_heading(question), {})
-        supported = compact_synthesis_excerpt(contract.get("supported"), 320)
-        gaps = compact_synthesis_excerpt(contract.get("missing_details"), 140)
-        chunks = sequence_items(contract.get("retrieved_chunks"))[:2]
+        supported = compact_synthesis_excerpt(contract.get("supported"), 700)
+        gaps = compact_synthesis_excerpt(contract.get("missing_details"), 180)
+        equations = format_equation_evidence(contract.get("supported"), contract.get("synthesis_source_indexes", []))
+        chunks = sequence_items(contract.get("retrieved_chunks"))[:1]
         chunk_lines = [
-            f"[{chunk['source_index']}] {compact_text(chunk.get('content'), 180)}"
+            f"[{chunk['source_index']}] {compact_text(chunk.get('content'), 220)}"
             for chunk in chunks
             if isinstance(chunk, dict) and isinstance(chunk.get("source_index"), int)
         ]
         evidence_blocks.append(
             f"Question {index}: {question}\nSupported: {supported or '[none]'}\n"
+            f"Supported equations: {equations or '[none found]'}\n"
             f"Specific gaps: {gaps or '[none stated]'}\nEvidence: {' | '.join(chunk_lines) or '[none]'}"
         )
-    draft = compact_report_for_revision(report)
+    draft = compact_report_for_revision(report, chars_per_section=320)
     issue_text = "\n".join(f"- {issue}" for issue in issues)
     evidence_text = "\n\n".join(evidence_blocks)
     return (
@@ -339,7 +346,8 @@ def build_report_revision_prompt(
         "Return this fixed schema: Executive Summary, Introduction and Context, Topic Sections, Cross-cutting Analysis "
         "and Synthesis, Limitations and Open Questions, Conclusion, References. Include exactly one topic section per question, "
         "numbered 3.1 onward in the supplied question order. Do not omit supported benchmark results or supported methods. "
-        "Do not turn a partial answer into a total evidence gap. Keep citations attached to their supported claims; cite every "
+        "Do not turn a partial answer into a total evidence gap. Preserve every complete, directly relevant equation present "
+        "in its question's supported excerpt; do not substitute an equation from another attention family. Keep citations attached to their supported claims; cite every "
         "factual sentence, including framing sections. Preserve equations only when supplied. Keep the conclusion concise and "
         "do not repeat benchmark values. Output Markdown only.\n\n"
         f"Validation failures:\n{issue_text}\n\n"
@@ -348,7 +356,7 @@ def build_report_revision_prompt(
     )
 
 
-def compact_report_for_revision(report: str, chars_per_section: int = 620) -> str:
+def compact_report_for_revision(report: str, chars_per_section: int = 440) -> str:
     """Retain each report section while bounding revision input size."""
     sections = markdown_sections(report)
     if not sections:
@@ -356,8 +364,20 @@ def compact_report_for_revision(report: str, chars_per_section: int = 620) -> st
     compacted = []
     for heading, section in sections:
         body = strip_leading_heading(section)
-        compacted.append(f"## {heading}\n{compact_text(body, chars_per_section)}")
-    return compact_text("\n\n".join(compacted), 7000)
+        compacted.append(f"## {heading}\n{compact_at_sentence(body, chars_per_section)}")
+    return compact_text("\n\n".join(compacted), 5200)
+
+
+def format_equation_evidence(text: Any, source_indexes: Sequence[int]) -> str:
+    value = clean_markdown(text)
+    expressions = re.findall(r"\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$\$[\s\S]*?\$\$", value)
+    if not expressions:
+        expressions = [line for line in value.splitlines() if "=" in line and len(line) < 320]
+    expressions = dedupe_text(compact_text(item, 230) for item in expressions[:2])
+    markers = format_citation_indexes(source_indexes)
+    if markers:
+        expressions.append(f"Equation source markers: {markers}")
+    return "\n".join(expressions)
 
 
 def report_validation_score(validation: dict[str, Any], report: str, questions: Sequence[str]) -> int:
@@ -896,7 +916,12 @@ def frame_topics(markdown: str) -> list[dict[str, Any]]:
             continue
         citations = citation_markers(section)
         heading = strip_heading_numbering(match.group(1))
-        topics.append({"heading": heading, "label": frame_topic_label(heading), "citations": citations, "gap": line_has_gap_claim(section)})
+        topics.append({
+            "heading": heading,
+            "label": frame_topic_label(heading),
+            "citations": citations,
+            "gap": line_has_gap_claim(section) and not section_has_supported_cited_content(section),
+        })
     return topics
 
 
@@ -969,7 +994,10 @@ def limitations_section(evidence_packs: Sequence[dict[str, Any]], report_context
 def cleanup_report(report: str, sources: Sequence[dict[str, Any]]) -> tuple[str, list[str]]:
     repairs, cleaned_lines = [], []
     for line in strip_references(clean_markdown(report)).splitlines():
+        had_placeholder = has_placeholder_source_marker(line)
         cleaned = cleanup_section_text(line)
+        if had_placeholder:
+            repairs.append("removed placeholder citation marker")
         if not cleaned and clean_text(line):
             repairs.append("removed noisy or malformed line")
             continue
@@ -981,11 +1009,40 @@ def cleanup_report(report: str, sources: Sequence[dict[str, Any]]) -> tuple[str,
     return normalize_final_report(repair_headings(text), sources), dedupe_text(repairs)
 
 
+def repair_uncited_frame_sections(
+    report: str,
+    sources: Sequence[dict[str, Any]] = (),
+) -> tuple[str, list[str]]:
+    """Rebuild factual framing prose from cited topic sections when it lacks citations."""
+    missing = {normalize_heading(item) for item in uncited_factual_frame_sections(report)}
+    if not missing:
+        return report, []
+    topic_digest = "\n\n".join(
+        section for heading, section in markdown_sections(report)
+        if re.match(r"^3\.\d+\b", heading)
+    )
+    roles = {
+        "1. Executive Summary": "summary",
+        "2. Introduction and Context": "intro",
+        "4. Cross-cutting Analysis and Synthesis": "cross_cutting",
+        "6. Conclusion": "conclusion",
+    }
+    result, repairs = report, []
+    for heading, role in roles.items():
+        if normalize_heading(heading) not in missing:
+            continue
+        body = frame_section(topic_digest, role)
+        if citation_markers(body):
+            result = replace_named_report_section(result, heading, body)
+            repairs.append(f"rebuilt uncited {heading.lower()} from cited topic findings")
+    return (normalize_final_report(result, sources), repairs) if repairs else (report, [])
+
+
 def cleanup_section_text(text: Any) -> str:
     value = clean_markdown(text)
     value = remove_authoring_labels(value)
     value = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "", value)
-    value = re.sub(r"\[\s*(?:uncited|citation needed|source needed)\s*\]", "", value, flags=re.I)
+    value = re.sub(r"\[\s*(?:—|-|uncited|citation needed|source needed|n/?a)\s*\]", "", value, flags=re.I)
     value = re.sub(r"\b(tasks|evidence|results)\s+(On|The)\b", r"\1. \2", value)
     value = re.sub(r"\b(capabilities|relationships|context|mechanisms)\s+(Empirically|Current)\b", r"\1. \2", value)
     value = re.sub(r"\b(representations|architecture|formulation)\s+(This|The)\b", r"\1. \2", value)
@@ -1135,6 +1192,7 @@ def required_evidence_label(question: str) -> str:
         "equation": "a source-backed equation or a specific explanation of the missing expression",
         "api": "actual framework API names and documentation sources",
         "complexity": "complexity or memory-cost evidence",
+        "efficient_variants": "at least two source-backed efficient attention approaches",
         "application": "application evidence tied to the requested domain",
         "variant": "named attention variants and their differences",
     }.get(kind, "clean cited evidence that directly answers the sub-question")
@@ -1144,7 +1202,7 @@ def question_kind(question: Any) -> str:
     q = clean_text(question).lower()
     if any(term in q for term in ("api", "framework", "pytorch", "tensorflow", "keras")):
         return "api"
-    if "bahdanau" in q or "additive" in q:
+    if "bahdanau" in q:
         return "bahdanau_equation" if any(term in q for term in ("equation", "formula", "mathematical")) else "variant"
     if "scaled dot" in q or "multi-head" in q or "multihead" in q:
         return "scaled_attention"
@@ -1152,6 +1210,10 @@ def question_kind(question: Any) -> str:
         return "benchmark"
     if any(term in q for term in ("complexity", "memory", "recurrent", "quadratic", "cost")):
         return "complexity"
+    if "efficient" in q and any(term in q for term in ("variant", "approach", "method")):
+        return "efficient_variants"
+    if "type" in q or "variant" in q or "differ" in q:
+        return "variant"
     if any(term in q for term in ("equation", "formula", "mathematical", "score function", "softmax weighting")):
         return "equation"
     if any(term in q for term in ("application", "vision", "beyond nlp", "computer vision", "vit")):
@@ -1165,7 +1227,8 @@ def question_kind(question: Any) -> str:
 
 def section_satisfies_required_evidence(question: str, section: str) -> bool:
     text = clean_text(section).lower()
-    if line_has_gap_claim(text):
+    has_supported_content = section_has_supported_cited_content(section)
+    if line_has_gap_claim(text) and not has_supported_content:
         return True
     kind = question_kind(question)
     if kind == "definition":
@@ -1195,7 +1258,25 @@ def section_satisfies_required_evidence(question: str, section: str) -> bool:
     if kind == "application":
         return any(term in text for term in ("vision transformer", "computer vision", "image", "patch", "vit"))
     if kind == "variant":
-        return sum(1 for term in ("additive", "multiplicative", "self-attention", "multi-head", "dot-product") if term in text) >= 2
+        has_two_types = sum(1 for term in ("additive", "multiplicative", "self-attention", "multi-head", "dot-product") if term in text) >= 2
+        asks_for_equations = bool(re.search(r"\b(equation|equations|formula|formulation|mathematical)\b", clean_text(question), re.I))
+        has_math_or_named_gap = bool(re.search(r"=|softmax|sqrt|√", text)) or line_has_gap_claim(text)
+        return has_two_types and bool(citation_markers(text)) and (not asks_for_equations or has_math_or_named_gap)
+    if kind == "efficient_variants":
+        approaches = set()
+        for sentence in split_sentences(section):
+            sentence_text = clean_text(sentence).lower()
+            if not citation_markers(sentence) or line_has_gap_claim(sentence):
+                continue
+            if "sparse" in sentence_text and "attention" in sentence_text:
+                approaches.add("sparse")
+            if "kernel" in sentence_text and any(term in sentence_text for term in ("linear", "approx", "feature")):
+                approaches.add("kernel")
+            if "low-rank" in sentence_text or "linformer" in sentence_text:
+                approaches.add("low-rank")
+            if "efficient architecture" in sentence_text or "efficient architectures" in sentence_text:
+                approaches.add("architecture")
+        return len(approaches) >= 2
     return bool(citation_markers(section))
 
 
@@ -1254,6 +1335,8 @@ def validate_report(report: str, sources: Sequence[dict[str, Any]], questions: S
     schema_issues = report_schema_issues(report, questions)
     citation_gap_questions = report_pack_citation_gaps(report, evidence_packs, questions, per_question_synthesis)
     issues.extend(required_evidence_issues(report, questions))
+    equation_issues = supported_equation_omissions(report, questions, per_question_synthesis)
+    issues.extend(equation_issues)
     relevance_issues = report_topic_relevance_issues(report, questions)
     false_gaps = report_evidence_gap_contradictions(report, questions, per_question_synthesis, evidence_packs)
     issues.extend(relevance_issues)
@@ -1263,6 +1346,7 @@ def validate_report(report: str, sources: Sequence[dict[str, Any]], questions: S
         "issues": dedupe_text(issues),
         "schema_issues": schema_issues,
         "citation_gap_questions": citation_gap_questions,
+        "equation_issues": equation_issues,
         "false_gap_questions": false_gaps,
         "topic_relevance_issues": relevance_issues,
     }
@@ -1274,31 +1358,84 @@ def required_evidence_issues(report: str, questions: Sequence[str]) -> list[str]
         section = report_section_for_question(report, question, questions)
         if not section:
             continue
-        if line_has_gap_claim(section):
-            continue
         if not section_satisfies_required_evidence(question, section):
             issues.append(f"section lacks required evidence ({required_evidence_label(question)}): {question}")
     return issues
 
 
 def report_topic_relevance_issues(report: str, questions: Sequence[str]) -> list[str]:
-    """Reject cited topic sentences that share no meaningful terms with their question."""
+    """Check topic claims with Markdown list/table context and common domain abbreviations."""
     issues = []
     for question in questions:
         section = report_section_for_question(report, question, questions)
         if not section:
             continue
-        question_terms = detail_terms(question)
-        for sentence in split_sentences(strip_leading_heading(section)):
-            sentence = clean_text(sentence)
-            if not sentence or line_has_gap_claim(sentence) or not citation_markers(sentence):
+        question_terms = report_relevance_terms(question)
+        context_terms: set[str] = set()
+        for line in strip_leading_heading(section).splitlines():
+            line = clean_text(line)
+            if not line or line.startswith("|") and re.fullmatch(r"[|\s:-]+", line):
                 continue
-            if sentence.startswith(("|", "- ", "**Core equation:**")):
+            label = strip_markdown(line).strip(" :")
+            if line.startswith("**") and not citation_markers(line) and len(label.split()) <= 5:
+                context_terms.update(report_relevance_terms(label))
                 continue
-            if detail_terms(sentence).isdisjoint(question_terms):
-                issues.append(f"report includes an irrelevant cited sentence under: {question}")
+            if line.startswith("|"):
+                continue
+            grouped_bullet = line.startswith(("- ", "* ")) and not context_terms.isdisjoint(question_terms)
+            for sentence in split_sentences(line):
+                sentence = clean_text(sentence).lstrip("-* ")
+                if not sentence or line_has_gap_claim(sentence) or not citation_markers(sentence):
+                    continue
+                if is_equation_definition_clause(sentence):
+                    continue
+                if grouped_bullet:
+                    continue
+                if sentence.startswith("**Core equation:**"):
+                    continue
+                if report_relevance_terms(sentence).isdisjoint(question_terms | context_terms):
+                    issues.append(f"report includes an irrelevant cited sentence under: {question}")
+                    break
+            if issues and issues[-1].endswith(question):
                 break
     return dedupe_text(issues)
+
+
+def report_relevance_terms(text: Any) -> set[str]:
+    terms = detail_terms(text)
+    aliases = {
+        "nlp": {"natural", "language", "processing"},
+        "cv": {"computer", "vision"},
+        "vit": {"vision", "transformer", "transformers"},
+        "natural-language": {"natural", "language"},
+        "computer-vision": {"computer", "vision"},
+    }
+    for token in list(terms):
+        terms.update(aliases.get(token, set()))
+    return terms
+
+
+def is_equation_definition_clause(text: Any) -> bool:
+    value = strip_markdown(text).lower()
+    return bool(re.match(r"^where\b", value) and re.search(r"\b(queries?|keys?|values?|dimension|matrix|matrices|vector)\b", value))
+
+
+def section_has_supported_cited_content(section: str) -> bool:
+    """Recognize supported prose and table rows without treating caveat rows as findings."""
+    for line in clean_markdown(section).splitlines():
+        value = clean_text(line)
+        if not value or value.lstrip().startswith("#") or re.fullmatch(r"[|\s:-]+", value):
+            continue
+        if value.startswith("|"):
+            cells = [clean_text(cell) for cell in value.strip("|").split("|")]
+            for cell in cells:
+                if citation_markers(cell) and not line_has_gap_claim(cell) and len(strip_markdown(cell).split()) >= 3:
+                    return True
+            continue
+        for sentence in split_sentences(value):
+            if citation_markers(sentence) and not line_has_gap_claim(sentence) and len(strip_markdown(sentence).split()) >= 3:
+                return True
+    return False
 
 
 def report_evidence_gap_contradictions(
@@ -1331,13 +1468,7 @@ def report_evidence_gap_contradictions(
         pack_support = bool(topic_body_from_chunks(question, pack)) if isinstance(pack, dict) else False
         if not synthesis_support and not pack_support:
             continue
-        reported_findings = [
-            sentence for sentence in clean_report_sentences(
-                strip_leading_heading(section), max_sentences=8, require_citation=True, question=question
-            )
-            if not line_has_gap_claim(sentence)
-        ]
-        if not reported_findings:
+        if not section_has_supported_cited_content(section):
             contradictions.append(question)
     return dedupe_text(contradictions)
 
@@ -1348,6 +1479,8 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
         return ["report is empty"]
     if not any(is_references_heading(line) for line in text.splitlines()):
         issues.append("report must include a References section")
+    if has_placeholder_source_marker(text):
+        issues.append("report contains placeholder or non-source citation markers")
     if RAW_LABEL_RE.search(text):
         issues.append("report contains raw planner or synthesis labels")
     if NOISE_RE.search(text):
@@ -1372,6 +1505,14 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
     if invalid:
         issues.append(f"report uses unavailable citations: {format_citation_indexes(invalid)}")
     return dedupe_text(issues)
+
+
+def has_placeholder_source_marker(text: Any) -> bool:
+    return bool(re.search(
+        r"\[\s*(?:—|--?|uncited|citation\s+needed|source\s+needed|unknown|n/?a)\s*\]",
+        str(text or ""),
+        flags=re.I,
+    ))
 
 
 def uncited_factual_frame_sections(report: str) -> list[str]:
@@ -1422,7 +1563,7 @@ def report_artifact_lines(report: str) -> list[str]:
             continue
         if structured_report_line(value):
             continue
-        if is_noisy_text(value) or BAD_SENTENCE_START_RE.search(strip_markdown(value)) or formula_fragment_score(value) >= 2:
+        if is_noisy_text(value) or (BAD_SENTENCE_START_RE.search(strip_markdown(value)) and not is_equation_definition_clause(value)) or formula_fragment_score(value) >= 2:
             bad.append(value[:140])
     return bad
 
@@ -1487,11 +1628,21 @@ def report_schema_issues(report: str, questions: Sequence[str]) -> list[str]:
             issues.append(f"missing sequential planner topic heading: 3.{index}")
             continue
         entry = next(item for item in topic_section_heading_entries(report) if item["number"] == f"3.{index}")
-        expected = normalize_heading(planner_question_heading(questions[index - 1]))
-        actual = normalize_heading(strip_heading_numbering(entry["heading"]))
-        if not headings_match(expected, actual):
+        if not topic_heading_matches_question(entry["heading"], questions[index - 1]):
             issues.append(f"topic heading 3.{index} does not match planner question: {questions[index - 1]}")
     return issues
+
+
+def topic_heading_matches_question(heading: str, question: str) -> bool:
+    expected = normalize_heading(planner_question_heading(question))
+    actual = normalize_heading(strip_heading_numbering(heading))
+    expected_terms, actual_terms = detail_terms(expected), detail_terms(actual)
+    if headings_match(expected, actual):
+        return True
+    shared = expected_terms & actual_terms
+    named = set(named_terms(question)) & actual_terms
+    required = min(2, len(expected_terms))
+    return len(shared) >= required or bool(named)
 
 
 def ensure_limitations(report: str, issues: Sequence[str], sources: Sequence[dict[str, Any]]) -> str:
@@ -1579,6 +1730,39 @@ def report_sub_question_coverage_check(report: str, planner_questions: Sequence[
         "missing": missing,
         "items": [{"question": q, "heading": planner_question_heading(q), "status": "missing" if normalize_heading(q) in missing_keys else "covered"} for q in questions],
     }
+
+
+def supported_equation_omissions(
+    report: str,
+    questions: Sequence[str],
+    per_question_synthesis: Sequence[dict[str, Any]],
+) -> list[str]:
+    """Catch omission of a complete, explicitly supported Bahdanau scoring equation."""
+    notes = per_question_synthesis_by_question(per_question_synthesis)
+    omissions = []
+    for question in questions:
+        note = notes.get(normalize_heading(question), {})
+        synthesis, _ = split_synthesis_gaps(note.get("synthesis"))
+        if not asks_for_mathematics(question) or not has_complete_bahdanau_score(synthesis):
+            continue
+        section = report_section_for_question(report, question, questions)
+        if section and not has_complete_bahdanau_score(section):
+            omissions.append(f"report omits the complete source-backed Bahdanau scoring equation for: {question}")
+    return omissions
+
+
+def asks_for_mathematics(question: str) -> bool:
+    return bool(re.search(r"\b(equation|equations|formula|formulation|mathematical|score function)\b", clean_text(question), re.I))
+
+
+def has_complete_bahdanau_score(text: Any) -> bool:
+    value = clean_text(text).lower()
+    has_score = bool(re.search(r"(?:a|e)_?\s*\(?s.{0,100}h", value))
+    has_parameters = all(
+        re.search(rf"\b{letter}_?\{{?a\}}?\b", value)
+        for letter in ("v", "w", "u")
+    )
+    return has_score and has_parameters and "tanh" in value
 
 
 def missing_sub_question_coverage(report: str, planner_questions: Sequence[str]) -> list[str]:
@@ -2110,7 +2294,7 @@ format_memory_signal_evidence = lambda *args, **kwargs: ""
 format_planner_evidence_packet = lambda *args, **kwargs: ""
 format_source_priority_guidance = lambda sources: ""
 remove_conflicting_missing_evidence_statements = lambda report, evidence_text="": report
-remove_placeholder_citations = lambda text: re.sub(r"\[(?:uncited|citation needed|source needed)\]", "", str(text), flags=re.I)
+remove_placeholder_citations = lambda text: re.sub(r"\[\s*(?:—|--?|uncited|citation needed|source needed|unknown|n/?a)\s*\]", "", str(text), flags=re.I)
 ensure_planner_question_sections = lambda report, *args, **kwargs: report
 
 # Compatibility shims for older tests/scripts.  The compact agent routes these

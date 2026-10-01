@@ -194,6 +194,104 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertTrue(any("3.1" in issue and "definition" in issue.lower() for issue in issues))
         self.assertTrue(any("3.2" in issue and "benchmark" in issue.lower() for issue in issues))
 
+    def test_schema_accepts_specific_benchmark_heading(self):
+        question = "How do attention mechanisms perform on standard benchmarks such as machine translation (WMT) and GLUE?"
+
+        self.assertTrue(report_agent.topic_heading_matches_question("Benchmark Performance (WMT & GLUE)", question))
+
+    def test_gap_caveat_does_not_bypass_required_supported_methods(self):
+        question = "What are the known limitations and recent efficient variants of attention mechanisms?"
+        section = (
+            "### 3.1. Limitations and Efficient Variants\n"
+            "Sparse attention reduces token-pair computations [2].\n"
+            "The evidence does not identify other efficient approaches."
+        )
+
+        issues = report_agent.required_evidence_issues(
+            f"## 3. Topic Sections\n{section}", [question]
+        )
+
+        self.assertTrue(any("efficient attention approaches" in issue for issue in issues))
+
+    def test_supported_methods_and_specific_gap_satisfy_efficient_variant_contract(self):
+        question = "What are the known limitations and recent efficient variants of attention mechanisms?"
+        section = (
+            "Sparse attention reduces token-pair computations [2].\n"
+            "Kernel-based linear approximations reduce quadratic computation [2].\n"
+            "The evidence does not provide comparative benchmark results."
+        )
+
+        self.assertTrue(report_agent.section_satisfies_required_evidence(question, section))
+
+    def test_cited_table_finding_prevents_false_total_gap(self):
+        question = "What are the main types of attention mechanisms and their equations?"
+        report = (
+            "## 3. Topic Sections\n### 3.1. Main Types of Attention\n"
+            "| Type | Supported description |\n| --- | --- |\n"
+            "| Additive | Uses a feed-forward compatibility function [1] |\n"
+            "Self-attention's exact equation is not provided."
+        )
+        synthesis = [{"question": question, "synthesis": "Additive attention uses a feed-forward scoring function [1] and multiplicative attention uses dot products [2]."}]
+
+        self.assertEqual(
+            report_agent.report_evidence_gap_contradictions(report, [question], synthesis), []
+        )
+
+    def test_context_labels_keep_application_bullets_on_topic(self):
+        question = "What are the primary applications of attention mechanisms in NLP and computer vision?"
+        report = (
+            "## 3. Topic Sections\n### 3.1. Primary Applications\n"
+            "**Natural-Language Processing**\n- Language modeling with autoregressive Transformers [2]\n"
+            "**Computer Vision**\n- Vision Transformers for image classification [2]"
+        )
+
+        self.assertEqual(report_agent.report_topic_relevance_issues(report, [question]), [])
+
+    def test_framing_repair_rebuilds_uncited_sections_from_cited_topic_content(self):
+        report = GOOD_REPORT.replace(
+            "This report examines the formula and its documented limitations [1].",
+            "Attention is widely used for many tasks without citation.",
+        ).replace(
+            "The evidence provides the scaled dot-product attention formulation [1]. Details on masking variants and runtime remain unavailable [1].",
+            "This report considers attention mechanisms and their applications without citation.",
+        )
+
+        repaired, repairs = report_agent.repair_uncited_frame_sections(report, fixture_context()["sources"])
+
+        self.assertTrue(repairs)
+        self.assertEqual(report_agent.uncited_factual_frame_sections(repaired), [])
+        self.assertNotIn("without citation", repaired)
+
+    def test_explanatory_where_clause_after_equation_is_not_an_artifact(self):
+        clause = r"where (Q) (queries), (K) (keys), and (V) (values) are matrices [1]."
+
+        self.assertTrue(report_agent.is_equation_definition_clause(clause))
+        self.assertNotIn(clause, report_agent.report_artifact_lines(clause))
+
+    def test_bahdanau_equation_present_in_synthesis_must_be_preserved(self):
+        question = "What is the mathematical formulation of Bahdanau additive attention?"
+        synthesis = [{
+            "question": question,
+            "synthesis": r"The score is \(a(s,h)=v_a^T\\tanh(W_a s+U_a h)\) [1].",
+        }]
+        incomplete = (
+            "## 3. Topic Sections\n### 3.1. Bahdanau Additive Attention\n"
+            "The score uses a learned additive function [1]."
+        )
+        complete = incomplete + r"\n\nCore equation: \(a(s,h)=v_a^T\\tanh(W_a s+U_a h)\) [1]."
+
+        self.assertEqual(len(report_agent.supported_equation_omissions(incomplete, [question], synthesis)), 1)
+        self.assertEqual(report_agent.supported_equation_omissions(complete, [question], synthesis), [])
+
+    def test_placeholder_citation_is_removed_during_cleanup(self):
+        cleaned, repairs = report_agent.cleanup_report(
+            "## 3.1. Attention Types\nSelf-attention's equation is not supplied [—].",
+            fixture_context()["sources"],
+        )
+
+        self.assertNotIn("[—]", cleaned)
+        self.assertIn("removed placeholder citation marker", repairs)
+
     def test_end_to_end_report_keeps_contract_boundaries_and_validates(self):
         captured = {}
 
@@ -243,10 +341,11 @@ class ReportEvidenceContractTests(unittest.TestCase):
         ):
             payload = report_agent.ReportAgent(model="mocked-model").generate(fixture_context())
 
-        self.assertIn("Attention is widely used for sequence tasks", payload["report"])
+        self.assertNotIn("Attention is widely used for sequence tasks", payload["report"])
+        self.assertTrue(any("uncited" in item for item in payload["diagnostics"]["report_deterministic_repairs"]))
         self.assertTrue(payload["diagnostics"]["report_llm_used"])
         self.assertFalse(payload["diagnostics"]["report_deterministic_fallback_used"])
-        self.assertEqual(payload["diagnostics"]["report_finalization_status"], "needs_review")
+        self.assertEqual(payload["diagnostics"]["report_finalization_status"], "clean_with_evidence_gaps")
         self.assertEqual(payload["diagnostics"]["report_llm_revision"]["error"], "revision unavailable")
 
     def test_all_gap_topic_fails_when_question_synthesis_has_supported_claims(self):
