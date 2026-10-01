@@ -38,7 +38,7 @@ def fixture_context():
 
 
 GOOD_REPORT = r"""## 1. Executive Summary
-The evidence provides the scaled dot-product attention formulation [1]. Details on masking variants and runtime remain unavailable.
+The evidence provides the scaled dot-product attention formulation [1]. Details on masking variants and runtime remain unavailable [1].
 
 ## 2. Introduction and Context
 This report examines the formula and its documented limitations [1].
@@ -142,22 +142,95 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertIn("[1] https://arxiv.org/abs/1706.03762", payload["report"])
         self.assertEqual(payload["diagnostics"]["report_schema_issues"], [])
         self.assertEqual(payload["diagnostics"]["report_finalization_status"], "clean_with_evidence_gaps")
+        self.assertTrue(payload["diagnostics"]["report_llm_used"])
+        self.assertFalse(payload["diagnostics"]["report_deterministic_fallback_used"])
 
-    def test_uncited_or_malformed_llm_draft_can_be_replaced_by_better_deterministic_report(self):
+    def test_invalid_llm_draft_is_revised_by_llm_not_replaced_with_deterministic_prose(self):
         bad_report = GOOD_REPORT.replace(
             "This report examines the formula and its documented limitations [1].",
             "Attention is widely used for sequence tasks without citation.",
         )
         with patch.object(
             report_agent, "generate_report_with_llm",
-            return_value=(bad_report, "mocked_llm", ""),
+            side_effect=[(bad_report, "mocked_llm", ""), (GOOD_REPORT, "mocked_llm", "")],
         ):
             payload = report_agent.ReportAgent(model="mocked-model").generate(fixture_context())
 
-        self.assertTrue(payload["diagnostics"]["report_quality_fallback"]["attempted"])
-        self.assertTrue(payload["diagnostics"]["report_quality_fallback"]["accepted"])
+        self.assertTrue(payload["diagnostics"]["report_llm_revision"]["attempted"])
+        self.assertTrue(payload["diagnostics"]["report_llm_revision"]["accepted"])
         self.assertEqual(payload["diagnostics"]["report_issues"], [])
-        self.assertIn("validated_fallback", payload["diagnostics"]["report_generation_mode"])
+        self.assertEqual(payload["diagnostics"]["report_generation_mode"], "llm_revised_from_question_evidence")
+
+    def test_failed_llm_revision_keeps_draft_and_marks_needs_review(self):
+        bad_report = GOOD_REPORT.replace(
+            "This report examines the formula and its documented limitations [1].",
+            "Attention is widely used for sequence tasks without citation.",
+        )
+        with patch.object(
+            report_agent, "generate_report_with_llm",
+            side_effect=[(bad_report, "mocked_llm", ""), (None, "deterministic_fallback_llm_error", "revision unavailable")],
+        ):
+            payload = report_agent.ReportAgent(model="mocked-model").generate(fixture_context())
+
+        self.assertIn("Attention is widely used for sequence tasks", payload["report"])
+        self.assertTrue(payload["diagnostics"]["report_llm_used"])
+        self.assertFalse(payload["diagnostics"]["report_deterministic_fallback_used"])
+        self.assertEqual(payload["diagnostics"]["report_finalization_status"], "needs_review")
+        self.assertEqual(payload["diagnostics"]["report_llm_revision"]["error"], "revision unavailable")
+
+    def test_all_gap_topic_fails_when_question_synthesis_has_supported_claims(self):
+        gap_report = (
+            "## 3. Topic Sections\n"
+            "### 3.1. Mathematical Formulation Of Scaled Dot-product Attention Including Equation\n"
+            "The retrieved evidence is incomplete for this sub-question."
+        )
+        validation = report_agent.validate_report(
+            gap_report,
+            fixture_context()["sources"],
+            [QUESTION],
+            fixture_context()["evidence_packs"],
+            fixture_context()["per_question_synthesis"],
+        )
+
+        self.assertEqual(validation["false_gap_questions"], [QUESTION])
+
+    def test_all_gap_topic_fails_when_only_question_pack_has_clean_evidence(self):
+        gap_report = (
+            "## 3. Topic Sections\n"
+            "### 3.1. Mathematical Formulation Of Scaled Dot-product Attention Including Equation\n"
+            "The retrieved evidence is incomplete for this sub-question."
+        )
+        pack = {
+            "question": QUESTION,
+            "chunks": [{
+                "source_index": 2,
+                "content": "Scaled dot-product attention computes query-key scores, applies softmax, and weights values.",
+            }],
+        }
+
+        contradictions = report_agent.report_evidence_gap_contradictions(gap_report, [QUESTION], [], [pack])
+
+        self.assertEqual(contradictions, [QUESTION])
+
+    def test_deterministic_fallback_does_not_copy_unrelated_chunk_fragments(self):
+        question = "What is the definition of the attention mechanism in machine learning?"
+        section, _ = report_agent.build_topic_section(
+            1,
+            question,
+            {
+                "coverage": "covered",
+                "chunks": [{
+                    "source_index": 1,
+                    "content": "Semantic plausibility (animals get tired, streets do not) 3 [1]. g, attention mechanisms have enabled breakthroughs in protein structure prediction [1].",
+                }],
+            },
+            {},
+            [{"index": 1, "url": "https://example.org/source"}],
+        )
+
+        self.assertNotIn("Semantic plausibility", section)
+        self.assertNotIn("g, attention", section)
+        self.assertIn("evidence", section.lower())
 
     def test_llm_failure_returns_deterministic_report_instead_of_raising(self):
         with patch.object(
@@ -169,6 +242,8 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertTrue(payload["report"])
         self.assertIn("## 6. Conclusion", payload["report"])
         self.assertEqual(payload["diagnostics"]["report_generation_error"], "mock model unavailable")
+        self.assertFalse(payload["diagnostics"]["report_llm_used"])
+        self.assertTrue(payload["diagnostics"]["report_deterministic_fallback_used"])
 
 
 if __name__ == "__main__":
