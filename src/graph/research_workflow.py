@@ -298,6 +298,8 @@ def synthesis_node(state: ResearchState) -> ResearchState:
             "errors": [*state.get("errors", []), *synthesis_errors],
         }
 
+    print("[synthesis] synthesis output:\n", synthesis.get("synthesis"))
+
     synthesis_agent.write_to_memory(synthesis, memory_path)
     return {
         **state,
