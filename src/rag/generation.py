@@ -1731,15 +1731,21 @@ def synthesize_per_question_notes(
     for question in questions:
         ranked_context = rank_results_for_question(question, retrieved_context)
         question_context = ranked_context[:DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS]
-        context_text = build_question_context_text(
+        context_text, selected_chunks = build_question_context_evidence(
             question_context,
             sources,
             max_chars=DEFAULT_PER_QUESTION_SYNTHESIS_CHARS,
         )
+        selection = {
+            "selected_chunks": selected_chunks,
+            "selected_chunk_count": len(selected_chunks),
+            "context_chars": len(context_text),
+        }
         if not context_text:
             notes.append(
                 {
                     "question": question,
+                    **selection,
                     "synthesis": "Missing Evidence: no retrieved context matched this planner sub-question.",
                     "source_indexes": [],
                     "attempts": 0,
@@ -1783,6 +1789,7 @@ def synthesize_per_question_notes(
             notes.append(
                 {
                     "question": question,
+                    **selection,
                     "synthesis": synthesis,
                     "source_indexes": citation_markers(synthesis),
                     "attempts": 1,
@@ -1796,6 +1803,7 @@ def synthesize_per_question_notes(
             notes.append(
                 {
                     "question": question,
+                    **selection,
                     "synthesis": synthesis,
                     "source_indexes": citation_markers(synthesis),
                     "attempts": 1,
@@ -1839,12 +1847,22 @@ def build_question_context_text(
     sources: Sequence[dict[str, Any]],
     max_chars: int = DEFAULT_PER_QUESTION_SYNTHESIS_CHARS,
 ) -> str:
+    context_text, _ = build_question_context_evidence(retrieved_context, sources, max_chars)
+    return context_text
+
+
+def build_question_context_evidence(
+    retrieved_context: Sequence[RetrievalResult],
+    sources: Sequence[dict[str, Any]],
+    max_chars: int = DEFAULT_PER_QUESTION_SYNTHESIS_CHARS,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Return the prompt evidence and its exact serialized chunks for memory."""
     compact_chunks = compact_retrieved_chunks(
         retrieved_context,
         sources=sources,
         max_chars=DEFAULT_CONTEXT_BLOCK_CHARS,
     )
-    lines = []
+    lines, selected_chunks = [], []
     used = 0
     for chunk in compact_chunks:
         source_index = chunk.get("source_index")
@@ -1857,8 +1875,9 @@ def build_question_context_text(
         if used + len(block) > max_chars and lines:
             break
         lines.append(block)
+        selected_chunks.append({**chunk, "content": content})
         used += len(block)
-    return "\n\n".join(lines)
+    return "\n\n".join(lines), selected_chunks
 
 
 def deterministic_question_synthesis(
