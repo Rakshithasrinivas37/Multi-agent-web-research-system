@@ -588,16 +588,25 @@ def retrieve_sub_question_context_groups(
             question_source_urls=question_source_urls,
             required_evidence=required_evidence,
         )
+        browser_merge_reason = browser_candidate_merge_reason(
+            question=question,
+            candidates=candidates,
+            browser_candidates=browser_candidates,
+            final_chunks=final_chunks,
+        )
 
         print(f"[synthesis] Sub-question: {question}\n")
-        print(f"[synthesis] Candidates: {len(candidates)} | Browser candidates: {len(browser_candidates)}\n")
+        print(
+            f"[synthesis] Candidates: {len(candidates)} | Browser candidates: {len(browser_candidates)} "
+            f"| Browser merge: {browser_merge_reason or 'skipped'}\n"
+        )
         for index, result in enumerate(candidates, start=1):
             print(f"[synthesis] Candidate {index}/{len(candidates)} | ID: {result.id} | Score: {result.score}\n{result.document}\n")
 
         for index, result in enumerate(browser_candidates, start=1):
             print(f"[synthesis] Browser candidate {index}/{len(browser_candidates)} | ID: {result.id} | Score: {result.score}\n{result.document}\n")
             
-        if browser_candidates:
+        if browser_merge_reason:
             fallback_sources.append("browser_results")
             candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
         missing_facets = missing_facets_for_results(question, candidates)
@@ -663,6 +672,8 @@ def retrieve_sub_question_context_groups(
                 "ranked_ids": [r.id for r in ranked_candidates],
                 "meaningful_ids": [r.id for r in meaningful],
                 "facet_selected_ids": [r.id for r in facet_selected],
+                "browser_candidate_ids": [r.id for r in browser_candidates],
+                "browser_merge_reason": browser_merge_reason or "skipped",
                 "final_ids": [r.id for r in tagged],
             },
         )
@@ -681,6 +692,24 @@ def retrieval_trace_entries(results: Sequence[RetrievalResult]) -> list[dict[str
          "score": r.score}
         for r in results
     ]
+
+
+def browser_candidate_merge_reason(
+    question: str,
+    candidates: Sequence[RetrievalResult],
+    browser_candidates: Sequence[RetrievalResult],
+    final_chunks: int,
+) -> str:
+    """Use browser snippets only as a fallback/rescue pool, not as the default winner."""
+
+    if not browser_candidates:
+        return ""
+    if len(candidates) < max(1, final_chunks):
+        return "insufficient_rag_candidates"
+    missing_facets = missing_facets_for_results(question, candidates)
+    if missing_facets:
+        return "missing_facets"
+    return ""
 
 
 def sub_question_context_group(

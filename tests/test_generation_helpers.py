@@ -2150,6 +2150,73 @@ Missing Evidence: exact benchmark values are not present.
         self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], "How does multiplicative Luong attention work?")
         self.assertEqual(groups[0]["chunks"][0].metadata["url"], "https://arxiv.org/pdf/1508.04025")
 
+    def test_retrieve_sub_question_context_groups_skips_browser_when_rag_is_sufficient(self):
+        rag_results = [
+            RetrievalResult(
+                id="rag-definition",
+                document="Alpha attention definition explains query key value scoring with enough source-backed context. " * 4,
+                metadata={"title": "RAG definition", "url": "https://example.com/rag-definition"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="rag-equation",
+                document="Alpha attention equation states Attention(Q,K,V)=softmax(QK^T)V with enough explanation. " * 4,
+                metadata={"title": "RAG equation", "url": "https://example.com/rag-equation"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            ),
+        ]
+        browser_results = [
+            {
+                "sources": [
+                    {
+                        "url": "https://example.com/browser",
+                        "title": "Browser fallback",
+                        "source_type": "webpage",
+                        "full_content": "Browser fallback alpha attention evidence that should not displace sufficient RAG chunks. " * 8,
+                    }
+                ]
+            }
+        ]
+
+        with (
+            patch("src.rag.sub_question_context.source_url_coverage_retrieve", return_value=[]),
+            patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", return_value=rag_results),
+            patch("src.rag.sub_question_context.collection_scan_question_retrieve", return_value=[]),
+        ):
+            groups = retrieve_sub_question_context_groups(
+                research_plan={},
+                questions=["What is alpha attention definition equation?"],
+                objective="Alpha objective",
+                chroma_path="/tmp/chroma",
+                collection_name="test",
+                history_keys=[],
+                candidate_chunks=8,
+                final_chunks=2,
+                per_query_k=25,
+                semantic_k=10,
+                bm25_k=10,
+                semantic_weight=0.3,
+                bm25_weight=0.3,
+                authority_weight=0.4,
+                bm25_scan_limit=100,
+                embedding_device="",
+                rerank=False,
+                reranker_model="cross-encoder",
+                rerank_k=8,
+                rerank_weight=0.7,
+                browser_results=browser_results,
+            )
+
+        selected_ids = {chunk.id for chunk in groups[0]["chunks"]}
+        self.assertEqual(selected_ids, {"rag-definition", "rag-equation"})
+        self.assertNotIn("browser_results", groups[0]["fallback_sources"])
+        self.assertEqual(groups[0]["selection_trace"]["browser_merge_reason"], "skipped")
+        self.assertTrue(groups[0]["selection_trace"]["browser_candidate_ids"])
+
     def test_browser_question_context_prefers_exact_benchmark_from_primary_source(self):
         browser_results = [
             {
