@@ -588,6 +588,15 @@ def retrieve_sub_question_context_groups(
             question_source_urls=question_source_urls,
             required_evidence=required_evidence,
         )
+
+        print(f"[synthesis] Sub-question: {question}\n")
+        print(f"[synthesis] Candidates: {len(candidates)} | Browser candidates: {len(browser_candidates)}\n")
+        for index, result in enumerate(candidates, start=1):
+            print(f"[synthesis] Candidate {index}/{len(candidates)} | ID: {result.id} | Score: {result.score}\n{result.document}\n")
+
+        for index, result in enumerate(browser_candidates, start=1):
+            print(f"[synthesis] Browser candidate {index}/{len(browser_candidates)} | ID: {result.id} | Score: {result.score}\n{result.document}\n")
+            
         if browser_candidates:
             fallback_sources.append("browser_results")
             candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
