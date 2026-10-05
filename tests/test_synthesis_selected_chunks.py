@@ -76,6 +76,7 @@ class SynthesisSelectedChunksTests(unittest.TestCase):
         self.assertEqual(len(evidence), note["context_chars"])
         self.assertIn(evidence, complete.call_args.kwargs["messages"][1]["content"])
         self.assertIn("chunk-1", log)
+        self.assertIn("'origin': 'retrieved'", log)
         self.assertNotIn("chunk-2", log)
         self.assertNotIn("Paper 2", log)
 

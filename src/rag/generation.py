@@ -1841,6 +1841,7 @@ def synthesize_per_question_notes(
                 f"[synthesis prompt] Sub-question: {question}\n"
                 f"[synthesis prompt] Selected chunks: {len(selected_chunks)} | Evidence characters: {len(context_text)}\n"
                 f"[synthesis prompt] Chunk IDs in prompt order: {[chunk['id'] for chunk in selected_chunks]}\n"
+                f"[synthesis prompt] Chunk origins: {synthesis_prompt_chunk_origins(selected_chunks)}\n"
                 f"[synthesis prompt] BEGIN EXACT EVIDENCE\n{context_text}\n"
                 "[synthesis prompt] END EXACT EVIDENCE",
                 flush=True,
@@ -2976,6 +2977,25 @@ def compact_retrieved_chunks(
             }
         )
     return chunks
+
+
+def synthesis_prompt_chunk_origins(chunks: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Summarize whether final prompt chunks came from browser extraction or indexed RAG."""
+
+    summaries = []
+    for chunk in chunks:
+        chunk_id = clean_text(chunk.get("id"))
+        source_type = clean_text(chunk.get("source_type"))
+        origin = "browser" if chunk_id.startswith("browser-question-") else "retrieved"
+        summaries.append(
+            {
+                "id": chunk_id,
+                "origin": origin,
+                "source_type": source_type,
+                "url": clean_text(chunk.get("url")),
+            }
+        )
+    return summaries
 
 
 def build_sub_question_evidence_packs(
