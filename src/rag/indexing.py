@@ -23,14 +23,14 @@ from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
-DEFAULT_COLLECTION_NAME = "research_rag_qwen3_embedding_8b"
+DEFAULT_COLLECTION_NAME = os.environ.get("RAG_COLLECTION_NAME", "research_rag_qwen3_06b")
 DEFAULT_CHROMA_PATH = "data/chroma"
 DEFAULT_CHUNK_SIZE = 1500
 DEFAULT_CHUNK_OVERLAP = 250
 DEFAULT_PARENT_CHUNK_SIZE = 4000
 DEFAULT_PARENT_CHUNK_OVERLAP = 400
 DEFAULT_PARENT_STORE_NAME = "parent_chunks.sqlite3"
-DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
+DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
 DEFAULT_EMBEDDING_BATCH_SIZE = 16
