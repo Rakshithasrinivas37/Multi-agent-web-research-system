@@ -104,7 +104,8 @@ class LangChainSentenceTransformerEmbeddings:
         return self.embedding_function(texts)
 
     def embed_query(self, text: str) -> list[float]:
-        return self.embedding_function([text])[0]
+        # Queries get the Qwen3 instruction prompt; documents do not.
+        return self.embedding_function.embed_queries([text])[0]
 
     def close(self) -> None:
         self.embedding_function.close()
@@ -367,6 +368,7 @@ def source_url_coverage_retrieve(
     try:
         result = collection.get(**get_args)
     except Exception:
+        traceback.print_exc()
         return []
 
     ids = result.get("ids", []) if isinstance(result, dict) else []
@@ -583,7 +585,11 @@ def semantic_search(
             filter=where,
         )
     except Exception:
-        return []
+        # Do not hide infrastructure failures (model load, dimension mismatch, bad filter)
+        # as "0 results"; surface them so synthesis does not run on missing evidence.
+        print(f"[semantic_search] FAILED for query: {query}")
+        traceback.print_exc()
+        raise
     finally:
         embeddings.close()
 
@@ -624,6 +630,7 @@ def bm25_search(
     try:
         result = collection.get(**get_args)
     except Exception:
+        traceback.print_exc()
         return []
 
     ids = result.get("ids", []) if isinstance(result, dict) else []
@@ -631,6 +638,7 @@ def bm25_search(
     metadatas = result.get("metadatas", []) if isinstance(result, dict) else []
     langchain_documents = build_langchain_documents(ids=ids, documents=documents, metadatas=metadatas)
     if not langchain_documents:
+        print(f"[bm25_search] No documents in collection for filter={where}; BM25 skipped")
         return []
 
     try:
@@ -642,6 +650,7 @@ def bm25_search(
         )
         ranked_documents = retriever.invoke(query)
     except Exception:
+        traceback.print_exc()
         return []
 
     rows = []
@@ -1259,6 +1268,9 @@ def get_langchain_chroma(
         collection_name=collection_name,
         persist_directory=str(chroma_path),
         embedding_function=embedding_function or LangChainSentenceTransformerEmbeddings(device=embedding_device),
+        # Match the cosine space used when indexing so relevance scores are computed correctly.
+        collection_metadata={"hnsw:space": "cosine"},
+        relevance_score_fn=lambda distance: 1.0 - distance,
     )
 
 

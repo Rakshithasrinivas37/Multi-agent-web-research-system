@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,20 +23,25 @@ from src.tools.progress import emit_progress
 from src.tools.text_utils import clean_text
 
 
-DEFAULT_COLLECTION_NAME = "research_rag_bge_large"
+DEFAULT_COLLECTION_NAME = "research_rag_qwen3_embedding_8b"
 DEFAULT_CHROMA_PATH = "data/chroma"
 DEFAULT_CHUNK_SIZE = 1500
 DEFAULT_CHUNK_OVERLAP = 250
 DEFAULT_PARENT_CHUNK_SIZE = 4000
 DEFAULT_PARENT_CHUNK_OVERLAP = 400
 DEFAULT_PARENT_STORE_NAME = "parent_chunks.sqlite3"
-DEFAULT_EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"
+DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
 # "auto" prefers CUDA on RunPod, MPS on Apple Silicon, then CPU as fallback.
 DEFAULT_EMBEDDING_DEVICE = "auto"
 DEFAULT_EMBEDDING_BATCH_SIZE = 16
 DEFAULT_CUDA_EMBEDDING_BATCH_SIZE = 4
 DEFAULT_CHROMA_UPSERT_BATCH_SIZE = 8
 DEFAULT_METADATA_SCHEMA_VERSION = 9
+# Qwen3-Embedding wants an instruction on QUERIES only; documents get no prompt.
+QWEN_QUERY_INSTRUCTION = (
+    "Instruct: Given a research question, retrieve relevant passages that answer the question\nQuery: "
+)
+DEFAULT_EMBEDDING_MAX_SEQ_LENGTH = 2048
 HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN")
 TOKEN_WRAPPER_QUOTES = "\"'\u201c\u201d\u2018\u2019"
 TOKEN_PATTERN = re.compile(r"\S+")
@@ -89,6 +95,10 @@ STORAGE_TEXT_REPLACEMENTS = str.maketrans(
     }
 )
 
+# One shared embedding model per (model_name, device) for the whole process.
+_MODEL_LOCK = threading.Lock()
+_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+
 
 @dataclass(frozen=True)
 class SourceRecord:
@@ -105,6 +115,13 @@ class SourceRecord:
     content: str
 
 
+def release_embedding_models() -> None:
+    """Free the shared embedding model(s). Call once at the end of a full graph run."""
+    with _MODEL_LOCK:
+        _MODEL_CACHE.clear()
+    clear_embedding_model_memory()
+
+
 class SentenceTransformerEmbeddingFunction:
     """Chroma-compatible embedding function backed by sentence-transformers."""
 
@@ -114,38 +131,47 @@ class SentenceTransformerEmbeddingFunction:
         self.device = clean_text(device or os.environ.get("RAG_EMBEDDING_DEVICE")) or DEFAULT_EMBEDDING_DEVICE
         self._model = None
 
-    def __call__(self, input: list[str]) -> list[list[float]]:
-        model = self.model()
-        batch_size = embedding_batch_size(self.device)
-        while True:
-            try:
-                embeddings = model.encode(
-                    input,
-                    batch_size=batch_size,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
-                return embeddings.tolist()
-            except RuntimeError as error:
-                if not is_cuda_oom_error(error) or batch_size <= 1:
-                    raise
-                batch_size = max(1, batch_size // 2)
-                print(f"[rag_index] CUDA OOM while embedding; retrying with batch_size={batch_size}")
-                clear_embedding_model_memory()
-            finally:
-                clear_embedding_model_memory()
+    def _load_sentence_transformer(self, sentence_transformer_cls: Any, torch_module: Any) -> Any:
+        """Load the model in half precision with fallbacks, avoiding the meta-tensor .to() failure."""
+        device = self.device
+        if device.startswith("cuda"):
+            dtype = torch_module.bfloat16 if torch_module.cuda.is_bf16_supported() else torch_module.float16
+        elif device == "mps":
+            dtype = torch_module.float16
+        else:
+            dtype = torch_module.float32
 
-    def name(self) -> str:
-        """Stable Chroma embedding function name used when reopening collections."""
-        safe_model_name = self.model_name.replace("/", "_").replace(":", "_")
-        return f"sentence-transformers_{safe_model_name}"
+        attempts = [
+            ("dtype+low_cpu_mem_usage=False", {"torch_dtype": dtype, "low_cpu_mem_usage": False}),
+            ("dtype+device_map", {"torch_dtype": dtype, "device_map": {"": device}}),  # needs accelerate
+        ]
+        max_seq_length = max(
+            128, to_int(os.environ.get("RAG_EMBEDDING_MAX_SEQ_LENGTH"), DEFAULT_EMBEDDING_MAX_SEQ_LENGTH)
+        )
+        last_error: Optional[BaseException] = None
+        for label, model_kwargs in attempts:
+            try:
+                loaded = sentence_transformer_cls(
+                    self.model_name,
+                    device=device,
+                    model_kwargs=model_kwargs,
+                    tokenizer_kwargs={"padding_side": "left"},
+                )
+                loaded.max_seq_length = max_seq_length
+                print(f"[rag_index] loaded {self.model_name} on {device} using {label}")
+                return loaded
+            except Exception as error:
+                last_error = error
+                print(f"[rag_index] embedding load failed ({label}): {type(error).__name__}: {error}")
+                clear_embedding_model_memory()
+        raise RuntimeError(f"Embedding model {self.model_name} failed to load on {device}") from last_error
 
     def model(self) -> Any:
         if self._model is not None:
             return self._model
         normalize_huggingface_token_env()
         try:
+            import torch
             from sentence_transformers import SentenceTransformer
         except ImportError as error:
             raise RuntimeError(
@@ -154,19 +180,54 @@ class SentenceTransformerEmbeddingFunction:
             ) from error
 
         self.device = select_embedding_device(self.device)
-        self._model = SentenceTransformer(self.model_name, device=self.device)
+        key = (self.model_name, self.device)
+        with _MODEL_LOCK:  # serialize loads; one shared copy per (model, device)
+            if key not in _MODEL_CACHE:
+                _MODEL_CACHE[key] = self._load_sentence_transformer(SentenceTransformer, torch)
+            self._model = _MODEL_CACHE[key]
         return self._model
 
-    def close(self) -> None:
-        """Release the loaded embedding model between full graph runs."""
-        if self._model is not None:
+    def _encode(self, texts: list[str], prompt: str = "") -> list[list[float]]:
+        model = self.model()
+        batch_size = embedding_batch_size(self.device)
+        extra = {"prompt": prompt} if prompt else {}
+        while True:
             try:
-                if hasattr(self._model, "to"):
-                    self._model.to("cpu")
-            except Exception:
-                pass
+                embeddings = model.encode(
+                    texts,
+                    batch_size=batch_size,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                    **extra,
+                )
+                return embeddings.tolist()
+            except RuntimeError as error:
+                if not is_cuda_oom_error(error) or batch_size <= 1:
+                    raise
+                batch_size = max(1, batch_size // 2)
+                print(f"[rag_index] CUDA OOM while embedding; retrying with batch_size={batch_size}")
+                clear_embedding_model_memory()
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        """Document embedding path (used by Chroma upsert). No instruction prompt."""
+        return self._encode(input)
+
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        """Query embedding path. Adds the Qwen3 instruction prompt."""
+        return self._encode(texts, prompt=QWEN_QUERY_INSTRUCTION)
+
+    def name(self) -> str:
+        """Stable Chroma embedding function name used when reopening collections."""
+        safe_model_name = self.model_name.replace("/", "_").replace(":", "_")
+        return f"sentence-transformers_{safe_model_name}"
+
+    def close(self) -> None:
+        """Drop this handle only. The shared cached model stays loaded for the next query.
+
+        Call release_embedding_models() to actually free GPU/CPU memory.
+        """
         self._model = None
-        clear_embedding_model_memory()
 
 
 def normalize_huggingface_token_env() -> None:
@@ -1163,7 +1224,7 @@ def source_metadata_in_collection(collection: Any, history_key: str, url: str) -
             limit=1,
         )
     except Exception:
-        return ""
+        return {}
 
     metadatas = result.get("metadatas", []) if isinstance(result, dict) else []
     if not metadatas or not isinstance(metadatas[0], dict):
