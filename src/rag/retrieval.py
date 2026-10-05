@@ -588,6 +588,11 @@ def semantic_search(
         embeddings.close()
 
     rows = []
+
+    print(f"[semantic_search] Retrieved {len(results)} results for query: {query}\n")
+    for index, (document, score) in enumerate(results):
+        print(f"[semantic_search] Result {index + 1}/{len(results)} | ID: {document_id(document)} | Score: {score}\n{document.page_content}\n")
+
     for index, (document, score) in enumerate(results):
         rows.append(
             RetrievalResult(
@@ -640,6 +645,11 @@ def bm25_search(
         return []
 
     rows = []
+    print(f"[bm25_search] Retrieved {len(ranked_documents)} results for query: {query}\n")
+
+    for index, document in enumerate(ranked_documents[: max(1, bm25_k)], start=1):
+        print(f"[bm25_search] Result {index}/{len(ranked_documents)} | ID: {document_id(document)}\n{document.page_content}\n")
+    
     for bm25_rank, document in enumerate(ranked_documents[: max(1, bm25_k)], start=1):
         rows.append(
             RetrievalResult(
