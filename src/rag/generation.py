@@ -1772,6 +1772,10 @@ def synthesize_per_question_notes(
 ) -> list[dict[str, Any]]:
     notes = []
     for question in questions:
+        assigned_context = [
+            result for result in retrieved_context
+            if question_key((result.metadata or {}).get("synthesis_question", "")) == question_key(question)
+        ]
         ranked_context = question_ranked_results(question, retrieved_context, question_source_urls)
         unique_context = unique_retrieval_results(ranked_context)
         # Reserve a slot for each relevant planner-linked source before filling by rank.
@@ -1781,7 +1785,7 @@ def synthesize_per_question_notes(
                           and result_supports_question(question, r)), None)
             if match is not None:
                 preferred.append(match)
-        ordered_context = unique_retrieval_results([*preferred, *unique_context])
+        ordered_context = unique_retrieval_results([*assigned_context, *preferred, *unique_context])
         question_context = ordered_context
         prompt_decisions = []
         context_text, selected_chunks = build_question_context_evidence(
@@ -1798,6 +1802,7 @@ def synthesize_per_question_notes(
             "context_chars": len(context_text),
             "selection_trace": {
                 "input_chunks": retrieval_trace_entries(retrieved_context),
+                "assigned_question_chunk_ids": [r.id for r in assigned_context],
                 "preferred_source_urls": question_source_urls_for(question, question_source_urls),
                 "ranked_ids": [r.id for r in ranked_context],
                 "deduplicated_ids": [r.id for r in unique_context],

@@ -2214,8 +2214,8 @@ Missing Evidence: exact benchmark values are not present.
         selected_ids = {chunk.id for chunk in groups[0]["chunks"]}
         self.assertEqual(selected_ids, {"rag-definition", "rag-equation"})
         self.assertNotIn("browser_results", groups[0]["fallback_sources"])
-        self.assertEqual(groups[0]["selection_trace"]["browser_merge_reason"], "skipped")
-        self.assertTrue(groups[0]["selection_trace"]["browser_candidate_ids"])
+        self.assertEqual(groups[0]["selection_trace"]["browser_generation_reason"], "skipped")
+        self.assertEqual(groups[0]["selection_trace"]["browser_candidate_ids"], [])
 
     def test_browser_question_context_prefers_exact_benchmark_from_primary_source(self):
         browser_results = [

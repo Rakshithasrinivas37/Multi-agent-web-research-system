@@ -89,6 +89,37 @@ class SynthesisSelectedChunksTests(unittest.TestCase):
         self.assertEqual(note["selected_chunk_count"], 0)
         self.assertEqual(note["context_chars"], 0)
 
+    def test_assigned_retrieval_chunks_are_sent_before_global_rerank_candidates(self):
+        assigned = RetrievalResult(
+            id="assigned-q1",
+            document="Definition evidence for question one explains attention as weighted value aggregation using query key compatibility. " * 3,
+            metadata={
+                "title": "Assigned",
+                "url": "https://example.org/assigned",
+                "synthesis_question": "What is attention?",
+            },
+            score=0.2, semantic_score=0.2, bm25_score=0.0,
+        )
+        stronger_other = RetrievalResult(
+            id="other-q2",
+            document="Benchmark evidence for another question mentions attention performance metrics and unrelated task results. " * 3,
+            metadata={
+                "title": "Other",
+                "url": "https://example.org/other",
+                "synthesis_question": "What benchmarks exist?",
+            },
+            score=1.0, semantic_score=1.0, bm25_score=0.0,
+        )
+        _, sources = generation.build_generation_context([assigned, stronger_other])
+        with patch.object(generation, "question_ranked_results", return_value=[stronger_other, assigned]), \
+             patch.object(generation, "create_chat_completion_with_retries", return_value=self.response):
+            note = generation.synthesize_per_question_notes(
+                object(), "mock-model", "Attention", "Summarize evidence",
+                ["What is attention?"], [assigned, stronger_other], sources,
+            )[0]
+        self.assertEqual(note["selected_chunks"][0]["id"], "assigned-q1")
+        self.assertEqual(note["selection_trace"]["assigned_question_chunk_ids"], ["assigned-q1"])
+
     def test_failure_keeps_evidence_sent_in_attempted_prompt(self):
         with patch.object(generation, "rank_results_for_question", return_value=self.results), \
              patch.object(generation, "create_chat_completion_with_retries", side_effect=RuntimeError("service unavailable")):
