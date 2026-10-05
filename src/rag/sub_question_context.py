@@ -618,7 +618,9 @@ def retrieve_sub_question_context_groups(
             required_evidence=required_evidence,
         )
         selected = helpers.meaningful_retrieval_results(ranked_candidates) or ranked_candidates or list(candidates)
+        meaningful = list(selected)
         selected = select_facet_covered_results(question, selected, final_chunks)
+        facet_selected = list(selected)
         graph_result = graph_expand_question_results(
             question=question,
             candidates=ranked_candidates or candidates,
@@ -629,6 +631,17 @@ def retrieve_sub_question_context_groups(
         if graph_result.get("graph_added_count"):
             fallback_sources.append("graphrag")
         tagged = [tag_result_for_question(result, question) for result in selected[:final_chunks]]
+        chunk_text = "\n\n".join(
+            f"[retrieval] Chunk {index}/{len(tagged)} | ID: {result.id}\n{result.document}"
+            for index, result in enumerate(tagged, start=1)
+        )
+        print(
+            f"[retrieval] Sub-question: {question}\n"
+            f"[retrieval] Candidates: {len(candidates)} | Selected chunks: {len(tagged)}\n"
+            f"[retrieval] Selected chunks (IDs, URLs, scores): {retrieval_trace_entries(tagged)}\n"
+            f"{chunk_text}",
+            flush=True,
+        )
         return sub_question_context_group(
             question,
             query_set,
@@ -636,6 +649,13 @@ def retrieve_sub_question_context_groups(
             tagged,
             fallback_sources=fallback_sources,
             graph_context=graph_result,
+            selection_trace={
+                "candidates": retrieval_trace_entries(candidates),
+                "ranked_ids": [r.id for r in ranked_candidates],
+                "meaningful_ids": [r.id for r in meaningful],
+                "facet_selected_ids": [r.id for r in facet_selected],
+                "final_ids": [r.id for r in tagged],
+            },
         )
 
     max_workers = sub_question_retrieval_max_workers(len(clean_questions), rerank=rerank)
@@ -643,6 +663,15 @@ def retrieve_sub_question_context_groups(
         return [retrieve_question(question) for question in clean_questions]
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rag-subquestion") as executor:
         return list(executor.map(retrieve_question, clean_questions))
+
+
+def retrieval_trace_entries(results: Sequence[RetrievalResult]) -> list[dict[str, Any]]:
+    """Keep stage diagnostics serializable without copying document bodies."""
+    return [
+        {"id": r.id, "url": clean_text((r.metadata or {}).get("url") or (r.metadata or {}).get("source_url")),
+         "score": r.score}
+        for r in results
+    ]
 
 
 def sub_question_context_group(
@@ -653,6 +682,7 @@ def sub_question_context_group(
     fallback_used: bool = False,
     fallback_sources: Sequence[str] | None = None,
     graph_context: dict[str, Any] | None = None,
+    selection_trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean_fallback_sources = [clean_text(source) for source in fallback_sources or [] if clean_text(source)]
     graph_context = graph_context or {}
@@ -669,6 +699,7 @@ def sub_question_context_group(
         "graph_entity_count": int(graph_context.get("entity_count") or 0),
         "graph_entities": list(graph_context.get("entities") or []),
         "chunks": list(chunks),
+        "selection_trace": selection_trace or {},
     }
 
 
@@ -1126,6 +1157,7 @@ def sub_question_context_counts(groups: Sequence[dict[str, Any]]) -> list[dict[s
             "graph_added_count": int(group.get("graph_added_count") or 0),
             "graph_entity_count": int(group.get("graph_entity_count") or 0),
             "graph_entities": list(group.get("graph_entities", [])),
+            "selection_trace": dict(group.get("selection_trace", {})),
         }
         for group in groups
         if isinstance(group, dict)
