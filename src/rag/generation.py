@@ -1832,6 +1832,14 @@ def synthesize_per_question_notes(
                 tool="groq",
                 metadata={"model": rag_generation_model(model), "question": question[:120]},
             )
+            print(
+                f"[synthesis prompt] Sub-question: {question}\n"
+                f"[synthesis prompt] Selected chunks: {len(selected_chunks)} | Evidence characters: {len(context_text)}\n"
+                f"[synthesis prompt] Chunk IDs in prompt order: {[chunk['id'] for chunk in selected_chunks]}\n"
+                f"[synthesis prompt] BEGIN EXACT EVIDENCE\n{context_text}\n"
+                "[synthesis prompt] END EXACT EVIDENCE",
+                flush=True,
+            )
             response = create_chat_completion_with_retries(
                 client,
                 model=rag_generation_model(model),
