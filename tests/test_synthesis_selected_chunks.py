@@ -63,6 +63,22 @@ class SynthesisSelectedChunksTests(unittest.TestCase):
         self.assertNotIn("Paper 2", context)
         self.assertEqual(context, generation.build_question_context_text(self.results[:4], self.sources, max_chars=400))
 
+    def test_logged_evidence_matches_final_prompt_after_budget(self):
+        with patch.object(generation, "question_ranked_results", return_value=self.results), \
+             patch.object(generation, "DEFAULT_PER_QUESTION_SYNTHESIS_CHARS", 400), \
+             patch.object(generation, "create_chat_completion_with_retries", return_value=self.response) as complete, \
+             patch("builtins.print") as printed:
+            note = self.synthesize(["What is attention?"])[0]
+        log = next(call.args[0] for call in printed.call_args_list
+                   if str(call.args[0]).startswith("[synthesis prompt] Sub-question:"))
+        evidence = log.split("BEGIN EXACT EVIDENCE\n", 1)[1].split("\n[synthesis prompt] END EXACT EVIDENCE", 1)[0]
+        self.assertEqual(note["selected_chunk_count"], 1)
+        self.assertEqual(len(evidence), note["context_chars"])
+        self.assertIn(evidence, complete.call_args.kwargs["messages"][1]["content"])
+        self.assertIn("chunk-1", log)
+        self.assertNotIn("chunk-2", log)
+        self.assertNotIn("Paper 2", log)
+
     def test_empty_selection_records_empty_list_without_llm_call(self):
         with patch.object(generation, "rank_results_for_question", return_value=[]), \
              patch.object(generation, "create_chat_completion_with_retries") as complete:
