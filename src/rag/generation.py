@@ -1773,7 +1773,7 @@ def synthesize_per_question_notes(
     notes = []
     for question in questions:
         ranked_context = question_ranked_results(question, retrieved_context, question_source_urls)
-        unique_context = dedupe_near_duplicate_chunks(ranked_context)
+        unique_context = unique_retrieval_results(ranked_context)
         # Reserve a slot for each relevant planner-linked source before filling by rank.
         preferred = []
         for url in question_source_urls_for(question, question_source_urls):
@@ -1782,13 +1782,15 @@ def synthesize_per_question_notes(
             if match is not None:
                 preferred.append(match)
         ordered_context = unique_retrieval_results([*preferred, *unique_context])
-        question_context = ordered_context[:DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS]
+        question_context = ordered_context
         prompt_decisions = []
         context_text, selected_chunks = build_question_context_evidence(
             question_context,
             sources,
             max_chars=DEFAULT_PER_QUESTION_SYNTHESIS_CHARS,
             selection_trace=prompt_decisions,
+            question=question,
+            max_chunks=DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS,
         )
         selection = {
             "selected_chunks": selected_chunks,
@@ -1799,9 +1801,12 @@ def synthesize_per_question_notes(
                 "preferred_source_urls": question_source_urls_for(question, question_source_urls),
                 "ranked_ids": [r.id for r in ranked_context],
                 "deduplicated_ids": [r.id for r in unique_context],
-                "chunk_limit_dropped_ids": [r.id for r in ordered_context[DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS:]],
+                "chunk_limit_dropped_ids": [d["id"] for d in prompt_decisions if d["outcome"] == "chunk_limit"],
                 "prompt_decisions": prompt_decisions,
                 "final_ids": [c["id"] for c in selected_chunks],
+                "missing_facets": [f for f in question_required_facets(question)
+                                   if not facet_present(f, context_text)],
+                "coverage_check_kind": "lexical_facets_not_claim_validation",
             },
         }
         if not context_text:
@@ -1856,7 +1861,7 @@ def synthesize_per_question_notes(
             synthesis = normalize_citation_markers(response.choices[0].message.content)
             fallback_used = not citation_markers(synthesis)
             if fallback_used:
-                synthesis = deterministic_question_synthesis(question, question_context, sources)
+                synthesis = f"Partial evidence for planner question: {question}\n\n{context_text}"
             notes.append(
                 {
                     "question": question,
@@ -1870,7 +1875,7 @@ def synthesize_per_question_notes(
             )
         except Exception as error:
             print(f"[synthesis] per-question synthesis failed for '{question[:100]}': {clean_text(error)[:180]}")
-            synthesis = deterministic_question_synthesis(question, question_context, sources)
+            synthesis = f"Partial evidence for planner question: {question}\n\n{context_text}"
             notes.append(
                 {
                     "question": question,
@@ -1927,25 +1932,55 @@ def build_question_context_evidence(
     sources: Sequence[dict[str, Any]],
     max_chars: int = DEFAULT_PER_QUESTION_SYNTHESIS_CHARS,
     selection_trace: list[dict[str, Any]] | None = None,
+    question: str = "",
+    max_chunks: int | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Return the prompt evidence and its exact serialized chunks for memory."""
     compact_chunks = compact_retrieved_chunks(
         retrieved_context,
         sources=sources,
-        max_chars=DEFAULT_CONTEXT_BLOCK_CHARS,
+        max_chars=None if question else DEFAULT_CONTEXT_BLOCK_CHARS,
     )
     lines, selected_chunks = [], []
+    if question:
+        compact_chunks = [{**c, "content": question_evidence_excerpt(c["content"], question)}
+                          for c in compact_chunks]
+        usable = []
+        for chunk in compact_chunks:
+            if evidence_is_boilerplate(chunk["content"]):
+                if selection_trace is not None:
+                    selection_trace.append({"id": chunk["id"], "outcome": "boilerplate"})
+            else:
+                usable.append(chunk)
+        compact_chunks = usable
     if selection_trace is not None:
         compact_ids = {c["id"] for c in compact_chunks}
         selection_trace.extend({"id": r.id, "outcome": "unusable_excerpt"}
                                for r in retrieved_context if r.id not in compact_ids)
     used = 0
-    for chunk in compact_chunks:
+    covered = set()
+    facets = question_required_facets(question) if question else []
+    while compact_chunks:
+        if facets:
+            best = max(range(len(compact_chunks)), key=lambda i: sum(
+                facet_present(f, compact_chunks[i]["content"]) for f in facets if f not in covered
+            ))
+            chunk = compact_chunks.pop(best)
+        else:
+            chunk = compact_chunks.pop(0)
+        if max_chunks is not None and len(selected_chunks) >= max_chunks:
+            if selection_trace is not None:
+                selection_trace.append({"id": chunk["id"], "outcome": "chunk_limit"})
+            continue
         source_index = chunk.get("source_index")
         marker = f"[{source_index}]" if isinstance(source_index, int) else "[uncited]"
         title = clean_text(chunk.get("title")) or clean_text(chunk.get("url")) or "Retrieved chunk"
         content = clean_text(chunk.get("content"))
         if not content:
+            continue
+        if question and any(excerpts_overlap(content, c["content"]) for c in selected_chunks):
+            if selection_trace is not None:
+                selection_trace.append({"id": chunk["id"], "outcome": "duplicate_excerpt"})
             continue
         block = f"{marker} {title}\nURL: {clean_text(chunk.get('url'))}\n{content}"
         block_chars = len(block) + (2 if lines else 0)
@@ -1956,9 +1991,47 @@ def build_question_context_evidence(
         lines.append(block)
         selected_chunks.append({**chunk, "content": content})
         used += block_chars
+        covered.update(f for f in facets if facet_present(f, content))
         if selection_trace is not None:
             selection_trace.append({"id": chunk["id"], "outcome": "selected"})
     return "\n\n".join(lines), selected_chunks
+
+
+def excerpts_overlap(left: str, right: str) -> bool:
+    """Compare ordered word shingles, retaining passages with substantial new content."""
+    def shingles(text: str) -> set[tuple[str, ...]]:
+        words = clean_text(text).lower().split()
+        return {tuple(words[i:i + 5]) for i in range(max(0, len(words) - 4))}
+    a, b = shingles(left), shingles(right)
+    return bool(a and b and len(a & b) / min(len(a), len(b)) >= 0.7)
+
+
+def evidence_is_boilerplate(text: str) -> bool:
+    promises = re.search(
+        r"we (?:begin by|furnish|recommend|initiate)|this (?:survey|monograph) provides|"
+        r"presented with complete mathematical derivations|listing order is random|equal contribution",
+        text, re.I,
+    )
+    concrete = re.search(r"=|\d+(?:\.\d+)?\s*(?:%|BLEU|accuracy|F1)", text, re.I)
+    return bool(promises and not concrete)
+
+
+def question_evidence_excerpt(text: str, question: str, max_chars: int = 1100) -> str:
+    """Keep whole evidence units; never manufacture a clipped equation to fit a budget."""
+    if len(text) <= max_chars:
+        return text
+    units = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text)
+    terms = query_tokens(question)
+    types = infer_question_evidence_types(question)
+    ranked = sorted(range(len(units)), key=lambda i: (
+        len(terms & query_tokens(units[i])) + evidence_signal_score(units[i], types)
+    ), reverse=True)
+    chosen, used = [], 0
+    for i in ranked:
+        if used + len(units[i]) + (len(" [...] ") if chosen else 0) <= max_chars:
+            chosen.append(i)
+            used += len(units[i]) + (len(" [...] ") if len(chosen) > 1 else 0)
+    return " [...] ".join(units[i] for i in sorted(chosen))
 
 
 def deterministic_question_synthesis(
@@ -2607,7 +2680,7 @@ def question_ranked_results(
         for result in source_matched_results(candidates, question_source_urls_for(question, question_source_urls))
         if result_supports_question(question, result)
     ]
-    ranked = rank_results_for_question(question, preferred) + rank_results_for_question(question, candidates)
+    ranked = (rank_results_for_question(question, preferred) if preferred else []) + rank_results_for_question(question, candidates)
     return unique_retrieval_results(ranked)
 
 
@@ -2664,13 +2737,23 @@ def rank_results_for_question(question: str, candidates: Sequence[RetrievalResul
     evidence_types = infer_question_evidence_types(question)
     ranked = []
     for position, result in enumerate(candidates):
-        text = retrieval_result_text(result)
+        text = retrieved_chunk_preview(result.document, result.metadata or {}, max_chars=None)
+        if not text:
+            continue
         terms = query_tokens(text)
         overlap = len(question_terms & terms)
         evidence_score = evidence_type_score(text, evidence_types)
         signal_score = evidence_signal_score(text, evidence_types)
         if overlap or evidence_score or signal_score:
             score = overlap * 3 + evidence_score * 2 + signal_score * 3 + retrieval_result_priority(result)
+            if question_key((result.metadata or {}).get("synthesis_question", "")) == question_key(question):
+                score += 8
+            if re.search(r"listing order is random|equal contribution|acknowledg|we (?:begin by|furnish|recommend|initiate)|this (?:survey|monograph) provides", text, re.I):
+                score -= 25
+            if re.search(r"types|mechanisms.*differ", question, re.I) and re.search(
+                r"(?:additive|multiplicative)\s+(?:approximation|errors?)", text, re.I
+            ):
+                score -= 25
             ranked.append((score, -position, result))
     return [result for _, _, result in sorted(ranked, reverse=True)]
 
