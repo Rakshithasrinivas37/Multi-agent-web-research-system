@@ -595,6 +595,80 @@ class ReportEvidenceContractTests(unittest.TestCase):
         self.assertIn("softmax", repaired)
         self.assertNotIn("evidence is incomplete", repaired.lower())
 
+    def test_quality_validator_flags_topic_section_ending_with_connector(self):
+        report = (
+            "## 3. Topic Sections\n"
+            "### 3.1. Mathematical Formulation Of Scaled Dot-product Attention Including Equation\n"
+            "The supplied diagram shows a configuration with\n\n"
+            "## References\n[1] https://example.org/source"
+        )
+
+        issues = report_agent.report_quality_issues(report, fixture_context()["sources"])
+
+        self.assertTrue(any("truncated topic sections: 3.1" in issue for issue in issues))
+
+    def test_targeted_topic_repair_replaces_truncated_section(self):
+        context = fixture_context()
+        report = (
+            "## 3. Topic Sections\n"
+            "### 3.1. Mathematical Formulation Of Scaled Dot-product Attention Including Equation\n"
+            "Scaled dot-product attention uses query-key scores and values [1].\n"
+            "The supplied diagram shows a configuration with"
+        )
+        notes = report_agent.per_question_synthesis_by_question(context["per_question_synthesis"])
+        packs = {report_agent.normalize_heading(item["question"]): item for item in context["evidence_packs"]}
+
+        repaired, diagnostics = report_agent.repair_report_topic_sections(
+            report, [QUESTION], packs, notes, context["sources"]
+        )
+
+        self.assertTrue(diagnostics)
+        self.assertNotIn("configuration with", repaired)
+        self.assertIn("Core equation", repaired)
+
+    def test_benchmark_citation_repair_uses_source_containing_exact_metric(self):
+        question = "What benchmark results were reported for machine translation?"
+        contract = {
+            "question": question,
+            "supported": "The Transformer achieved 28.4 BLEU on WMT 2014 English-to-German [3].",
+            "retrieved_chunks": [
+                {"source_index": 2, "content": "Linformer reduces attention complexity."},
+                {"source_index": 3, "content": "The model achieved 28.4 BLEU on WMT 2014 English-to-German."},
+            ],
+        }
+        report = (
+            "## 3. Topic Sections\n"
+            "### 3.1. Machine Translation Benchmarks\n"
+            "The Transformer achieved 28.4 BLEU on WMT 2014 English-to-German [2]."
+        )
+
+        repaired, repairs = report_agent.repair_benchmark_citations(
+            report, [question], {report_agent.normalize_heading(question): contract}
+        )
+
+        self.assertTrue(repairs)
+        self.assertIn("English-to-German [3].", repaired)
+        self.assertNotIn("English-to-German [2].", repaired)
+        self.assertEqual(
+            report_agent.benchmark_citation_issues(
+                repaired, [question], {report_agent.normalize_heading(question): contract}
+            ),
+            [],
+        )
+
+    def test_validation_flags_api_gap_disproved_by_same_section(self):
+        question = "Which PyTorch APIs implement attention?"
+        report = (
+            "## 3. Topic Sections\n"
+            "### 3.1. PyTorch Attention APIs\n"
+            "PyTorch provides `torch.nn.MultiheadAttention` for multi-head attention [1].\n"
+            "The supplied evidence does not identify exact API class names."
+        )
+
+        issues = report_agent.report_internal_gap_contradictions(report, [question])
+
+        self.assertEqual(issues, [f"section claims a supplied API identifier is missing: {question}"])
+
     def test_all_gap_topic_fails_when_only_question_pack_has_clean_evidence(self):
         gap_report = (
             "## 3. Topic Sections\n"
