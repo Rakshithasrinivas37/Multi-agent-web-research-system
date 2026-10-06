@@ -197,8 +197,8 @@ def _hybrid_retrieve_candidates(
         metadata={"query": query, "top_k": top_k, "semantic_k": semantic_k, "bm25_k": bm25_k},
     )
     top_k = max(1, top_k)
-    semantic_k = max(top_k, semantic_k)
-    bm25_k = max(top_k, bm25_k)
+    semantic_k = max(1, semantic_k)
+    bm25_k = max(1, bm25_k)
 
     clean_history_keys = clean_history_key_list(history_keys)
     if clean_history_keys:
@@ -625,9 +625,7 @@ def semantic_search(
     rows = []
 
     print(f"[semantic_search] Retrieved {len(results)} results for query: {query}\n")
-    for index, (document, score) in enumerate(results):
-        print(f"[semantic_search] Result {index + 1}/{len(results)} | ID: {document_id(document)} | Score: {score}\n{document.page_content}\n")
-
+    
     for index, (document, score) in enumerate(results):
         rows.append(
             RetrievalResult(
@@ -685,9 +683,6 @@ def bm25_search(
     rows = []
     print(f"[bm25_search] Retrieved {len(ranked_documents)} results for query: {query}\n")
 
-    for index, document in enumerate(ranked_documents[: max(1, bm25_k)], start=1):
-        print(f"[bm25_search] Result {index}/{len(ranked_documents)} | ID: {document_id(document)}\n{document.page_content}\n")
-    
     for bm25_rank, document in enumerate(ranked_documents[: max(1, bm25_k)], start=1):
         rows.append(
             RetrievalResult(

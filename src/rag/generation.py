@@ -79,7 +79,7 @@ DEFAULT_MAX_CONTEXT_CHARS = 12000
 DEFAULT_MAX_TOKENS = 900
 DEFAULT_REPORT_MAX_TOKENS = 900
 DEFAULT_REPORT_TOP_K = 20
-DEFAULT_REPORT_PER_QUERY_K = 25
+DEFAULT_REPORT_PER_QUERY_K = 20
 DEFAULT_REPORT_SEMANTIC_WEIGHT = 0.30
 DEFAULT_REPORT_BM25_WEIGHT = 0.30
 DEFAULT_REPORT_AUTHORITY_WEIGHT = 0.15
@@ -191,7 +191,7 @@ def synthesize_report_from_research_plan(
     bm25_scan_limit: int = DEFAULT_BM25_SCAN_LIMIT,
     embedding_device: str = "",
     diversify_urls: bool = True,
-    rerank: bool = False,
+    rerank: bool = True,
     reranker_model: str = DEFAULT_RERANKER_MODEL,
     rerank_k: int = DEFAULT_RERANK_K,
     rerank_weight: float = DEFAULT_RERANK_WEIGHT,
