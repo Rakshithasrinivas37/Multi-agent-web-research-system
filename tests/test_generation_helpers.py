@@ -2006,6 +2006,7 @@ Missing Evidence: exact benchmark values are not present.
         with (
             patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", return_value=initial),
             patch("src.rag.sub_question_context.facet_rescue_context_retrieve", return_value=rescued) as facet_scan,
+            patch("src.rag.sub_question_context.browser_question_context_retrieve", return_value=[]) as browser_retrieve,
         ):
             groups = retrieve_sub_question_context_groups(
                 research_plan={"sub_questions": [question]},
@@ -2033,7 +2034,10 @@ Missing Evidence: exact benchmark values are not present.
         selected_ids = {result.id for result in groups[0]["chunks"]}
 
         facet_scan.assert_called_once()
+        browser_retrieve.assert_not_called()
         self.assertIn("facet_scan", groups[0]["fallback_sources"])
+        self.assertNotIn("browser_results", groups[0]["fallback_sources"])
+        self.assertEqual(groups[0]["selection_trace"]["browser_generation_reason"], "skipped")
         self.assertEqual({"linformer", "longformer", "performer"}, selected_ids)
 
     def test_retrieve_sub_question_context_groups_scans_collection_when_hybrid_empty(self):
