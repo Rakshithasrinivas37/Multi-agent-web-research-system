@@ -145,7 +145,11 @@ class ReportAgent:
             )
         report = normalize_final_report(report, sources)
         report, repairs = cleanup_report(report, sources)
-        validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
+        report, benchmark_repairs = repair_benchmark_citations(report, questions, evidence_contracts)
+        repairs.extend(benchmark_repairs)
+        validation = validate_report(
+            report, sources, questions, evidence_packs, synthesis_items, evidence_contracts
+        )
         revision_diagnostics = {"attempted": False, "accepted": False, "error": "", "rejection_reason": ""}
         if llm_generated and (
             validation["issues"] or validation["schema_issues"]
@@ -163,7 +167,13 @@ class ReportAgent:
             if revised:
                 revised = normalize_final_report(revised, sources)
                 revised, revision_repairs = cleanup_report(revised, sources)
-                revised_validation = validate_report(revised, sources, questions, evidence_packs, synthesis_items)
+                revised, revision_benchmark_repairs = repair_benchmark_citations(
+                    revised, questions, evidence_contracts
+                )
+                revision_repairs.extend(revision_benchmark_repairs)
+                revised_validation = validate_report(
+                    revised, sources, questions, evidence_packs, synthesis_items, evidence_contracts
+                )
                 preserves_unaffected = revision_preserves_unaffected_topics(
                     report, revised, questions, validation
                 )
@@ -201,7 +211,13 @@ class ReportAgent:
             if topic_repairs:
                 repaired = normalize_final_report(repaired, sources)
                 repaired, topic_cleanup = cleanup_report(repaired, sources)
-                repaired_validation = validate_report(repaired, sources, questions, evidence_packs, synthesis_items)
+                repaired, repaired_benchmark_citations = repair_benchmark_citations(
+                    repaired, questions, evidence_contracts
+                )
+                topic_cleanup.extend(repaired_benchmark_citations)
+                repaired_validation = validate_report(
+                    repaired, sources, questions, evidence_packs, synthesis_items, evidence_contracts
+                )
                 if report_validation_score(repaired_validation, repaired, questions) <= report_validation_score(validation, report, questions):
                     report, validation = repaired, repaired_validation
                     repairs.extend(topic_cleanup)
@@ -211,12 +227,16 @@ class ReportAgent:
         report, frame_repairs = repair_uncited_frame_sections(report, sources)
         if frame_repairs:
             repairs.extend(frame_repairs)
-            validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
+            validation = validate_report(
+                report, sources, questions, evidence_packs, synthesis_items, evidence_contracts
+            )
 
         report, limitations_repaired = enforce_evidence_limitations(report, questions, evidence_contracts)
         if limitations_repaired:
             repairs.append("rebuilt limitations from question evidence contracts")
-            validation = validate_report(report, sources, questions, evidence_packs, synthesis_items)
+            validation = validate_report(
+                report, sources, questions, evidence_packs, synthesis_items, evidence_contracts
+            )
 
         final_coverage = report_sub_question_coverage_check(report, questions)
         revision_diagnostics["remaining_issue_count"] = (
@@ -417,7 +437,7 @@ def build_report_prompt(
     </priority_order>
 
     <final_check>
-    Before answering, silently verify: (1) every factual sentence has a valid marker from the map; (2) sections follow question order; (3) the Limitations section contains only recorded gaps; (4) no claim exceeds its excerpt; (5) no section duplicates another.
+    Before answering, silently verify: (1) every factual sentence has a valid marker from the map; (2) each benchmark value cites the excerpt containing that exact value; (3) sections follow question order; (4) the Limitations section contains only recorded gaps; (5) no claim exceeds its excerpt; (6) every prose sentence is complete and no section ends mid-sentence; (7) no section duplicates another.
     </final_check>
 
     <output>
@@ -761,7 +781,14 @@ def repair_report_topic_sections(
             and not section_has_supported_cited_content(section)
             and has_question_evidence
         )
-        if section and section_satisfies_required_evidence(question, section) and not gap_only_despite_evidence:
+        internal_gap_contradiction = bool(section and section_internal_gap_contradictions(section))
+        if (
+            section
+            and section_satisfies_required_evidence(question, section)
+            and not gap_only_despite_evidence
+            and not internal_gap_contradiction
+            and not section_appears_truncated(section)
+        ):
             continue
         fallback, diagnostic = build_topic_section(index, question, pack, note, sources)
         text = replace_numbered_topic_section(text, expected, fallback)
@@ -1075,15 +1102,33 @@ def definition_note_from_evidence(pack: dict[str, Any], synthesis_note: dict[str
 def benchmark_note_from_evidence(pack: dict[str, Any], synthesis_note: dict[str, Any]) -> str:
     text = re.sub(r"[\u00a0\u202f\u2009]", " ", evidence_text_for_requirement(pack, synthesis_note))
     text = text.replace("‑", "-").replace("–", "-").replace("—", "-")
-    marker = format_citation_indexes(dedupe_ints([*pack_source_indexes(pack), *per_question_synthesis_source_indexes(synthesis_note)])[:2])
-    if not marker:
-        return ""
     notes = []
     if re.search(r"WMT\s*2014[^.]{0,120}English\S*to\S*German|English\S*to\S*German[^.]{0,120}WMT\s*2014", text, flags=re.I) and re.search(r"28\.4\s*BLEU", text, flags=re.I):
-        notes.append(f"On WMT 2014 English-to-German, the attention-only Transformer result is reported as 28.4 BLEU {marker}.")
+        marker = benchmark_metric_marker(pack, synthesis_note, "28.4 BLEU")
+        if marker:
+            notes.append(f"On WMT 2014 English-to-German, the attention-only Transformer result is reported as 28.4 BLEU {marker}.")
     if re.search(r"WMT\s*2014[^.]{0,120}English\S*to\S*French|English\S*to\S*French[^.]{0,120}WMT\s*2014", text, flags=re.I) and re.search(r"41\.8\s*BLEU", text, flags=re.I):
-        notes.append(f"On WMT 2014 English-to-French, the reported single-model result is 41.8 BLEU {marker}.")
+        marker = benchmark_metric_marker(pack, synthesis_note, "41.8 BLEU")
+        if marker:
+            notes.append(f"On WMT 2014 English-to-French, the reported single-model result is 41.8 BLEU {marker}.")
     return "\n\n".join(notes)
+
+
+def benchmark_metric_marker(pack: dict[str, Any], synthesis_note: dict[str, Any], metric: str) -> str:
+    """Return only source markers attached to evidence containing the exact metric."""
+    target = re.sub(r"\s+", "", clean_text(metric)).lower()
+    indexes = []
+    for chunk in sequence_items(pack.get("chunks")) if isinstance(pack, dict) else []:
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("source_index"), int):
+            continue
+        content = re.sub(r"\s+", "", clean_text(chunk.get("content"))).lower()
+        if target in content:
+            indexes.append(chunk["source_index"])
+    synthesis = synthesis_note.get("synthesis") if isinstance(synthesis_note, dict) else ""
+    for sentence in split_sentences(synthesis):
+        if target in re.sub(r"\s+", "", clean_text(sentence)).lower():
+            indexes.extend(citation_markers(sentence))
+    return format_citation_indexes(dedupe_ints(indexes))
 
 
 def complexity_note_from_evidence(pack: dict[str, Any], synthesis_note: dict[str, Any]) -> str:
@@ -1493,6 +1538,8 @@ def report_sentence_quality(sentence: Any, require_citation: bool = True, allow_
         return False
     if re.search(r"\b\d+\.\d+\.\d+\b|\bFigure\s+\d+\b", value, flags=re.I):
         return False
+    if prose_appears_truncated(value):
+        return False
     return True
 
 
@@ -1698,7 +1745,14 @@ def repair_headings(markdown: str) -> str:
     return clean_markdown("\n".join(lines))
 
 
-def validate_report(report: str, sources: Sequence[dict[str, Any]], questions: Sequence[str], evidence_packs: Sequence[dict[str, Any]], per_question_synthesis: Sequence[dict[str, Any]] = ()) -> dict[str, Any]:
+def validate_report(
+    report: str,
+    sources: Sequence[dict[str, Any]],
+    questions: Sequence[str],
+    evidence_packs: Sequence[dict[str, Any]],
+    per_question_synthesis: Sequence[dict[str, Any]] = (),
+    evidence_contracts: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     issues = report_quality_issues(report, sources)
     schema_issues = report_schema_issues(report, questions)
     citation_gap_questions = report_pack_citation_gaps(report, evidence_packs, questions, per_question_synthesis)
@@ -1707,7 +1761,11 @@ def validate_report(report: str, sources: Sequence[dict[str, Any]], questions: S
     issues.extend(equation_issues)
     relevance_issues = report_topic_relevance_issues(report, questions)
     false_gaps = report_evidence_gap_contradictions(report, questions, per_question_synthesis, evidence_packs)
+    benchmark_issues = benchmark_citation_issues(report, questions, evidence_contracts or {})
+    internal_gap_issues = report_internal_gap_contradictions(report, questions)
     issues.extend(relevance_issues)
+    issues.extend(benchmark_issues)
+    issues.extend(internal_gap_issues)
     issues.extend(f"report discards cited supported findings and labels the topic a gap: {q}" for q in false_gaps)
     issues.extend(f"report section does not cite supplied evidence: {q}" for q in citation_gap_questions)
     return {
@@ -1717,6 +1775,8 @@ def validate_report(report: str, sources: Sequence[dict[str, Any]], questions: S
         "equation_issues": equation_issues,
         "false_gap_questions": false_gaps,
         "topic_relevance_issues": relevance_issues,
+        "benchmark_citation_issues": benchmark_issues,
+        "internal_gap_issues": internal_gap_issues,
     }
 
 
@@ -1841,6 +1901,40 @@ def report_evidence_gap_contradictions(
     return dedupe_text(contradictions)
 
 
+def section_internal_gap_contradictions(section: Any) -> list[str]:
+    """Find explicit gap claims disproved by content in the same topic section."""
+    body = strip_leading_heading(clean_markdown(section))
+    non_gap_text = " ".join(
+        sentence for sentence in split_sentences(body) if not line_has_gap_claim(sentence)
+    )
+    contradictions = []
+    has_api_identifier = bool(re.search(
+        r"\b(?:torch\.nn\.MultiheadAttention|scaled_dot_product_attention|"
+        r"tf\.keras\.layers\.MultiHeadAttention|keras\.layers\.MultiHeadAttention)\b",
+        non_gap_text,
+        flags=re.I,
+    ))
+    has_benchmark = bool(benchmark_metric_tokens(non_gap_text))
+    for sentence in split_sentences(body):
+        if not line_has_gap_claim(sentence):
+            continue
+        lowered = clean_text(sentence).lower()
+        if has_api_identifier and re.search(r"\b(?:api|class|function|method|identifier|name)s?\b", lowered):
+            contradictions.append("API identifier")
+        if has_benchmark and re.search(r"\b(?:benchmark|metric|score|result|value)s?\b", lowered):
+            contradictions.append("benchmark metric")
+    return dedupe_text(contradictions)
+
+
+def report_internal_gap_contradictions(report: str, questions: Sequence[str]) -> list[str]:
+    issues = []
+    for question in questions:
+        section = report_section_for_question(report, question, questions)
+        for detail in section_internal_gap_contradictions(section):
+            issues.append(f"section claims a supplied {detail} is missing: {question}")
+    return dedupe_text(issues)
+
+
 def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None = None, evidence_text: str = "") -> list[str]:
     text, issues = clean_markdown(report), []
     if not text:
@@ -1869,6 +1963,9 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
     weak = weak_topic_headings(text)
     if weak:
         issues.append(f"report contains weak topic headings: {', '.join(weak[:4])}")
+    truncated = truncated_topic_section_numbers(text)
+    if truncated:
+        issues.append(f"report contains truncated topic sections: {', '.join(truncated[:4])}")
     uncited_frames = uncited_factual_frame_sections(text)
     if uncited_frames:
         issues.append(f"report contains uncited factual prose in frame sections: {', '.join(uncited_frames)}")
@@ -1876,6 +1973,61 @@ def report_quality_issues(report: str, sources: Sequence[dict[str, Any]] | None 
     if invalid:
         issues.append(f"report uses unavailable citations: {format_citation_indexes(invalid)}")
     return dedupe_text(issues)
+
+
+TRAILING_PROSE_CONNECTORS = {
+    "a", "an", "and", "as", "at", "because", "by", "for", "from", "in", "including",
+    "into", "of", "on", "or", "such", "than", "that", "the", "through", "to", "via",
+    "when", "where", "which", "while", "with",
+}
+
+
+def prose_appears_truncated(text: Any) -> bool:
+    """Detect prose that ends before its grammatical completion."""
+    value = strip_markdown(text).strip()
+    if not value or value.startswith(("http://", "https://")):
+        return False
+    if value.count("(") != value.count(")") or value.count("{") != value.count("}"):
+        return True
+    without_terminal = value.rstrip(".!?;:,'\"”’)]}")
+    words = re.findall(r"[A-Za-z]+", without_terminal.lower())
+    if not words:
+        return False
+    if words[-1] in TRAILING_PROSE_CONNECTORS:
+        return True
+    return bool(re.search(r"\b(?:for example|such as|consists? of|configuration with|defined as)\s*$", without_terminal, re.I))
+
+
+def section_appears_truncated(section: Any) -> bool:
+    """Check the final prose line in a topic section while ignoring equations and tables."""
+    candidates, in_fence, in_math = [], False, False
+    for raw_line in clean_markdown(section).splitlines():
+        line = clean_text(raw_line)
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if line == r"\[":
+            in_math = True
+            continue
+        if line == r"\]":
+            in_math = False
+            continue
+        if in_fence or in_math or line.startswith("|") or re.fullmatch(r"[|\s:-]+", line):
+            continue
+        if line.startswith(("**Core equation:**", "Source:")):
+            continue
+        candidates.append(line.lstrip("-* "))
+    return bool(candidates and prose_appears_truncated(candidates[-1]))
+
+
+def truncated_topic_section_numbers(report: str) -> list[str]:
+    return [
+        heading.split()[0].rstrip(".")
+        for heading, section in markdown_sections(report)
+        if re.match(r"^3\.\d+\b", heading) and section_appears_truncated(section)
+    ]
 
 
 def executive_conclusion_overlap(report: str) -> list[str]:
@@ -2561,6 +2713,92 @@ def split_sentences(text: Any) -> list[str]:
     return [part.strip(" -") for part in value.splitlines() if clean_text(part)]
 
 
+BENCHMARK_METRIC_RE = re.compile(
+    r"(?i)\b\d+(?:\.\d+)?\s*(?:%|BLEU|F1|ROUGE|AUC|accuracy|score|top-?1)\b"
+)
+
+
+def benchmark_metric_tokens(text: Any) -> list[str]:
+    return dedupe_text(
+        re.sub(r"\s+", "", match.group(0)).lower()
+        for match in BENCHMARK_METRIC_RE.finditer(clean_text(text))
+    )
+
+
+def benchmark_evidence_records(contract: dict[str, Any]) -> list[tuple[int, str]]:
+    records = []
+    for chunk in sequence_items(contract.get("retrieved_chunks")):
+        if isinstance(chunk, dict) and isinstance(chunk.get("source_index"), int):
+            records.append((chunk["source_index"], clean_text(chunk.get("content"))))
+    for sentence in split_sentences(contract.get("supported")):
+        for source_index in citation_markers(sentence):
+            records.append((source_index, sentence))
+    return records
+
+
+def benchmark_supporting_source_indexes(sentence: str, contract: dict[str, Any]) -> list[int]:
+    metrics = benchmark_metric_tokens(sentence)
+    if not metrics:
+        return []
+    sentence_terms = detail_terms(sentence)
+    supported = []
+    for source_index, evidence in benchmark_evidence_records(contract):
+        if not set(metrics).issubset(benchmark_metric_tokens(evidence)):
+            continue
+        shared_terms = sentence_terms & detail_terms(evidence)
+        if shared_terms.intersection({"bleu", "wmt", "glue", "imagenet", "accuracy", "score", "f1", "top-1"}):
+            supported.append(source_index)
+    return dedupe_ints(supported)
+
+
+def benchmark_citation_issues(
+    report: str,
+    questions: Sequence[str],
+    evidence_contracts: dict[str, dict[str, Any]],
+) -> list[str]:
+    issues = []
+    for question in questions:
+        contract = evidence_contracts.get(normalize_heading(question), {})
+        section = report_section_for_question(report, question, questions)
+        if not contract or not section:
+            continue
+        for sentence in split_sentences(strip_leading_heading(section)):
+            if not benchmark_metric_tokens(sentence):
+                continue
+            supporting = benchmark_supporting_source_indexes(sentence, contract)
+            if supporting and set(citation_markers(sentence)).isdisjoint(supporting):
+                issues.append(f"benchmark value cites a source that does not contain the metric: {question}")
+                break
+    return dedupe_text(issues)
+
+
+def repair_benchmark_citations(
+    report: str,
+    questions: Sequence[str],
+    evidence_contracts: dict[str, dict[str, Any]],
+) -> tuple[str, list[str]]:
+    """Replace benchmark markers when the evidence identifies supporting sources."""
+    text, repairs = clean_markdown(report), []
+    for question in questions:
+        contract = evidence_contracts.get(normalize_heading(question), {})
+        section = report_section_for_question(text, question, questions)
+        if not contract or not section:
+            continue
+        repaired_section = section
+        for sentence in split_sentences(strip_leading_heading(section)):
+            supporting = benchmark_supporting_source_indexes(sentence, contract)
+            cited = citation_markers(sentence)
+            if not supporting or not cited or not set(cited).isdisjoint(supporting):
+                continue
+            replacement = re.sub(r"(?:\s*\[\d+\])+", "", sentence).rstrip(" .")
+            replacement = f"{replacement} {format_citation_indexes(supporting)}."
+            repaired_section = repaired_section.replace(sentence, replacement)
+            repairs.append(f"routed benchmark citation to supporting source for: {question}")
+        if repaired_section != section:
+            text = text.replace(section, repaired_section, 1)
+    return text, dedupe_text(repairs)
+
+
 def trim_clipped_fragments(text: str) -> str:
     value = clean_markdown(text)
     cleaned_lines = [
@@ -2583,7 +2821,12 @@ def line_has_gap_claim(line: Any) -> bool:
 
 
 def evidence_gap_pattern() -> str:
-    return r"(evidence\s+gap|evidence\s+is\s+incomplete|missing\s+required\s+evidence|missing\s+evidence|not\s+provided|not\s+available|not\s+present|insufficient|incomplete|partial|cannot\s+be\s+(?:answered|provided))"
+    return (
+        r"(evidence\s+gap|evidence\s+is\s+incomplete|missing\s+required\s+evidence|"
+        r"missing\s+evidence|not\s+provided|not\s+available|not\s+present|"
+        r"(?:does|did)\s+not\s+(?:provide|identify|specify|include|name|state)|insufficient|"
+        r"incomplete|partial|cannot\s+be\s+(?:answered|provided))"
+    )
 
 
 def unavailable_citation_markers(text: str, available_indexes: set[int]) -> list[int]:
