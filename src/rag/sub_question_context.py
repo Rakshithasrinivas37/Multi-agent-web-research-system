@@ -29,6 +29,7 @@ from src.rag.query_helpers import (
 from src.rag.graphrag import graph_expand_question_results, graphrag_enabled
 from src.rag.retrieval import RetrievalResult, expand_parent_context_results, multi_query_hybrid_retrieve, source_url_coverage_retrieve
 from src.tools.groq_retry import create_chat_completion_with_retries
+from src.tools.tavily_search import search_with_tavily
 from src.tools.text_utils import clean_text
 
 
@@ -47,6 +48,8 @@ DEFAULT_QUERY_MAX_WORDS = 10
 DEFAULT_EVIDENCE_TAIL_TERMS = 2
 DEFAULT_NEAR_DUPLICATE_SIMILARITY = 0.58
 DEFAULT_CHUNK_DUPLICATE_SIMILARITY = 0.82
+DEFAULT_TAVILY_GAP_RESULTS_PER_QUERY = 3
+DEFAULT_TAVILY_GAP_QUERY_LIMIT = 4
 BENCHMARK_VALUE_PATTERN = re.compile(
     r"(?i)\b\d+(?:\.\d+)?\s*(?:%|bleu|rouge|f1|auc|accuracy|precision|recall|score|ms|s|hours?)\b"
 )
@@ -621,6 +624,27 @@ def retrieve_sub_question_context_groups(
             question_source_urls=question_source_urls,
             required_evidence=required_evidence,
         ) if browser_generation_reason else []
+        pre_live_candidates = helpers.merge_retrieved_context(
+            meaningful_rag_candidates,
+            browser_candidates,
+        )
+        live_search_reason = browser_candidate_generation_reason(
+            question=question,
+            candidates=helpers.meaningful_retrieval_results(pre_live_candidates),
+            final_chunks=final_chunks,
+        ) if browser_generation_reason else ""
+        live_browser_candidates = tavily_gap_context_retrieve(
+            question=question,
+            queries=query_set,
+            candidates=pre_live_candidates,
+            top_k=candidate_chunks,
+            required_evidence=required_evidence,
+        ) if live_search_reason else []
+        if live_browser_candidates:
+            browser_candidates = helpers.merge_retrieved_context(
+                browser_candidates,
+                live_browser_candidates,
+            )
 
         print(f"[synthesis] Sub-question: {question}\n")
         print(
@@ -635,6 +659,8 @@ def retrieve_sub_question_context_groups(
             
         if browser_candidates:
             fallback_sources.append("browser_results")
+            if live_browser_candidates:
+                fallback_sources.append("tavily_gap_search")
             candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
         if not candidates:
             print(f"[synthesis] no per-question chunks found for: {question[:120]}")
@@ -684,6 +710,8 @@ def retrieve_sub_question_context_groups(
                 "meaningful_rag_ids": [r.id for r in meaningful_rag_candidates],
                 "facet_selected_ids": [r.id for r in facet_selected],
                 "browser_candidate_ids": [r.id for r in browser_candidates],
+                "live_browser_candidate_ids": [r.id for r in live_browser_candidates],
+                "live_search_reason": live_search_reason or "skipped",
                 "browser_generation_reason": browser_generation_reason or "skipped",
                 "final_ids": [r.id for r in tagged],
             },
@@ -718,6 +746,86 @@ def browser_candidate_generation_reason(
     if missing_facets:
         return "missing_facets"
     return ""
+
+
+def tavily_gap_search_enabled() -> bool:
+    """Enable live missing-evidence recovery only when Tavily is configured."""
+
+    configured = bool(clean_text(os.environ.get("TAVILY_API_KEY")))
+    value = clean_text(os.environ.get("RAG_TAVILY_GAP_SEARCH", "true")).lower()
+    return configured and value not in {"0", "false", "no", "off"}
+
+
+def tavily_gap_context_retrieve(
+    question: str,
+    queries: Sequence[str],
+    candidates: Sequence[RetrievalResult],
+    top_k: int,
+    required_evidence: Sequence[str] | None = None,
+) -> list[RetrievalResult]:
+    """Search for sources that cover facets still absent from local evidence."""
+
+    if not tavily_gap_search_enabled():
+        return []
+    missing_facets = missing_facets_for_results(question, candidates)
+    search_topics = missing_facets or [question]
+    evidence_terms = " ".join(sorted(browser_evidence_query_terms(
+        question,
+        required_evidence=required_evidence,
+    ))[:6])
+    search_queries = dedupe_preserve_order(
+        clean_text(f"{question} {topic} {evidence_terms} authoritative source")
+        for topic in search_topics
+    )[:DEFAULT_TAVILY_GAP_QUERY_LIMIT]
+    results = []
+    helpers = generation_helpers()
+    for query_index, query in enumerate(search_queries):
+        try:
+            rows = search_with_tavily(query, max_results=DEFAULT_TAVILY_GAP_RESULTS_PER_QUERY)
+        except Exception as error:
+            print(f"[synthesis] Tavily gap search failed for {query!r}: {error}")
+            continue
+        for result_index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            url = clean_text(row.get("url"))
+            title = clean_text(row.get("title")) or url
+            content = clean_text(row.get("raw_content") or row.get("content") or row.get("snippet"))
+            if not url or not content:
+                continue
+            metadata = {
+                "url": url,
+                "source_url": url,
+                "title": title,
+                "source_type": "tavily",
+                "source_quality": "live_gap_search",
+                "query_contexts": query,
+            }
+            try:
+                semantic_score = float(row.get("score") or 0.0)
+            except (TypeError, ValueError):
+                semantic_score = 0.0
+            results.append(RetrievalResult(
+                id=tavily_question_chunk_id(url, content, query_index, result_index),
+                document=content,
+                metadata=metadata,
+                score=0.0,
+                semantic_score=semantic_score,
+                bm25_score=0.0,
+                authority_score=1.0 if helpers.is_primary_source(metadata) else 0.0,
+            ))
+    ranked = rank_collection_scan_results(
+        question=question,
+        queries=queries,
+        candidates=results,
+        required_evidence=required_evidence,
+    )
+    return ranked[:max(1, top_k)]
+
+
+def tavily_question_chunk_id(url: str, content: str, query_index: int, result_index: int) -> str:
+    digest = hashlib.sha1(f"{url}|{content}".encode("utf-8", errors="ignore")).hexdigest()[:24]
+    return f"tavily-question-{query_index}-{result_index}-{digest}"
 
 
 def sub_question_context_group(
@@ -1022,7 +1130,9 @@ def select_facet_covered_results(
     helpers = generation_helpers()
     results = list(ranked_results)
     facets = question_required_facets(question)
-    if not facets or not results:
+    evidence_types = infer_question_evidence_types(question)
+    concrete_types = {"equation", "complexity", "benchmark", "api"} & set(evidence_types)
+    if not results or (not facets and not concrete_types):
         return results[: max(1, limit)]
 
     selected = []
@@ -1033,6 +1143,21 @@ def select_facet_covered_results(
             if key in seen:
                 continue
             if facet_present(facet, helpers.retrieval_result_text(result)):
+                selected.append(result)
+                seen.add(key)
+                break
+
+    for evidence_type in ("equation", "complexity", "benchmark", "api"):
+        if evidence_type not in evidence_types:
+            continue
+        for result in results:
+            key = helpers.retrieval_result_key(result)
+            if key in seen:
+                continue
+            if required_evidence_signal_present(
+                helpers.retrieval_result_text(result),
+                [evidence_type],
+            ):
                 selected.append(result)
                 seen.add(key)
                 break
@@ -1085,6 +1210,8 @@ def rank_collection_scan_results(
         primary_source = helpers.is_primary_source(metadata)
         primary_signal = primary_source and signal_score
         exact_signal = signal_score >= 10
+        if facets and not facet_score and not preferred_source:
+            continue
         if not (overlap or topic_overlap or evidence_score or signal_score or facet_score or preferred_source):
             continue
         score = (
@@ -1113,6 +1240,24 @@ def rank_collection_scan_results(
     if ranked:
         return dedupe_near_duplicate_chunks(helpers.unique_retrieval_results(ranked))
     return helpers.source_balanced_results(fallback)
+
+
+def required_evidence_signal_present(text: str, evidence_types: Sequence[str]) -> bool:
+    """Reject generic overlap for questions requesting one concrete evidence form."""
+
+    requested = {clean_text(item).lower() for item in evidence_types} - {"definition", "evidence"}
+    if len(requested) != 1:
+        return True
+    evidence_type = next(iter(requested))
+    value = clean_text(text)
+    patterns = {
+        "equation": r"(?:=|softmax\s*\(|\bexp\s*\(|\bsum\s*\(|√|sqrt\s*\()",
+        "complexity": r"(?:\bO\s*\(|\bquadratic\b|\blinear complexity\b|\bmemory (?:cost|complexity|requirement)|\bsequence length\b)",
+        "benchmark": r"\b\d+(?:\.\d+)?\s*(?:%|BLEU|ROUGE|F1|AUC|accuracy|score|ms|seconds?)\b",
+        "api": r"\b(?:API|class|function|method|parameter|argument|signature|torch\.|tf\.|keras\.)\b",
+    }
+    pattern = patterns.get(evidence_type)
+    return True if not pattern else bool(re.search(pattern, value, flags=re.IGNORECASE))
 
 
 def chunk_starts_mid_word(text: str) -> bool:
@@ -1224,7 +1369,7 @@ def retrieval_audit_entries(results: Sequence[RetrievalResult]) -> list[dict[str
             "url": clean_text(metadata.get("url") or metadata.get("source_url")),
             "title": clean_text(metadata.get("title")),
             "source_type": clean_text(metadata.get("source_type")),
-            "origin": "browser" if clean_text(result.id).startswith("browser-question-") else "retrieved",
+            "origin": "browser" if clean_text(result.id).startswith(("browser-question-", "tavily-question-")) else "retrieved",
             "score": result.score,
             "semantic_score": result.semantic_score,
             "bm25_score": result.bm25_score,

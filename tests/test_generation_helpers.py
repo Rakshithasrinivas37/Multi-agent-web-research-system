@@ -61,6 +61,7 @@ from src.rag.sub_question_context import (
     select_question_first_synthesis_context,
     sub_question_retrieval_max_workers,
     sub_question_retrieval_queries,
+    tavily_gap_context_retrieve,
     valid_retrieval_queries,
 )
 from src.rag.retrieval import RetrievalResult
@@ -71,6 +72,73 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_CHARS, 0)
         self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS, 0)
         self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS, 0)
+
+    def test_application_question_extracts_each_named_domain(self):
+        facets = question_required_facets(
+            "What are the applications of attention in NLP, computer vision, and speech processing?"
+        )
+        self.assertEqual(
+            {facet.lower() for facet in facets},
+            {"nlp", "computer vision", "speech processing"},
+        )
+
+    def test_named_attention_variant_rejects_unrelated_equation(self):
+        question = "What is the mathematical equation for scaled dot-product attention?"
+        wrong = RetrievalResult(
+            id="gru-equation",
+            document="The recurrent reset gate equation is r = sigmoid(Wx + Uh) for the decoder state.",
+            metadata={"title": "Recurrent decoder", "url": "https://example.org/recurrent"},
+            score=1.0,
+            semantic_score=1.0,
+            bm25_score=0.0,
+        )
+        right = RetrievalResult(
+            id="scaled-attention",
+            document=(
+                "Scaled dot-product attention is Attention(Q,K,V)=softmax(QK^T/sqrt(d_k))V, "
+                "where queries are matched with keys and the normalized weights combine values. "
+            ) * 2,
+            metadata={"title": "Scaled dot-product attention", "url": "https://example.org/attention"},
+            score=0.5,
+            semantic_score=0.5,
+            bm25_score=0.0,
+        )
+        ranked = rank_collection_scan_results(question, [question], [wrong, right])
+        self.assertEqual([result.id for result in ranked], ["scaled-attention"])
+
+    @patch.dict("os.environ", {"TAVILY_API_KEY": "test-key"}, clear=True)
+    @patch("src.rag.sub_question_context.search_with_tavily")
+    def test_tavily_gap_retrieval_targets_missing_named_facet(self, search):
+        search.return_value = [{
+            "url": "https://www.tensorflow.org/api_docs/python/tf/keras/layers/MultiHeadAttention",
+            "title": "TensorFlow MultiHeadAttention",
+            "content": (
+                "TensorFlow provides the tf.keras.layers.MultiHeadAttention API with query, value, "
+                "key, attention_mask, and return_attention_scores parameters."
+            ) * 2,
+            "score": 0.9,
+        }]
+        existing = [RetrievalResult(
+            id="pytorch",
+            document="PyTorch MultiheadAttention implements multi-head attention with query key and value tensors.",
+            metadata={"title": "PyTorch MultiheadAttention", "url": "https://pytorch.org/docs/stable/mha"},
+            score=1.0,
+            semantic_score=1.0,
+            bm25_score=0.0,
+        )]
+        question = "What APIs implement attention, including PyTorch MultiheadAttention and TensorFlow attention layers?"
+
+        results = tavily_gap_context_retrieve(
+            question=question,
+            queries=["attention library APIs"],
+            candidates=existing,
+            top_k=3,
+            required_evidence=["api"],
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].id.startswith("tavily-question-"))
+        self.assertIn("tensorflow", search.call_args.args[0].lower())
 
     @patch.dict("os.environ", {}, clear=True)
     def test_synthesis_mode_defaults_to_per_question(self):
