@@ -120,6 +120,49 @@ class SynthesisSelectedChunksTests(unittest.TestCase):
         self.assertEqual(note["selected_chunks"][0]["id"], "assigned-q1")
         self.assertEqual(note["selection_trace"]["assigned_question_chunk_ids"], ["assigned-q1"])
 
+    def test_other_question_chunks_are_excluded_from_synthesis_pool(self):
+        question = "What is attention?"
+        assigned = RetrievalResult(
+            id="assigned-q1",
+            document="Attention uses learned compatibility weights to combine value representations for a query. " * 3,
+            metadata={
+                "title": "Assigned",
+                "url": "https://example.org/assigned",
+                "synthesis_question": question,
+            },
+            score=0.2,
+            semantic_score=0.2,
+            bm25_score=0.0,
+        )
+        other = RetrievalResult(
+            id="other-q2",
+            document="An unrelated benchmark reports a much stronger numerical score for a different question. " * 3,
+            metadata={
+                "title": "Other",
+                "url": "https://example.org/other",
+                "synthesis_question": "What benchmarks exist?",
+            },
+            score=100.0,
+            semantic_score=1.0,
+            bm25_score=0.0,
+        )
+        _, sources = generation.build_generation_context([assigned, other])
+
+        with patch.object(generation, "create_chat_completion_with_retries", return_value=self.response) as complete:
+            note = generation.synthesize_per_question_notes(
+                object(), "mock-model", "Attention", "Summarize evidence",
+                [question], [assigned, other], sources,
+            )[0]
+
+        selected_ids = [chunk["id"] for chunk in note["selected_chunks"]]
+        self.assertEqual(selected_ids, ["assigned-q1"])
+        self.assertEqual(note["selection_trace"]["input_chunks"][0]["id"], "assigned-q1")
+        self.assertEqual(note["selection_trace"]["global_input_chunk_count"], 2)
+        self.assertEqual(note["selection_trace"]["excluded_other_question_chunk_ids"], ["other-q2"])
+        prompt = complete.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("learned compatibility weights", prompt)
+        self.assertNotIn("unrelated benchmark", prompt)
+
     def test_failure_keeps_evidence_sent_in_attempted_prompt(self):
         with patch.object(generation, "rank_results_for_question", return_value=self.results), \
              patch.object(generation, "create_chat_completion_with_retries", side_effect=RuntimeError("service unavailable")):

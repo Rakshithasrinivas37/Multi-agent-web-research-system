@@ -1777,7 +1777,19 @@ def synthesize_per_question_notes(
             result for result in retrieved_context
             if question_key((result.metadata or {}).get("synthesis_question", "")) == question_key(question)
         ]
-        ranked_context = question_ranked_results(question, retrieved_context, question_source_urls)
+        tagged_context = [
+            result for result in retrieved_context
+            if question_key((result.metadata or {}).get("synthesis_question", ""))
+        ]
+        unassigned_context = [
+            result for result in retrieved_context
+            if not question_key((result.metadata or {}).get("synthesis_question", ""))
+        ]
+        # Retrieval groups tag every selected chunk with its planner question. Once
+        # those tags exist, evidence assigned to another question must never enter
+        # this prompt. Untagged context is retained only for legacy/direct callers.
+        scoped_context = assigned_context if tagged_context else unassigned_context
+        ranked_context = question_ranked_results(question, scoped_context, question_source_urls)
         unique_context = unique_retrieval_results(ranked_context)
         # Reserve a slot for each relevant planner-linked source before filling by rank.
         preferred = []
@@ -1802,7 +1814,11 @@ def synthesize_per_question_notes(
             "selected_chunk_count": len(selected_chunks),
             "context_chars": len(context_text),
             "selection_trace": {
-                "input_chunks": retrieval_trace_entries(retrieved_context),
+                "input_chunks": retrieval_trace_entries(scoped_context),
+                "global_input_chunk_count": len(retrieved_context),
+                "excluded_other_question_chunk_ids": [
+                    result.id for result in tagged_context if result not in assigned_context
+                ],
                 "assigned_question_chunk_ids": [r.id for r in assigned_context],
                 "preferred_source_urls": question_source_urls_for(question, question_source_urls),
                 "ranked_ids": [r.id for r in ranked_context],
@@ -2996,7 +3012,7 @@ def synthesis_prompt_chunk_origins(chunks: Sequence[dict[str, Any]]) -> list[dic
     for chunk in chunks:
         chunk_id = clean_text(chunk.get("id"))
         source_type = clean_text(chunk.get("source_type"))
-        origin = "browser" if chunk_id.startswith("browser-question-") else "retrieved"
+        origin = "browser" if chunk_id.startswith(("browser-question-", "tavily-question-")) else "retrieved"
         summaries.append(
             {
                 "id": chunk_id,
