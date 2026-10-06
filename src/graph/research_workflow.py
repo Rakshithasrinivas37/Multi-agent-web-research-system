@@ -391,7 +391,7 @@ def report_node(state: ResearchState) -> ResearchState:
             "errors": [*state.get("errors", []), *report_errors],
         }
 
-    report_agent.write_to_memory(report, memory_path)
+    report_agent.write_to_memory(report, memory_path, report_context=report_context)
     return {
         **state,
         "report": report,

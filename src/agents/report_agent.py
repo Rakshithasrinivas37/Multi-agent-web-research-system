@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -254,6 +256,15 @@ class ReportAgent:
             "report": report,
             "sources": sources,
             "model": self.model,
+            "report_agent_chunks_by_question": [
+                {
+                    "question": question,
+                    "chunks": sequence_items(
+                        evidence_contracts.get(normalize_heading(question), {}).get("retrieved_chunks")
+                    ),
+                }
+                for question in questions
+            ],
             "diagnostics": {
                 "source_count": len(sources),
                 "evidence_pack_count": len(evidence_packs),
@@ -295,7 +306,12 @@ class ReportAgent:
         report_payload: dict[str, Any],
         memory_path: str = "data/shared_memory.json",
         report_path: str | None = None,
+        report_context: dict[str, Any] | None = None,
     ) -> None:
+        if report_context:
+            trace_path = write_retrieval_trace_file(report_context, report_payload, memory_path)
+            report_payload.setdefault("diagnostics", {})["retrieval_trace_path"] = trace_path
+            print(f"[report] Retrieval trace written to: {trace_path}", flush=True)
         saved_path = write_report_file(report_payload, memory_path, report_path)
         SharedMemory(memory_path).write_agent_output("report", {"final_report": {**report_payload, "report_path": saved_path}})
 
@@ -2405,6 +2421,72 @@ def write_report_file(report_payload: dict[str, Any], memory_path: str = "data/s
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(report + "\n", encoding="utf-8")
     return str(output_path)
+
+
+def write_retrieval_trace_file(
+    report_context: dict[str, Any],
+    report_payload: dict[str, Any],
+    memory_path: str,
+) -> str:
+    """Write per-question chunk selections from retrieval through report generation."""
+    retrieval = trace_items_by_question(report_context.get("sub_question_context_counts"))
+    synthesis = trace_items_by_question(report_context.get("per_question_synthesis"))
+    packs = trace_items_by_question(report_context.get("evidence_packs"))
+    report = trace_items_by_question(report_payload.get("report_agent_chunks_by_question"))
+    questions = dedupe_text([
+        *sequence_items(report_context.get("planner_questions")),
+        *(item.get("question") for group in (retrieval, synthesis, packs, report) for item in group.values()),
+    ])
+    traces = []
+    for question in questions:
+        key = normalize_heading(question)
+        retrieval_item = retrieval.get(key, {})
+        synthesis_item = synthesis.get(key, {})
+        all_chunks = trace_dict_items(retrieval_item.get("all_retrieved_chunks"))
+        top_chunks = trace_dict_items(
+            retrieval_item.get("top_selected_chunks") or packs.get(key, {}).get("chunks")
+        )[:6]
+        synthesis_chunks = trace_dict_items(synthesis_item.get("selected_chunks"))
+        report_chunks = trace_dict_items(report.get(key, {}).get("chunks"))
+        traces.append({
+            "question": question,
+            "counts": {
+                "all_retrieved": len(all_chunks),
+                "top_selected": len(top_chunks),
+                "passed_to_synthesis_agent": len(synthesis_chunks),
+                "passed_to_report_agent": len(report_chunks),
+            },
+            "all_retrieved_chunks": all_chunks,
+            "top_selected_6_chunks": top_chunks,
+            "chunks_passed_to_synthesis_agent": synthesis_chunks,
+            "chunks_passed_to_report_agent": report_chunks,
+            "retrieval_selection_trace": retrieval_item.get("selection_trace", {}),
+            "synthesis_selection_trace": synthesis_item.get("selection_trace", {}),
+        })
+
+    objective = clean_text(report_payload.get("objective") or report_context.get("objective"))
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    output_path = Path(memory_path).parent / "retrieval_traces" / f"{slugify_filename(objective)}-{timestamp}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps({
+        "objective": objective,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "question_count": len(traces),
+        "questions": traces,
+    }, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return str(output_path)
+
+
+def trace_items_by_question(items: Any) -> dict[str, dict[str, Any]]:
+    return {
+        normalize_heading(item.get("question")): item
+        for item in sequence_items(items)
+        if isinstance(item, dict) and clean_text(item.get("question"))
+    }
+
+
+def trace_dict_items(items: Any) -> list[dict[str, Any]]:
+    return [dict(item) for item in sequence_items(items) if isinstance(item, dict)]
 
 
 def default_report_path(report_payload: dict[str, Any], memory_path: str) -> Path:
