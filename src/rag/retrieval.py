@@ -31,14 +31,14 @@ from src.tools.text_utils import clean_text
 
 
 DEFAULT_TOP_K = 5
-DEFAULT_SEMANTIC_K = 20
-DEFAULT_BM25_K = 20
+DEFAULT_SEMANTIC_K = 10
+DEFAULT_BM25_K = 10
 DEFAULT_SEMANTIC_WEIGHT = 0.55
 DEFAULT_BM25_WEIGHT = 0.35
 DEFAULT_AUTHORITY_WEIGHT = 0.10
 DEFAULT_BM25_SCAN_LIMIT = 1000
 DEFAULT_RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-DEFAULT_RERANK_K = 20
+DEFAULT_RERANK_K = 10
 DEFAULT_RERANK_WEIGHT = 0.70
 DEFAULT_SOURCE_URL_K = 1
 DEFAULT_FEATURE_WEIGHT = 0.15
@@ -133,6 +133,58 @@ def hybrid_retrieve(
 ) -> list[RetrievalResult]:
     """Retrieve chunks using semantic vector similarity plus BM25 keyword matching."""
 
+    merged = _hybrid_retrieve_candidates(
+        query=query,
+        chroma_path=chroma_path,
+        collection_name=collection_name,
+        top_k=top_k,
+        semantic_k=semantic_k,
+        bm25_k=bm25_k,
+        history_key=history_key,
+        history_keys=history_keys,
+        semantic_weight=semantic_weight,
+        bm25_weight=bm25_weight,
+        authority_weight=authority_weight,
+        bm25_scan_limit=bm25_scan_limit,
+        embedding_device=embedding_device,
+    )
+    if not merged:
+        return []
+
+    top_k = max(1, top_k)
+    if rerank:
+        merged = rerank_results(
+            query=clean_text(query),
+            results=merged,
+            top_n=max(top_k, rerank_k),
+            model_name=reranker_model,
+            device=embedding_device,
+            rerank_weight=rerank_weight,
+        )
+    if diversify_urls:
+        merged = diversify_by_url(merged, top_k=top_k)
+    else:
+        merged = merged[:top_k]
+    return expand_parent_context_results(merged, chroma_path=chroma_path)
+
+
+def _hybrid_retrieve_candidates(
+    query: str,
+    chroma_path: Union[str, Path],
+    collection_name: str,
+    top_k: int,
+    semantic_k: int,
+    bm25_k: int,
+    history_key: str,
+    history_keys: Sequence[str] | None,
+    semantic_weight: float,
+    bm25_weight: float,
+    authority_weight: float,
+    bm25_scan_limit: int,
+    embedding_device: str,
+) -> list[RetrievalResult]:
+    """Return ranked child chunks without reranking, diversification, or context expansion."""
+
     query = clean_text(query)
     if not query:
         return []
@@ -153,7 +205,7 @@ def hybrid_retrieve(
         scoped_results = []
         seen_ids = set()
         for scoped_history_key in clean_history_keys:
-            for result in hybrid_retrieve(
+            for result in _hybrid_retrieve_candidates(
                 query=query,
                 chroma_path=chroma_path,
                 collection_name=collection_name,
@@ -166,20 +218,13 @@ def hybrid_retrieve(
                 authority_weight=authority_weight,
                 bm25_scan_limit=bm25_scan_limit,
                 embedding_device=embedding_device,
-                diversify_urls=False,
-                rerank=rerank,
-                reranker_model=reranker_model,
-                rerank_k=rerank_k,
-                rerank_weight=rerank_weight,
+                history_keys=None,
             ):
                 if result.id in seen_ids:
                     continue
                 seen_ids.add(result.id)
                 scoped_results.append(result)
-        scoped_results = sorted(scoped_results, key=lambda item: item.score, reverse=True)
-        if diversify_urls:
-            scoped_results = diversify_by_url(scoped_results, top_k=top_k)
-        return scoped_results[:top_k]
+        return sorted(scoped_results, key=lambda item: item.score, reverse=True)
 
     where = metadata_filter(history_key)
     collection = get_collection(chroma_path, collection_name)
@@ -208,18 +253,7 @@ def hybrid_retrieve(
         bm25_weight=bm25_weight,
         authority_weight=authority_weight,
     )
-    if rerank:
-        merged = rerank_results(
-            query=query,
-            results=merged,
-            top_n=max(top_k, rerank_k),
-            model_name=reranker_model,
-            device=embedding_device,
-            rerank_weight=rerank_weight,
-        )
-    if diversify_urls:
-        merged = diversify_by_url(merged, top_k=top_k)
-    return expand_parent_context_results(merged[:top_k], chroma_path=chroma_path)
+    return merged
 
 
 def multi_query_hybrid_retrieve(
@@ -238,7 +272,7 @@ def multi_query_hybrid_retrieve(
     bm25_scan_limit: int = DEFAULT_BM25_SCAN_LIMIT,
     embedding_device: str = "",
     diversify_urls: bool = True,
-    rerank: bool = False,
+    rerank: bool = True,
     reranker_model: str = DEFAULT_RERANKER_MODEL,
     rerank_k: int = DEFAULT_RERANK_K,
     rerank_weight: float = DEFAULT_RERANK_WEIGHT,
@@ -252,7 +286,7 @@ def multi_query_hybrid_retrieve(
     max_workers = retrieval_max_workers(len(clean_queries), rerank=rerank)
 
     def retrieve_query(query: str) -> list[RetrievalResult]:
-        return hybrid_retrieve(
+        return _hybrid_retrieve_candidates(
             query=query,
             chroma_path=chroma_path,
             collection_name=collection_name,
@@ -266,12 +300,7 @@ def multi_query_hybrid_retrieve(
             authority_weight=authority_weight,
             bm25_scan_limit=bm25_scan_limit,
             embedding_device=embedding_device,
-            diversify_urls=False,
-            rerank=False,
-            reranker_model=reranker_model,
-            rerank_k=rerank_k,
-            rerank_weight=rerank_weight,
-        )
+        )[: max(1, per_query_k)]
 
     if max_workers <= 1:
         result_groups = [retrieve_query(query) for query in clean_queries]
