@@ -580,9 +580,37 @@ def retrieve_sub_question_context_groups(
             if fallback_candidates:
                 fallback_sources.append("collection_scan")
                 candidates = helpers.merge_retrieved_context(candidates, fallback_candidates)
+        # Exhaust indexed RAG recovery before considering direct browser snippets.
+        # This keeps already-indexed evidence as the primary synthesis input.
+        missing_facets = missing_facets_for_results(question, candidates)
+        if missing_facets:
+            facet_candidates = facet_rescue_context_retrieve(
+                question=question,
+                missing_facets=missing_facets,
+                queries=query_set,
+                chroma_path=chroma_path,
+                collection_name=collection_name,
+                history_keys=history_keys,
+                top_k=candidate_chunks,
+                scan_limit=bm25_scan_limit,
+                question_source_urls=question_source_urls,
+                required_evidence=required_evidence,
+            )
+            if facet_candidates:
+                fallback_sources.append("facet_scan")
+                candidates = helpers.merge_retrieved_context(candidates, facet_candidates)
+
+        rag_ranked_candidates = rank_collection_scan_results(
+            question=question,
+            queries=query_set,
+            candidates=candidates,
+            question_source_urls=question_source_urls,
+            required_evidence=required_evidence,
+        )
+        meaningful_rag_candidates = helpers.meaningful_retrieval_results(rag_ranked_candidates)
         browser_generation_reason = browser_candidate_generation_reason(
             question=question,
-            candidates=candidates,
+            candidates=meaningful_rag_candidates,
             final_chunks=final_chunks,
         )
         browser_candidates = browser_question_context_retrieve(
@@ -608,23 +636,6 @@ def retrieve_sub_question_context_groups(
         if browser_candidates:
             fallback_sources.append("browser_results")
             candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
-        missing_facets = missing_facets_for_results(question, candidates)
-        if missing_facets:
-            facet_candidates = facet_rescue_context_retrieve(
-                question=question,
-                missing_facets=missing_facets,
-                queries=query_set,
-                chroma_path=chroma_path,
-                collection_name=collection_name,
-                history_keys=history_keys,
-                top_k=candidate_chunks,
-                scan_limit=bm25_scan_limit,
-                question_source_urls=question_source_urls,
-                required_evidence=required_evidence,
-            )
-            if facet_candidates:
-                fallback_sources.append("facet_scan")
-                candidates = helpers.merge_retrieved_context(candidates, facet_candidates)
         if not candidates:
             print(f"[synthesis] no per-question chunks found for: {question[:120]}")
         ranked_candidates = rank_collection_scan_results(
@@ -670,6 +681,7 @@ def retrieve_sub_question_context_groups(
                 "candidates": retrieval_trace_entries(candidates),
                 "ranked_ids": [r.id for r in ranked_candidates],
                 "meaningful_ids": [r.id for r in meaningful],
+                "meaningful_rag_ids": [r.id for r in meaningful_rag_candidates],
                 "facet_selected_ids": [r.id for r in facet_selected],
                 "browser_candidate_ids": [r.id for r in browser_candidates],
                 "browser_generation_reason": browser_generation_reason or "skipped",
