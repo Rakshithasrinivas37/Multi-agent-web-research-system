@@ -744,6 +744,7 @@ def sub_question_context_group(
         "graph_added_count": int(graph_context.get("graph_added_count") or 0),
         "graph_entity_count": int(graph_context.get("entity_count") or 0),
         "graph_entities": list(graph_context.get("entities") or []),
+        "candidates": list(candidates),
         "chunks": list(chunks),
         "selection_trace": selection_trace or {},
     }
@@ -1203,11 +1204,35 @@ def sub_question_context_counts(groups: Sequence[dict[str, Any]]) -> list[dict[s
             "graph_added_count": int(group.get("graph_added_count") or 0),
             "graph_entity_count": int(group.get("graph_entity_count") or 0),
             "graph_entities": list(group.get("graph_entities", [])),
+            "all_retrieved_chunks": retrieval_audit_entries(group.get("candidates", [])),
+            "top_selected_chunks": retrieval_audit_entries(group.get("chunks", []))[:6],
             "selection_trace": dict(group.get("selection_trace", {})),
         }
         for group in groups
         if isinstance(group, dict)
     ]
+
+
+def retrieval_audit_entries(results: Sequence[RetrievalResult]) -> list[dict[str, Any]]:
+    """Serialize complete chunk bodies and ranking signals for run-level auditing."""
+    entries = []
+    for rank, result in enumerate(results or [], start=1):
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        entries.append({
+            "rank": rank,
+            "id": result.id,
+            "url": clean_text(metadata.get("url") or metadata.get("source_url")),
+            "title": clean_text(metadata.get("title")),
+            "source_type": clean_text(metadata.get("source_type")),
+            "origin": "browser" if clean_text(result.id).startswith("browser-question-") else "retrieved",
+            "score": result.score,
+            "semantic_score": result.semantic_score,
+            "bm25_score": result.bm25_score,
+            "authority_score": result.authority_score,
+            "rerank_score": result.rerank_score,
+            "content": clean_text(result.document),
+        })
+    return entries
 
 
 def tag_result_for_question(result: RetrievalResult, question: str) -> RetrievalResult:
