@@ -107,6 +107,7 @@ DEFAULT_SYNTHESIS_GRAPHRAG_ENABLED = True
 DEFAULT_SYNTHESIS_MAX_CHUNKS = 48
 DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS = 4
 DEFAULT_PER_QUESTION_SYNTHESIS_CHARS = 2200
+DEFAULT_QUESTION_EVIDENCE_EXCERPT_CHARS = 700
 DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS = 1200
 DEFAULT_MIN_SYNTHESIS_CHARS = 900
 MIN_EVIDENCE_CHARS = 120
@@ -2022,7 +2023,11 @@ def evidence_is_boilerplate(text: str) -> bool:
     return bool(promises and not concrete)
 
 
-def question_evidence_excerpt(text: str, question: str, max_chars: int = 1100) -> str:
+def question_evidence_excerpt(
+    text: str,
+    question: str,
+    max_chars: int = DEFAULT_QUESTION_EVIDENCE_EXCERPT_CHARS,
+) -> str:
     """Keep whole evidence units; never manufacture a clipped equation to fit a budget."""
     if len(text) <= max_chars:
         return text
