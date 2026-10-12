@@ -68,6 +68,32 @@ The equation is supported, while masking variants and runtime measurements remai
 
 
 class ReportEvidenceContractTests(unittest.TestCase):
+    def test_report_prompt_enforces_editorial_structure_and_evidence_boundaries(self):
+        context = fixture_context()
+        notes = report_agent.per_question_synthesis_by_question(context["per_question_synthesis"])
+        packs = {report_agent.normalize_heading(item["question"]): item for item in context["evidence_packs"]}
+        contracts = report_agent.build_question_evidence_contracts(
+            [QUESTION], notes, packs, context["sources"]
+        )
+
+        prompt = report_agent.build_report_prompt(
+            context["objective"],
+            "report",
+            [QUESTION],
+            notes,
+            context["sources"],
+            context["coverage_by_question"],
+            contracts,
+        )
+
+        self.assertIn("Act as a senior research editor", prompt)
+        self.assertIn("Decide on one clear through-line", prompt)
+        self.assertIn('Create exactly one "### 3.N.', prompt)
+        self.assertIn("Treat each question block as a separate evidence boundary", prompt)
+        self.assertIn("A partial answer is better than a fabricated complete one", prompt)
+        self.assertIn("Revise the draft silently until it passes this audit", prompt)
+        self.assertNotIn("report report", prompt)
+
     def test_contract_separates_supported_gaps_and_question_specific_citations(self):
         context = fixture_context()
         notes = report_agent.per_question_synthesis_by_question(context["per_question_synthesis"])
