@@ -50,6 +50,9 @@ DEFAULT_NEAR_DUPLICATE_SIMILARITY = 0.58
 DEFAULT_CHUNK_DUPLICATE_SIMILARITY = 0.82
 DEFAULT_TAVILY_GAP_RESULTS_PER_QUERY = 3
 DEFAULT_TAVILY_GAP_QUERY_LIMIT = 4
+DEFAULT_EVIDENCE_JUDGE_MODEL = "openai/gpt-oss-20b"
+DEFAULT_EVIDENCE_JUDGE_MAX_CHUNKS = 12
+DEFAULT_EVIDENCE_JUDGE_CHUNK_CHARS = 650
 BENCHMARK_VALUE_PATTERN = re.compile(
     r"(?i)\b\d+(?:\.\d+)?\s*(?:%|bleu|rouge|f1|auc|accuracy|precision|recall|score|ms|s|hours?)\b"
 )
@@ -611,10 +614,22 @@ def retrieve_sub_question_context_groups(
             required_evidence=required_evidence,
         )
         meaningful_rag_candidates = helpers.meaningful_retrieval_results(rag_ranked_candidates)
+        deterministic_missing_facets = missing_facets_for_results(question, candidates)
+        evidence_judge = llm_evidence_coverage_judge(
+            question=question,
+            required_evidence=required_evidence,
+            candidates=meaningful_rag_candidates,
+        )
+        judged_missing_facets = clean_string_list(evidence_judge.get("missing_facets"))
+        missing_facets = dedupe_preserve_order([
+            *deterministic_missing_facets,
+            *judged_missing_facets,
+        ])
         browser_generation_reason = browser_candidate_generation_reason(
             question=question,
             candidates=meaningful_rag_candidates,
             final_chunks=final_chunks,
+            missing_facets=missing_facets,
         )
         browser_candidates = browser_question_context_retrieve(
             question=question,
@@ -678,6 +693,20 @@ def retrieve_sub_question_context_groups(
         facet_selected = list(selected_rag)
         ranked_candidates = rag_ranked_candidates
 
+        print(
+            "[retrieval] Pre-selection scores: "
+            + str([
+                {
+                    "id": result.id,
+                    "origin": "browser" if result.id.startswith(("browser-question-", "tavily-question-")) else "rag",
+                    "score": round(float(result.score), 4),
+                    "rerank_score": round(float(result.rerank_score), 4),
+                }
+                for result in [*rag_ranked_candidates, *browser_candidates]
+            ]),
+            flush=True,
+        )
+
         if len(selected_rag) < final_chunks and browser_candidates:
             ranked_browser = rank_collection_scan_results(
                 question=question,
@@ -734,6 +763,9 @@ def retrieve_sub_question_context_groups(
                 "live_browser_candidate_ids": [r.id for r in live_browser_candidates],
                 "live_search_reason": live_search_reason or "skipped",
                 "browser_generation_reason": browser_generation_reason or "skipped",
+                "deterministic_missing_facets": deterministic_missing_facets,
+                "llm_missing_facets": judged_missing_facets,
+                "llm_evidence_coverage": evidence_judge,
                 "final_ids": [r.id for r in tagged],
             },
         )
@@ -754,17 +786,113 @@ def retrieval_trace_entries(results: Sequence[RetrievalResult]) -> list[dict[str
     ]
 
 
+def llm_evidence_coverage_judge(
+    question: str,
+    required_evidence: Sequence[str],
+    candidates: Sequence[RetrievalResult],
+) -> dict[str, Any]:
+    """Use a bounded LLM check to find evidence gaps after deterministic retrieval.
+
+    The deterministic facet check remains authoritative. This judge may add a
+    missing facet, but an unavailable or malformed LLM response never removes
+    a gap and therefore cannot prevent fallback retrieval.
+    """
+
+    facets = dedupe_preserve_order([
+        *clean_string_list(required_evidence),
+        *question_required_facets(question),
+    ])
+    if not facets or not candidates:
+        return {"status": "skipped", "missing_facets": [], "covered_facets": [], "supporting_chunk_ids": {}}
+
+    api_key = clean_text(os.environ.get("GROQ_API_KEY"))
+    if not api_key or clean_text(os.environ.get("RAG_LLM_FACET_JUDGE", "true")).lower() in {"0", "false", "no", "off"}:
+        return {"status": "disabled", "missing_facets": [], "covered_facets": [], "supporting_chunk_ids": {}}
+
+    rows = []
+    allowed_ids = set()
+    for result in list(candidates)[:DEFAULT_EVIDENCE_JUDGE_MAX_CHUNKS]:
+        chunk_id = clean_text(result.id)
+        content = clean_text(result.document)[:DEFAULT_EVIDENCE_JUDGE_CHUNK_CHARS]
+        if not chunk_id or not content:
+            continue
+        allowed_ids.add(chunk_id)
+        rows.append({"id": chunk_id, "text": content})
+    if not rows:
+        return {"status": "skipped", "missing_facets": [], "covered_facets": [], "supporting_chunk_ids": {}}
+
+    prompt = json.dumps({
+        "question": clean_text(question),
+        "required_facets": facets,
+        "chunks": rows,
+        "output_schema": {
+            "covered_facets": ["facet"],
+            "missing_facets": ["facet"],
+            "supporting_chunk_ids": {"facet": ["chunk-id"]},
+        },
+    }, ensure_ascii=True)
+    system = (
+        "You are an evidence coverage judge. Inspect only the supplied chunks. "
+        "A facet is covered only when a chunk explicitly supports it; do not infer "
+        "or reconstruct missing equations, numbers, or claims. Return valid JSON "
+        "with covered_facets, missing_facets, and supporting_chunk_ids."
+    )
+    try:
+        from groq import Groq
+
+        response = create_chat_completion_with_retries(
+            Groq(),
+            model=clean_text(os.environ.get("RAG_EVIDENCE_JUDGE_MODEL")) or DEFAULT_EVIDENCE_JUDGE_MODEL,
+            temperature=0,
+            max_tokens=350,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw = clean_text(response.choices[0].message.content)
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("evidence judge returned a non-object JSON value")
+        covered = [facet for facet in clean_string_list(payload.get("covered_facets")) if facet in facets]
+        missing = [facet for facet in clean_string_list(payload.get("missing_facets")) if facet in facets]
+        support = {}
+        for facet, ids in (payload.get("supporting_chunk_ids") or {}).items():
+            if facet not in facets:
+                continue
+            valid_ids = [clean_text(item) for item in ids or [] if clean_text(item) in allowed_ids]
+            if valid_ids:
+                support[facet] = dedupe_preserve_order(valid_ids)
+        return {
+            "status": "ok",
+            "covered_facets": dedupe_preserve_order(covered),
+            "missing_facets": dedupe_preserve_order(missing),
+            "supporting_chunk_ids": support,
+        }
+    except Exception as error:
+        print(f"[retrieval] LLM evidence coverage judge unavailable: {type(error).__name__}: {error}")
+        return {
+            "status": "error",
+            "error": f"{type(error).__name__}: {error}",
+            "missing_facets": [],
+            "covered_facets": [],
+            "supporting_chunk_ids": {},
+        }
+
+
 def browser_candidate_generation_reason(
     question: str,
     candidates: Sequence[RetrievalResult],
     final_chunks: int,
+    missing_facets: Sequence[str] | None = None,
 ) -> str:
     """Build browser snippets only when indexed RAG evidence is weak or absent."""
 
     if len(candidates) < max(1, final_chunks):
         return "insufficient_rag_candidates"
-    missing_facets = missing_facets_for_results(question, candidates)
-    if missing_facets:
+    facets = list(missing_facets) if missing_facets is not None else missing_facets_for_results(question, candidates)
+    if facets:
         return "missing_facets"
     return ""
 
