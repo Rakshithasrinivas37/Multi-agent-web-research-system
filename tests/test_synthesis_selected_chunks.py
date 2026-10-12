@@ -1,0 +1,176 @@
+"""Selected synthesis evidence must survive the shared-memory handoff."""
+
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+from src.agents.synthesis_agent import SynthesisAgent
+from src.rag import generation
+from src.rag.retrieval import RetrievalResult
+
+
+class SynthesisSelectedChunksTests(unittest.TestCase):
+    def setUp(self):
+        self.results = [
+            RetrievalResult(
+                id=f"chunk-{i}",
+                document=f"Evidence number {i} explains how attention weights combine query and key representations. " * 3,
+                metadata={"title": f"Paper {i}", "url": f"https://example.org/paper-{i}"},
+                score=1.0 / i, semantic_score=0.8, bm25_score=0.2,
+            )
+            for i in range(1, 7)
+        ]
+        _, self.sources = generation.build_generation_context(self.results)
+        self.response = SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="Attention combines representations [1].")
+        )])
+
+    def synthesize(self, questions):
+        return generation.synthesize_per_question_notes(
+            object(), "mock-model", "Attention", "Summarize evidence",
+            questions, self.results, self.sources,
+        )
+
+    def test_selected_prompt_chunks_persist_for_each_question(self):
+        with patch.object(generation, "rank_results_for_question", side_effect=[self.results, self.results[::-1]]), \
+             patch.object(generation, "create_chat_completion_with_retries", return_value=self.response) as complete:
+            notes = self.synthesize(["What is attention?", "How do attention weights work?"])
+
+        for note, call, expected in zip(notes, complete.call_args_list, [self.results[:4], self.results[::-1][:4]]):
+            chunks = note["selected_chunks"]
+            self.assertEqual(note["selected_chunk_count"], 4)
+            self.assertEqual([chunk["id"] for chunk in chunks], [result.id for result in expected])
+            prompt = call.kwargs["messages"][1]["content"]
+            for chunk, result in zip(chunks, expected):
+                self.assertIn(chunk["content"], prompt)
+                self.assertIn(f"[{chunk['source_index']}] {chunk['title']}", prompt)
+                self.assertEqual(chunk["url"], result.metadata["url"])
+                self.assertEqual(chunk["score"], result.score)
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "shared_memory.json"
+            SynthesisAgent().write_to_memory({"per_question_synthesis": notes}, str(path))
+            saved = json.loads(path.read_text())["synthesis"]["report_context"]["per_question_synthesis"]
+        self.assertEqual(saved, notes)
+
+    def test_budget_excluded_chunks_are_not_saved_as_prompt_evidence(self):
+        context, chunks = generation.build_question_context_evidence(self.results[:4], self.sources, max_chars=400)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn(chunks[0]["content"], context)
+        self.assertNotIn("Paper 2", context)
+        self.assertEqual(context, generation.build_question_context_text(self.results[:4], self.sources, max_chars=400))
+
+    def test_logged_evidence_matches_final_prompt_after_budget(self):
+        with patch.object(generation, "question_ranked_results", return_value=self.results), \
+             patch.object(generation, "DEFAULT_PER_QUESTION_SYNTHESIS_CHARS", 400), \
+             patch.object(generation, "create_chat_completion_with_retries", return_value=self.response) as complete, \
+             patch("builtins.print") as printed:
+            note = self.synthesize(["What is attention?"])[0]
+        log = next(call.args[0] for call in printed.call_args_list
+                   if str(call.args[0]).startswith("[synthesis prompt] Sub-question:"))
+        evidence = log.split("BEGIN EXACT EVIDENCE\n", 1)[1].split("\n[synthesis prompt] END EXACT EVIDENCE", 1)[0]
+        self.assertEqual(note["selected_chunk_count"], 1)
+        self.assertEqual(len(evidence), note["context_chars"])
+        self.assertIn(evidence, complete.call_args.kwargs["messages"][1]["content"])
+        self.assertIn("chunk-1", log)
+        self.assertIn("'origin': 'retrieved'", log)
+        self.assertNotIn("chunk-2", log)
+        self.assertNotIn("Paper 2", log)
+
+    def test_empty_selection_records_empty_list_without_llm_call(self):
+        with patch.object(generation, "rank_results_for_question", return_value=[]), \
+             patch.object(generation, "create_chat_completion_with_retries") as complete:
+            note = self.synthesize(["What is missing?"])[0]
+        complete.assert_not_called()
+        self.assertEqual(note["selected_chunks"], [])
+        self.assertEqual(note["selected_chunk_count"], 0)
+        self.assertEqual(note["context_chars"], 0)
+
+    def test_assigned_retrieval_chunks_are_sent_before_global_rerank_candidates(self):
+        assigned = RetrievalResult(
+            id="assigned-q1",
+            document="Definition evidence for question one explains attention as weighted value aggregation using query key compatibility. " * 3,
+            metadata={
+                "title": "Assigned",
+                "url": "https://example.org/assigned",
+                "synthesis_question": "What is attention?",
+            },
+            score=0.2, semantic_score=0.2, bm25_score=0.0,
+        )
+        stronger_other = RetrievalResult(
+            id="other-q2",
+            document="Benchmark evidence for another question mentions attention performance metrics and unrelated task results. " * 3,
+            metadata={
+                "title": "Other",
+                "url": "https://example.org/other",
+                "synthesis_question": "What benchmarks exist?",
+            },
+            score=1.0, semantic_score=1.0, bm25_score=0.0,
+        )
+        _, sources = generation.build_generation_context([assigned, stronger_other])
+        with patch.object(generation, "question_ranked_results", return_value=[stronger_other, assigned]), \
+             patch.object(generation, "create_chat_completion_with_retries", return_value=self.response):
+            note = generation.synthesize_per_question_notes(
+                object(), "mock-model", "Attention", "Summarize evidence",
+                ["What is attention?"], [assigned, stronger_other], sources,
+            )[0]
+        self.assertEqual(note["selected_chunks"][0]["id"], "assigned-q1")
+        self.assertEqual(note["selection_trace"]["assigned_question_chunk_ids"], ["assigned-q1"])
+
+    def test_other_question_chunks_are_excluded_from_synthesis_pool(self):
+        question = "What is attention?"
+        assigned = RetrievalResult(
+            id="assigned-q1",
+            document="Attention uses learned compatibility weights to combine value representations for a query. " * 3,
+            metadata={
+                "title": "Assigned",
+                "url": "https://example.org/assigned",
+                "synthesis_question": question,
+            },
+            score=0.2,
+            semantic_score=0.2,
+            bm25_score=0.0,
+        )
+        other = RetrievalResult(
+            id="other-q2",
+            document="An unrelated benchmark reports a much stronger numerical score for a different question. " * 3,
+            metadata={
+                "title": "Other",
+                "url": "https://example.org/other",
+                "synthesis_question": "What benchmarks exist?",
+            },
+            score=100.0,
+            semantic_score=1.0,
+            bm25_score=0.0,
+        )
+        _, sources = generation.build_generation_context([assigned, other])
+
+        with patch.object(generation, "create_chat_completion_with_retries", return_value=self.response) as complete:
+            note = generation.synthesize_per_question_notes(
+                object(), "mock-model", "Attention", "Summarize evidence",
+                [question], [assigned, other], sources,
+            )[0]
+
+        selected_ids = [chunk["id"] for chunk in note["selected_chunks"]]
+        self.assertEqual(selected_ids, ["assigned-q1"])
+        self.assertEqual(note["selection_trace"]["input_chunks"][0]["id"], "assigned-q1")
+        self.assertEqual(note["selection_trace"]["global_input_chunk_count"], 2)
+        self.assertEqual(note["selection_trace"]["excluded_other_question_chunk_ids"], ["other-q2"])
+        prompt = complete.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("learned compatibility weights", prompt)
+        self.assertNotIn("unrelated benchmark", prompt)
+
+    def test_failure_keeps_evidence_sent_in_attempted_prompt(self):
+        with patch.object(generation, "rank_results_for_question", return_value=self.results), \
+             patch.object(generation, "create_chat_completion_with_retries", side_effect=RuntimeError("service unavailable")):
+            note = self.synthesize(["What is attention?"])[0]
+        self.assertTrue(note["fallback_used"])
+        self.assertEqual(note["selected_chunk_count"], 4)
+        self.assertEqual(note["error"], "service unavailable")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 from src.rag.indexing import (
     clean_document_text,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_PARENT_CHUNK_SIZE,
     langchain_ingestion_classes,
     normalize_huggingface_token_env,
     parent_content_for_id,
@@ -25,6 +27,10 @@ from src.rag.retrieval import RetrievalResult, expand_parent_context_results, me
 
 
 class IndexingChunkingTests(unittest.TestCase):
+    def test_default_chunk_sizes_are_compact(self):
+        self.assertLessEqual(DEFAULT_CHUNK_SIZE, 800)
+        self.assertLessEqual(DEFAULT_PARENT_CHUNK_SIZE, 2400)
+
     def test_clean_document_text_removes_common_web_noise(self):
         text = """Skip to content
 Accept all cookies

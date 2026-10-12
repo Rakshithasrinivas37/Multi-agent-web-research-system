@@ -61,6 +61,7 @@ from src.rag.sub_question_context import (
     select_question_first_synthesis_context,
     sub_question_retrieval_max_workers,
     sub_question_retrieval_queries,
+    tavily_gap_context_retrieve,
     valid_retrieval_queries,
 )
 from src.rag.retrieval import RetrievalResult
@@ -71,6 +72,73 @@ class GenerationHelperTests(unittest.TestCase):
         self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_CHARS, 0)
         self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_CHUNKS, 0)
         self.assertGreater(DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS, 0)
+
+    def test_application_question_extracts_each_named_domain(self):
+        facets = question_required_facets(
+            "What are the applications of attention in NLP, computer vision, and speech processing?"
+        )
+        self.assertEqual(
+            {facet.lower() for facet in facets},
+            {"nlp", "computer vision", "speech processing"},
+        )
+
+    def test_named_attention_variant_rejects_unrelated_equation(self):
+        question = "What is the mathematical equation for scaled dot-product attention?"
+        wrong = RetrievalResult(
+            id="gru-equation",
+            document="The recurrent reset gate equation is r = sigmoid(Wx + Uh) for the decoder state.",
+            metadata={"title": "Recurrent decoder", "url": "https://example.org/recurrent"},
+            score=1.0,
+            semantic_score=1.0,
+            bm25_score=0.0,
+        )
+        right = RetrievalResult(
+            id="scaled-attention",
+            document=(
+                "Scaled dot-product attention is Attention(Q,K,V)=softmax(QK^T/sqrt(d_k))V, "
+                "where queries are matched with keys and the normalized weights combine values. "
+            ) * 2,
+            metadata={"title": "Scaled dot-product attention", "url": "https://example.org/attention"},
+            score=0.5,
+            semantic_score=0.5,
+            bm25_score=0.0,
+        )
+        ranked = rank_collection_scan_results(question, [question], [wrong, right])
+        self.assertEqual([result.id for result in ranked], ["scaled-attention"])
+
+    @patch.dict("os.environ", {"TAVILY_API_KEY": "test-key"}, clear=True)
+    @patch("src.rag.sub_question_context.search_with_tavily")
+    def test_tavily_gap_retrieval_targets_missing_named_facet(self, search):
+        search.return_value = [{
+            "url": "https://www.tensorflow.org/api_docs/python/tf/keras/layers/MultiHeadAttention",
+            "title": "TensorFlow MultiHeadAttention",
+            "content": (
+                "TensorFlow provides the tf.keras.layers.MultiHeadAttention API with query, value, "
+                "key, attention_mask, and return_attention_scores parameters."
+            ) * 2,
+            "score": 0.9,
+        }]
+        existing = [RetrievalResult(
+            id="pytorch",
+            document="PyTorch MultiheadAttention implements multi-head attention with query key and value tensors.",
+            metadata={"title": "PyTorch MultiheadAttention", "url": "https://pytorch.org/docs/stable/mha"},
+            score=1.0,
+            semantic_score=1.0,
+            bm25_score=0.0,
+        )]
+        question = "What APIs implement attention, including PyTorch MultiheadAttention and TensorFlow attention layers?"
+
+        results = tavily_gap_context_retrieve(
+            question=question,
+            queries=["attention library APIs"],
+            candidates=existing,
+            top_k=3,
+            required_evidence=["api"],
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].id.startswith("tavily-question-"))
+        self.assertIn("tensorflow", search.call_args.args[0].lower())
 
     @patch.dict("os.environ", {}, clear=True)
     def test_synthesis_mode_defaults_to_per_question(self):
@@ -2006,6 +2074,7 @@ Missing Evidence: exact benchmark values are not present.
         with (
             patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", return_value=initial),
             patch("src.rag.sub_question_context.facet_rescue_context_retrieve", return_value=rescued) as facet_scan,
+            patch("src.rag.sub_question_context.browser_question_context_retrieve", return_value=[]) as browser_retrieve,
         ):
             groups = retrieve_sub_question_context_groups(
                 research_plan={"sub_questions": [question]},
@@ -2033,7 +2102,10 @@ Missing Evidence: exact benchmark values are not present.
         selected_ids = {result.id for result in groups[0]["chunks"]}
 
         facet_scan.assert_called_once()
+        browser_retrieve.assert_not_called()
         self.assertIn("facet_scan", groups[0]["fallback_sources"])
+        self.assertNotIn("browser_results", groups[0]["fallback_sources"])
+        self.assertEqual(groups[0]["selection_trace"]["browser_generation_reason"], "skipped")
         self.assertEqual({"linformer", "longformer", "performer"}, selected_ids)
 
     def test_retrieve_sub_question_context_groups_scans_collection_when_hybrid_empty(self):
@@ -2149,6 +2221,73 @@ Missing Evidence: exact benchmark values are not present.
         self.assertIn("browser_results", groups[0]["fallback_sources"])
         self.assertEqual(groups[0]["chunks"][0].metadata["synthesis_question"], "How does multiplicative Luong attention work?")
         self.assertEqual(groups[0]["chunks"][0].metadata["url"], "https://arxiv.org/pdf/1508.04025")
+
+    def test_retrieve_sub_question_context_groups_skips_browser_when_rag_is_sufficient(self):
+        rag_results = [
+            RetrievalResult(
+                id="rag-definition",
+                document="Alpha attention definition explains query key value scoring with enough source-backed context. " * 4,
+                metadata={"title": "RAG definition", "url": "https://example.com/rag-definition"},
+                score=1.0,
+                semantic_score=1.0,
+                bm25_score=0.0,
+            ),
+            RetrievalResult(
+                id="rag-equation",
+                document="Alpha attention equation states Attention(Q,K,V)=softmax(QK^T)V with enough explanation. " * 4,
+                metadata={"title": "RAG equation", "url": "https://example.com/rag-equation"},
+                score=0.9,
+                semantic_score=0.9,
+                bm25_score=0.0,
+            ),
+        ]
+        browser_results = [
+            {
+                "sources": [
+                    {
+                        "url": "https://example.com/browser",
+                        "title": "Browser fallback",
+                        "source_type": "webpage",
+                        "full_content": "Browser fallback alpha attention evidence that should not displace sufficient RAG chunks. " * 8,
+                    }
+                ]
+            }
+        ]
+
+        with (
+            patch("src.rag.sub_question_context.source_url_coverage_retrieve", return_value=[]),
+            patch("src.rag.sub_question_context.multi_query_hybrid_retrieve", return_value=rag_results),
+            patch("src.rag.sub_question_context.collection_scan_question_retrieve", return_value=[]),
+        ):
+            groups = retrieve_sub_question_context_groups(
+                research_plan={},
+                questions=["What is alpha attention definition equation?"],
+                objective="Alpha objective",
+                chroma_path="/tmp/chroma",
+                collection_name="test",
+                history_keys=[],
+                candidate_chunks=8,
+                final_chunks=2,
+                per_query_k=25,
+                semantic_k=10,
+                bm25_k=10,
+                semantic_weight=0.3,
+                bm25_weight=0.3,
+                authority_weight=0.4,
+                bm25_scan_limit=100,
+                embedding_device="",
+                rerank=False,
+                reranker_model="cross-encoder",
+                rerank_k=8,
+                rerank_weight=0.7,
+                browser_results=browser_results,
+            )
+
+        selected_ids = {chunk.id for chunk in groups[0]["chunks"]}
+        self.assertEqual(selected_ids, {"rag-definition", "rag-equation"})
+        self.assertNotIn("browser_results", groups[0]["fallback_sources"])
+        self.assertEqual(groups[0]["selection_trace"]["browser_generation_reason"], "skipped")
+        self.assertEqual(groups[0]["selection_trace"]["browser_candidate_ids"], [])
 
     def test_browser_question_context_prefers_exact_benchmark_from_primary_source(self):
         browser_results = [

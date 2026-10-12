@@ -33,7 +33,7 @@ class RetrievalParallelTests(unittest.TestCase):
             ]
 
         with patch.dict("os.environ", {"RAG_RETRIEVAL_MAX_WORKERS": "2"}, clear=False):
-            with patch("src.rag.retrieval.hybrid_retrieve", side_effect=fake_hybrid_retrieve):
+            with patch("src.rag.retrieval._hybrid_retrieve_candidates", side_effect=fake_hybrid_retrieve):
                 results = retrieval.multi_query_hybrid_retrieve(
                     ["alpha", "beta"],
                     top_k=2,
@@ -44,10 +44,10 @@ class RetrievalParallelTests(unittest.TestCase):
         self.assertEqual({result.id for result in results}, {"id-alpha", "id-beta"})
 
     def test_multi_query_hybrid_retrieve_reranks_merged_candidates_once(self):
-        hybrid_calls = []
+        candidate_calls = []
 
         def fake_hybrid_retrieve(query: str, **kwargs):
-            hybrid_calls.append((query, kwargs.get("rerank")))
+            candidate_calls.append(query)
             return [
                 RetrievalResult(
                     id=f"id-{query}",
@@ -66,7 +66,7 @@ class RetrievalParallelTests(unittest.TestCase):
             return list(results)
 
         with patch.dict("os.environ", {"RAG_RETRIEVAL_MAX_WORKERS": "2"}, clear=False):
-            with patch("src.rag.retrieval.hybrid_retrieve", side_effect=fake_hybrid_retrieve):
+            with patch("src.rag.retrieval._hybrid_retrieve_candidates", side_effect=fake_hybrid_retrieve):
                 with patch("src.rag.retrieval.rerank_results", side_effect=fake_rerank_results) as rerank_mock:
                     results = retrieval.multi_query_hybrid_retrieve(
                         ["alpha", "beta"],
@@ -77,8 +77,43 @@ class RetrievalParallelTests(unittest.TestCase):
                     )
 
         self.assertEqual({result.id for result in results}, {"id-alpha", "id-beta"})
-        self.assertEqual([rerank for _, rerank in hybrid_calls], [False, False])
+        self.assertEqual(set(candidate_calls), {"alpha", "beta"})
         self.assertEqual(rerank_mock.call_count, 1)
+
+    def test_multi_query_hybrid_retrieve_finalizes_merged_results_once(self):
+        def fake_candidates(query: str, **kwargs):
+            return [
+                RetrievalResult(
+                    id=f"id-{query}",
+                    document=f"Evidence for {query}",
+                    metadata={"url": f"https://example.com/{query}"},
+                    score=1.0,
+                    semantic_score=1.0,
+                    bm25_score=0.0,
+                )
+            ]
+
+        passthrough = lambda results, **kwargs: list(results)
+        with (
+            patch("src.rag.retrieval._hybrid_retrieve_candidates", side_effect=fake_candidates),
+            patch("src.rag.retrieval.rerank_results", side_effect=passthrough) as rerank_mock,
+            patch("src.rag.retrieval.diversify_by_url", side_effect=passthrough) as diversify_mock,
+            patch("src.rag.retrieval.expand_formula_neighbor_chunks", side_effect=passthrough) as formula_mock,
+            patch("src.rag.retrieval.expand_parent_context_results", side_effect=passthrough) as parent_mock,
+        ):
+            results = retrieval.multi_query_hybrid_retrieve(
+                ["alpha", "beta"],
+                top_k=2,
+                per_query_k=1,
+                rerank=True,
+                diversify_urls=True,
+            )
+
+        self.assertEqual({result.id for result in results}, {"id-alpha", "id-beta"})
+        rerank_mock.assert_called_once()
+        diversify_mock.assert_called_once()
+        formula_mock.assert_called_once()
+        parent_mock.assert_called_once()
 
     def test_rerank_results_falls_back_when_reranker_fails(self):
         results = [

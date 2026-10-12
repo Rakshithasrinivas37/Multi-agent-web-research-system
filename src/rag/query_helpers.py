@@ -63,6 +63,8 @@ COVERAGE_EVIDENCE_TERMS = {
     "equation",
     "formula",
     "implementation",
+    "improvement",
+    "improvements",
     "limitation",
     "limitations",
     "metric",
@@ -127,12 +129,17 @@ COVERAGE_FACET_STOPWORDS = QUERY_FILLER_TERMS | COVERAGE_GENERIC_TERMS | COVERAG
     "detail",
     "details",
     "documentation",
+    "equations",
+    "formulas",
     "formulation",
     "example",
     "examples",
     "found",
     "governing",
     "official",
+    "implementations",
+    "libraries",
+    "library",
     "original",
     "paper",
     "papers",
@@ -243,7 +250,7 @@ def infer_question_evidence_types(question: str) -> list[str]:
         ("api", r"\b(api|pytorch|tensorflow|keras|implementation|code|signature|usage)\b"),
         ("complexity", r"\b(complexity|memory|time|efficient|linear|quadratic|scalability)\b"),
         ("applications", r"\b(application|use case|vision|nlp|computer vision)\b"),
-        ("limitations", r"\b(limitation|challenge|drawback|open question)\b"),
+        ("limitations", r"\b(limitations?|challenges?|drawbacks?|open questions?)\b"),
     ]
     return [name for name, pattern in checks if re.search(pattern, lowered)] or ["evidence"]
 
@@ -276,6 +283,12 @@ def question_required_facets(question: str) -> list[str]:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
             add(match.group(1))
     for match in re.finditer(r"\b(?:[A-Z]{2,}[A-Za-z0-9_.-]*|[A-Z][a-z]+(?:[A-Z][A-Za-z0-9_.-]+)+)\b", text):
+        candidates.append(match.group(0))
+    for match in re.finditer(
+        r"\b(?:natural language processing|NLP|computer vision|speech processing|speech recognition)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
         candidates.append(match.group(0))
     for match in re.finditer(
         r"\b([A-Za-z0-9][A-Za-z0-9_.+-]*(?:\s+[A-Za-z0-9][A-Za-z0-9_.+-]*){0,2})\s+"
@@ -363,6 +376,15 @@ def facet_present(facet: str, text: str) -> bool:
     lowered_facet = normalized.lower()
     if lowered_facet in lowered_text:
         return True
+    domain_patterns = {
+        "nlp": r"\b(?:natural language|language model|machine translation|translation|bert|text)\b",
+        "natural language processing": r"\b(?:nlp|natural language|language model|machine translation|translation|bert|text)\b",
+        "computer vision": r"\b(?:computer vision|vision transformer|vit|image|imagenet|visual)\b",
+        "speech processing": r"\b(?:speech|audio|acoustic|voice|asr)\b",
+        "speech recognition": r"\b(?:speech|audio|acoustic|voice|asr)\b",
+    }
+    if pattern := domain_patterns.get(lowered_facet):
+        return bool(re.search(pattern, lowered_text, flags=re.IGNORECASE))
     facet_tokens = coverage_question_tokens(lowered_facet)
     text_tokens = coverage_question_tokens(lowered_text)
     return bool(facet_tokens and facet_tokens <= text_tokens)

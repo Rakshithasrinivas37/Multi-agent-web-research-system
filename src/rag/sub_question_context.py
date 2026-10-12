@@ -29,6 +29,7 @@ from src.rag.query_helpers import (
 from src.rag.graphrag import graph_expand_question_results, graphrag_enabled
 from src.rag.retrieval import RetrievalResult, expand_parent_context_results, multi_query_hybrid_retrieve, source_url_coverage_retrieve
 from src.tools.groq_retry import create_chat_completion_with_retries
+from src.tools.tavily_search import search_with_tavily
 from src.tools.text_utils import clean_text
 
 
@@ -47,6 +48,11 @@ DEFAULT_QUERY_MAX_WORDS = 10
 DEFAULT_EVIDENCE_TAIL_TERMS = 2
 DEFAULT_NEAR_DUPLICATE_SIMILARITY = 0.58
 DEFAULT_CHUNK_DUPLICATE_SIMILARITY = 0.82
+DEFAULT_TAVILY_GAP_RESULTS_PER_QUERY = 3
+DEFAULT_TAVILY_GAP_QUERY_LIMIT = 4
+DEFAULT_EVIDENCE_JUDGE_MODEL = "openai/gpt-oss-20b"
+DEFAULT_EVIDENCE_JUDGE_MAX_CHUNKS = 12
+DEFAULT_EVIDENCE_JUDGE_CHUNK_CHARS = 650
 BENCHMARK_VALUE_PATTERN = re.compile(
     r"(?i)\b\d+(?:\.\d+)?\s*(?:%|bleu|rouge|f1|auc|accuracy|precision|recall|score|ms|s|hours?)\b"
 )
@@ -580,17 +586,8 @@ def retrieve_sub_question_context_groups(
             if fallback_candidates:
                 fallback_sources.append("collection_scan")
                 candidates = helpers.merge_retrieved_context(candidates, fallback_candidates)
-        browser_candidates = browser_question_context_retrieve(
-            question=question,
-            queries=query_set,
-            browser_results=browser_results or [],
-            top_k=candidate_chunks,
-            question_source_urls=question_source_urls,
-            required_evidence=required_evidence,
-        )
-        if browser_candidates:
-            fallback_sources.append("browser_results")
-            candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
+        # Exhaust indexed RAG recovery before considering direct browser snippets.
+        # This keeps already-indexed evidence as the primary synthesis input.
         missing_facets = missing_facets_for_results(question, candidates)
         if missing_facets:
             facet_candidates = facet_rescue_context_retrieve(
@@ -608,20 +605,129 @@ def retrieve_sub_question_context_groups(
             if facet_candidates:
                 fallback_sources.append("facet_scan")
                 candidates = helpers.merge_retrieved_context(candidates, facet_candidates)
-        if not candidates:
-            print(f"[synthesis] no per-question chunks found for: {question[:120]}")
-        ranked_candidates = rank_collection_scan_results(
+
+        rag_ranked_candidates = rank_collection_scan_results(
             question=question,
             queries=query_set,
             candidates=candidates,
             question_source_urls=question_source_urls,
             required_evidence=required_evidence,
         )
-        selected = helpers.meaningful_retrieval_results(ranked_candidates) or ranked_candidates or list(candidates)
-        selected = select_facet_covered_results(question, selected, final_chunks)
+        meaningful_rag_candidates = helpers.meaningful_retrieval_results(rag_ranked_candidates)
+        deterministic_missing_facets = missing_facets_for_results(question, candidates)
+        evidence_judge = llm_evidence_coverage_judge(
+            question=question,
+            required_evidence=required_evidence,
+            candidates=meaningful_rag_candidates,
+        )
+        judged_missing_facets = clean_string_list(evidence_judge.get("missing_facets"))
+        missing_facets = dedupe_preserve_order([
+            *deterministic_missing_facets,
+            *judged_missing_facets,
+        ])
+        browser_generation_reason = browser_candidate_generation_reason(
+            question=question,
+            candidates=meaningful_rag_candidates,
+            final_chunks=final_chunks,
+            missing_facets=missing_facets,
+        )
+        browser_candidates = browser_question_context_retrieve(
+            question=question,
+            queries=query_set,
+            browser_results=browser_results or [],
+            top_k=candidate_chunks,
+            question_source_urls=question_source_urls,
+            required_evidence=required_evidence,
+        ) if browser_generation_reason else []
+        pre_live_candidates = helpers.merge_retrieved_context(
+            meaningful_rag_candidates,
+            browser_candidates,
+        )
+        live_search_reason = browser_candidate_generation_reason(
+            question=question,
+            candidates=helpers.meaningful_retrieval_results(pre_live_candidates),
+            final_chunks=final_chunks,
+        ) if browser_generation_reason else ""
+        live_browser_candidates = tavily_gap_context_retrieve(
+            question=question,
+            queries=query_set,
+            candidates=pre_live_candidates,
+            top_k=candidate_chunks,
+            required_evidence=required_evidence,
+        ) if live_search_reason else []
+        if live_browser_candidates:
+            browser_candidates = helpers.merge_retrieved_context(
+                browser_candidates,
+                live_browser_candidates,
+            )
+
+        print(f"[synthesis] Sub-question: {question}\n")
+        print(
+            f"[synthesis] Candidates: {len(candidates)} | Browser candidates: {len(browser_candidates)} "
+            f"| Browser generation: {browser_generation_reason or 'skipped'}\n"
+        )
+        for index, result in enumerate(candidates, start=1):
+            print(f"[synthesis] Candidate {index}/{len(candidates)} | ID: {result.id} | Score: {result.score}\n{result.document}\n")
+
+        for index, result in enumerate(browser_candidates, start=1):
+            print(f"[synthesis] Browser candidate {index}/{len(browser_candidates)} | ID: {result.id} | Score: {result.score}\n{result.document}\n")
+            
+        if browser_candidates:
+            fallback_sources.append("browser_results")
+            if live_browser_candidates:
+                fallback_sources.append("tavily_gap_search")
+        if not candidates:
+            print(f"[synthesis] no per-question chunks found for: {question[:120]}")
+        # Rank and select indexed RAG evidence first. Browser snippets are a
+        # gap-filling fallback and must not displace relevant indexed chunks.
+        rag_ranked_candidates = rank_collection_scan_results(
+            question=question,
+            queries=query_set,
+            candidates=candidates,
+            question_source_urls=question_source_urls,
+            required_evidence=required_evidence,
+        )
+        selected_rag = helpers.meaningful_retrieval_results(rag_ranked_candidates) or rag_ranked_candidates or list(candidates)
+        meaningful = list(selected_rag)
+        selected_rag = select_facet_covered_results(question, selected_rag, final_chunks)
+        facet_selected = list(selected_rag)
+        ranked_candidates = rag_ranked_candidates
+
+        print(
+            "[retrieval] Pre-selection scores: "
+            + str([
+                {
+                    "id": result.id,
+                    "origin": "browser" if result.id.startswith(("browser-question-", "tavily-question-")) else "rag",
+                    "score": round(float(result.score), 4),
+                    "rerank_score": round(float(result.rerank_score), 4),
+                }
+                for result in [*rag_ranked_candidates, *browser_candidates]
+            ]),
+            flush=True,
+        )
+
+        if len(selected_rag) < final_chunks and browser_candidates:
+            ranked_browser = rank_collection_scan_results(
+                question=question,
+                queries=query_set,
+                candidates=browser_candidates,
+                question_source_urls=question_source_urls,
+                required_evidence=required_evidence,
+            )
+            browser_selected = select_facet_covered_results(
+                question,
+                helpers.meaningful_retrieval_results(ranked_browser) or ranked_browser,
+                final_chunks - len(selected_rag),
+            )
+            selected = helpers.merge_retrieved_context(selected_rag, browser_selected)[:final_chunks]
+            ranked_candidates = helpers.merge_retrieved_context(rag_ranked_candidates, ranked_browser)
+        else:
+            selected = selected_rag
+
         graph_result = graph_expand_question_results(
             question=question,
-            candidates=ranked_candidates or candidates,
+            candidates=rag_ranked_candidates or candidates,
             seed_results=selected,
             final_chunks=final_chunks,
         )
@@ -629,6 +735,17 @@ def retrieve_sub_question_context_groups(
         if graph_result.get("graph_added_count"):
             fallback_sources.append("graphrag")
         tagged = [tag_result_for_question(result, question) for result in selected[:final_chunks]]
+        chunk_text = "\n\n".join(
+            f"[retrieval] Chunk {index}/{len(tagged)} | ID: {result.id}\n{result.document}"
+            for index, result in enumerate(tagged, start=1)
+        )
+        print(
+            f"[retrieval] Sub-question: {question}\n"
+            f"[retrieval] Candidates: {len(candidates)} | Selected chunks: {len(tagged)}\n"
+            f"[retrieval] Selected chunks (IDs, URLs, scores): {retrieval_trace_entries(tagged)}\n"
+            f"{chunk_text}",
+            flush=True,
+        )
         return sub_question_context_group(
             question,
             query_set,
@@ -636,6 +753,21 @@ def retrieve_sub_question_context_groups(
             tagged,
             fallback_sources=fallback_sources,
             graph_context=graph_result,
+            selection_trace={
+                "candidates": retrieval_trace_entries(candidates),
+                "ranked_ids": [r.id for r in ranked_candidates],
+                "meaningful_ids": [r.id for r in meaningful],
+                "meaningful_rag_ids": [r.id for r in meaningful_rag_candidates],
+                "facet_selected_ids": [r.id for r in facet_selected],
+                "browser_candidate_ids": [r.id for r in browser_candidates],
+                "live_browser_candidate_ids": [r.id for r in live_browser_candidates],
+                "live_search_reason": live_search_reason or "skipped",
+                "browser_generation_reason": browser_generation_reason or "skipped",
+                "deterministic_missing_facets": deterministic_missing_facets,
+                "llm_missing_facets": judged_missing_facets,
+                "llm_evidence_coverage": evidence_judge,
+                "final_ids": [r.id for r in tagged],
+            },
         )
 
     max_workers = sub_question_retrieval_max_workers(len(clean_questions), rerank=rerank)
@@ -643,6 +775,206 @@ def retrieve_sub_question_context_groups(
         return [retrieve_question(question) for question in clean_questions]
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="rag-subquestion") as executor:
         return list(executor.map(retrieve_question, clean_questions))
+
+
+def retrieval_trace_entries(results: Sequence[RetrievalResult]) -> list[dict[str, Any]]:
+    """Keep stage diagnostics serializable without copying document bodies."""
+    return [
+        {"id": r.id, "url": clean_text((r.metadata or {}).get("url") or (r.metadata or {}).get("source_url")),
+         "score": r.score}
+        for r in results
+    ]
+
+
+def llm_evidence_coverage_judge(
+    question: str,
+    required_evidence: Sequence[str],
+    candidates: Sequence[RetrievalResult],
+) -> dict[str, Any]:
+    """Use a bounded LLM check to find evidence gaps after deterministic retrieval.
+
+    The deterministic facet check remains authoritative. This judge may add a
+    missing facet, but an unavailable or malformed LLM response never removes
+    a gap and therefore cannot prevent fallback retrieval.
+    """
+
+    facets = dedupe_preserve_order([
+        *clean_string_list(required_evidence),
+        *question_required_facets(question),
+    ])
+    if not facets or not candidates:
+        return {"status": "skipped", "missing_facets": [], "covered_facets": [], "supporting_chunk_ids": {}}
+
+    api_key = clean_text(os.environ.get("GROQ_API_KEY"))
+    if not api_key or clean_text(os.environ.get("RAG_LLM_FACET_JUDGE", "true")).lower() in {"0", "false", "no", "off"}:
+        return {"status": "disabled", "missing_facets": [], "covered_facets": [], "supporting_chunk_ids": {}}
+
+    rows = []
+    allowed_ids = set()
+    for result in list(candidates)[:DEFAULT_EVIDENCE_JUDGE_MAX_CHUNKS]:
+        chunk_id = clean_text(result.id)
+        content = clean_text(result.document)[:DEFAULT_EVIDENCE_JUDGE_CHUNK_CHARS]
+        if not chunk_id or not content:
+            continue
+        allowed_ids.add(chunk_id)
+        rows.append({"id": chunk_id, "text": content})
+    if not rows:
+        return {"status": "skipped", "missing_facets": [], "covered_facets": [], "supporting_chunk_ids": {}}
+
+    prompt = json.dumps({
+        "question": clean_text(question),
+        "required_facets": facets,
+        "chunks": rows,
+        "output_schema": {
+            "covered_facets": ["facet"],
+            "missing_facets": ["facet"],
+            "supporting_chunk_ids": {"facet": ["chunk-id"]},
+        },
+    }, ensure_ascii=True)
+    system = (
+        "You are an evidence coverage judge. Inspect only the supplied chunks. "
+        "A facet is covered only when a chunk explicitly supports it; do not infer "
+        "or reconstruct missing equations, numbers, or claims. Return valid JSON "
+        "with covered_facets, missing_facets, and supporting_chunk_ids."
+    )
+    try:
+        from groq import Groq
+
+        response = create_chat_completion_with_retries(
+            Groq(),
+            model=clean_text(os.environ.get("RAG_EVIDENCE_JUDGE_MODEL")) or DEFAULT_EVIDENCE_JUDGE_MODEL,
+            temperature=0,
+            max_tokens=350,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        raw = clean_text(response.choices[0].message.content)
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("evidence judge returned a non-object JSON value")
+        covered = [facet for facet in clean_string_list(payload.get("covered_facets")) if facet in facets]
+        missing = [facet for facet in clean_string_list(payload.get("missing_facets")) if facet in facets]
+        support = {}
+        for facet, ids in (payload.get("supporting_chunk_ids") or {}).items():
+            if facet not in facets:
+                continue
+            valid_ids = [clean_text(item) for item in ids or [] if clean_text(item) in allowed_ids]
+            if valid_ids:
+                support[facet] = dedupe_preserve_order(valid_ids)
+        return {
+            "status": "ok",
+            "covered_facets": dedupe_preserve_order(covered),
+            "missing_facets": dedupe_preserve_order(missing),
+            "supporting_chunk_ids": support,
+        }
+    except Exception as error:
+        print(f"[retrieval] LLM evidence coverage judge unavailable: {type(error).__name__}: {error}")
+        return {
+            "status": "error",
+            "error": f"{type(error).__name__}: {error}",
+            "missing_facets": [],
+            "covered_facets": [],
+            "supporting_chunk_ids": {},
+        }
+
+
+def browser_candidate_generation_reason(
+    question: str,
+    candidates: Sequence[RetrievalResult],
+    final_chunks: int,
+    missing_facets: Sequence[str] | None = None,
+) -> str:
+    """Build browser snippets only when indexed RAG evidence is weak or absent."""
+
+    if len(candidates) < max(1, final_chunks):
+        return "insufficient_rag_candidates"
+    facets = list(missing_facets) if missing_facets is not None else missing_facets_for_results(question, candidates)
+    if facets:
+        return "missing_facets"
+    return ""
+
+
+def tavily_gap_search_enabled() -> bool:
+    """Enable live missing-evidence recovery only when Tavily is configured."""
+
+    configured = bool(clean_text(os.environ.get("TAVILY_API_KEY")))
+    value = clean_text(os.environ.get("RAG_TAVILY_GAP_SEARCH", "true")).lower()
+    return configured and value not in {"0", "false", "no", "off"}
+
+
+def tavily_gap_context_retrieve(
+    question: str,
+    queries: Sequence[str],
+    candidates: Sequence[RetrievalResult],
+    top_k: int,
+    required_evidence: Sequence[str] | None = None,
+) -> list[RetrievalResult]:
+    """Search for sources that cover facets still absent from local evidence."""
+
+    if not tavily_gap_search_enabled():
+        return []
+    missing_facets = missing_facets_for_results(question, candidates)
+    search_topics = missing_facets or [question]
+    evidence_terms = " ".join(sorted(browser_evidence_query_terms(
+        question,
+        required_evidence=required_evidence,
+    ))[:6])
+    search_queries = dedupe_preserve_order(
+        clean_text(f"{question} {topic} {evidence_terms} authoritative source")
+        for topic in search_topics
+    )[:DEFAULT_TAVILY_GAP_QUERY_LIMIT]
+    results = []
+    helpers = generation_helpers()
+    for query_index, query in enumerate(search_queries):
+        try:
+            rows = search_with_tavily(query, max_results=DEFAULT_TAVILY_GAP_RESULTS_PER_QUERY)
+        except Exception as error:
+            print(f"[synthesis] Tavily gap search failed for {query!r}: {error}")
+            continue
+        for result_index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            url = clean_text(row.get("url"))
+            title = clean_text(row.get("title")) or url
+            content = clean_text(row.get("raw_content") or row.get("content") or row.get("snippet"))
+            if not url or not content:
+                continue
+            metadata = {
+                "url": url,
+                "source_url": url,
+                "title": title,
+                "source_type": "tavily",
+                "source_quality": "live_gap_search",
+                "query_contexts": query,
+            }
+            try:
+                semantic_score = float(row.get("score") or 0.0)
+            except (TypeError, ValueError):
+                semantic_score = 0.0
+            results.append(RetrievalResult(
+                id=tavily_question_chunk_id(url, content, query_index, result_index),
+                document=content,
+                metadata=metadata,
+                score=0.0,
+                semantic_score=semantic_score,
+                bm25_score=0.0,
+                authority_score=1.0 if helpers.is_primary_source(metadata) else 0.0,
+            ))
+    ranked = rank_collection_scan_results(
+        question=question,
+        queries=queries,
+        candidates=results,
+        required_evidence=required_evidence,
+    )
+    return ranked[:max(1, top_k)]
+
+
+def tavily_question_chunk_id(url: str, content: str, query_index: int, result_index: int) -> str:
+    digest = hashlib.sha1(f"{url}|{content}".encode("utf-8", errors="ignore")).hexdigest()[:24]
+    return f"tavily-question-{query_index}-{result_index}-{digest}"
 
 
 def sub_question_context_group(
@@ -653,6 +985,7 @@ def sub_question_context_group(
     fallback_used: bool = False,
     fallback_sources: Sequence[str] | None = None,
     graph_context: dict[str, Any] | None = None,
+    selection_trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     clean_fallback_sources = [clean_text(source) for source in fallback_sources or [] if clean_text(source)]
     graph_context = graph_context or {}
@@ -668,7 +1001,9 @@ def sub_question_context_group(
         "graph_added_count": int(graph_context.get("graph_added_count") or 0),
         "graph_entity_count": int(graph_context.get("entity_count") or 0),
         "graph_entities": list(graph_context.get("entities") or []),
+        "candidates": list(candidates),
         "chunks": list(chunks),
+        "selection_trace": selection_trace or {},
     }
 
 
@@ -944,7 +1279,9 @@ def select_facet_covered_results(
     helpers = generation_helpers()
     results = list(ranked_results)
     facets = question_required_facets(question)
-    if not facets or not results:
+    evidence_types = infer_question_evidence_types(question)
+    concrete_types = {"equation", "complexity", "benchmark", "api"} & set(evidence_types)
+    if not results or (not facets and not concrete_types):
         return results[: max(1, limit)]
 
     selected = []
@@ -955,6 +1292,21 @@ def select_facet_covered_results(
             if key in seen:
                 continue
             if facet_present(facet, helpers.retrieval_result_text(result)):
+                selected.append(result)
+                seen.add(key)
+                break
+
+    for evidence_type in ("equation", "complexity", "benchmark", "api"):
+        if evidence_type not in evidence_types:
+            continue
+        for result in results:
+            key = helpers.retrieval_result_key(result)
+            if key in seen:
+                continue
+            if required_evidence_signal_present(
+                helpers.retrieval_result_text(result),
+                [evidence_type],
+            ):
                 selected.append(result)
                 seen.add(key)
                 break
@@ -1007,6 +1359,8 @@ def rank_collection_scan_results(
         primary_source = helpers.is_primary_source(metadata)
         primary_signal = primary_source and signal_score
         exact_signal = signal_score >= 10
+        if facets and not facet_score and not preferred_source:
+            continue
         if not (overlap or topic_overlap or evidence_score or signal_score or facet_score or preferred_source):
             continue
         score = (
@@ -1035,6 +1389,24 @@ def rank_collection_scan_results(
     if ranked:
         return dedupe_near_duplicate_chunks(helpers.unique_retrieval_results(ranked))
     return helpers.source_balanced_results(fallback)
+
+
+def required_evidence_signal_present(text: str, evidence_types: Sequence[str]) -> bool:
+    """Reject generic overlap for questions requesting one concrete evidence form."""
+
+    requested = {clean_text(item).lower() for item in evidence_types} - {"definition", "evidence"}
+    if len(requested) != 1:
+        return True
+    evidence_type = next(iter(requested))
+    value = clean_text(text)
+    patterns = {
+        "equation": r"(?:=|softmax\s*\(|\bexp\s*\(|\bsum\s*\(|√|sqrt\s*\()",
+        "complexity": r"(?:\bO\s*\(|\bquadratic\b|\blinear complexity\b|\bmemory (?:cost|complexity|requirement)|\bsequence length\b)",
+        "benchmark": r"\b\d+(?:\.\d+)?\s*(?:%|BLEU|ROUGE|F1|AUC|accuracy|score|ms|seconds?)\b",
+        "api": r"\b(?:API|class|function|method|parameter|argument|signature|torch\.|tf\.|keras\.)\b",
+    }
+    pattern = patterns.get(evidence_type)
+    return True if not pattern else bool(re.search(pattern, value, flags=re.IGNORECASE))
 
 
 def chunk_starts_mid_word(text: str) -> bool:
@@ -1126,10 +1498,35 @@ def sub_question_context_counts(groups: Sequence[dict[str, Any]]) -> list[dict[s
             "graph_added_count": int(group.get("graph_added_count") or 0),
             "graph_entity_count": int(group.get("graph_entity_count") or 0),
             "graph_entities": list(group.get("graph_entities", [])),
+            "all_retrieved_chunks": retrieval_audit_entries(group.get("candidates", [])),
+            "top_selected_chunks": retrieval_audit_entries(group.get("chunks", []))[:6],
+            "selection_trace": dict(group.get("selection_trace", {})),
         }
         for group in groups
         if isinstance(group, dict)
     ]
+
+
+def retrieval_audit_entries(results: Sequence[RetrievalResult]) -> list[dict[str, Any]]:
+    """Serialize complete chunk bodies and ranking signals for run-level auditing."""
+    entries = []
+    for rank, result in enumerate(results or [], start=1):
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        entries.append({
+            "rank": rank,
+            "id": result.id,
+            "url": clean_text(metadata.get("url") or metadata.get("source_url")),
+            "title": clean_text(metadata.get("title")),
+            "source_type": clean_text(metadata.get("source_type")),
+            "origin": "browser" if clean_text(result.id).startswith(("browser-question-", "tavily-question-")) else "retrieved",
+            "score": result.score,
+            "semantic_score": result.semantic_score,
+            "bm25_score": result.bm25_score,
+            "authority_score": result.authority_score,
+            "rerank_score": result.rerank_score,
+            "content": clean_text(result.document),
+        })
+    return entries
 
 
 def tag_result_for_question(result: RetrievalResult, question: str) -> RetrievalResult:
