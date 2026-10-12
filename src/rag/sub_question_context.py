@@ -661,23 +661,44 @@ def retrieve_sub_question_context_groups(
             fallback_sources.append("browser_results")
             if live_browser_candidates:
                 fallback_sources.append("tavily_gap_search")
-            candidates = helpers.merge_retrieved_context(candidates, browser_candidates)
         if not candidates:
             print(f"[synthesis] no per-question chunks found for: {question[:120]}")
-        ranked_candidates = rank_collection_scan_results(
+        # Rank and select indexed RAG evidence first. Browser snippets are a
+        # gap-filling fallback and must not displace relevant indexed chunks.
+        rag_ranked_candidates = rank_collection_scan_results(
             question=question,
             queries=query_set,
             candidates=candidates,
             question_source_urls=question_source_urls,
             required_evidence=required_evidence,
         )
-        selected = helpers.meaningful_retrieval_results(ranked_candidates) or ranked_candidates or list(candidates)
-        meaningful = list(selected)
-        selected = select_facet_covered_results(question, selected, final_chunks)
-        facet_selected = list(selected)
+        selected_rag = helpers.meaningful_retrieval_results(rag_ranked_candidates) or rag_ranked_candidates or list(candidates)
+        meaningful = list(selected_rag)
+        selected_rag = select_facet_covered_results(question, selected_rag, final_chunks)
+        facet_selected = list(selected_rag)
+        ranked_candidates = rag_ranked_candidates
+
+        if len(selected_rag) < final_chunks and browser_candidates:
+            ranked_browser = rank_collection_scan_results(
+                question=question,
+                queries=query_set,
+                candidates=browser_candidates,
+                question_source_urls=question_source_urls,
+                required_evidence=required_evidence,
+            )
+            browser_selected = select_facet_covered_results(
+                question,
+                helpers.meaningful_retrieval_results(ranked_browser) or ranked_browser,
+                final_chunks - len(selected_rag),
+            )
+            selected = helpers.merge_retrieved_context(selected_rag, browser_selected)[:final_chunks]
+            ranked_candidates = helpers.merge_retrieved_context(rag_ranked_candidates, ranked_browser)
+        else:
+            selected = selected_rag
+
         graph_result = graph_expand_question_results(
             question=question,
-            candidates=ranked_candidates or candidates,
+            candidates=rag_ranked_candidates or candidates,
             seed_results=selected,
             final_chunks=final_chunks,
         )

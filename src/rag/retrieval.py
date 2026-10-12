@@ -286,7 +286,7 @@ def multi_query_hybrid_retrieve(
     max_workers = retrieval_max_workers(len(clean_queries), rerank=rerank)
 
     def retrieve_query(query: str) -> list[RetrievalResult]:
-        return _hybrid_retrieve_candidates(
+        candidates = _hybrid_retrieve_candidates(
             query=query,
             chroma_path=chroma_path,
             collection_name=collection_name,
@@ -301,6 +301,18 @@ def multi_query_hybrid_retrieve(
             bm25_scan_limit=bm25_scan_limit,
             embedding_device=embedding_device,
         )[: max(1, per_query_k)]
+        if not rerank or not candidates:
+            return candidates
+        # Rerank against the individual rewritten query. A joined query for
+        # several planner questions can promote evidence for the wrong topic.
+        return rerank_results(
+            query=query,
+            results=candidates,
+            top_n=min(len(candidates), max(1, rerank_k)),
+            model_name=reranker_model,
+            device=embedding_device,
+            rerank_weight=rerank_weight,
+        )
 
     if max_workers <= 1:
         result_groups = [retrieve_query(query) for query in clean_queries]
@@ -315,15 +327,8 @@ def multi_query_hybrid_retrieve(
                 by_id[result.id] = result
 
     merged = sorted(by_id.values(), key=lambda item: item.score, reverse=True)
-    if rerank:
-        merged = rerank_results(
-            query=joined_query_text(clean_queries)[:4000],
-            results=merged,
-            top_n=max(top_k, rerank_k, len(clean_queries) * max(1, per_query_k)),
-            model_name=reranker_model,
-            device=embedding_device,
-            rerank_weight=rerank_weight,
-        )
+    # Each query group was reranked above using its own question. Do not
+    # rerank the merged pool with a concatenated multi-question query.
     if diversify_urls:
         merged = diversify_by_url(merged, top_k=top_k)
     else:
