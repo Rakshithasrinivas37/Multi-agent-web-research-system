@@ -1873,10 +1873,14 @@ def synthesize_per_question_notes(
                 model=rag_generation_model(model),
                 temperature=0,
                 max_tokens=DEFAULT_PER_QUESTION_SYNTHESIS_MAX_TOKENS,
+                response_format={"type": "json_object"},
                 messages=[
                     {
                         "role": "system",
-                        "content": "You synthesize one planner question from retrieved RAG evidence only. Do not use outside knowledge.",
+                        "content": (
+                            "You are an evidence extractor. Return only valid JSON matching the requested schema. "
+                            "Use only the supplied chunks. Never reconstruct incomplete equations or add outside facts."
+                        ),
                     },
                     {"role": "user", "content": prompt},
                 ],
@@ -1890,9 +1894,11 @@ def synthesize_per_question_notes(
                     "question": question,
                     **selection,
                     "synthesis": synthesis,
-                    "source_indexes": citation_markers(synthesis),
+                    "source_indexes": parsed["source_indexes"],
+                    "supporting_chunk_ids": parsed["supporting_chunk_ids"],
+                    "missing_evidence": parsed["missing_evidence"],
                     "attempts": 1,
-                    "fallback_used": fallback_used,
+                    "fallback_used": False,
                     "error": "",
                 }
             )
@@ -1905,6 +1911,8 @@ def synthesize_per_question_notes(
                     **selection,
                     "synthesis": synthesis,
                     "source_indexes": citation_markers(synthesis),
+                    "supporting_chunk_ids": [result.id for result in question_context],
+                    "missing_evidence": ["The model did not return valid structured evidence notes."],
                     "attempts": 1,
                     "fallback_used": True,
                     "error": clean_text(error)[:300],
@@ -1931,14 +1939,22 @@ Planner sub-question:
 Retrieved evidence for this sub-question only:
 {context_text}
 
-Write report-agent-ready notes for this one planner sub-question only.
-Use only the retrieved evidence above.
-Include supported definitions, equations, formulas, API details, benchmark values, comparisons, limitations, and examples only when they appear above.
-If the evidence is partial, first write what is supported with citations, then name only the exact missing detail.
-Cite every factual claim with the available source markers exactly like [1].
-Do not use Markdown tables.
-Do not write the final report.
-Do not add facts, source names, authors, dates, titles, papers, numbers, equations, or citations that are not present above."""
+Return only this JSON object:
+{{
+  "supported_notes": "Concise evidence-backed notes with citations immediately after claims, using only markers present above.",
+  "missing_evidence": ["Exact requested detail that is absent, or an empty list."],
+  "source_indexes": [1],
+  "supporting_chunk_ids": ["Exact Chunk ID values from the evidence above."]
+}}
+
+Rules:
+- Use only the retrieved evidence above.
+- Preserve equations, definitions, API details, benchmark values, comparisons, limitations, and examples exactly when present.
+- Never reconstruct a truncated equation or infer an unsupported claim.
+- Every factual statement in supported_notes must have an adjacent source marker such as [1].
+- source_indexes and supporting_chunk_ids must refer only to evidence actually used.
+- Do not include Markdown headings, report structure, next steps, workflow instructions, or instructions for another agent.
+- If evidence is incomplete, put only the missing factual details in missing_evidence."""
 
 
 def build_question_context_text(
@@ -2111,33 +2127,72 @@ def combine_per_question_synthesis(
             ]
         )
 
-    fallback_questions = [
-        clean_text(item.get("question"))
-        for item in per_question_notes
-        if item.get("fallback_used") and clean_text(item.get("question"))
-    ]
     lines.extend(
         [
             "",
             "## Conflicts Or Gaps",
             format_per_question_gap_summary(per_question_notes),
-            "",
-            "## Recommended Report Flow",
-            f"Use one topic section per planner sub-question in the order above. Overall instruction: {synthesis_instruction}",
         ]
     )
-    if fallback_questions:
-        lines.append("Questions using deterministic fallback: " + "; ".join(fallback_questions))
     return clean_text("\n".join(lines))
 
 
 def format_per_question_gap_summary(per_question_notes: Sequence[dict[str, Any]]) -> str:
     gaps = []
     for item in per_question_notes:
-        synthesis = clean_text(item.get("synthesis")).lower()
-        if not citation_markers(item.get("synthesis")) or "missing evidence" in synthesis:
+        missing = clean_string_list(item.get("missing_evidence"))
+        if missing:
+            gaps.append(f"- {clean_text(item.get('question'))}: {'; '.join(missing[:4])}")
+        elif not citation_markers(item.get("synthesis")):
             gaps.append(f"- {clean_text(item.get('question'))}: missing or partial cited evidence.")
     return "\n".join(gaps) or "- No missing-evidence claims were produced by per-question synthesis."
+
+
+def parse_per_question_synthesis(
+    raw: Any,
+    question_context: Sequence[RetrievalResult],
+    sources: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate the structured per-question synthesis response."""
+
+    text = clean_text(raw)
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("per-question synthesis must be a JSON object")
+
+    supported = normalize_citation_markers(payload.get("supported_notes"))
+    if not supported or not citation_markers(supported):
+        raise ValueError("structured synthesis has no cited supported_notes")
+
+    available_ids = {clean_text(result.id) for result in question_context if clean_text(result.id)}
+    supporting_ids = dedupe_preserve_order(
+        clean_text(item)
+        for item in payload.get("supporting_chunk_ids", []) or []
+        if clean_text(item) in available_ids
+    )
+    if not supporting_ids:
+        raise ValueError("structured synthesis has no valid supporting_chunk_ids")
+
+    available_indexes = {
+        int(source.get("index"))
+        for source in sources
+        if isinstance(source, dict) and isinstance(source.get("index"), int)
+    }
+    source_indexes = [
+        value for value in citation_markers(supported)
+        if value in available_indexes
+    ]
+    if not source_indexes:
+        raise ValueError("structured synthesis has no valid source indexes")
+
+    return {
+        "synthesis": supported,
+        "missing_evidence": clean_string_list(payload.get("missing_evidence")),
+        "source_indexes": dedupe_ints(source_indexes),
+        "supporting_chunk_ids": supporting_ids,
+    }
 
 
 def deterministic_synthesis_from_evidence_packs(
