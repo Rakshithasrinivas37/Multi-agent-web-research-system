@@ -37,7 +37,7 @@ DEFAULT_EMBEDDING_BATCH_SIZE = 16
 DEFAULT_CUDA_EMBEDDING_BATCH_SIZE = 4
 DEFAULT_CHROMA_UPSERT_BATCH_SIZE = 8
 DEFAULT_METADATA_SCHEMA_VERSION = 9
-# Qwen3-Embedding wants an instruction on QUERIES only; documents get no prompt.
+# Qwen3-Embedding uses an instruction on QUERIES only; other models use plain query text.
 QWEN_QUERY_INSTRUCTION = (
     "Instruct: Given a research question, retrieve relevant passages that answer the question\nQuery: "
 )
@@ -214,8 +214,9 @@ class SentenceTransformerEmbeddingFunction:
         return self._encode(input)
 
     def embed_queries(self, texts: list[str]) -> list[list[float]]:
-        """Query embedding path. Adds the Qwen3 instruction prompt."""
-        return self._encode(texts, prompt=QWEN_QUERY_INSTRUCTION)
+        """Add Qwen's retrieval instruction only for Qwen embedding models."""
+        prompt = QWEN_QUERY_INSTRUCTION if "qwen" in self.model_name.lower() else ""
+        return self._encode(texts, prompt=prompt)
 
     def name(self) -> str:
         """Stable Chroma embedding function name used when reopening collections."""
