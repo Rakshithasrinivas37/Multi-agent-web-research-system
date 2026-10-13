@@ -944,6 +944,17 @@ The matrix-based formulation is. In the implementation described in the later wo
         self.assertIn("Core equation", prompt)
         self.assertIn("show the most general/source-backed equation first", prompt)
 
+    def test_report_prompt_keeps_conflicting_scopes_distinct(self):
+        prompt = build_report_prompt(
+            objective="Research objective",
+            output_format="report",
+            questions=[],
+            per_question_synthesis={},
+            sources=[],
+        )
+
+        self.assertIn("different assumptions, metrics, or scopes", prompt)
+
     def test_build_report_prompt_includes_structured_coverage_contract(self):
         prompt = build_report_prompt(
             objective="Attention mechanism",
